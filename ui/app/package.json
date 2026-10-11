@@ -10,7 +10,7 @@
     "dev": "JKB_APP_DEV_RENDERER=1 electron-vite dev",
     "start": "electron-vite preview",
     "test": "node --test --test-timeout=120000 \"test/*.test.mjs\"",
-    "package": "electron-builder --dir --config electron-builder.yml"
+    "package": "node ../scripts/pty-helper-exec.mjs && electron-builder --dir --config electron-builder.yml"
   },
   "dependencies": {
     "node-pty": "^1.1.0"
