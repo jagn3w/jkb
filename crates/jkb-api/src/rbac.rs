@@ -306,7 +306,7 @@ impl Request {
             | Self::RoleRotateContainer { .. }
             | Self::WorkflowSet { .. }
             | Self::WorkflowDefine { .. }
-            // The packaged templates are read-only to everyone; the copies the workflow scripts read
+            // The packaged templates are read-only to everyone; the copies the coordinators read
             // instead are the operator's, as choosing a strategy is.
             | Self::WorkflowAgentCopy { .. }
             | Self::WorkflowAgentSet { .. }

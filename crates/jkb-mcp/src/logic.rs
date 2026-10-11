@@ -92,8 +92,8 @@ pub struct GetContextArgs {
     pub n: Option<usize>,
 }
 
-/// `query` / `task_next` arguments (a DSL string; `task_next` uses only its
-/// scope/tag parts).
+/// `query` / `task_next` arguments (a DSL string; for `task_next` every predicate narrows the
+/// frontier, with the kind forced to `task`).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct QueryArgs {
     /// Query DSL (may be empty for `task_next` = the whole ready frontier).
@@ -289,7 +289,7 @@ pub fn run_view(tools: &Tools, args: &RunViewArgs) -> Result<Answer> {
     )
 }
 
-/// The ready-frontier tasks, optionally scoped/tag-filtered by the DSL in `query`.
+/// The ready-frontier tasks, narrowed by every predicate of the DSL in `query`.
 ///
 /// # Errors
 /// Returns an error if the DSL is malformed or a read fails.

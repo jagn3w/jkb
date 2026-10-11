@@ -145,11 +145,11 @@ fn bad_asks_are_named_refusals() {
     let kb = Kb::new();
     for (r, needle) in [
         (
-            json!({ "op": "workflow.agent", "name": "swarm-status", "vars": { "status": "x" } }),
+            json!({ "op": "workflow.agent", "name": "swarm-reviewer", "vars": { "branch": "x" } }),
             "no value for",
         ),
         (
-            json!({ "op": "workflow.agent", "name": "swarm-status", "packaged": true, "version": 1 }),
+            json!({ "op": "workflow.agent", "name": "swarm-reviewer", "packaged": true, "version": 1 }),
             "not both",
         ),
         (
@@ -157,7 +157,7 @@ fn bad_asks_are_named_refusals() {
             "no agent template",
         ),
         (
-            json!({ "op": "workflow.agent_set", "name": "swarm-status", "edit": { "describe": "d" } }),
+            json!({ "op": "workflow.agent_set", "name": "swarm-reviewer", "edit": { "describe": "d" } }),
             "read-only",
         ),
         (

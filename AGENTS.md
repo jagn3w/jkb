@@ -74,7 +74,7 @@ run — starts the same one.
   `/jkb-task-swarm` calls its integration branch, and both paths show up here. `dropped` is a
   cancelled task that was on the branch — the opposite outcome to `landed`, never folded into it.
 - `jkb task review record --findings <ns>` — record that a review ran against the current
-  branch. `/jkb-review-log` does this for you; `jkb task land` requires it.
+  branch. `/jkb-review` does this for you; `jkb task land` requires it.
 
 **Recording where a task is being worked.** `jkb task work` does this for you; do it explicitly
 only when the branch was made some other way (a swarm run, a branch you cut by hand).

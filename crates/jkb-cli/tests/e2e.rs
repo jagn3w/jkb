@@ -437,6 +437,16 @@ fn search_query(route: Route) -> Query {
 }
 
 fn ready_uids(db: &Db) -> Vec<String> {
-    let rows = db.read(|conn| task::ready(conn, Scope::All, &[])).unwrap();
+    let rows = db
+        .read(|conn| {
+            task::ready(
+                conn,
+                jkb_core::query::Query {
+                    scope: Scope::All,
+                    ..jkb_core::query::Query::default()
+                },
+            )
+        })
+        .unwrap();
     rows.into_iter().map(|r| r.uid).collect()
 }

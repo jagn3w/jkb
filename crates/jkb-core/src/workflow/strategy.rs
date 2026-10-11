@@ -436,7 +436,7 @@ impl StrategySpec {
             ),
             Phase::Review => (
                 Role::Reviewer,
-                "run a review round (`/jkb-review-log`), then `jkb workflow observe <uid>`",
+                "run a review round (`/jkb-review`), then `jkb workflow observe <uid>`",
             ),
             Phase::SystemicReview => (
                 Role::SystemicReviewer,

@@ -451,13 +451,33 @@ mod tests {
         let id = make_task(&db, "task:a");
 
         // Unclaimed → ready.
-        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        let frontier = db
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::All,
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
+            .unwrap();
         assert_eq!(frontier.len(), 1);
 
         // Claimed → excluded from the frontier.
         db.write_txn("t", move |conn, meta| claim(conn, meta, id, "host:dead"))
             .unwrap();
-        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        let frontier = db
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::All,
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
+            .unwrap();
         assert!(frontier.is_empty());
 
         // A live scan that does NOT include the owner reclaims it → back in the frontier.
@@ -465,7 +485,17 @@ mod tests {
             crate::transition::reclaim_dead(conn, meta, &[], |_| jkb_fsm::Fact::No)
         })
         .unwrap();
-        let frontier = db.read(|conn| ready(conn, Scope::All, &[])).unwrap();
+        let frontier = db
+            .read(|conn| {
+                ready(
+                    conn,
+                    crate::query::Query {
+                        scope: Scope::All,
+                        ..crate::query::Query::default()
+                    },
+                )
+            })
+            .unwrap();
         assert_eq!(frontier.len(), 1);
     }
 

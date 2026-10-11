@@ -158,7 +158,7 @@ pub enum WorkflowCmd {
         /// reviewed-design or direct.
         graph: String,
     },
-    /// The agent templates the workflow scripts give their agents (design D53.7): packaged ones
+    /// The agent templates the coordinator sessions give themselves and their workers (design D53.7): packaged ones
     /// (read-only) and the operator's copies, which override a packaged template of their name.
     Agent {
         #[command(subcommand)]

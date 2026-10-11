@@ -209,16 +209,25 @@ fi
 #
 # The agent types a coordinator spawns its workers as, mapped to their roles, so a harness-attested
 # call from one holds that role and nothing more (D52.9). Idempotent. An operator's own mapping of
-# the same type is overwritten; map a different type name to keep a custom one.
+# the same type is overwritten; map a different type name to keep a custom one. `jkb-implementer`
+# and `jkb-reviewer` are the types `jkb commands install` writes and the coordinators start. And
+# `workflow-subagent` is cleared: it was the stopgap that gave every Claude Workflow agent the
+# coordinator role, and coordinator sessions replaced those workflows, so an agent reporting it now
+# holds no role at all. The bare `implementer` and `reviewer` are cleared for the same reason: the
+# prefixed types replace them, and a repository's own agent of either bare name would otherwise attest
+# with that role.
 #
 # Non-fatal, by this script's rule: the git hooks below must still be installed.
 setup_roles() {
   jkb --db "$db" role rotate-container --write --keep-live || return 1
   local t
-  for t in designer implementer reviewer; do
-    jkb --db "$db" role map "$t" "$t" || return 1
-  done
+  jkb --db "$db" role map designer designer || return 1
   jkb --db "$db" role map systemic-reviewer systemic_reviewer || return 1
+  jkb --db "$db" role map jkb-implementer implementer || return 1
+  jkb --db "$db" role map jkb-reviewer reviewer || return 1
+  for t in implementer reviewer workflow-subagent; do
+    jkb --db "$db" role map "$t" --clear || return 1
+  done
 }
 say "roles: the container credential and the worker agent types"
 if setup_roles; then :; else

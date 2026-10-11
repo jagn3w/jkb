@@ -579,7 +579,7 @@ async function openFindings(client: CliJkbClient, node?: FlightNode): Promise<vo
   const nss = node.task.review_nss;
   if (nss.length === 0) {
     vscode.window.showInformationMessage(
-      "jkb: no review recorded for this task yet — run /review-log in its session.",
+      "jkb: no review recorded for this task yet — run /jkb-review in its session.",
     );
     return;
   }
@@ -595,7 +595,7 @@ async function openFindings(client: CliJkbClient, node?: FlightNode): Promise<vo
   }
   if (findings.length === 0) {
     vscode.window.showWarningMessage(
-      `jkb: ${nss.join(", ")} holds no findings — they never reached the KB. Re-run /review-log.`,
+      `jkb: ${nss.join(", ")} holds no findings — they never reached the KB. Re-run /jkb-review.`,
     );
     return;
   }

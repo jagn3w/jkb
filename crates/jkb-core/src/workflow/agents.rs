@@ -1,19 +1,21 @@
-//! Workflow agent templates: the prompts a workflow script gives its agents, as data (design D53.7,
-//! `docs/code-factory.md`).
+//! Workflow agent templates: the prompts a coordinator session gives itself and its workers, as data
+//! (design D53.7, `docs/code-factory.md`; the agents-and-roles design's "Coordinator sessions replace
+//! Claude Workflows").
 //!
-//! A template is a name, the workflow that runs it, the D52 role its calls act as, the prompt with
-//! `{{placeholders}}` the script fills, what the agent is allowed to do ([`AgentPermissions`]),
+//! A template is a name, the workflow it belongs to, the D52 role its calls act as, the prompt with
+//! `{{placeholders}}` the coordinator fills (`jkb workflow agent show <name> --var …`), what the agent is allowed to do ([`AgentPermissions`]),
 //! and the agents it hands its result to (the Workflows tab's graph edges).
 //!
 //! **Two sources, one listing**, the way strategy presets sit beside strategy definitions:
 //!
 //! * **packaged** templates are compiled in from [`PACKAGED_FILE`] (`agents.json` beside this
 //!   module). Nothing can edit one in place — there is no row to update — and a newer jkb's text
-//!   reaches every database without a migration. They were copied out of the workflow scripts'
-//!   prompt functions; changing one is a contribution to that file ([`export`]).
+//!   reaches every database without a migration. They were first copied out of the Claude
+//!   Workflow scripts the coordinators replaced; changing one is a contribution to that file
+//!   ([`export`]).
 //! * **operator copies** are rows of `workflow_agents` (V025), versioned and append-only. A copy
 //!   under a packaged template's name **overrides** it: [`resolve`] answers the copy, so the
-//!   script that asks for the template by name runs the operator's text.
+//!   coordinator that asks for the template by name runs the operator's text.
 //!
 //! The template file stores each prompt as an array of lines, so a contribution's pull request
 //! diffs line by line rather than as one escaped string.
@@ -89,7 +91,7 @@ pub struct AgentPermissions {
 /// What one version of a template says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDef {
-    /// The workflow script that runs it (`task-swarm`, `code-review`).
+    /// The workflow it belongs to (`task-swarm`, `code-review`, or [`SUBAGENTS_WORKFLOW`]).
     pub workflow: String,
     /// The role its calls act as.
     pub role: Role,
@@ -477,6 +479,90 @@ fn packaged_named(name: &str) -> Result<Option<&'static Agent>> {
     Ok(packaged()?.iter().find(|a| a.name == name))
 }
 
+// -------------------------------------------------------------------------------------------
+// Subagent definitions
+// -------------------------------------------------------------------------------------------
+
+/// The workflow of the templates that are Claude Code subagent types rather than prompts: what a
+/// coordinator starts its workers as, so each worker's `jkb` calls are attested as its own role.
+pub const SUBAGENTS_WORKFLOW: &str = "subagents";
+
+/// The prefix every subagent type carries: the installer's own (`jkb commands install` writes
+/// `jkb-<stem>`), so the type a coordinator names, the file it is installed as and the role map's
+/// key are one spelling, and a user's own `reviewer` agent is never mapped to a role. It does not
+/// stop a repository from defining an agent of the same name, which Claude Code would prefer and
+/// attestation would map by name; that is the role map's trust in agent-type names, recorded in the
+/// agents-and-roles design.
+pub const SUBAGENT_PREFIX: &str = "jkb-";
+
+/// A packaged subagent template rendered as a Claude Code agent definition (`.claude/agents/*.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentDef {
+    /// Its type name, `jkb-…`: the frontmatter `name` and what the role map maps.
+    pub name: String,
+    /// The definition file: frontmatter, then the template as its system prompt.
+    pub markdown: String,
+}
+
+/// Every packaged template of [`SUBAGENTS_WORKFLOW`], rendered as an agent definition.
+///
+/// Packaged only: the installer runs without a database, and a definition is the worker's
+/// standing contract, not its task — the task prompt a coordinator passes is the template it
+/// fills with `jkb workflow agent show`, which does honour an operator copy (and why a copy of a
+/// subagent template is refused: it would be shown as in effect and never installed). A worker that
+/// may write nothing beyond the KB gets a read-and-run tool list (no `Edit`/`Write`); one that writes
+/// code or git gets the editing tools. **Neither gets `Agent`.** A subagent can start subagents
+/// (measured on this Claude Code: a nested start returned), and each child attests as its own type,
+/// so a reviewer holding `Agent` could start a `jkb-implementer` and edit code, and an implementer
+/// could start a reviewer of its own branch. Workers never start workers; a coordinator splits.
+///
+/// # Errors
+/// [`Error::Types`] for a subagent template without the `jkb-` prefix, with a placeholder (a
+/// definition is installed as it is, so nothing would fill it), or marked a fragment.
+pub fn subagent_definitions() -> Result<Vec<SubagentDef>> {
+    packaged()?
+        .iter()
+        .filter(|a| a.def.workflow == SUBAGENTS_WORKFLOW)
+        .map(|a| {
+            if !a.name.starts_with(SUBAGENT_PREFIX) {
+                return Err(invalid(format!(
+                    "subagent `{}` does not start with `{SUBAGENT_PREFIX}`",
+                    a.name
+                )));
+            }
+            if a.def.fragment || !placeholders(&a.def.template)?.is_empty() {
+                return Err(invalid(format!(
+                    "subagent `{}` must be a whole prompt: no placeholders, not a fragment",
+                    a.name
+                )));
+            }
+            // JSON strings are YAML double-quoted strings, so a description holding `:` or `#`
+            // cannot break the frontmatter.
+            let describe =
+                serde_json::to_string(&a.def.describe).map_err(|e| invalid(e.to_string()))?;
+            let mut md = format!("---\nname: {}\ndescription: {describe}\n", a.name);
+            md.push_str(match a.def.permissions.writes {
+                Writes::Nothing | Writes::Kb => "tools: Read, Grep, Glob, Bash\n",
+                Writes::Git | Writes::Code => {
+                    "tools: Read, Grep, Glob, Edit, Write, NotebookEdit, Bash, TodoWrite\n"
+                }
+            });
+            if let Some(model) = &a.def.permissions.model {
+                md.push_str("model: ");
+                md.push_str(model);
+                md.push('\n');
+            }
+            md.push_str("---\n\n");
+            md.push_str(a.def.template.trim_end());
+            md.push('\n');
+            Ok(SubagentDef {
+                name: a.name.clone(),
+                markdown: md,
+            })
+        })
+        .collect()
+}
+
 /// What [`export`] checks a target file against: the packaged versions of the template's name.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExportBase {
@@ -818,6 +904,16 @@ fn base_if_packaged(name: &str, def: &AgentDef) -> Result<Option<String>> {
 
 fn append(conn: &Connection, name: &str, def: &AgentDef, based_on: Option<&str>) -> Result<Agent> {
     def.validate()?;
+    // A subagent type is installed from the packaged file, never from a copy: one stored here would
+    // be listed as in effect and never run. The one writer refuses it, so neither `copy` nor `set`
+    // can make one.
+    if def.workflow == SUBAGENTS_WORKFLOW {
+        return Err(invalid(format!(
+            "`{name}` would be a `{SUBAGENTS_WORKFLOW}` template: subagent types are installed from \
+             the packaged file by `jkb commands install`, so a copy would never run — contribute the \
+             change to the packaged template instead"
+        )));
+    }
     let permissions =
         serde_json::to_string(&def.permissions).map_err(|e| invalid(e.to_string()))?;
     let hands = serde_json::to_string(&def.hands_off_to).map_err(|e| invalid(e.to_string()))?;

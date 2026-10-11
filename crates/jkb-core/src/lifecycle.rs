@@ -320,7 +320,7 @@ fn review_gate(f: &TaskFacts) -> Verdict<TaskEvent> {
         // findings, neither of which is a transition of this machine.
         require_yes(f.reviewed, || {
             Denial::new(
-                "No review is recorded for this head. Run `/review-log`, or land anyway with \
+                "No review is recorded for this head. Run `/jkb-review`, or land anyway with \
                  `jkb task land --no-review`.",
             )
         }),

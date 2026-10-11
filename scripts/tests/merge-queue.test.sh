@@ -8,10 +8,11 @@
 # verification you ran once and did not commit is a verification the next person does not have.
 #
 # The two questions asked of every case are the two the swarm acts on: WHAT CODE did it exit, and
-# DID $BASE MOVE. Those together are the whole contract — `.claude/workflows/task-swarm.js` reads
-# the code to decide whether a task group is marked done, and the base moving is what "done" is
-# supposed to mean. `dev-scripts.test.sh`'s case10 holds the other half of that seam, that every
-# code the header documents is one the workflow classifies.
+# DID $BASE MOVE. Those together are the whole contract — the swarm's coordinator reads the
+# script's outcome line to decide whether a task group landed, and the base moving is what "landed"
+# is supposed to mean. Every case also checks that the outcome line is printed, last, naming the
+# code the script exited with; `dev-scripts.test.sh`'s case10 holds the other half of that seam,
+# that every code the header documents is classified as this test expects.
 #
 # The gate is stubbed to exit codes we choose, because this suite is about the QUEUE, not about
 # cargo: `build.sh`, `test.sh` and the planted suites read BUILD_RC/TEST_RC/SUITE_RC. `jkb` is
@@ -73,6 +74,11 @@ check() {
     local got rc mv jkb
     got="$(queue "$r" "$@")"
     IFS='|' read -r rc mv jkb detail <<<"$got"
+    # THE OUTCOME LINE, ON EVERY PATH. The coordinator acts on it, so an exit that skips it (a
+    # trap lost, an `exec` added) leaves it nothing to act on but a guess.
+    if ! [[ "${detail% }" =~ ^merge-queue:\ (landed|eject|stall)\ \(exit\ $rc\)$ ]]; then
+        fail "queue: $label outcome line" "the last line is not \`merge-queue: <outcome> (exit $rc)\`: ${detail}"
+    fi
     if [ "$rc" = "$want_rc" ] && [ "$mv" = "$want_mv" ] && [ "$jkb" = "$want_jkb" ]; then
         ok "$label → exit $rc, base $mv, $jkb landing record(s)"
     else
@@ -180,7 +186,47 @@ echo "==> scripts/merge-queue.sh: what it exits, and whether the base moved"
 mkdir -p "$work/bin"
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$JKB_CALLS"\nexit 0\n' >"$work/bin/jkb"
 chmod +x "$work/bin/jkb"
-run_cases case_land case_red_gate case_red_suite case_nothing_ahead case_empty_work \
+case_signalled() {   # killed mid-gate by any signal: never `landed`, and the base never moves
+    local r pid out sig pre bad="" want; r="$(mkrepo signalled)"
+    printf '#!/bin/sh\nsleep 4\ntouch "$(dirname "$0")/../gate.done"\nexit 0\n' >"$r/scripts/build.sh"
+    printf 'gate.done\n' >"$r/.gitignore"
+    git -C "$r" add -A; git -C "$r" commit -qm slow-gate
+    git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
+    git -C "$r" checkout -q trunk
+    pre="$(git -C "$r" rev-parse trunk)"
+    # TERM and HUP are what a timeout or a closed terminal sends, and are trapped: the gate finishes
+    # first (no orphan in the worktree) and the stall names them. USR1 and USR2 are ones nothing
+    # names, which is the point: the outcome must not depend on which signals someone trapped. Not
+    # INT, and not PIPE: a signal ignored when bash starts can be neither trapped nor delivered, and
+    # a non-interactive shell starts background jobs with SIGINT ignored, while some CI runners start
+    # every job with SIGPIPE ignored (seen on CI: the PIPE case ran the queue to a real landing). Either
+    # way the queue runs to its real end and the case tests nothing.
+    for sig in TERM HUP USR1 USR2; do
+        git -C "$r" checkout -q trunk 2>/dev/null; git -C "$r" reset -q --hard "$pre"; rm -f "$r/gate.done"
+        ( cd "$r" && PATH="$work/bin:$PATH" JKB=jkb JKB_CALLS="$r/.jkb-calls" \
+            exec bash scripts/merge-queue.sh feat trunk "$r" >"$work/signalled.out" 2>&1 ) &
+        pid=$!
+        sleep 2; kill -s "$sig" "$pid"; wait "$pid" 2>/dev/null
+        out="$(tail -1 "$work/signalled.out")"
+        case "$sig" in
+            TERM | HUP) want="merge-queue: stall: killed by $sig, after the step it was running finished" ;;
+            *) want="merge-queue: stall: ended without an outcome" ;;
+        esac
+        if [ "${out#"$want"}" = "$out" ]; then
+            bad=1; fail "queue: signalled $sig" "a $sig mid-gate ended with: $out"; continue
+        fi
+        case "$sig" in TERM | HUP)
+            [ -e "$r/gate.done" ] \
+                || { bad=1; fail "queue: signalled $sig gate" "the queue exited on $sig before its gate finished, leaving it running in the worktree"; } ;;
+        esac
+        [ "$(git -C "$r" rev-parse trunk)" = "$pre" ] \
+            || { bad=1; fail "queue: signalled $sig base" "a queue killed by $sig mid-gate moved the base"; }
+    done
+    sleep 3   # let an untrapped run's orphaned gate finish before the next case
+    [ -n "$bad" ] || ok "a queue killed mid-gate by TERM, HUP, USR1 or USR2 reports a stall and leaves the base (TERM/HUP after the gate)"
+}
+
+run_cases case_signalled case_land case_red_gate case_red_suite case_nothing_ahead case_empty_work \
           case_conflict case_already_landed case_wedged case_already_merged
 
 finish

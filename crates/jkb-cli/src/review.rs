@@ -132,13 +132,13 @@ impl GateVerdict {
         match self {
             Self::Passed => None,
             Self::NeverReviewed => Some(
-                "No review has been recorded. Run /jkb-review-log in the session, or land with \
+                "No review has been recorded. Run /jkb-review in the session, or land with \
                  --no-review."
                     .to_owned(),
             ),
             Self::NoFindingsRecorded(nss) => Some(format!(
                 "Its review ({}) holds no findings at all, so they never reached the KB — this \
-                 is not a clean review. Re-run /jkb-review-log.",
+                 is not a clean review. Re-run /jkb-review.",
                 nss.join(", ")
             )),
             Self::OpenFindings(count, _) => Some(format!(
@@ -252,13 +252,13 @@ pub(crate) fn enforce(
     match verdict {
         GateVerdict::Passed => Ok(false),
         GateVerdict::NeverReviewed => anyhow::bail!(
-            "{uid} has no recorded review — run `/jkb-review-log` in the session (it records the \
+            "{uid} has no recorded review — run `/jkb-review` in the session (it records the \
              review itself), or land with --no-review to record a waiver instead"
         ),
         GateVerdict::NoFindingsRecorded(nss) => anyhow::bail!(
             "{uid} records a review of {} but that namespace holds no findings at all — so \
              the review's findings never reached the KB (a quarantined tasks.md, a typo'd \
-             --findings, or a namespace renamed since). Re-run `/jkb-review-log`, or land with \
+             --findings, or a namespace renamed since). Re-run `/jkb-review`, or land with \
              --no-review. This is NOT read as a clean review.",
             nss.join(", ")
         ),
@@ -276,7 +276,7 @@ pub(crate) fn enforce(
         }
         GateVerdict::LastRoundNotClean { ns, must_fix } => anyhow::bail!(
             "{uid}'s newest review round ({ns}) found {must_fix} must-fix finding(s). Fixing them is \
-             not a review of the fix: run another round (`/jkb-review-log`), which must come back \
+             not a review of the fix: run another round (`/jkb-review`), which must come back \
              with none — or land with --no-review to record a waiver instead"
         ),
         GateVerdict::RoundsUnknown => anyhow::bail!(
@@ -287,12 +287,14 @@ pub(crate) fn enforce(
     }
 }
 
-/// The reviewer workflow's result, as `jkb task review file` reads it: its `findings`, each with the
-/// fields the op files and whatever else the workflow reports (`kind`, `unverified`), which are ignored.
+/// A review round's result, as `jkb task review file` reads it: its `findings`, each with the fields
+/// the op files, a `scope` that is checked, and whatever else the reviewer reports (`kind`), which is
+/// ignored. A pre-existing finding is refused (see [`parse_result`]): the review coordinator files
+/// those to the backlog, and one filed here would hold the branch for a defect it did not cause.
 #[derive(serde::Deserialize)]
 struct WorkflowResult {
     findings: Vec<WorkflowFinding>,
-    /// Set when the review did not run (`code-review.js`: a failed survey). Its empty `findings` are
+    /// Set when the review did not run (the reviewer could not read the change). Its empty `findings` are
     /// not a clean review, and filing them as one would let the land gate pass unreviewed work.
     #[serde(default)]
     error: Option<String>,
@@ -319,6 +321,47 @@ struct WorkflowFinding {
     scenario: Option<String>,
     #[serde(default)]
     fix: Option<String>,
+    /// Absent reads as introduced. A closed set, so a spelling it does not know (`pre_existing`,
+    /// `Pre-existing`) is refused as a malformed result rather than filed as the change's own.
+    #[serde(default)]
+    scope: Option<FindingScope>,
+}
+
+/// Whose a finding is: this change's (`introduced`, `aggravated`) or not (`pre-existing`).
+#[derive(serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum FindingScope {
+    Introduced,
+    Aggravated,
+    PreExisting,
+}
+
+/// Read a review result, refusing one that files a pre-existing finding as the change's own.
+///
+/// **In the callee, not in the prompt.** Which findings are this change's was one clause in the
+/// review coordinator's prompt, and a pre-existing must-fix it forgot to set aside became an open
+/// must-fix on the branch (and a second task, once the coordinator also filed it to the backlog).
+fn parse_result(text: &str, what: &str) -> Result<WorkflowResult> {
+    let result: WorkflowResult = serde_json::from_str(text).with_context(|| {
+        format!(
+            "{what} is not a review result: a JSON object with a `findings` array of {{severity \
+             (must-fix|concern|nit), scope (introduced|aggravated), summary, file, line, scenario, \
+             fix}}"
+        )
+    })?;
+    if let Some(f) = result
+        .findings
+        .iter()
+        .find(|f| f.scope == Some(FindingScope::PreExisting))
+    {
+        anyhow::bail!(
+            "{what} files a pre-existing finding (`{}`) as this change's own — nothing was filed. \
+             Leave pre-existing findings out of the round and report them to your coordinator, which \
+             files them to the backlog",
+            f.summary
+        );
+    }
+    Ok(result)
 }
 
 /// The largest workflow result `task review file` reads.
@@ -348,19 +391,14 @@ pub(crate) fn file_cmd(
             .with_context(|| format!("reading {}", from.display()))?;
         from.display().to_string()
     };
-    let result: WorkflowResult = serde_json::from_str(&text).with_context(|| {
-        format!(
-            "{what} is not a review result: a JSON object with a `findings` array of {{severity \
-             (must-fix|concern|nit), summary, file, line, scenario, fix}}"
-        )
-    })?;
+    let result = parse_result(&text, &what)?;
     // Whether the review ran fully is the op's to judge (`ReviewRun::refusal`); what a result must
     // say for it to judge is checked here, where the file can be named.
     let (Some(reviewers), Some(returned)) = (result.reviewers, result.returned) else {
         anyhow::bail!(
             "{what} does not say how many reviewers ran and came back (`reviewers`, `returned`), so a \
              review that read part of the change cannot be told from one that read all of it — \
-             nothing was filed; update `.claude/workflows/code-review.js`"
+             nothing was filed; say both in the result"
         );
     };
     let run = jkb_api::review::ReviewRun {
@@ -525,12 +563,38 @@ fn print_recording(
             ),
             skipped_unlanded,
         );
-        println!("  review each in its own session (`/jkb-review-log` there), or land first.");
+        println!("  review each in its own session (`/jkb-review` there), or land first.");
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// A pre-existing finding is refused by the filer, whoever forgot to set it aside; introduced,
+    /// aggravated and unscoped ones file.
+    #[test]
+    fn a_pre_existing_finding_is_refused_and_the_rest_file() {
+        let result = |scope: &str| {
+            format!(
+                r#"{{"reviewers": 1, "returned": 1, "findings": [{{"severity": "must-fix",
+                    "summary": "s", {scope}}}]}}"#
+            )
+        };
+        let refused = super::parse_result(&result(r#""scope": "pre-existing""#), "r")
+            .err()
+            .expect("a pre-existing finding was accepted")
+            .to_string();
+        assert!(refused.contains("coordinator"), "{refused}");
+        // An unknown spelling is refused too, never read as the change's own.
+        assert!(super::parse_result(&result(r#""scope": "pre_existing""#), "r").is_err());
+        for ok in [
+            r#""scope": "introduced""#,
+            r#""scope": "aggravated""#,
+            r#""file": "f""#,
+        ] {
+            assert!(super::parse_result(&result(ok), "r").is_ok(), "{ok}");
+        }
+    }
+
     use jkb_core::Db;
 
     /// A task whose reviews outnumber what one query takes is still gated by all of them — asked in

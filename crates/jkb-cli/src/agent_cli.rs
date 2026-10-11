@@ -1,8 +1,8 @@
 //! `jkb workflow agent …` (design D53.7) as a client of the `workflow.agent*` ops: the agent
-//! templates the workflow scripts read, and what the Code Factory's Workflows tab calls for the same
+//! templates the coordinator sessions read, and what the Code Factory's Workflows tab calls for the same
 //! work.
 //!
-//! A script reads its prompt with `jkb workflow agent show <name> --var k=v …`: the operator's copy
+//! A coordinator reads a prompt with `jkb workflow agent show <name> --var k=v …`: the operator's copy
 //! when one overrides the packaged template, filled in, refused when a placeholder is left empty or
 //! a value names none. `export` is the one verb that writes a file: the template, as the next
 //! version in the checkout's packaged-templates file — the commit a contribution makes.
@@ -24,7 +24,7 @@ pub enum AgentCmd {
     #[command(alias = "ls")]
     List,
     /// One template: the one in effect, unless `--packaged` or `--version` says otherwise. With
-    /// `--var`, only its prompt, filled in — what a workflow script reads.
+    /// `--var`, only its prompt, filled in — what a coordinator reads.
     Show {
         /// Its name.
         name: String,

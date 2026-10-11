@@ -489,22 +489,32 @@ fn task_tag_add_and_remove_roundtrip() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let uid = add_task(&db, "taggable");
+    add_task(&db, "untouched");
 
     jkb(&db)
         .args(["task", "tag", "add", &uid, "size=small"])
         .assert()
         .success();
-    // Filtering the frontier by the tag finds it.
+    // Filtering the frontier by the tag finds it, and only it. (`tag:` is the query DSL's spelling;
+    // `#size=small` is quick-add's, and here it is a full-text word, which FTS5 rejects. This step used `#` and still
+    // passed while the frontier dropped every predicate but scope and tags: unfiltered, the frontier
+    // held the tagged task anyway.)
     jkb(&db)
-        .args(["--global", "task", "next", "#size=small"])
+        .args(["--global", "task", "next", "tag:size=small"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("taggable"));
+        .stdout(predicate::str::contains("taggable"))
+        .stdout(predicate::str::contains("untouched").not());
 
     jkb(&db)
         .args(["task", "tag", "rm", &uid, "size=small"])
         .assert()
         .success();
+    jkb(&db)
+        .args(["--global", "task", "next", "tag:size=small"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("taggable").not());
     // A malformed tag is rejected.
     jkb(&db)
         .args(["task", "tag", "add", &uid, "nofacet"])
@@ -5313,7 +5323,7 @@ fn workflow_agent_copy_set_show_and_export() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|a| a["name"] == "swarm-status" && a["source"] == "packaged"));
+        .any(|a| a["name"] == "swarm-coordinator" && a["source"] == "packaged"));
 
     // A placeholder left empty is refused rather than run with a hole in the prompt.
     jkb(&db)
@@ -5321,7 +5331,7 @@ fn workflow_agent_copy_set_show_and_export() {
             "workflow",
             "agent",
             "show",
-            "swarm-status",
+            "swarm-coordinator",
             "--var",
             "status=open",
         ])
@@ -5330,10 +5340,10 @@ fn workflow_agent_copy_set_show_and_export() {
         .stderr(predicate::str::contains("no value for"));
 
     jkb(&db)
-        .args(["workflow", "agent", "copy", "swarm-status"])
+        .args(["workflow", "agent", "copy", "swarm-coordinator"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("as swarm-status v1"));
+        .stdout(predicate::str::contains("as swarm-coordinator v1"));
     let template = dir.path().join("t.md");
     std::fs::write(&template, "Set {{status}} on {{commands}}.").unwrap();
     jkb(&db)
@@ -5341,20 +5351,20 @@ fn workflow_agent_copy_set_show_and_export() {
             "workflow",
             "agent",
             "set",
-            "swarm-status",
+            "swarm-coordinator",
             "--template-file",
         ])
         .arg(&template)
         .args(["--model", "session"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("swarm-status is now v2"));
+        .stdout(predicate::str::contains("swarm-coordinator is now v2"));
     jkb(&db)
         .args([
             "workflow",
             "agent",
             "show",
-            "swarm-status",
+            "swarm-coordinator",
             "--var",
             "status=open",
             "--var",
@@ -5372,18 +5382,18 @@ fn workflow_agent_copy_set_show_and_export() {
     )
     .unwrap();
     jkb(&db)
-        .args(["workflow", "agent", "export", "swarm-status", "--file"])
+        .args(["workflow", "agent", "export", "swarm-coordinator", "--file"])
         .arg(&file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("swarm-status packaged as v2"));
+        .stdout(predicate::str::contains("swarm-coordinator packaged as v2"));
     let text: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     let entry = text["agents"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|a| a["name"] == "swarm-status")
+        .find(|a| a["name"] == "swarm-coordinator")
         .unwrap()
         .clone();
     assert_eq!(
@@ -5407,7 +5417,7 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
             "workflow",
             "agent",
             "copy",
-            "swarm-status",
+            "swarm-coordinator",
             "--template-file",
         ])
         .arg(&bad)
@@ -5415,7 +5425,7 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
         .failure()
         .stderr(predicate::str::contains("{{"));
     jkb(&db)
-        .args(["--json", "workflow", "agent", "show", "swarm-status"])
+        .args(["--json", "workflow", "agent", "show", "swarm-coordinator"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"source\":\"packaged\""));
@@ -5424,7 +5434,7 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
             "workflow",
             "agent",
             "copy",
-            "swarm-status",
+            "swarm-coordinator",
             "--describe",
             "mine",
             "--model",
@@ -5432,9 +5442,9 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("as swarm-status v1"));
+        .stdout(predicate::str::contains("as swarm-coordinator v1"));
     let shown = jkb(&db)
-        .args(["--json", "workflow", "agent", "show", "swarm-status"])
+        .args(["--json", "workflow", "agent", "show", "swarm-coordinator"])
         .output()
         .unwrap();
     let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
@@ -5448,14 +5458,14 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
     // Exporting it would overwrite v2 with text that never saw it, so it is refused, naming both —
     // unless overridden.
     for a in upstream["agents"].as_array_mut().unwrap() {
-        if a["name"] == "swarm-status" {
+        if a["name"] == "swarm-coordinator" {
             a["version"] = serde_json::json!(2);
             a["template"] = serde_json::json!(["Set {{status}} upstream."]);
         }
     }
     std::fs::write(&file, serde_json::to_string_pretty(&upstream).unwrap()).unwrap();
     jkb(&db)
-        .args(["workflow", "agent", "export", "swarm-status", "--file"])
+        .args(["workflow", "agent", "export", "swarm-coordinator", "--file"])
         .arg(&file)
         .assert()
         .failure()
@@ -5469,14 +5479,14 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
             "workflow",
             "agent",
             "export",
-            "swarm-status",
+            "swarm-coordinator",
             "--override-base",
             "--file",
         ])
         .arg(&file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("swarm-status packaged as v3"));
+        .stdout(predicate::str::contains("swarm-coordinator packaged as v3"));
 }
 
 /// `jkb workflow show --graph` prints the machines from the compiled tables, for a named strategy or
@@ -5657,4 +5667,35 @@ fn task_move_reparents_under_a_step_refuses_a_plan_and_undoes() {
         .assert()
         .success()
         .stdout(predicate::str::contains(&child).not());
+}
+
+/// The attestation hook is the jkb the dev container runs outside the agent's sandbox, and remote
+/// mode never installs the bundled assets, so the hook is what puts the subagent types a coordinator
+/// starts its workers as into the container's Claude config — without a word on its stdout, which
+/// is the hook protocol.
+#[test]
+fn the_attest_hook_installs_the_subagent_types() {
+    let dir = TempDir::new().unwrap();
+    let claude = dir.path().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let mut cmd = assert_cmd::Command::from_std(jkb_bare());
+    let out = cmd
+        .env("HOME", dir.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("JKB_NO_AUTO_COMMANDS")
+        .args(["attest", "hook"])
+        .write_stdin("{}")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        out.stdout.is_empty(),
+        "the install wrote to the hook's stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    for name in ["jkb-implementer", "jkb-reviewer"] {
+        let def = std::fs::read_to_string(claude.join("agents").join(format!("{name}.md")))
+            .unwrap_or_else(|e| panic!("{name} was not installed: {e}"));
+        assert!(def.starts_with(&format!("---\nname: {name}\n")), "{def}");
+    }
 }

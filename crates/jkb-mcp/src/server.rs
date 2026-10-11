@@ -106,7 +106,7 @@ impl JkbServer {
 
     /// The ready-frontier tasks.
     #[tool(
-        description = "List the ready task frontier (unblocked, non-terminal), ordered by priority then due. Optional DSL scope/tags."
+        description = "List the ready task frontier (unblocked, non-terminal), ordered by priority then due. Optional query DSL: every predicate narrows it (scope, tags, -tag:, status, priority, full-text words)."
     )]
     async fn task_next(&self, params: Parameters<QueryArgs>) -> Result<CallToolResult, ErrorData> {
         self.run(move |t| logic::task_next(&t, &params.0)).await
