@@ -1615,7 +1615,9 @@ mod tests {
                 "{cmd:?} may run differently from how it is read, so it is not approved"
             );
             if cmd.contains("&>>") && !test_bash().1 {
-                // Classified above all the same; only bash's own run needs bash 4.
+                // Classified above all the same; only bash's own run needs bash 4. The notice is
+                // seen only under `--nocapture` (a passing test's output is discarded); CI's Linux
+                // runners have bash 5, so the run is skipped only on a machine without one.
                 eprintln!(
                     "skipped bash's run of {cmd:?}: no bash 4+ here (macOS's /bin/bash is 3.2)"
                 );
