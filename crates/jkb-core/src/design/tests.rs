@@ -2907,3 +2907,23 @@ fn a_nested_design_takes_no_doc_target_of_its_own() {
         .unwrap_err();
     assert!(err.to_string().contains("exported twice"), "{err}");
 }
+
+/// A span staged into two plans, one of which the move takes out of its tree, still reads STAGED
+/// through the other — but the first plan would stop counting it, so the move is refused.
+#[test]
+fn a_move_that_takes_away_one_of_two_stagings_is_refused() {
+    let db = db();
+    let root = create_in(&db, "jkb", "R", "r");
+    let child = create_in(&db, "jkb", "C", "c words");
+    let other = create_in(&db, "jkb", "P", "p");
+    nest_under(&db, &child, &root).unwrap();
+    let sp = span(&db, &child, "c words", Reviewer::Operator).unwrap();
+    approve_as(&db, &sp, Approver::Operator).unwrap();
+    let in_root = new_plan(&db, &root, &["r"]).unwrap().steps[0].uid.clone();
+    let in_child = new_plan(&db, &child, &["c"]).unwrap().steps[0].uid.clone();
+    stage_into(&db, &sp, &in_root).unwrap();
+    stage_into(&db, &sp, &in_child).unwrap();
+    let err = nest_under(&db, &child, &other).unwrap_err();
+    assert!(err.to_string().contains(&sp), "{err}");
+    assert_eq!(view_of(&db, &child, &sp).steps.len(), 2, "nothing moved");
+}

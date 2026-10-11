@@ -80,10 +80,10 @@ pub fn descendants(conn: &Connection, design: ItemId) -> Result<Vec<(ItemId, Str
 
 /// Nest design `uid` under design `under`, after its existing children.
 ///
-/// Refused when the move would change what a span reads or where text is exported: a span below
-/// `uid` staged into a plan of its current tree would leave that tree, and its STAGED/IMPLEMENTED
-/// would silently read APPROVED ([`root_of`]); and a design below `uid` with a doc target of its
-/// own would be exported twice, to its file and inlined into the new parent's (review round 1).
+/// Refused when the move would take a staging away or export text twice: a span of the tree the
+/// design leaves would stop counting a plan step it is staged into (its plan stops listing it, and
+/// it can read APPROVED — [`root_of`]); or a design below `uid` with a doc target of its own would
+/// be exported twice, to its file and inlined into the new root's (review rounds 1–3).
 ///
 /// # Errors
 /// An unknown design, a parent in another repo, a parent inside `uid` (a cycle), a staged span the
@@ -118,9 +118,9 @@ pub fn nest(conn: &Connection, meta: &WriteMeta, uid: &str, under: &str) -> Resu
             return Err(exported_twice(design_uid));
         }
     }
-    // Whether a staged span keeps its plan is measured, not predicted: every span of the tree the
-    // design leaves is read before and after the move, in this transaction, and a span that was
-    // STAGED or IMPLEMENTED and reads APPROVED after refuses it. Predicting it from the edges took
+    // Whether a staged span keeps its plans is measured, not predicted: every span of the tree the
+    // design leaves is read before and after the move, in this transaction, and a span that stops
+    // counting any step it was staged into refuses it. Predicting it from the edges took
     // two rounds to get wrong both ways (refusing a design that brings its own plan along, and
     // missing a root's span staged into a plan of the child that leaves) — review rounds 1 and 2.
     let old_root = root_of(conn, child)?;
@@ -129,15 +129,22 @@ pub fn nest(conn: &Connection, meta: &WriteMeta, uid: &str, under: &str) -> Resu
     let before = staged_spans(conn, &tree)?;
     containment::contain(conn, meta, child, parent, next_position(conn, parent)?)?;
     let after = staged_spans(conn, &tree)?;
+    // A span loses a staging when a step it counted before no longer counts: the same span still
+    // STAGED through another step had silently left the first plan (review round 3).
     let lost: Vec<&str> = before
-        .keys()
-        .filter(|span| !after.contains_key(*span))
-        .map(String::as_str)
+        .iter()
+        .filter(|(span, steps)| {
+            let now = after.get(*span);
+            steps
+                .iter()
+                .any(|step| now.is_none_or(|n| !n.contains(step)))
+        })
+        .map(|(span, _)| span.as_str())
         .collect();
     if !lost.is_empty() {
         return Err(invalid(format!(
-            "the move would take these spans out of the tree of the plans they are staged into, \
-             and they would read APPROVED: {}",
+            "the move would take these spans out of the tree of a plan they are staged into, so \
+             that plan would stop counting them: {}",
             lost.join(", ")
         )));
     }
@@ -154,19 +161,19 @@ pub(super) fn exported_twice(design_uid: &str) -> crate::Error {
     ))
 }
 
-/// The spans of `designs` that read STAGED or IMPLEMENTED now, by uid.
+/// The steps each span of `designs` counts as staged into now, for the spans with any, by uid.
 fn staged_spans(
     conn: &Connection,
     designs: &[(ItemId, String)],
-) -> Result<BTreeMap<String, SpanState>> {
+) -> Result<BTreeMap<String, Vec<String>>> {
     let mut out = BTreeMap::new();
     for (design, _) in designs {
         let (doc, _) = load(conn, *design)?;
         let text = doc.text();
         for span in span_items(conn, *design)? {
-            let state = view(conn, &span, &doc, &text)?.state;
-            if matches!(state, SpanState::Staged | SpanState::Implemented) {
-                out.insert(span.uid, state);
+            let steps = view(conn, &span, &doc, &text)?.steps;
+            if !steps.is_empty() {
+                out.insert(span.uid, steps);
             }
         }
     }
