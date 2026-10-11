@@ -1,26 +1,5 @@
-/* The Design tab's Execution Plan and Tasks panes (D53.6). Colour is meaning only: a staged span
+/* The Design tab's Plans and Tasks views (D53.6). Colour is meaning only: a staged span
  * carries its state's accent, a failed or cancelled task is muted, nothing else is coloured. */
-
-.design-split {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(300px, 380px);
-  height: 100%;
-  min-height: 0;
-}
-
-.design-document {
-  min-height: 0;
-  overflow: auto;
-}
-
-.plan-column {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  overflow: auto;
-  border-left: var(--hairline-width) solid var(--hairline);
-  font-size: var(--text-md);
-}
 
 .pane-bar {
   display: flex;
@@ -50,6 +29,44 @@
 
 .pane-body {
   padding: var(--space-2) var(--space-3);
+}
+
+/* The Tasks view: the list on the left, the chosen task beside it. */
+.tasks-view {
+  display: grid;
+  grid-template-columns: minmax(260px, 2fr) minmax(320px, 3fr);
+  height: 100%;
+  min-height: 0;
+}
+
+.tasks-list,
+.tasks-detail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+}
+
+.tasks-detail {
+  border-left: var(--hairline-width) solid var(--hairline);
+}
+
+.task-group h3 {
+  margin: var(--space-3) 0 var(--space-1);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.task-group:first-child h3 {
+  margin-top: 0;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--ink-muted);
 }
 
 .plan-hint {

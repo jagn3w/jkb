@@ -23,6 +23,8 @@ export interface Design {
   readonly seq: number;
   /** The `mq` topic its updates are announced on. */
   readonly topic: string;
+  /** The design it is nested under, or `null` at the top level. Absent from a daemon older than nesting. */
+  readonly parent?: string | null;
 }
 
 /** `jkb_api::designs::Piece`. */
@@ -156,7 +158,8 @@ function isDesign(v: unknown): v is Design {
     isString(v["title"]) &&
     (v["namespace"] === null || isString(v["namespace"])) &&
     isNumber(v["seq"]) &&
-    isString(v["topic"])
+    isString(v["topic"]) &&
+    (v["parent"] === undefined || v["parent"] === null || isString(v["parent"]))
   );
 }
 

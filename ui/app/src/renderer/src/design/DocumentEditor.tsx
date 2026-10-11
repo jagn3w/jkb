@@ -18,13 +18,18 @@ import type { DesignSession } from "./session";
 export function DocumentEditor({
   session,
   onDiscuss,
+  onView,
 }: {
   readonly session: DesignSession;
   readonly onDiscuss: (from: number, to: number, text: string) => void;
+  /** The editor once it exists, and `undefined` once it is gone: what *See next* moves. */
+  readonly onView?: (view: EditorView | undefined) => void;
 }): React.JSX.Element {
   const host = useRef<HTMLDivElement>(null);
   const discuss = useRef(onDiscuss);
   discuss.current = onDiscuss;
+  const viewed = useRef(onView);
+  viewed.current = onView;
 
   useEffect(() => {
     const parent = host.current;
@@ -68,8 +73,10 @@ export function DocumentEditor({
     };
     sync();
     const off = session.onChange(sync);
+    viewed.current?.(view);
     return () => {
       off();
+      viewed.current?.(undefined);
       view.destroy();
       undo.destroy();
     };

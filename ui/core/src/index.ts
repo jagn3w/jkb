@@ -9,6 +9,7 @@ export * from "./staging.js";
 export * from "./details.js";
 export * from "./daemon.js";
 export * from "./design.js";
+export * from "./navigate.js";
 export * from "./plan.js";
 export * from "./prompts.js";
 export * from "./workflows.js";
