@@ -195,11 +195,13 @@ case_signalled() {   # killed mid-gate by any signal: never `landed`, and the ba
     git -C "$r" checkout -q trunk
     pre="$(git -C "$r" rev-parse trunk)"
     # TERM and HUP are what a timeout or a closed terminal sends, and are trapped: the gate finishes
-    # first (no orphan in the worktree) and the stall names them. PIPE and USR1 are ones nothing
-    # names, which is the point: the outcome must not depend on which signals someone trapped. (Not
-    # INT: a non-interactive shell starts background jobs with SIGINT ignored, so the queue would run
-    # to its real end and the case would test nothing.)
-    for sig in TERM HUP PIPE USR1; do
+    # first (no orphan in the worktree) and the stall names them. USR1 and USR2 are ones nothing
+    # names, which is the point: the outcome must not depend on which signals someone trapped. Not
+    # INT, and not PIPE: a signal ignored when bash starts can be neither trapped nor delivered, and
+    # a non-interactive shell starts background jobs with SIGINT ignored, while some CI runners start
+    # every job with SIGPIPE ignored (seen on CI: the PIPE case ran the queue to a real landing). Either
+    # way the queue runs to its real end and the case tests nothing.
+    for sig in TERM HUP USR1 USR2; do
         git -C "$r" checkout -q trunk 2>/dev/null; git -C "$r" reset -q --hard "$pre"; rm -f "$r/gate.done"
         ( cd "$r" && PATH="$work/bin:$PATH" JKB=jkb JKB_CALLS="$r/.jkb-calls" \
             exec bash scripts/merge-queue.sh feat trunk "$r" >"$work/signalled.out" 2>&1 ) &
@@ -221,7 +223,7 @@ case_signalled() {   # killed mid-gate by any signal: never `landed`, and the ba
             || { bad=1; fail "queue: signalled $sig base" "a queue killed by $sig mid-gate moved the base"; }
     done
     sleep 3   # let an untrapped run's orphaned gate finish before the next case
-    [ -n "$bad" ] || ok "a queue killed mid-gate by TERM, HUP, PIPE or USR1 reports a stall and leaves the base (TERM/HUP after the gate)"
+    [ -n "$bad" ] || ok "a queue killed mid-gate by TERM, HUP, USR1 or USR2 reports a stall and leaves the base (TERM/HUP after the gate)"
 }
 
 run_cases case_signalled case_land case_red_gate case_red_suite case_nothing_ahead case_empty_work \
