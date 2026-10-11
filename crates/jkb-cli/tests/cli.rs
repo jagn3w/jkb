@@ -5699,3 +5699,27 @@ fn the_attest_hook_installs_the_subagent_types() {
         assert!(def.starts_with(&format!("---\nname: {name}\n")), "{def}");
     }
 }
+
+#[test]
+fn ls_of_a_path_that_names_nothing_fails_rather_than_listing_empty() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .args(["task", "add", "alpha task", "+proj/x"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["ls", "proj/typo"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "neither a namespace nor an item uid",
+        ));
+    // An empty namespace that exists is still an empty listing, not an error.
+    jkb(&db).args(["ns", "mk", "proj/empty"]).assert().success();
+    jkb(&db)
+        .args(["ls", "proj/empty"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(empty)"));
+}
