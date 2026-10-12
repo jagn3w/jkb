@@ -9,6 +9,7 @@
 mod agent_cli;
 mod archive;
 mod atomic;
+mod closed_stdout;
 mod commands;
 mod design_cli;
 mod design_export;
@@ -1597,7 +1598,11 @@ impl From<PolicyArg> for ConflictPolicy {
 }
 
 fn main() {
+    closed_stdout::install();
     if let Err(err) = run(Cli::parse()) {
+        if closed_stdout::is_stdout_closed(&err) {
+            std::process::exit(closed_stdout::EXIT_STATUS);
+        }
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }

@@ -5723,3 +5723,57 @@ fn ls_of_a_path_that_names_nothing_fails_rather_than_listing_empty() {
         .success()
         .stdout(predicate::str::contains("(empty)"));
 }
+
+/// Run `cmd` with its stdout a pipe whose reader has already gone, as `jkb … | sed 1q` leaves it.
+fn output_into_a_closed_pipe(mut cmd: Command) -> std::process::Output {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    cmd.stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+/// What a shell reports for a process `SIGPIPE` killed, which is what `cat` gives in the same spot.
+const CLOSED_PIPE_STATUS: i32 = 141;
+
+#[test]
+fn printing_into_a_closed_pipe_ends_quietly() {
+    // `println!` panics on a closed stdout ("failed printing to stdout: Broken pipe") unless
+    // something catches it: status 101 and a panic report on stderr.
+    let mut cmd = jkb_bare();
+    cmd.args(["notify", "topic"]);
+    let out = output_into_a_closed_pipe(cmd);
+    assert_eq!(out.status.code(), Some(CLOSED_PIPE_STATUS), "{out:?}");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn writing_bytes_into_a_closed_pipe_ends_quietly() {
+    // `blob cat` writes with `write_all`, whose error comes back up through `run` rather than as
+    // a panic — the other path a closed stdout can take.
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let bytes = b"a blob to print\n".repeat(64);
+    let hash = jkb_core::blob::hash_bytes(&bytes);
+    {
+        let store = jkb_core::Db::open(&db).unwrap();
+        let (h, b) = (hash.clone(), bytes.clone());
+        store
+            .write_txn("t", move |c, _| jkb_core::blob::store(c, &h, &b, None))
+            .unwrap();
+    }
+    let mut cmd = jkb(&db);
+    cmd.args(["blob", "cat", &hash]);
+    let out = output_into_a_closed_pipe(cmd);
+    assert_eq!(out.status.code(), Some(CLOSED_PIPE_STATUS), "{out:?}");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

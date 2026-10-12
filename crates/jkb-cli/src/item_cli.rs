@@ -343,7 +343,6 @@ fn blob_ls(ops: &Ops<'_>, contains: Option<String>, limit: usize) -> Result<()> 
 /// `jkb blob cat <hash>` — a text blob to stdout, by a unique hash prefix (which can never print the
 /// wrong version).
 fn blob_cat(ops: &Ops<'_>, prefix: &str) -> Result<()> {
-    use std::io::Write as _;
     // The host reads the bytes in-process, whatever they are: the archive's recovery path is
     // `jkb blob cat <hash> > file`, for a PDF as much as for a text file.
     if let Some(db) = ops.db {
@@ -351,14 +350,14 @@ fn blob_cat(ops: &Ops<'_>, prefix: &str) -> Result<()> {
         let (_, bytes) = db
             .read_with(move |c| jkb_api::items::blob_bytes(c, &prefix))
             .map_err(|e| anyhow::anyhow!(e.message))?;
-        std::io::stdout().write_all(&bytes)?;
+        crate::closed_stdout::write_stdout(&bytes)?;
         return Ok(());
     }
     match ops.call(Request::KbBlob {
         prefix: prefix.to_owned(),
     })? {
         Response::Blob { text, .. } => {
-            std::io::stdout().write_all(text.as_bytes())?;
+            crate::closed_stdout::write_stdout(text.as_bytes())?;
             Ok(())
         }
         other => unexpected("kb.blob", &other),
