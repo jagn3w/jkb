@@ -163,6 +163,15 @@ pub trait SyncSerializer: Send + Sync {
     fn quarantine_on_parse_error(&self) -> bool {
         false
     }
+
+    /// Whether this format writes an item's `+ns` mirrors (its reference placements outside
+    /// the file) into the file and reads them back. Only such a format can *remove* a mirror
+    /// by omitting it: for one that never carries mirrors, an item parsed with none says
+    /// nothing about the item's placements, and the import must leave them alone. `document`
+    /// carries none; `tasks` opts in.
+    fn carries_mirrors(&self) -> bool {
+        false
+    }
 }
 
 /// The serializer names available in this build.

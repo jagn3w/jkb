@@ -48,6 +48,10 @@ impl SyncSerializer for TasksSerializer {
     fn quarantine_on_parse_error(&self) -> bool {
         true
     }
+
+    fn carries_mirrors(&self) -> bool {
+        true
+    }
 }
 
 /// Parse the whole file into a [`SyncDoc`]. A single trailing newline is normalized

@@ -3486,3 +3486,165 @@ fn the_retry_after_a_failed_mirror_derivation_mirrors_the_import() {
         "every imported task needs its `tasks/…` mirror after the retry"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// `+ns` mirrors a file stops declaring.
+// ---------------------------------------------------------------------------------------------
+
+/// Every namespace path the item with `uid` is placed in as a reference (a mirror), sorted.
+fn reference_paths(db: &Db, uid: &str) -> Vec<String> {
+    let uid = uid.to_owned();
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT n.path FROM placements p
+             JOIN items i ON i.id = p.item_id
+             JOIN namespaces n ON n.id = p.namespace_id
+             WHERE i.uid = ?1 AND p.role = 'reference' ORDER BY n.path",
+        )?;
+        let rows = stmt.query_map([uid], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+    .unwrap()
+}
+
+const MIRRORED_MD: &str = "\
+## Backend
+- [ ] Set up CI +repos/app +repos/web ^setup
+- [ ] Fix flaky test ^fix
+";
+
+/// Deleting a `+ns` mirror from a line removes the placement, rather than the next render
+/// writing it straight back over the edit.
+#[test]
+fn a_mirror_deleted_from_the_file_stays_deleted() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, MIRRORED_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let setup = format!("{}#setup", uri_for(&file));
+    let before = reference_paths(&db, &setup);
+    assert!(
+        before.contains(&"repos/app".to_owned()) && before.contains(&"repos/web".to_owned()),
+        "both declared mirrors are placed: {before:?}"
+    );
+    assert!(
+        before.iter().any(|p| p.starts_with("tasks/")),
+        "the derived `tasks/…` mirror exists: {before:?}"
+    );
+
+    let edited = MIRRORED_MD.replace(" +repos/web", "");
+    fs::write(&file, &edited).unwrap();
+    sync(&db, "docs/plan").unwrap();
+
+    let after = reference_paths(&db, &setup);
+    assert!(
+        !after.contains(&"repos/web".to_owned()),
+        "the mirror the file dropped must be unplaced: {after:?}"
+    );
+    assert!(after.contains(&"repos/app".to_owned()), "{after:?}");
+    assert!(
+        after.iter().any(|p| p.starts_with("tasks/")),
+        "the derived `tasks/…` mirror is not the file's to remove: {after:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        edited,
+        "the edit survives"
+    );
+
+    // And it stays settled: the next pass neither re-adds the mirror nor rewrites the file.
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), edited);
+    assert!(!reference_paths(&db, &setup).contains(&"repos/web".to_owned()));
+}
+
+/// The three-way `Merged` arm applies the same rule: a mirror the disk dropped is removed while
+/// a disjoint KB edit to another task is merged in.
+#[test]
+fn a_mirror_deleted_from_the_file_stays_deleted_through_a_merge() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, MIRRORED_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let setup = format!("{}#setup", uri_for(&file));
+    let fix = format!("{}#fix", uri_for(&file));
+
+    // KB side: complete the other task. Disk side: drop one mirror from `setup`.
+    db.write_txn("cli", move |conn, meta| {
+        let id = jkb_core::item::id_for_uid(conn, &fix)?.expect("fix exists");
+        task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)
+    })
+    .unwrap();
+    fs::write(&file, MIRRORED_MD.replace(" +repos/web", "")).unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report
+            .results
+            .iter()
+            .any(|r| matches!(r.outcome, Outcome::Merged)),
+        "expected a three-way merge: {:?}",
+        report.results
+    );
+    let after = reference_paths(&db, &setup);
+    assert!(!after.contains(&"repos/web".to_owned()), "{after:?}");
+    assert!(after.contains(&"repos/app".to_owned()), "{after:?}");
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(!text.contains("+repos/web"), "{text}");
+    assert!(text.contains("- [x] Fix flaky test"), "{text}");
+}
+
+/// A format that never writes mirrors cannot remove one by omission: a `document` file's item
+/// keeps a placement made in the KB across an import of a disk edit.
+#[test]
+fn a_document_import_leaves_the_items_mirrors_alone() {
+    let dir = real_tempdir();
+    let file = dir.path().join("README.md");
+    fs::write(&file, "hello").unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/repo",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    sync(&db, "docs/repo").unwrap();
+    let placed_uri = uri.clone();
+    db.write_txn("cli", move |conn, meta| {
+        let id = binding::item_for_uri(conn, &placed_uri)?.expect("bound");
+        let mns = ns::ensure(conn, "references/readmes")?;
+        jkb_core::placement::place(conn, meta, id, mns, jkb_types::PlacementRole::Reference, 0)
+    })
+    .unwrap();
+
+    fs::write(&file, "hello, edited").unwrap();
+    sync(&db, "docs/repo").unwrap();
+    assert_eq!(content_for(&db, &uri).as_deref(), Some("hello, edited"));
+    let still = db
+        .read(move |conn| {
+            let id = binding::item_for_uri(conn, &uri)?.expect("bound");
+            Ok(conn.query_row(
+                "SELECT count(*) FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+                 WHERE p.item_id = ?1 AND p.role = 'reference' AND n.path = 'references/readmes'",
+                [id.get()],
+                |r| r.get::<_, i64>(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(
+        still, 1,
+        "a document import must not unplace the item's mirror"
+    );
+}

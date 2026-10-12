@@ -1445,7 +1445,7 @@ fn finish_import(
     if !ctx.imports() {
         return Ok(Outcome::Skipped);
     }
-    let resolved = apply_doc(conn, meta, ctx, path, bare_uri, doc)?;
+    let resolved = apply_doc(conn, meta, f, doc)?;
     let rendered = serializer.render(doc)?;
     // Persist identity / normalization back to disk (the rendered form is authoritative).
     if rendered != disk_bytes {
@@ -1891,7 +1891,7 @@ fn three_way_resolve(
                 )?;
                 return Ok(Outcome::Refused);
             }
-            let resolved = apply_doc(conn, meta, ctx, path, bare_uri, &merged)?;
+            let resolved = apply_doc(conn, meta, f, &merged)?;
             let rendered = serializer.render(&merged)?;
             if ctx.exports() {
                 write_file(path, &rendered, snapshot)?;
@@ -2082,11 +2082,16 @@ struct FileCtx<'a> {
 fn apply_doc(
     conn: &Connection,
     meta: &WriteMeta,
-    ctx: &Ctx,
-    path: &Path,
-    bare_uri: &str,
+    f: &FileCtx<'_>,
     doc: &SyncDoc,
 ) -> Result<Vec<ItemId>> {
+    let FileCtx {
+        ctx,
+        path,
+        bare_uri,
+        serializer,
+        ..
+    } = *f;
     if !ctx.imports() {
         return Err(Error::Types(TypeError::Validation(format!(
             "refusing to write the disk side of {} into the KB: this mount does not import. \
@@ -2134,6 +2139,7 @@ fn apply_doc(
 
     // Pass 1 — items only (no edges yet).
     let mut resolved: HashMap<String, ItemId> = HashMap::new();
+    let mut declared_mirrors: HashMap<ItemId, HashSet<NamespaceId>> = HashMap::new();
     for it in &doc.items {
         let uri = item_uri(bare_uri, &it.local_id);
         let home = it
@@ -2148,11 +2154,31 @@ fn apply_doc(
             }
             None => create_item(conn, meta, ctx, it, &uri, home)?,
         };
+        let declared = declared_mirrors.entry(id).or_default();
         for m in &it.mirrors {
             let mns = ns::ensure(conn, m)?;
             placement::place(conn, meta, id, mns, PlacementRole::Reference, 0)?;
+            declared.insert(mns);
         }
         resolved.insert(it.local_id.clone(), id);
+    }
+
+    // A mirror the file stopped declaring is a mirror the user removed. Placing is not enough
+    // on its own: without this the placement survived, the next render wrote `+ns` back onto
+    // the line, and the user's deletion was overwritten by the very sync that imported it.
+    //
+    // The removable set is exactly what the render would write — [`mirror_rows_for`], the one
+    // query both sides share — so a `tasks/…` index placement (`task::ensure_all_mirrors`) or a
+    // placement inside the file's own subtree, which the file never shows and so can never
+    // stop declaring, is untouched. A format that does not carry mirrors at all (`document`)
+    // declares nothing by omission, so it removes nothing.
+    if serializer.carries_mirrors() {
+        let ids: Vec<ItemId> = declared_mirrors.keys().copied().collect();
+        for (id, mns, _) in mirror_rows_for(conn, &ids, &file_ns_path)? {
+            if !declared_mirrors.get(&id).is_some_and(|d| d.contains(&mns)) {
+                placement::unplace(conn, meta, id, mns)?;
+            }
+        }
     }
 
     // Items that vanished from the file are detached (rebound to `managed:`) so they are
@@ -2656,8 +2682,25 @@ fn mirror_paths_for(
     file_ns_path: &str,
 ) -> Result<HashMap<ItemId, Vec<String>>> {
     let mut out: HashMap<ItemId, Vec<String>> = HashMap::new();
+    for (id, _, path) in mirror_rows_for(conn, ids, file_ns_path)? {
+        out.entry(id).or_default().push(path);
+    }
+    Ok(out)
+}
+
+/// The mirror placements a file renders for the given items: `(item, namespace, path)` for
+/// each reference placement outside the file's own namespace subtree and outside `tasks/**`,
+/// ordered by item then path. The **one** definition of "the mirrors this file shows", read
+/// by the render ([`mirror_paths_for`]) and by the import that removes the ones a file stopped
+/// declaring ([`apply_doc`]) — two copies of the filter would let the import remove a
+/// placement the file never showed.
+fn mirror_rows_for(
+    conn: &Connection,
+    ids: &[ItemId],
+    file_ns_path: &str,
+) -> Result<Vec<(ItemId, NamespaceId, String)>> {
     if ids.is_empty() {
-        return Ok(out);
+        return Ok(Vec::new());
     }
     // Escape LIKE metacharacters in the path (namespace paths contain `_`), so the subtree
     // exclusion is literal and doesn't spuriously match a sibling namespace.
@@ -2667,7 +2710,7 @@ fn mirror_paths_for(
     // `task::ensure_task_mirror`), not user-authored `+ns` mirrors — never serialize
     // them back into the file, or they'd leak in as `+tasks/…` and break byte-stability.
     let sql = format!(
-        "SELECT p.item_id, n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+        "SELECT p.item_id, n.id, n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
          WHERE p.role = 'reference' AND n.path != ? AND n.path NOT LIKE ? ESCAPE '\\'
            AND n.path != 'tasks' AND n.path NOT LIKE 'tasks/%'
            AND p.item_id IN ({placeholders})
@@ -2682,13 +2725,13 @@ fn mirror_paths_for(
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
-        Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?))
+        Ok((
+            ItemId::new(r.get::<_, i64>(0)?),
+            NamespaceId::new(r.get::<_, i64>(1)?),
+            r.get::<_, String>(2)?,
+        ))
     })?;
-    for row in rows {
-        let (id, path) = row?;
-        out.entry(id).or_default().push(path);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 // ---------------------------------------------------------------------------
