@@ -302,14 +302,26 @@ fn discover_quietly(
     root: &Path,
     facts: &PrFacts,
 ) -> Result<Result<Option<i64>, String>> {
-    let Some(branch) = &facts.branch else {
-        return Ok(Err(no_branch_reason(facts)));
+    Ok(
+        match quiet_verdict(facts, |branch| pr::discover(root, branch)) {
+            Ok(number) => {
+                kb.pr_record(&facts.uid, number)?;
+                Ok(Some(number))
+            }
+            Err(why) => Err(why),
+        },
+    )
+}
+
+/// What a branch lookup means for `close-merged`: the one pull request's number, or the reason
+/// printed on the task's line of the hold report. Pure apart from `look`, so every reason it can
+/// render is reachable from a test.
+fn quiet_verdict(facts: &PrFacts, look: impl FnOnce(&str) -> pr::Discovery) -> Result<i64, String> {
+    let Some(branch) = facts.branch.as_deref() else {
+        return Err(no_branch_reason(facts));
     };
-    Ok(match pr::discover(root, branch) {
-        pr::Discovery::One(found) => {
-            kb.pr_record(&facts.uid, found.number)?;
-            Ok(Some(found.number))
-        }
+    match look(branch) {
+        pr::Discovery::One(found) => Ok(found.number),
         pr::Discovery::None => Err(format!("no pull request has `{branch}` as its head branch")),
         pr::Discovery::Ambiguous(numbers) => Err(format!(
             "`{branch}` is the head branch of {} pull requests — pick one with \
@@ -317,7 +329,7 @@ fn discover_quietly(
             numbers.len()
         )),
         pr::Discovery::Unavailable(why) => Err(why),
-    })
+    }
 }
 
 /// Why a task whose history names no branch has no pull request to look up — and the remedy for
@@ -375,5 +387,105 @@ fn report(verdicts: &[CloseVerdict], dry_run: bool, json: bool) {
         for v in &held {
             println!("  {} — {}", v.uid, v.held.as_deref().unwrap_or(""));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use jkb_api::prs::PrFacts;
+
+    use super::quiet_verdict;
+    use crate::pr::{Discovery, PullRequest};
+
+    /// One of each [`Discovery`] outcome. The `match` is exhaustive with no wildcard, so a variant
+    /// added later fails to compile here until it is given a sample — the set stays closed.
+    fn every_discovery() -> Vec<Discovery> {
+        let one = Discovery::One(Box::new(PullRequest {
+            number: 31,
+            state: Some("MERGED".to_owned()),
+            merged_at: None,
+            base_ref_name: Some("main".to_owned()),
+            head_ref_name: Some("task/x".to_owned()),
+        }));
+        let all = vec![
+            one,
+            Discovery::None,
+            Discovery::Ambiguous(vec![31, 44]),
+            Discovery::Unavailable("`gh` is not installed".to_owned()),
+        ];
+        for d in &all {
+            match d {
+                Discovery::One(_)
+                | Discovery::None
+                | Discovery::Ambiguous(_)
+                | Discovery::Unavailable(_) => {}
+            }
+        }
+        all
+    }
+
+    /// The task facts a lookup sees: `branch` from the session history, `branch_facet` from the
+    /// task's `branch=` tag.
+    fn facts(branch: Option<&str>, branch_facet: Option<&str>) -> PrFacts {
+        PrFacts {
+            uid: "task:x".to_owned(),
+            pr: None,
+            branch: branch.map(str::to_owned),
+            branch_facet: branch_facet.map(str::to_owned),
+            live_landing: false,
+            superseded: None,
+            resumed_at: None,
+            writable: true,
+        }
+    }
+
+    /// Every hold reason `close-merged` can print for a branch lookup reads as one sentence.
+    ///
+    /// Two of these once rendered fourteen spaces mid-sentence: a `\`-continued literal whose
+    /// continuation had been lost, leaving the next line's indentation inside the string — the
+    /// defect `archive.rs`'s `every_remedy_reads_as_a_sentence` catches for `Remedy::advice`.
+    /// Asserted over the closed set — both no-branch causes, then every [`Discovery`] outcome —
+    /// on the run of whitespace the defect produces, not on a substring it leaves intact.
+    #[test]
+    fn every_hold_reason_reads_as_a_sentence() {
+        let no_lookup = |_: &str| -> Discovery { unreachable!("no branch, no lookup") };
+        let mut reasons = vec![
+            quiet_verdict(&facts(None, None), no_lookup),
+            quiet_verdict(&facts(None, Some("task/x")), no_lookup),
+        ];
+        for d in every_discovery() {
+            reasons.push(quiet_verdict(&facts(Some("task/x"), None), move |_| d));
+        }
+        let mut held = 0;
+        for reason in reasons {
+            let Err(reason) = reason else { continue };
+            held += 1;
+            assert!(!reason.trim().is_empty(), "a hold says nothing");
+            assert!(
+                !reason.contains("  "),
+                "a hold reason renders a run of whitespace, so a line continuation was lost: \
+                 {reason:?}"
+            );
+            assert!(
+                !reason.contains('\n'),
+                "a hold reason spans lines, which the one-task-per-line report cannot show: \
+                 {reason:?}"
+            );
+        }
+        assert_eq!(
+            held, 5,
+            "no branch (with and without a facet), none, ambiguous and unavailable each hold the task"
+        );
+    }
+
+    /// Exactly one pull request is the only outcome that does not hold the task.
+    #[test]
+    fn one_pull_request_is_found_not_held() {
+        let found = every_discovery()
+            .into_iter()
+            .map(|d| quiet_verdict(&facts(Some("task/x"), None), move |_| d))
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert_eq!(found, vec![31]);
     }
 }
