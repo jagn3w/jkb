@@ -131,12 +131,19 @@ run() { # run <label> <expect-substring>
     local n="${#LABELS[@]}" dir="$work/m${#LABELS[@]}"
     mv "$work/t" "$dir"
     LABELS+=("$label"); RUN_EXPECTS+=("$expect")
-    while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n 2>/dev/null || wait; done
+    # Counted here rather than read from `jobs`, so the limit holds on any bash. Without `wait -n`
+    # (bash < 4.3: macOS's /bin/bash is 3.2) a full batch is waited for instead.
+    if [ "$running" -ge "$jobs" ]; then
+        if [ "$wait_one" = 1 ]; then wait -n; running=$((running-1)); else wait; running=0; fi
+    fi
+    running=$((running+1))
     ( cd "$dir" && ./.container/check-config.sh >"$work/out$n" 2>&1; echo $? >"$work/rc$n"; rm -rf "$dir" ) &
 }
 
-LABELS=(); RUN_EXPECTS=()
+LABELS=(); RUN_EXPECTS=(); running=0
 jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+wait_one=0
+if [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 3 ]; }; then wait_one=1; fi
 settle() { # judge every backgrounded run, in order
     local i
     wait
