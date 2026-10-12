@@ -280,7 +280,13 @@ test("the terminal opens in the container by default, and a host terminal is a l
   await page.keyboard.press("Control+Backquote");
   assert.equal(await page.locator(".drawer-toggle").getAttribute("aria-expanded"), "true", "and opens it");
 
-  // Closing ends each program first; a tab goes once its end is confirmed.
+  // Closing ends each program first; a tab goes once its end is confirmed. There is no dev container
+  // here, so the container terminal's `docker exec` fails by itself; wait for that before closing it.
+  // Closed while that exec is still failing, its end is run inside the container, cannot be
+  // confirmed, and the tab rightly stays ("Close the tab again to forget it") -- the CI flake this
+  // wait removes: the test reaches here ~0.4 s after the open, which a loaded runner's docker
+  // round trip did not always beat.
+  await tab.locator(".terminal-status[data-failed]").waitFor({ timeout: 15_000 });
   for (const t of [hostTab, tab]) await t.getByRole("button", { name: /^Close / }).click();
   await page.waitForFunction(() => document.querySelectorAll(".terminal-tab").length === 0, undefined, { timeout: 15_000 });
 });
