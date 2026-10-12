@@ -486,7 +486,11 @@ pub struct Version {
     pub status: String,
 }
 
-/// `kb.history`: every synced version of the file at `path`, newest first, once per blob.
+/// `kb.history`: each version of the file at `path` that sync settled, newest first, once per blob.
+///
+/// A settled version is the journal's `base_blob_hash`. The bytes sync archives before overwriting a
+/// file are stored content-addressed with no link back to it, so they are not listed here; `jkb blob
+/// ls --contains` finds them.
 ///
 /// `path` is absolute in the CLIENT's filesystem, and `client_home` its `$HOME`: a path under that home
 /// is re-rooted at `server_home`, the way [`crate::kb::ambient`] finds a mount, so the dev container's

@@ -386,8 +386,10 @@ enum Command {
         #[command(subcommand)]
         cmd: BlobCmd,
     },
-    /// A synced file's history: every version the KB has bytes for, newest first.
-    /// Pair with `jkb blob cat <hash>` to read or diff any of them.
+    /// A synced file's history: each version of it that sync settled, newest first. Pair with
+    /// `jkb blob cat <hash>` to read or diff any of them. Bytes sync archived before
+    /// overwriting the file are in the blob store but not linked to it, so they are not listed
+    /// here: find them with `jkb blob ls --contains`.
     History {
         /// The file path (or its `file://` uri).
         path: String,
@@ -2016,7 +2018,9 @@ STAGING BRANCHES (where a batch lands before trunk — the swarm's integration b
                               cannot prove is reported with the reason. No verb takes a sha.
 
 RECOVERY (the archive nothing else exposes)
-  jkb history <path>          every synced version of a file, newest first.
+  jkb history <path>          each version of a file that sync settled, newest first. Not
+                              the bytes it archived before overwriting the file: those are
+                              stored with no link to it, so find them with `blob ls --contains`.
   jkb blob ls --contains "…"  find the version still carrying a line you remember.
   jkb blob cat <hash>         write those bytes to stdout (pipe to a file or `diff`).
       File sync stores the bytes of every version it settles and blobs are never deleted,
@@ -3645,8 +3649,8 @@ fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
     if now == *last {
         return;
     }
-    for (dir, why) in &findings {
-        let line = format!("git-audit: {}: {why}", dir.display());
+    for f in &findings {
+        let line = format!("git-audit: {}: {}", f.dir.display(), f.why);
         if json {
             eprintln!("{line}");
         } else {

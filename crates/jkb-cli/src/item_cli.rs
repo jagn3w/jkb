@@ -393,7 +393,8 @@ fn resolve_for_journal(path: &Path) -> std::path::PathBuf {
     abs
 }
 
-/// `jkb history <path>` — every synced version of a file, newest first.
+/// `jkb history <path>` — each version of a file that sync settled, newest first; not the bytes it
+/// archived before overwriting the file (see `jkb_api::items::history`).
 ///
 /// # Errors
 /// The op's refusal.

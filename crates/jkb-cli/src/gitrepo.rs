@@ -276,6 +276,28 @@ pub(crate) fn audit_repo_config(dir: &Path) -> Result<()> {
     check_repo_config(dir)
 }
 
+/// [`check_repo_config`]'s refusal when git cannot read a repository's config at all — a config it
+/// cannot parse, or a `.git` file naming a git directory that is gone. Nothing in it was judged, so
+/// it is not a finding of a planted key, and the reap scan words it apart ([`crate::git_audit`]).
+#[derive(Debug)]
+pub(crate) struct ConfigUnreadable {
+    dir: PathBuf,
+    git_says: String,
+}
+
+impl std::fmt::Display for ConfigUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "git could not read the config for {}: {}",
+            self.dir.display(),
+            self.git_says
+        )
+    }
+}
+
+impl std::error::Error for ConfigUnreadable {}
+
 /// [`audit_repo_config`]'s check — also what the reap service's scan asks of every repository
 /// (`git_audit`), so the two cannot come to disagree.
 ///
@@ -290,12 +312,13 @@ pub(crate) fn check_repo_config(dir: &Path) -> Result<()> {
     .with_context(|| format!("reading {}'s git config", dir.display()))?;
     // Outside any repository `config --list` still lists the operator's own scopes and succeeds; a
     // failure is a config git cannot parse, which is no more trustworthy than a planted one.
-    anyhow::ensure!(
-        out.status.success(),
-        "git could not read the config for {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
+    if !out.status.success() {
+        return Err(ConfigUnreadable {
+            dir: dir.to_path_buf(),
+            git_says: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }
+        .into());
+    }
     let layout = check_layout(dir)?;
     let git_dir = layout.as_ref().map(|(git_dir, _)| git_dir.clone());
     let repo = layout.and_then(|(_, common)| common.parent().map(Path::to_path_buf));
