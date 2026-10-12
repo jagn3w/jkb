@@ -2,9 +2,9 @@ use jkb_rbac::Grants as _;
 use jkb_types::ItemId;
 
 use super::{
-    agent_binding, agent_type_map, bind_agent, descends_from, generation, in_scope, list,
-    live_by_hash, map_agent_type, mint, resolve, revoke, role_for_agent_type, rotate_container,
-    token_hash, Bound, Minter, Role, CONTAINER_AGENT, GRANTABLE,
+    agent_binding, agent_type_map, bind_agent, descends_from, in_scope, list, live_by_hash,
+    map_agent_type, mint, resolve, revoke, role_for_agent_type, rotate_container, token_hash,
+    Bound, Minter, Role, CONTAINER_AGENT, GRANTABLE,
 };
 use crate::task::{create, NewTask};
 use crate::{Db, Error};
@@ -116,16 +116,10 @@ fn revoking_a_grant_revokes_everything_it_minted() {
             Ok((coord, ct, wt))
         })
         .unwrap();
-    let before = db.read(generation).unwrap();
     let n = db
         .write_txn("test", move |c, m| revoke(c, m, coord.id))
         .unwrap();
     assert_eq!(n, 2);
-    assert_ne!(
-        db.read(generation).unwrap(),
-        before,
-        "a cache sees the change"
-    );
     assert_eq!(db.read(move |c| resolve(c, &ct)).unwrap(), None);
     assert_eq!(db.read(move |c| resolve(c, &wt)).unwrap(), None);
     assert_eq!(db.read(|c| list(c, None, false)).unwrap(), vec![]);

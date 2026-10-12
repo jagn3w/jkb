@@ -6,11 +6,13 @@
 //!
 //! * **A [`RoleTable`] is data.** Which role holds which permission is a `&'static` table rather
 //!   than a `match` spread over the call sites that ask, for the same reason `jkb-fsm` declares a
-//!   lifecycle as a table: a table can be walked. [`Grants::check`] finds a role nothing grants
-//!   anything to, a permission no role holds, and a role declared twice — the three ways a policy
-//!   silently differs from what its author meant — and [`Grants::matrix`] renders the whole thing
-//!   for a person to read. A table can also be built at runtime ([`OwnedTable`]) from a static base
-//!   plus grants somebody chose, and answers the same questions.
+//!   lifecycle as a table: a table can be walked. [`Grants::check`] finds a role with no row, a
+//!   permission no role holds, a role declared twice, and a role listing one permission twice — the
+//!   four ways a policy silently differs from what its author meant ([`TableDefect`]). A role whose
+//!   row is empty is not a defect: it is a role declared to hold nothing, which a base table may
+//!   mean. [`Grants::matrix`] renders the whole thing for a person to read. A table can also be
+//!   built at runtime ([`OwnedTable`]) from a static base plus grants somebody chose, and answers
+//!   the same questions.
 //! * **An action says what it needs; a subject says what it holds.** [`Guarded::requirement`] and
 //!   [`Principal::roles`] are the two halves, and [`RoleBased`] joins them against a table. A
 //!   requirement can be [`Requirement::Nobody`] — an action no role may take through this door —
@@ -151,12 +153,14 @@ pub trait Grants<R: Role, P: Permission> {
         self.permissions_of(role).contains(&permission)
     }
 
-    /// Every role holding `permission`, in declaration order.
+    /// Every role holding `permission`, in declaration order, each once. Derived from
+    /// [`Grants::permits`], so a role's shadowed second row grants nothing here either.
     fn roles_for(&self, permission: P) -> Vec<R> {
+        let mut seen = HashSet::new();
         self.rows()
             .into_iter()
-            .filter(|(_, p)| p.contains(&permission))
             .map(|(r, _)| r)
+            .filter(|&r| seen.insert(r) && self.permits(r, permission))
             .collect()
     }
 
