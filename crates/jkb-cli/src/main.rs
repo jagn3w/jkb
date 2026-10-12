@@ -3086,7 +3086,7 @@ pub(crate) fn cmd_task_land(
     // `.jkb/archive` in a repo where `task work` has never run. The lock itself is a database lease
     // now, and leaves nothing on disk.
     session::ensure_excluded(&ctx.root)?;
-    let _lock = session_cli::LandLease::acquire(kb, &ctx.key)?;
+    let _lock = session_cli::LandLease::acquire(kb, &ctx.key, session_cli::LockFor::Land)?;
 
     let Preflight {
         sess,
@@ -3335,7 +3335,7 @@ fn settle_landing(
     //
     // The status is re-read **inside** the transaction: `land_preflight` checked it before a
     // multi-minute gate, and nothing serializes a `jkb task set --status cancelled` against a
-    // land (the land lease only excludes a second land). Writing `Done` over a cancellation made
+    // land (the land lease only excludes a second land, or an abandon). Writing `Done` over a cancellation made
     // this the one transition the guard exists to prevent. Same reasoning as `review::record`.
     // Whether the status was left as somebody else set it during the gate. Reported, not
     // returned as an error: the session HAS been disposed of by this point, so bailing left
@@ -3349,7 +3349,7 @@ fn settle_landing(
     //
     // The status is re-read **inside** the transaction: `land_preflight` checked it before a
     // multi-minute gate, and nothing serializes a `jkb task set --status cancelled` against a
-    // land (the land lease only excludes a second land). The machine has no `land` from `cancelled`,
+    // land (the land lease only excludes a second land, or an abandon). The machine has no `land` from `cancelled`,
     // so a cancellation that arrived during the gate is not overwritten — and it says so rather
     // than being silently skipped.
     //

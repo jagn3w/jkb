@@ -4183,7 +4183,8 @@ fn landing_is_serialised_by_a_lease_freed_only_when_its_holder_is_proven_gone() 
     let refused = |out: &std::process::Output| {
         assert!(!out.status.success(), "{out:?}");
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("another `jkb task land` is running"),
+            String::from_utf8_lossy(&out.stderr)
+                .contains("a `jkb task land` or `jkb task abandon` is running"),
             "{out:?}"
         );
     };
@@ -4221,6 +4222,44 @@ fn landing_is_serialised_by_a_lease_freed_only_when_its_holder_is_proven_gone() 
     assert!(out.status.success(), "{out:?}");
     assert_eq!(f.status_of(&uid), "done");
     assert_eq!(lease_of(&f.db, name), None, "released");
+}
+
+/// **Abandoning takes the land lock**: an abandon run while a land is mid-gate used to archive the
+/// session's worktree and reopen the task under it, and the land then finished grafting — the commits
+/// on the target, the task `open`. Held by a live land, abandon refuses and touches nothing; once the
+/// lock is free it proceeds and releases the lock again.
+#[test]
+fn abandoning_refuses_while_a_land_holds_the_land_lock() {
+    let f = Fixture::new();
+    let uid = f.add_task("abandoned mid-land");
+    let s = f.work(&uid);
+    let worktree = PathBuf::from(s["worktree"].as_str().unwrap());
+    let name = "land:proj";
+
+    // pid 1 on this host is alive: a land in progress.
+    set_lease(&f.db, name, Some("host:1 n -"));
+    let out = f.jkb().args(["task", "abandon", &uid]).output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("a `jkb task land` or `jkb task abandon` is running")
+            && stderr.contains("abandoning waits for it"),
+        "{out:?}"
+    );
+    assert!(worktree.exists(), "the session is untouched");
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "and the task not reopened"
+    );
+    assert!(claim_of(&f.db, &uid).is_some(), "nor its claim released");
+    assert_eq!(lease_of(&f.db, name).as_deref(), Some("host:1 n -"));
+
+    set_lease(&f.db, name, None);
+    f.jkb().args(["task", "abandon", &uid]).assert().success();
+    assert!(!worktree.exists(), "abandoned");
+    assert_eq!(f.status_of(&uid), "open");
+    assert_eq!(lease_of(&f.db, name), None, "and the lock released");
 }
 
 /// **A container session lands through the daemon** (tasks S6.4 stage 4): the graft and the gate run

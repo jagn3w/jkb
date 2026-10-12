@@ -1696,17 +1696,47 @@ pub fn branch_name(dir: &Path, name: &str) -> Result<BranchName> {
 /// created.
 ///
 /// # Errors
-/// Returns an error if `git` cannot be executed or refuses to create the branch.
+/// Returns an error if `git` cannot be executed or refuses to create the branch — naming the race
+/// when the branch was proven absent and then appeared while this was creating it.
 pub fn create_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
+    create_branch_between(dir, branch, start, || {})
+}
+
+/// [`create_branch`], running `between` after the existence check and before `git branch` — the
+/// window a concurrent creator lands in, held open by the test that pins the race's wording.
+fn create_branch_between(
+    dir: &Path,
+    branch: &str,
+    start: &str,
+    between: impl FnOnce(),
+) -> Result<bool> {
     valid_ref(branch)?;
     valid_ref(start)?;
     // Proven present, or attempt it: `git branch` refuses an existing branch on its own, so an
     // unestablished answer costs a clear git error rather than a silent wrong turn.
-    if has_branch(dir, branch)?.is_yes() {
+    let before = has_branch(dir, branch)?;
+    if before.is_yes() {
         return Ok(false);
     }
-    git_must(dir, &["branch", branch, start])?;
-    Ok(true)
+    between();
+    let args = ["branch", branch, start];
+    let (ok, text) = git_run(dir, &args)?;
+    if ok {
+        return Ok(true);
+    }
+    // A RACE, said as one. Two `jkb task work` on one task both see no branch and both run `git
+    // branch`; the loser used to print git's `cannot lock ref … reference already exists`. Decided
+    // by asking git again, never by parsing its English, and only when the first answer was a
+    // proven `No`: after an `Unknown` the branch may have been there all along, which is no race.
+    // Still a refusal rather than `Ok(false)`: the caller is mid-way through a command another
+    // process is also running, and what it would build on the other's branch is the other's call.
+    anyhow::ensure!(
+        !(before.is_no() && has_branch(dir, branch)?.is_yes()),
+        "branch `{branch}` was created by another process while this one was creating it — most \
+         likely a concurrent `jkb task work` on the same task. Nothing was changed here; let the \
+         other command finish, then run this one again."
+    );
+    anyhow::bail!("git {}: {text}", args.join(" "))
 }
 
 /// Delete branch `branch`, discarding unmerged commits when `force`.
@@ -2844,6 +2874,36 @@ mod tests {
             "gitrepo fixture",
             &fixture_git(Path::new("/somewhere"), &["status"]),
         );
+    }
+
+    /// Losing the race to create a branch is reported as that race, not as git's `cannot lock ref`:
+    /// two concurrent `jkb task work` on one task both find no batch branch and both cut one. The
+    /// other creator is put in the window between the existence check and `git branch`, which is
+    /// where the loser of a real race is.
+    #[test]
+    fn losing_the_race_to_create_a_branch_names_the_race() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path();
+        fixture(dir);
+        let err = super::create_branch_between(dir, "batch", "main", || {
+            let out = fixture_git(dir, &["branch", "batch", "main"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        })
+        .expect_err("the branch appeared under it, so this creation lost");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("created by another process while this one was creating it"),
+            "{msg}"
+        );
+        assert!(!msg.contains("cannot lock ref"), "{msg}");
+
+        // The other outcomes are unchanged: present beforehand is no creation and no error, and a
+        // refusal with no branch appearing still carries git's own text.
+        assert!(!super::create_branch(dir, "batch", "main").unwrap());
+        let err = super::create_branch(dir, "fresh", "no-such-start").unwrap_err();
+        assert!(!format!("{err:#}").contains("another process"), "{err:#}");
     }
 
     /// Unregistering one worktree — removed, or already gone — leaves a registration whose directory

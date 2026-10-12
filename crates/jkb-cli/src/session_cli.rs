@@ -1281,6 +1281,11 @@ pub(crate) fn abandon(
     json: bool,
 ) -> Result<()> {
     let ctx = repo::repo_ctx()?;
+    // THE LAND LOCK, taken before anything is read, as `land` takes it. Without it an abandon run
+    // while a land was mid-gate archived the session's worktree and reopened the task, and the land
+    // then finished its graft: the commits on the target, the task `open` with its session gone.
+    // Refused rather than waited for — a land's gate can run for minutes, and the user can rerun.
+    let _lock = LandLease::acquire(kb, &ctx.key, LockFor::Abandon)?;
     let facts = kb.facts_for_write(uid)?;
     // Abandon does two separable things: it **disposes of the session**, and it **reopens the
     // task**. Only the second is wrong for a terminal task — a landed one is already merged
@@ -1799,12 +1804,35 @@ fn refuse_a_running_opener(kb: &Kb<'_>, uid: &str, held: &str, worktree: &Path) 
     )
 }
 
+/// What a [`LandLease`] is taken for, which is what its refusal explains.
+#[derive(Clone, Copy)]
+pub(crate) enum LockFor {
+    /// `jkb task land`: grafting and gating one session.
+    Land,
+    /// `jkb task abandon`: removing a session's worktree, which a land may be grafting or gating.
+    Abandon,
+}
+
+impl LockFor {
+    const fn why(self) -> &'static str {
+        match self {
+            Self::Land => "landing is serial so its gate result stays meaningful",
+            Self::Abandon => {
+                "abandoning waits for it, because a land in progress may be grafting this \
+                 session's commits or gating them, and removing the worktree under it would leave \
+                 them on the target with the task reopened"
+            }
+        }
+    }
+}
+
 /// An exclusive hold on a repo's landing: the `land:<repo>` lease, released on drop (tasks S6.4 stage 4,
 /// decision D).
 ///
 /// Landing must be serial: two sessions grafting at once would each run the gate against a tree the
 /// other is about to change, which is exactly the "green alone, red together" case the gate exists to
-/// catch (design D36.4). The lock was a file in the repo holding a pid, which a process on the other
+/// catch (design D36.4). `jkb task abandon` takes it too ([`LockFor::Abandon`]): it removes the worktree
+/// a land grafts from, so the two must not interleave. The lock was a file in the repo holding a pid, which a process on the other
 /// side of the container bind cannot probe — each side would read the other's live lock as stale.
 ///
 /// **Stale only when its holder is proven gone**, asked in this order: a process this host can probe
@@ -1826,8 +1854,8 @@ impl<'a> LandLease<'a> {
         format!("{}{repo_key}", jkb_api::removals::LAND_LEASE_PREFIX)
     }
 
-    /// Take the lease, or fail naming who holds it.
-    pub(crate) fn acquire(kb: &Kb<'a>, repo_key: &str) -> Result<Self> {
+    /// Take the lease for `purpose`, or fail naming who holds it.
+    pub(crate) fn acquire(kb: &Kb<'a>, repo_key: &str, purpose: LockFor) -> Result<Self> {
         let name = Self::name(repo_key);
         let nonce = format!(
             "{}.{}",
@@ -1854,10 +1882,11 @@ impl<'a> LandLease<'a> {
             };
             anyhow::ensure!(
                 Self::gone(kb, &current)?,
-                "another `jkb task land` is running for this repo ({}) — landing is serial so its gate \
-                 result stays meaningful; wait for it to finish, or, if it is gone for good, run \
-                 `jkb task land --break-lock` on the host",
-                Self::describe(&current)
+                "a `jkb task land` or `jkb task abandon` is running for this repo ({}) — {}; wait \
+                 for it to finish, or, if it is gone for good, run `jkb task land --break-lock` on \
+                 the host",
+                Self::describe(&current),
+                purpose.why()
             );
             if kb.lease_take(&name, &holder, Some(&current))? {
                 return Ok(Self {
