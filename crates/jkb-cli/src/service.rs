@@ -313,8 +313,8 @@ fn launchd_plist(exe: &Path, db: &Path) -> String {
 
 /// A systemd **user** unit running the all-mounts watcher, restarted on failure.
 fn systemd_unit(exe: &Path, db: &Path) -> String {
-    let exe = exe.to_string_lossy();
-    let db = db.to_string_lossy();
+    let exe = systemd_quote(&exe.to_string_lossy());
+    let db = systemd_quote(&db.to_string_lossy());
     format!(
         "[Unit]\n\
          Description=jkb knowledge base file-sync watcher\n\
@@ -425,8 +425,8 @@ fn systemd_reap_unit(exe: &Path, db: &Path, container: Option<&str>) -> String {
             crate::transcripts::CONTAINER_NAME_VAR
         )
     });
-    let exe = exe.to_string_lossy();
-    let db = db.to_string_lossy();
+    let exe = systemd_quote(&exe.to_string_lossy());
+    let db = systemd_quote(&db.to_string_lossy());
     format!(
         "[Unit]\n\
          Description=jkb session worktree archiver\n\
@@ -478,8 +478,8 @@ fn launchd_serve_plist(exe: &Path, db: &Path) -> String {
 
 /// A systemd **user** unit running `jkb serve`, restarted on failure.
 fn systemd_serve_unit(exe: &Path, db: &Path) -> String {
-    let exe = exe.to_string_lossy();
-    let db = db.to_string_lossy();
+    let exe = systemd_quote(&exe.to_string_lossy());
+    let db = systemd_quote(&db.to_string_lossy());
     format!(
         "[Unit]\n\
          Description=jkb knowledge base daemon (serves the dev container)\n\
@@ -495,6 +495,37 @@ fn systemd_serve_unit(exe: &Path, db: &Path) -> String {
     )
 }
 
+/// One argument of a systemd `ExecStart=` line, spelled so systemd hands the process exactly `s`.
+///
+/// `ExecStart=` is not a shell line, but it is not literal either: systemd splits it into words at
+/// whitespace, unquotes and C-unescapes each word, expands `%` specifiers in it, and at exec time
+/// expands `$VAR`/`${VAR}` (systemd.service(5), "Command lines"; systemd.syntax(7), "Quoting").
+/// So a bare path is right only until it holds a space (two arguments: the wrong executable, or
+/// `--db` pointing at a truncated path) or a `%` (`%h`, `%u` … silently substituted, or a unit
+/// that fails to load on an unknown specifier). The word is therefore always double-quoted, with
+/// `\` and `"` backslash-escaped, `%` doubled to the specifier escape `%%`, `$` doubled to the
+/// literal-dollar escape `$$`, and control characters (a newline would end the line) written as
+/// `\xNN`, which the C-unescape step turns back into the byte.
+fn systemd_quote(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            c if c.is_ascii_control() => {
+                let _ = write!(out, "\\x{:02x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Minimal XML escaping for text that goes inside plist `<string>` elements.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -508,8 +539,8 @@ fn xml_escape(s: &str) -> String {
 mod tests {
     use super::{
         install_units, launchd_log, launchd_plist, launchd_reap_plist, launchd_serve_plist,
-        systemd_reap_unit, systemd_serve_unit, systemd_unit, xml_escape, Manager, LABEL,
-        REAP_LABEL, SERVE_LABEL,
+        systemd_quote, systemd_reap_unit, systemd_serve_unit, systemd_unit, xml_escape, Manager,
+        LABEL, REAP_LABEL, SERVE_LABEL,
     };
     use std::path::Path;
 
@@ -558,7 +589,9 @@ mod tests {
     #[test]
     fn systemd_unit_runs_the_watcher() {
         let unit = systemd_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
-        assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db sync --watch"));
+        assert!(
+            unit.contains("ExecStart=\"/usr/bin/jkb\" --db \"/home/u/.jkb/jkb.db\" sync --watch")
+        );
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
     }
@@ -611,8 +644,31 @@ mod tests {
         assert!(plist.contains("<key>KeepAlive</key>"));
         assert!(plist.contains("serve.log"));
         let unit = systemd_serve_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
-        assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db serve"));
+        assert!(unit.contains("ExecStart=\"/usr/bin/jkb\" --db \"/home/u/.jkb/jkb.db\" serve"));
         assert!(unit.contains("Restart=on-failure"));
+    }
+
+    /// A path with a space or a `%` must reach the process as ONE argument, spelled as written.
+    /// Unquoted, `/home/a b/jkb` ran `/home/a` with `b/jkb` as its first argument, and `%h` in a
+    /// database path was replaced by the home directory before `jkb` ever saw it.
+    #[test]
+    fn systemd_exec_start_quotes_and_escapes_the_exe_and_db() {
+        assert_eq!(
+            systemd_quote(r#"/a b/100%h$HOME"q"\n"#),
+            r#""/a b/100%%h$$HOME\"q\"\\n""#
+        );
+        assert_eq!(systemd_quote("a\nb\tc"), r#""a\x0ab\x09c""#);
+
+        let exe = Path::new("/opt/my apps/jkb");
+        let db = Path::new("/home/u/100% sure/jkb.db");
+        let want = r#"ExecStart="/opt/my apps/jkb" --db "/home/u/100%% sure/jkb.db""#;
+        for (unit, tail) in [
+            (systemd_unit(exe, db), " sync --watch\n"),
+            (systemd_serve_unit(exe, db), " serve\n"),
+            (systemd_reap_unit(exe, db, None), " task reap --watch\n"),
+        ] {
+            assert!(unit.contains(&format!("{want}{tail}")), "{unit}");
+        }
     }
 
     #[test]
@@ -631,7 +687,8 @@ mod tests {
             named.contains("Environment=JKB_CONTAINER_NAME=jkb-alt"),
             "the reaper must sweep the container the operator actually named: {named}"
         );
-        assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db task reap --watch"));
+        assert!(unit
+            .contains("ExecStart=\"/usr/bin/jkb\" --db \"/home/u/.jkb/jkb.db\" task reap --watch"));
         assert!(unit.contains("Restart=on-failure"));
         // NO `Environment=PATH=` HERE, deliberately, and the launchd side is not the same case.
         // systemd's `Environment=` REPLACES the inherited value rather than extending it, and its
