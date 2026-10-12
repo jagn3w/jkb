@@ -11,6 +11,7 @@ mod agent;
 mod catalog;
 mod enums;
 mod error;
+mod fts;
 mod id;
 mod traits;
 
@@ -20,5 +21,6 @@ pub use enums::{
     ConflictPolicy, EdgeType, NamespaceKind, PlacementRole, Resolution, SyncMode, TaskStatus,
 };
 pub use error::{Error, Result};
+pub use fts::fts5_match_expr;
 pub use id::{EdgeId, ItemId, NamespaceId, Uid};
 pub use traits::Embedder;

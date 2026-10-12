@@ -484,3 +484,60 @@ fn saving_an_invalid_view_is_rejected() {
         "an unparseable view query must be rejected"
     );
 }
+
+fn add_note(conn: &Connection, meta: &WriteMeta, uid: &str, content: &str) -> ItemId {
+    item::upsert(
+        conn,
+        meta,
+        &item::NewItem {
+            uid: uid.to_owned(),
+            kind: "note".to_owned(),
+            content: Some(content.to_owned()),
+            content_hash: None,
+            mime: None,
+        },
+    )
+    .unwrap()
+}
+
+/// Bare words are search words, never FTS5 syntax: each one used to reach `MATCH` as typed,
+/// so `or`, `a-b`, `col:x`, `foo*` or a lone punctuation word failed the whole query with
+/// `fts5: syntax error`.
+#[test]
+fn bare_words_that_are_fts5_syntax_match_as_words() {
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |conn, meta| {
+        add_note(conn, meta, "n:either", "take this or that");
+        add_note(conn, meta, "n:dash", "the a-b split");
+        add_note(conn, meta, "n:not", "do NOT panic near the edge");
+        add_note(conn, meta, "n:plain", "nothing special here");
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(uids_for(&db, "or"), vec!["n:either"]);
+    assert_eq!(uids_for(&db, "OR that"), vec!["n:either"]);
+    assert_eq!(uids_for(&db, "a-b"), vec!["n:dash"]);
+    assert_eq!(uids_for(&db, "NOT"), vec!["n:not"]);
+    assert_eq!(uids_for(&db, "NEAR edge"), vec!["n:not"]);
+    assert_eq!(uids_for(&db, "panic AND"), Vec::<String>::new());
+    // Words are ANDed: every word must occur.
+    assert_eq!(uids_for(&db, "split nothing"), Vec::<String>::new());
+    // A quoted DSL group contributes its words, and an embedded quote is escaped.
+    assert_eq!(uids_for(&db, r#""special here""#), vec!["n:plain"]);
+    assert_eq!(uids_for(&db, r#"here\""#), vec!["n:plain"]);
+    // Operator and punctuation words that are in no text match nothing, not an error.
+    for dsl in [
+        "content:x",
+        "foo*",
+        "(",
+        ")",
+        "-",
+        "^",
+        "+",
+        r#"\""#,
+        r#""""#,
+    ] {
+        assert_eq!(uids_for(&db, dsl), Vec::<String>::new(), "dsl {dsl:?}");
+    }
+}

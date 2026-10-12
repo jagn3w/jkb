@@ -732,3 +732,28 @@ fn vectors_for_answers_more_ids_than_one_statement_can_bind() {
         .unwrap();
     assert_eq!(found, usize::try_from(n).unwrap());
 }
+
+/// `FtsIndexer::search` takes search words: a word that is FTS5 syntax (`or`, `a-b`, a lone
+/// `"`) matches text instead of failing the statement.
+#[test]
+fn fts_search_words_are_never_fts5_syntax() {
+    let db = open_db();
+    let id = db
+        .write_txn("test", |conn, meta| {
+            Ok(add_item(conn, meta, "n:1", "this or the a-b thing"))
+        })
+        .unwrap();
+    let (or, dash, quote) = db
+        .read(|conn| {
+            let fts = FtsIndexer::new();
+            Ok((
+                fts.search(conn, "or", 10).unwrap(),
+                fts.search(conn, "a-b thing", 10).unwrap(),
+                fts.search(conn, "\"", 10).unwrap(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(or.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![id]);
+    assert_eq!(dash.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![id]);
+    assert!(quote.is_empty());
+}

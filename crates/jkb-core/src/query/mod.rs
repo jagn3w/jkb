@@ -138,7 +138,8 @@ pub struct Query {
     pub claimed: Option<bool>,
     /// `blocks:<uid>` — items that block the item with this uid.
     pub blocks: Option<String>,
-    /// A bare/quoted term for FTS `match`.
+    /// The bare/quoted words for FTS `match`, as typed: [`Query::evaluate`] quotes each word
+    /// as an FTS5 string ([`jkb_types::fts5_match_expr`]), so a word is never FTS5 syntax.
     pub fts: Option<String>,
     /// `~"…"` — a vector-similarity ranking term (applied by `jkb-search`, not here).
     pub vector: Option<String>,
@@ -189,7 +190,7 @@ impl Query {
         if let Some(term) = &self.fts {
             clauses
                 .push("i.id IN (SELECT rowid FROM fts_items WHERE fts_items MATCH ?)".to_owned());
-            params.push(Value::Text(term.clone()));
+            params.push(Value::Text(jkb_types::fts5_match_expr(term)));
         }
 
         let mut sql = "SELECT i.id FROM items i".to_owned();

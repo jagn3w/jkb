@@ -9,7 +9,7 @@
 
 use rusqlite::Connection;
 
-use jkb_types::ItemId;
+use jkb_types::{fts5_match_expr, ItemId};
 
 use crate::{IndexItem, Indexer, Result};
 
@@ -27,11 +27,15 @@ impl FtsIndexer {
     /// Full-text search for `query`, returning up to `limit` `(item_id, score)`
     /// pairs best-first. `score` is FTS5 `bm25` rank (more negative = better).
     ///
+    /// `query` is search words, not FTS5 syntax: each word is quoted as an FTS5 string
+    /// ([`fts5_match_expr`]) and the words are `AND`ed, so a word like `or` or `a-b`
+    /// matches text instead of failing as a syntax error.
+    ///
     /// The `rowid` of `fts_items` is `items.id` (external-content
     /// `content_rowid='id'`), so results are item ids directly — no join.
     ///
     /// # Errors
-    /// Returns an error if the query is malformed or the statement fails.
+    /// Returns an error if the statement fails.
     pub fn search(
         &self,
         conn: &Connection,
@@ -48,7 +52,7 @@ impl FtsIndexer {
              LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![query, limit], |row| {
+            .query_map(rusqlite::params![fts5_match_expr(query), limit], |row| {
                 Ok((ItemId::new(row.get(0)?), row.get::<_, f64>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
