@@ -814,4 +814,40 @@ mod edges_namespaces_autoincrement_tests {
             "the (src, dst, type) uniqueness was lost"
         );
     }
+
+    /// V028 drops `idx_task_transitions_branch`, which nothing read: the table's one read
+    /// (`transition::history`) goes by item, through `idx_task_transitions_item`.
+    #[test]
+    fn v028_drops_the_unread_branch_index_and_history_still_reads_by_item() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::run(&mut conn).unwrap();
+
+        let names: Vec<String> = indexes(&conn, "task_transitions")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["idx_task_transitions_item".to_owned()],
+            "task_transitions should keep only the index its history read uses"
+        );
+
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, txn_id, at, event, from_status, to_status, agent_id,
+                        branch, onto, ref_commit, pr_number, evidence
+                   FROM task_transitions WHERE item_id = ?1 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([1], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("USING INDEX idx_task_transitions_item")),
+            "the history read no longer uses its index: {plan:?}"
+        );
+    }
 }

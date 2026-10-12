@@ -716,11 +716,8 @@ pub fn landed(
     };
     let labels = landed.labels();
     let outcome = transition::perform(conn, meta, id, &facts, TaskEvent::ObservedLanded, &labels)?;
-    let refusal = outcome.refusal();
-    if refusal.is_some() && matches!(outcome, jkb_fsm::Outcome::Refused { .. }) {
-        transition::observed(conn, meta, id, &facts, TaskEvent::ObservedLanded, &labels)?;
-    }
-    landing(conn, id, refusal)
+    transition::observed(conn, meta, id, &facts, &outcome, &labels)?;
+    landing(conn, id, outcome.refusal())
 }
 
 /// One open must-fix finding.

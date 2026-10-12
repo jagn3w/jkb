@@ -487,7 +487,7 @@ impl Landing {
         }
     }
 
-    /// The landing **whenever it happened**, spent or not.
+    /// The **latest** recorded landing, spent or not — an earlier one is not kept.
     ///
     /// For the historical question — *did jkb ever graft this work onto that branch?* — which is
     /// what `jkb task review record` asks: a graft does not un-happen, and the reviewer read what
@@ -571,6 +571,13 @@ pub fn note(
 /// re-ran the verb: `close-merged` then asked GitHub for a pull request that never existed,
 /// because the queue grafts locally. Held for ever, which is the shape D48 exists to end.
 ///
+/// It takes the machine's `outcome` — what [`perform`] returned for these `facts` — rather than an
+/// event, so it can only record an event the machine was asked and refused on a guard. Any other
+/// outcome records nothing and returns `false`: a [`Outcome::Moved`] was recorded by [`perform`]
+/// already, an [`Outcome::Idempotent`] did not happen again, and an [`Outcome::Undefined`] is an
+/// event the machine has no edge for from this state (an abandoned task keeps `branch=`, and must
+/// not be revived by a landing of it).
+///
 /// # Errors
 /// Returns a database error if the insert fails.
 pub fn observed(
@@ -578,11 +585,15 @@ pub fn observed(
     meta: &WriteMeta,
     task: ItemId,
     facts: &TaskFacts,
-    event: TaskEvent,
+    outcome: &TaskOutcome,
     labels: &Labels,
-) -> Result<()> {
+) -> Result<bool> {
     use jkb_fsm::Event as _;
-    append(conn, meta, task, facts, event.name(), labels)
+    let Outcome::Refused { event, .. } = outcome else {
+        return Ok(false);
+    };
+    append(conn, meta, task, facts, event.name(), labels)?;
+    Ok(true)
 }
 
 /// One row, `from_status == to_status`, under whatever name the caller gives the event.
@@ -705,8 +716,10 @@ pub struct Reclaimed {
 
 #[cfg(test)]
 mod tests {
-    use super::{history, perform, reclaim_dead, Labels, Landing, TransitionRow};
-    use crate::lifecycle::{TaskEvent, TaskFacts};
+    use super::{
+        history, landing, observed, perform, reclaim_dead, Labels, Landing, TransitionRow,
+    };
+    use crate::lifecycle::{self, TaskEvent, TaskFacts};
     use crate::task::{create, NewTask};
     use crate::Db;
     use jkb_fsm::{Fact, Outcome};
@@ -1057,5 +1070,102 @@ mod tests {
             // right question for "did jkb ever graft this" and the wrong one for "may it land".
             assert_eq!(l.recorded().is_some(), had_landing, "recorded");
         }
+    }
+
+    /// Facts under which the merge queue's landing is refused on a guard: the work landed, the
+    /// task still has an open subtask.
+    fn held_landing() -> TaskFacts {
+        TaskFacts {
+            status: TaskStatus::InProgress,
+            landed_elsewhere: Fact::Yes,
+            open_subtasks: Fact::Yes,
+            ..TaskFacts::default()
+        }
+    }
+
+    fn onto(branch: &str) -> Labels {
+        Labels {
+            onto: Some(branch.to_owned()),
+            ..Labels::default()
+        }
+    }
+
+    /// `observed` records only what the machine refused, under the event the machine was asked —
+    /// never a moved, idempotent or undefined outcome.
+    #[test]
+    fn observed_records_only_a_refused_outcome_under_its_own_event() {
+        let db = db();
+        let id = a_task(&db);
+        let refused = lifecycle::apply(&held_landing(), TaskEvent::ObservedLanded);
+        assert!(matches!(refused, Outcome::Refused { .. }), "{refused:?}");
+        let cancelled = TaskFacts {
+            status: TaskStatus::Cancelled,
+            landed_elsewhere: Fact::Yes,
+            ..TaskFacts::default()
+        };
+        let undefined = lifecycle::apply(&cancelled, TaskEvent::ObservedLanded);
+        assert!(
+            matches!(undefined, Outcome::Undefined { .. }),
+            "{undefined:?}"
+        );
+        let starting = TaskFacts {
+            status: TaskStatus::Open,
+            actor: Some(AgentId::agent("a")),
+            ..TaskFacts::default()
+        };
+        let moved = lifecycle::apply(&starting, TaskEvent::Start);
+        assert!(matches!(moved, Outcome::Moved { .. }), "{moved:?}");
+        let idempotent = Outcome::Idempotent {
+            state: TaskStatus::Done,
+            event: TaskEvent::Land,
+        };
+
+        let written = db
+            .write_txn("test", move |conn, meta| {
+                let mut written = Vec::new();
+                for (facts, outcome) in [
+                    (cancelled, undefined),
+                    (starting, moved),
+                    (held_landing(), idempotent),
+                    (held_landing(), refused),
+                ] {
+                    written.push(observed(conn, meta, id, &facts, &outcome, &onto("main"))?);
+                }
+                Ok(written)
+            })
+            .expect("observed");
+        assert_eq!(written, [false, false, false, true]);
+
+        let rows = db.read(move |conn| history(conn, id)).expect("history");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].event, "observed_landed");
+        assert_eq!(rows[0].from_status.as_deref(), Some("in_progress"));
+        assert_eq!(rows[0].to_status, "in_progress");
+        assert_eq!(rows[0].labels.onto.as_deref(), Some("main"));
+    }
+
+    /// `Landing::recorded` is the **latest** landing in the history, not the first.
+    #[test]
+    fn recorded_is_the_latest_landing() {
+        let db = db();
+        let id = a_task(&db);
+        db.write_txn("test", move |conn, meta| {
+            for branch in ["first", "second"] {
+                let outcome = lifecycle::apply(&held_landing(), TaskEvent::ObservedLanded);
+                assert!(observed(
+                    conn,
+                    meta,
+                    id,
+                    &held_landing(),
+                    &outcome,
+                    &onto(branch)
+                )?);
+            }
+            Ok(())
+        })
+        .expect("observed");
+        let found = db.read(move |conn| landing(conn, id)).expect("landing");
+        let recorded = found.recorded().expect("a landing was recorded");
+        assert_eq!(recorded.labels.onto.as_deref(), Some("second"));
     }
 }
