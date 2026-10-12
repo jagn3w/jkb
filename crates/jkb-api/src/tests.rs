@@ -435,11 +435,23 @@ fn samples() -> Vec<Request> {
                 ..crate::workflows::AgentEdit::default()
             },
         },
-        Request::DesignList { repo: None },
+        Request::DesignList {
+            repo: None,
+            review: true,
+        },
         Request::DesignCreate {
             repo: "jkb".into(),
             title: "t".into(),
             body: "b".into(),
+        },
+        Request::DesignMove {
+            uid: "design:x".into(),
+            under: "design:y".into(),
+        },
+        Request::DesignSplit {
+            uid: "design:x".into(),
+            base: "1.AA".into(),
+            level: 2,
         },
         Request::DesignCat {
             uid: "design:x".into(),
@@ -459,6 +471,33 @@ fn samples() -> Vec<Request> {
         Request::DesignState {
             uid: "design:x".into(),
             since: None,
+        },
+        Request::DesignThreads {
+            uid: "design:x".into(),
+        },
+        Request::DesignThreadStart {
+            uid: "design:x".into(),
+            base: "1.AA".into(),
+            find: Some("w".into()),
+            occurrence: None,
+            start: None,
+            end: None,
+            text: "t".into(),
+        },
+        Request::DesignThreadReply {
+            thread: "thread:x".into(),
+            text: "t".into(),
+        },
+        Request::DesignThreadResolve {
+            thread: "thread:x".into(),
+        },
+        Request::DesignApproveSelection {
+            uid: "design:x".into(),
+            base: "1.AA".into(),
+            find: None,
+            occurrence: None,
+            start: Some(0),
+            end: Some(1),
         },
         Request::DesignSpans {
             uid: "design:x".into(),
@@ -1711,6 +1750,7 @@ const READS: &[&str] = &[
     "design.export",
     "design.state",
     "design.spans",
+    "design.threads",
     "design.plan",
     "design.plans",
     "design.prompt",

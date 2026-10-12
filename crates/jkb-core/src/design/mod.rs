@@ -27,6 +27,8 @@ mod discuss;
 pub mod export;
 pub mod plan;
 pub mod prompts;
+pub mod threads;
+pub mod tree;
 
 use std::collections::BTreeSet;
 
@@ -46,6 +48,7 @@ pub use discuss::{discussion, Discussion, Touched, MAX_DISCUSS_UNITS};
 pub use export::{DesignMeta, Exported, Source};
 pub use plan::{PlanTask, PlanView, Plans, StepView, TaskPlace, PLAN_KIND};
 pub use prompts::{Launch, PromptRecord, RecordPrompt, Recorded, PROMPT_KIND};
+pub use tree::Split;
 use yrs::Text as _;
 
 /// The item kind of a design.
@@ -214,6 +217,8 @@ pub struct DesignRow {
     pub seq: i64,
     /// Where its export is written, and the files it was made from (D55.5–6).
     pub meta: DesignMeta,
+    /// The design it is nested under ([`tree`]), or `None` at the top level.
+    pub parent: Option<String>,
 }
 
 /// One piece of a span's text and the state it is in.
@@ -277,6 +282,61 @@ pub struct DesignText {
     pub version: Version,
     /// Its spans, in text order.
     pub spans: Vec<SpanView>,
+}
+
+/// How much of a design's text is in each state: non-whitespace characters (UTF-16 units), so a
+/// blank line between two spans weighs nothing. What the design list's review bar draws.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StateCounts {
+    /// Uncovered text and every span that reads PROPOSED (demoted ones included).
+    pub proposed: u64,
+    /// Approved, not staged.
+    pub approved: u64,
+    /// Staged into a step whose tasks are not all done.
+    pub staged: u64,
+    /// Staged and built.
+    pub implemented: u64,
+}
+
+impl DesignText {
+    /// How much of the text is in each state, by the spans' derived states — the same reading the
+    /// editor colours and the export keeps (a span reading PROPOSED counts whole as PROPOSED).
+    #[must_use]
+    pub fn state_counts(&self) -> StateCounts {
+        let units = |s: &str| -> u64 {
+            s.chars()
+                .filter(|c| !c.is_whitespace())
+                .map(|c| u64::try_from(c.len_utf16()).unwrap_or(0))
+                .sum()
+        };
+        let mut covered: Vec<(u32, u32, SpanState)> = self
+            .spans
+            .iter()
+            .filter(|s| s.anchored && s.end > s.start && s.state != SpanState::Proposed)
+            .map(|s| (s.start, s.end, s.state))
+            .collect();
+        covered.sort_unstable_by_key(|c| (c.0, c.1));
+        let mut out = StateCounts::default();
+        let mut at = 0;
+        // Spans do not overlap; were they to, each unit is counted once.
+        for (start, end, state) in covered {
+            let start = start.max(at);
+            if end <= start {
+                continue;
+            }
+            let n = units(&slice(&self.text, start, end));
+            match state {
+                SpanState::Approved => out.approved += n,
+                SpanState::Staged => out.staged += n,
+                SpanState::Implemented => out.implemented += n,
+                SpanState::Proposed => {}
+            }
+            at = end;
+        }
+        out.proposed =
+            units(&self.text).saturating_sub(out.approved + out.staged + out.implemented);
+        out
+    }
 }
 
 /// What a write did.
@@ -432,6 +492,7 @@ pub fn create(
         namespace: Some(path),
         seq,
         meta: DesignMeta::default(),
+        parent: None,
     })
 }
 
@@ -467,6 +528,7 @@ pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<DesignRow>> {
         out.push(DesignRow {
             seq: newest_seq(conn, id)?,
             meta: export::meta_of(conn, id)?,
+            parent: parent_uid(conn, id)?,
             uid,
             title,
             namespace,
@@ -489,7 +551,16 @@ pub fn row(conn: &Connection, uid: &str) -> Result<DesignRow> {
         namespace: item::primary_namespace(conn, id)?,
         seq: newest_seq(conn, id)?,
         meta: export::meta_of(conn, id)?,
+        parent: parent_uid(conn, id)?,
     })
+}
+
+/// The uid of the design `design` is nested under, if any.
+fn parent_uid(conn: &Connection, design: ItemId) -> Result<Option<String>> {
+    match tree::parent_of(conn, design)? {
+        Some(p) => Ok(item::get(conn, p)?.map(|m| m.uid)),
+        None => Ok(None),
+    }
 }
 
 /// The newest seq a design holds, counting its compaction.
@@ -601,14 +672,31 @@ fn append_row(
     uid: &str,
     update: &[u8],
 ) -> Result<i64> {
+    append_row_as(conn, meta, design, uid, update, false)
+}
+
+/// [`append_row`], marking the row as a [`tree::split`]'s when `split`, which [`unrevertable`]
+/// refuses by name.
+fn append_row_as(
+    conn: &Connection,
+    meta: &WriteMeta,
+    design: ItemId,
+    uid: &str,
+    update: &[u8],
+    split: bool,
+) -> Result<i64> {
     let (rowid, seq) = store_row(conn, meta, design, uid, update)?;
+    let mut after = json!({ "design": uid, "seq": seq, "bytes": update.len() });
+    if split {
+        after["split"] = json!(true);
+    }
     changelog::upsert(
         conn,
         meta,
         Entity::DesignUpdates,
         &rowid.to_string(),
         None,
-        Some(&json!({ "design": uid, "seq": seq, "bytes": update.len() })),
+        Some(&after),
     )?;
     compact_if_due(conn, meta, design)?;
     Ok(seq)
@@ -1018,12 +1106,28 @@ pub fn add_span(
     occurrence: Option<usize>,
     reviewer: Reviewer,
 ) -> Result<Written> {
+    let words = threads::Words::Quote {
+        find: find.to_owned(),
+        occurrence,
+    };
+    span_over(conn, meta, uid, base, &words, reviewer)
+}
+
+/// [`add_span`] over `words`, a quote or a selection's range.
+fn span_over(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    base: &str,
+    words: &threads::Words,
+    reviewer: Reviewer,
+) -> Result<Written> {
     let id = design_id(conn, uid)?;
     let base = Version::parse(base)?;
     let (now, _) = load(conn, id)?;
     let before = before_write(conn, id, &now)?;
     let doc = load_base(conn, id, &base, &now)?;
-    let (s, e) = locate(&doc.text(), find, occurrence)?;
+    let (s, e) = words.resolve(&doc.text())?;
     let ids = doc.ids(s, e);
     if !now.all_present(&ids) {
         return Err(invalid(
@@ -1131,12 +1235,26 @@ fn span_item(conn: &Connection, uid: &str) -> Result<(SpanItem, ItemId, String)>
     }
     let metadata: Value = serde_json::from_str(&metadata)
         .map_err(|e| invalid(format!("span {uid} has unreadable metadata: {e}")))?;
-    let design_uid = metadata
-        .get("design")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid(format!("span {uid} names no design")))?
-        .to_owned();
-    let design = design_id(conn, &design_uid)?;
+    // The design a span belongs to is the one containing it — the row `span_items` lists it by,
+    // and the one `tree::split` moves. `metadata.design` is a copy for readers of the item, never
+    // the authority: `jkb undo` of an older metadata write (an approval) restores an old copy, and
+    // reading it then sent `approve` to a design the span had left (review round 1).
+    let contained = match containment::parent(conn, ItemId::new(id))? {
+        Some(parent) => item::get(conn, parent)?
+            .filter(|m| m.kind == KIND)
+            .map(|m| (parent, m.uid)),
+        None => None,
+    };
+    let (design, design_uid) = if let Some(found) = contained {
+        found
+    } else {
+        let named = metadata
+            .get("design")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid(format!("span {uid} names no design")))?
+            .to_owned();
+        (design_id(conn, &named)?, named)
+    };
     Ok((
         SpanItem {
             id: ItemId::new(id),
@@ -1180,9 +1298,10 @@ fn span_items(conn: &Connection, design: ItemId) -> Result<Vec<SpanItem>> {
 
 /// The state a span's approved words are in: APPROVED, or STAGED / IMPLEMENTED from the graph.
 ///
-/// Only `stages` edges into a step of the span's **own** design count ([`plan::design_of_step`]),
-/// the same rule [`stage`] refuses by: an edge written another way (`jkb inv link <span> stages
-/// <step>`) into another design's plan does not make the span STAGED. IMPLEMENTED needs every
+/// Only `stages` edges into a step of the span's **own** design's tree count
+/// ([`plan::design_of_step`], [`tree::root_of`]), the same rule [`stage`] refuses by: an edge
+/// written another way (`jkb inv link <span> stages <step>`) into another tree's plan does not make
+/// the span STAGED. IMPLEMENTED needs every
 /// counted step to be implemented ([`plan::StepTasks::implemented`]).
 fn approved_state(
     conn: &Connection,
@@ -1200,9 +1319,17 @@ fn approved_state(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut steps = Vec::new();
+    let root = if edges.is_empty() {
+        design
+    } else {
+        tree::root_of(conn, design)?
+    };
     for (step, uid) in edges {
-        if plan::design_of_step(conn, step, &uid).ok() == Some(design) {
-            steps.push((step, uid));
+        let owner = plan::design_of_step(conn, step, &uid).ok();
+        if let Some(owner) = owner {
+            if tree::root_of(conn, owner)? == root {
+                steps.push((step, uid));
+            }
         }
     }
     if steps.is_empty() {
@@ -1441,6 +1568,69 @@ pub fn approve(
     Ok(signed)
 }
 
+/// Approve exactly the words `words` names in design `uid` as read at `base` — the operator's
+/// alone. A selection that is exactly one span's text in `base` approves that span; any other makes
+/// a span over it (naming the operator) and approves it in the same write. A selection crossing an
+/// existing span's edge is refused rather than split: spans do not overlap.
+///
+/// # Errors
+/// A non-operator approver, an unknown design, a token that is not one of its versions, words not in
+/// that version or deleted since, a selection crossing a span's edge, or a database error.
+pub fn approve_selection(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    base: &str,
+    words: &threads::Words,
+    approver: &Approver,
+) -> Result<SpanView> {
+    if *approver != Approver::Operator {
+        return Err(invalid(
+            "approving a selection is the operator's — approve a span that names you instead",
+        ));
+    }
+    let id = design_id(conn, uid)?;
+    let version = Version::parse(base)?;
+    let (now, _) = load(conn, id)?;
+    let read = load_base(conn, id, &version, &now)?;
+    let (s, e) = words.resolve(&read.text())?;
+    for span in span_items(conn, id)? {
+        let Some((a, b)) = read.range(&span.uid).filter(|(a, b)| a < b) else {
+            continue;
+        };
+        if (a, b) == (s, e) {
+            return approve(conn, meta, &span.uid, base, approver);
+        }
+        if a < e && s < b {
+            return Err(invalid(format!(
+                "the selection crosses the edge of span {} — select exactly its text to approve \
+                 it, or only text outside every span",
+                span.uid
+            )));
+        }
+    }
+    let selected = read.ids(s, e);
+    let written = span_over(conn, meta, uid, base, words, Reviewer::Operator)?;
+    let span = written
+        .span
+        .ok_or_else(|| invalid("making the span over the selection wrote no span"))?;
+    // The approval is made at the version the span was written in, so check here what `approve`'s
+    // read-version rule would have: the span covers exactly the characters selected at `base`. A
+    // word inserted inside the selection since would otherwise land in the span and be approved
+    // unread (review round 1). Refused, the transaction takes the span back with it.
+    let (after, _) = load(conn, id)?;
+    let covered = after
+        .range(&span)
+        .map(|(a, b)| after.ids(a, b))
+        .unwrap_or_default();
+    if covered != selected {
+        return Err(invalid(
+            "the selected words changed after the version you read — re-read and select them again",
+        ));
+    }
+    approve(conn, meta, &span, &written.version.token(), approver)
+}
+
 /// Stage an approved span into a plan step: a `stages` edge (D53.6). STAGED is derived from it.
 ///
 /// # Errors
@@ -1461,10 +1651,12 @@ pub fn stage(
             "`{step_uid}` is a {kind}, not a plan step ({STEP_KIND})"
         )));
     }
-    if plan::design_of_step(conn, step, step_uid)? != design {
+    if tree::root_of(conn, plan::design_of_step(conn, step, step_uid)?)?
+        != tree::root_of(conn, design)?
+    {
         return Err(invalid(format!(
             "plan step {step_uid} belongs to another design's plan: a span is staged only into a \
-             step of its own design ({design_uid})"
+             step of its own design's tree ({design_uid})"
         )));
     }
     let current = span_now(conn, &span, design)?;
@@ -1644,11 +1836,30 @@ pub(crate) fn unrevertable(conn: &Connection, rowid: i64) -> Result<Option<Strin
     let exists: bool = conn
         .prepare_cached("SELECT EXISTS (SELECT 1 FROM design_updates WHERE id = ?1)")?
         .query_row([rowid], |r| r.get(0))?;
-    Ok((!exists).then(|| {
-        format!(
+    if !exists {
+        return Ok(Some(format!(
             "design update {rowid} is gone — folded into its design's snapshot by a compaction, \
              or removed with its design — so what it changed can no longer be told apart from the \
              rest"
+        )));
+    }
+    // A split's undo would put the text back as new characters, and the spans it moved back on
+    // anchors that cover none of them: half a restore, with spans no one can approve again.
+    let split: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM changelog WHERE entity_type = ?1 AND entity_id = ?2
+                AND json_extract(after, '$.split') = 1)",
+        )?
+        .query_row(
+            params![Entity::DesignUpdates.as_str(), rowid.to_string()],
+            |r| r.get(0),
+        )?;
+    Ok(split.then(|| {
+        format!(
+            "design update {rowid} split its design into child designs, and undo cannot put the \
+             moved spans back on the words they covered (undone text is new text to the CRDT) — \
+             so a split is not undone. To take one back, copy each child's text into the design \
+             with `jkb design edit`, then span and approve it again"
         )
     }))
 }

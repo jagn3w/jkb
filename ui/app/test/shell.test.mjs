@@ -118,10 +118,11 @@ test("the shell renders every tab and pane, with only the active pane shown", as
     assert.match(html, /id="terminal-drawer-body"[^>]*hidden/, "its body is hidden");
     assert.match(html, /aria-label="New terminal"[^>]*disabled/, "no new terminal before the roots are known");
     assert.doesNotMatch(html, /terminal-popover/, "no popover");
-    // The Design tab (D53.4): its pickers, empty until the designs are listed — which the bridge
-    // is asked for from an effect, never during render.
-    assert.match(html, /<select(?=[^>]*aria-label="Repo")(?=[^>]*disabled)/, "the repo picker waits for the listing");
-    assert.match(html, /<select(?=[^>]*aria-label="Design")(?=[^>]*disabled)/, "so does the design picker");
+    // The Design tab (D53.4): the design tree on the left, empty until the designs are listed —
+    // which the bridge is asked for from an effect, never during render.
+    assert.match(html, /<nav[^>]*class="design-sidebar"[^>]*aria-label="Designs"/, "the design tree");
+    assert.match(html, /<button(?=[^>]*aria-label="Refresh designs")(?=[^>]*disabled)/, "its refresh waits for the listing");
+    assert.doesNotMatch(html, /aria-label="Repo"/, "no repo dropdown");
     assert.match(html, /Loading designs…/);
     // The Workflows tab (D53.7): its pickers wait for the agents and strategies, asked for from
     // effects, never during render.

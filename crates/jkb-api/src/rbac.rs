@@ -226,6 +226,7 @@ impl Request {
             | Self::DesignExport { .. }
             | Self::DesignState { .. }
             | Self::DesignSpans { .. }
+            | Self::DesignThreads { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. }
@@ -283,6 +284,10 @@ impl Request {
             Self::WorkflowFire { .. } | Self::WorkflowObserve { .. } => OpPermission::Workflow,
             Self::RoleGrant { .. } | Self::RoleRevoke { .. } => OpPermission::Grant,
             Self::DesignCreate { .. }
+            | Self::DesignMove { .. }
+            | Self::DesignSplit { .. }
+            // A reply is any designer's: it is how Claude answers the operator's threads.
+            | Self::DesignThreadReply { .. }
             | Self::DesignApply { .. }
             | Self::DesignEdit { .. }
             | Self::DesignSpan { .. }
@@ -294,8 +299,12 @@ impl Request {
             | Self::DesignSources { .. } => OpPermission::Design,
             Self::DesignApprove { .. } => OpPermission::DesignApprove,
             Self::AttestMint { .. } | Self::AttestRelease { .. } => OpPermission::Attest,
+            // Threads are started and resolved by the operator, who alone approves a selection.
+            Self::DesignThreadStart { .. }
+            | Self::DesignThreadResolve { .. }
+            | Self::DesignApproveSelection { .. }
             // Waiving the review gate is the operator's escape hatch, whoever the strategy lets land.
-            Self::TaskReviewWaive { .. }
+            | Self::TaskReviewWaive { .. }
             | Self::TaskRanOnHost { .. }
             | Self::TaskReclaim { .. }
             | Self::LeaseBreak { .. }
@@ -374,6 +383,12 @@ impl Request {
             | Self::WorkflowAgentSet { .. }
             // A design is no one task's.
             | Self::DesignCreate { .. }
+            | Self::DesignMove { .. }
+            | Self::DesignSplit { .. }
+            | Self::DesignThreadStart { .. }
+            | Self::DesignThreadReply { .. }
+            | Self::DesignThreadResolve { .. }
+            | Self::DesignApproveSelection { .. }
             | Self::DesignApply { .. }
             | Self::DesignEdit { .. }
             | Self::DesignSpan { .. }
@@ -442,6 +457,7 @@ impl Request {
             | Self::DesignExport { .. }
             | Self::DesignState { .. }
             | Self::DesignSpans { .. }
+            | Self::DesignThreads { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. }

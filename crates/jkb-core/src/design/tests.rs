@@ -2553,3 +2553,616 @@ fn a_stages_edge_into_another_designs_plan_does_not_stage_the_span() {
     assert_eq!(v.state, SpanState::Approved);
     assert!(v.steps.is_empty(), "{v:?}");
 }
+
+// ---- nesting and split (operator feedback, 2026-10-11) -----------------------------------------
+
+fn create_in(db: &Db, repo: &str, title: &str, body: &str) -> String {
+    let (repo, title, body) = (repo.to_owned(), title.to_owned(), body.to_owned());
+    db.write_txn("t", move |c, m| super::create(c, m, &repo, &title, &body))
+        .unwrap()
+        .uid
+}
+
+fn nest_under(db: &Db, uid: &str, under: &str) -> Result<DesignRow> {
+    let (uid, under) = (uid.to_owned(), under.to_owned());
+    db.write_txn("t", move |c, m| tree::nest(c, m, &uid, &under))
+}
+
+fn split_at(db: &Db, uid: &str, base: &str, level: usize) -> Result<tree::Split> {
+    let (uid, base) = (uid.to_owned(), base.to_owned());
+    db.write_txn("t", move |c, m| tree::split(c, m, &uid, &base, level))
+}
+
+fn listed(db: &Db) -> Vec<DesignRow> {
+    db.read(|c| list(c, None)).unwrap()
+}
+
+/// The export's body: everything after its one header line.
+fn tree_export_body(db: &Db, uid: &str) -> String {
+    let uid = uid.to_owned();
+    let text = db.read(move |c| export::export(c, &uid)).unwrap().text;
+    text.split_once('\n')
+        .map(|(_, b)| b.to_owned())
+        .unwrap_or_default()
+}
+
+const SPLIT_BODY: &str = "# Title\n\nIntro.\n\n## Alpha\n\nAlpha text.\n\n## Beta\n\nBeta text.\n";
+
+#[test]
+fn a_split_moves_each_section_into_a_child_and_carries_approvals_and_stages() {
+    let db = db();
+    let uid = create(&db, SPLIT_BODY);
+    let intro = span(&db, &uid, "Intro.", Reviewer::Operator).unwrap();
+    approve_as(&db, &intro, Approver::Operator).unwrap();
+    let alpha = span(&db, &uid, "## Alpha\n\nAlpha text.", Reviewer::Operator).unwrap();
+    approve_as(&db, &alpha, Approver::Operator).unwrap();
+    let beta = span(&db, &uid, "## Beta\n\nBeta text.", Reviewer::Claude).unwrap();
+    let plan = new_plan(&db, &uid, &["build"]).unwrap();
+    let step = plan.steps[0].uid.clone();
+    stage_into(&db, &alpha, &step).unwrap();
+    let t = task_under(&db, step_id(&db, &step), "task:alpha");
+    db.write_txn("t", move |c, m| task::set_status(c, m, t, TaskStatus::Done))
+        .unwrap();
+    assert_eq!(view_of(&db, &uid, &alpha).state, SpanState::Implemented);
+    let body_before = tree_export_body(&db, &uid);
+
+    let split = split_at(&db, &uid, &token(&db, &uid), 2).unwrap();
+    assert_eq!(
+        split
+            .children
+            .iter()
+            .map(|c| c.title.as_str())
+            .collect::<Vec<_>>(),
+        ["Alpha", "Beta"]
+    );
+    assert_eq!((split.moved, split.carried), (2, 1));
+    assert_eq!(text(&db, &uid), "# Title\n\nIntro.\n\n");
+    let (a, b) = (&split.children[0].uid, &split.children[1].uid);
+    assert_eq!(text(&db, a), "## Alpha\n\nAlpha text.");
+    assert_eq!(text(&db, b), "## Beta\n\nBeta text.");
+    // The approval and the plan step came along: still IMPLEMENTED, now in the child.
+    let v = view_of(&db, a, &alpha);
+    assert_eq!(v.state, SpanState::Implemented);
+    assert_eq!(v.steps, vec![step.clone()]);
+    assert_eq!(v.approved_by.as_deref(), Some("operator"));
+    assert_eq!(design_of_span(&db, &alpha), *a);
+    // An unapproved span moves, as PROPOSED, keeping its reviewer.
+    let vb = view_of(&db, b, &beta);
+    assert_eq!(
+        (vb.state, vb.reviewer),
+        (SpanState::Proposed, Reviewer::Claude)
+    );
+    // The parent keeps what was not in a section.
+    assert_eq!(view_of(&db, &uid, &intro).state, SpanState::Approved);
+    // The listing nests the children; the parent's export is the text it was before the split.
+    let rows = listed(&db);
+    let parent_of = |u: &str| {
+        rows.iter()
+            .find(|r| r.uid == u)
+            .and_then(|r| r.parent.clone())
+    };
+    assert_eq!(parent_of(a).as_deref(), Some(uid.as_str()));
+    assert_eq!(parent_of(&uid), None);
+    assert_eq!(tree_export_body(&db, &uid), body_before);
+}
+
+#[test]
+fn a_split_never_cuts_a_span_and_splits_only_the_version_read() {
+    let db = db();
+    let uid = create(&db, SPLIT_BODY);
+    let stale = token(&db, &uid);
+    let across = span(&db, &uid, "Intro.\n\n## Alpha", Reviewer::Operator).unwrap();
+    let err = split_at(&db, &uid, &stale, 2).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("changed after the version you read"),
+        "{err}"
+    );
+    let err = split_at(&db, &uid, &token(&db, &uid), 2).unwrap_err();
+    assert!(err.to_string().contains(&across), "{err}");
+    assert!(err.to_string().contains("never cuts a span"), "{err}");
+    let err = split_at(&db, &uid, &token(&db, &uid), 4).unwrap_err();
+    assert!(err.to_string().contains("no level-4 heading"), "{err}");
+    assert_eq!(
+        text(&db, &uid),
+        SPLIT_BODY,
+        "a refused split writes nothing"
+    );
+    assert_eq!(listed(&db).len(), 1);
+}
+
+#[test]
+fn headings_inside_a_code_fence_are_not_split_at() {
+    let db = db();
+    let uid = create(
+        &db,
+        "# T\n\n```\n## not a heading\n```\n\n## Real\n\nText.\n",
+    );
+    let s = split_at(&db, &uid, &token(&db, &uid), 2).unwrap();
+    assert_eq!(s.children.len(), 1);
+    assert_eq!(s.children[0].title, "Real");
+    assert!(text(&db, &uid).contains("## not a heading"));
+}
+
+/// `jkb undo` refuses a split by name and moves nothing: undone text is new text to the CRDT, so
+/// the moved spans could not be put back on the words they covered.
+#[test]
+fn undo_refuses_a_split_by_name_and_moves_nothing() {
+    let db = db();
+    let uid = create(&db, SPLIT_BODY);
+    let alpha = span(&db, &uid, "## Alpha\n\nAlpha text.", Reviewer::Operator).unwrap();
+    approve_as(&db, &alpha, Approver::Operator).unwrap();
+    let s = split_at(&db, &uid, &token(&db, &uid), 2).unwrap();
+    let err = db.write_txn("t", crate::undo::undo_last).unwrap_err();
+    assert!(err.to_string().contains("a split is not undone"), "{err}");
+    assert_eq!(listed(&db).len(), 3);
+    assert_eq!(text(&db, &uid), "# Title\n\nIntro.\n\n");
+    assert_eq!(
+        view_of(&db, &s.children[0].uid, &alpha).state,
+        SpanState::Approved
+    );
+}
+
+#[test]
+fn a_design_nests_only_under_a_design_of_its_repo_and_never_under_itself() {
+    let db = db();
+    let a = create_in(&db, "jkb", "A", "a");
+    let b = create_in(&db, "jkb", "B", "b");
+    let other = create_in(&db, "zed", "Z", "z");
+    assert_eq!(
+        nest_under(&db, &b, &a).unwrap().parent.as_deref(),
+        Some(a.as_str())
+    );
+    assert!(nest_under(&db, &b, &other)
+        .unwrap_err()
+        .to_string()
+        .contains("own repo"));
+    assert!(nest_under(&db, &a, &b).is_err(), "a cycle is refused");
+    assert!(nest_under(&db, &a, &a).is_err());
+    // Nesting again under the same parent changes nothing.
+    assert_eq!(
+        nest_under(&db, &b, &a).unwrap().parent.as_deref(),
+        Some(a.as_str())
+    );
+}
+
+#[test]
+fn a_child_stages_into_its_roots_plans_and_never_into_another_tree() {
+    let db = db();
+    let root = create_in(&db, "jkb", "Root", "root");
+    let child = create_in(&db, "jkb", "Child", "child words");
+    let stranger = create_in(&db, "jkb", "Stranger", "s");
+    nest_under(&db, &child, &root).unwrap();
+    let sp = span(&db, &child, "child words", Reviewer::Operator).unwrap();
+    approve_as(&db, &sp, Approver::Operator).unwrap();
+    let ours = new_plan(&db, &root, &["build"]).unwrap().steps[0]
+        .uid
+        .clone();
+    let theirs = new_plan(&db, &stranger, &["build"]).unwrap().steps[0]
+        .uid
+        .clone();
+    let err = stage_into(&db, &sp, &theirs).unwrap_err();
+    assert!(err.to_string().contains("another design's plan"), "{err}");
+    assert_eq!(
+        stage_into(&db, &sp, &ours).unwrap().state,
+        SpanState::Staged
+    );
+}
+
+#[test]
+fn undoing_a_nest_puts_the_design_back_at_the_top() {
+    let db = db();
+    let a = create_in(&db, "jkb", "A", "a");
+    let b = create_in(&db, "jkb", "B", "b");
+    nest_under(&db, &b, &a).unwrap();
+    undo_last(&db);
+    let rows = listed(&db);
+    assert_eq!(rows.iter().find(|r| r.uid == b).unwrap().parent, None);
+}
+
+fn last_txn(db: &Db) -> i64 {
+    db.read(|c| Ok(c.query_row("SELECT MAX(txn_id) FROM changelog", [], |r| r.get(0))?))
+        .unwrap()
+}
+
+/// A split keeps the export only when its sections are the design's tail; text after them (a
+/// higher heading) or existing children would come out reordered, so both are refused.
+#[test]
+fn a_split_is_refused_where_the_export_would_come_out_reordered() {
+    let db = db();
+    let body = "## X\n\nx intro\n\n### X1\n\nx1\n\n## Y\n\ny intro\n\n### Y1\n\ny1\n";
+    let uid = create(&db, body);
+    let err = split_at(&db, &uid, &token(&db, &uid), 3).unwrap_err();
+    assert!(
+        err.to_string().contains("text after a level-3 section"),
+        "{err}"
+    );
+    let parent = create_in(&db, "jkb", "P", SPLIT_BODY);
+    let kid = create_in(&db, "jkb", "K", "k");
+    nest_under(&db, &kid, &parent).unwrap();
+    let err = split_at(&db, &parent, &token(&db, &parent), 2).unwrap_err();
+    assert!(
+        err.to_string().contains("already has child designs"),
+        "{err}"
+    );
+    assert_eq!(text(&db, &uid), body);
+}
+
+#[test]
+fn a_nest_never_strands_a_staged_span_or_exports_a_design_twice() {
+    let db = db();
+    let uid = create(&db, SPLIT_BODY);
+    let alpha = span(&db, &uid, "## Alpha\n\nAlpha text.", Reviewer::Operator).unwrap();
+    approve_as(&db, &alpha, Approver::Operator).unwrap();
+    let step = new_plan(&db, &uid, &["build"]).unwrap().steps[0]
+        .uid
+        .clone();
+    stage_into(&db, &alpha, &step).unwrap();
+    let s = split_at(&db, &uid, &token(&db, &uid), 2).unwrap();
+    let other = create_in(&db, "jkb", "Other", "o");
+    let err = nest_under(&db, &s.children[0].uid, &other).unwrap_err();
+    assert!(err.to_string().contains(&alpha), "{err}");
+    let targeted = create_in(&db, "jkb", "T", "t");
+    let t = targeted.clone();
+    db.write_txn("t", move |c, m| {
+        export::set_doc_target(c, m, &t, "docs/t.md")
+    })
+    .unwrap();
+    let err = nest_under(&db, &targeted, &other).unwrap_err();
+    assert!(err.to_string().contains("doc target of its own"), "{err}");
+}
+
+/// A span's design is the one containing it: undoing an approval made before a split restores the
+/// old `metadata.design`, and the span must still be approvable in the design it now lives in.
+#[test]
+fn undoing_an_approval_made_before_a_split_leaves_the_span_in_its_new_design() {
+    let db = db();
+    let uid = create(&db, SPLIT_BODY);
+    let alpha = span(&db, &uid, "## Alpha\n\nAlpha text.", Reviewer::Operator).unwrap();
+    approve_as(&db, &alpha, Approver::Operator).unwrap();
+    let approved_in = last_txn(&db);
+    let s = split_at(&db, &uid, &token(&db, &uid), 2).unwrap();
+    db.write_txn("t", move |c, m| crate::undo::undo(c, m, approved_in))
+        .unwrap();
+    let child = &s.children[0].uid;
+    assert_eq!(design_of_span(&db, &alpha), *child);
+    assert_eq!(view_of(&db, child, &alpha).state, SpanState::Proposed);
+    approve_as(&db, &alpha, Approver::Operator).unwrap();
+    assert_eq!(view_of(&db, child, &alpha).state, SpanState::Approved);
+}
+
+#[test]
+fn a_nested_design_sorts_after_every_existing_child() {
+    let db = db();
+    let pa = create_in(&db, "jkb", "P", "p");
+    let qa = create_in(&db, "jkb", "Q", "q");
+    let da = create_in(&db, "jkb", "D", "d");
+    let ba = create_in(&db, "jkb", "B", "b");
+    let ca = create_in(&db, "jkb", "C", "c");
+    nest_under(&db, &ba, &pa).unwrap();
+    nest_under(&db, &ca, &pa).unwrap();
+    nest_under(&db, &ba, &qa).unwrap();
+    nest_under(&db, &da, &pa).unwrap();
+    let pid = {
+        let pa = pa.clone();
+        db.read(move |x| design_id(x, &pa)).unwrap()
+    };
+    let kids: Vec<String> = db
+        .read(move |x| tree::children_of(x, pid))
+        .unwrap()
+        .into_iter()
+        .map(|(_, u)| u)
+        .collect();
+    assert_eq!(kids, vec![ca, da]);
+}
+
+/// A design that brings its own plan along keeps its staged spans: the plan moves with it.
+#[test]
+fn a_design_nests_with_its_own_plan_and_its_spans_stay_staged() {
+    let db = db();
+    let parent = create_in(&db, "jkb", "P", "p");
+    let b = create_in(&db, "jkb", "B", "b words");
+    let sp = span(&db, &b, "b words", Reviewer::Operator).unwrap();
+    approve_as(&db, &sp, Approver::Operator).unwrap();
+    let step = new_plan(&db, &b, &["build"]).unwrap().steps[0].uid.clone();
+    stage_into(&db, &sp, &step).unwrap();
+    nest_under(&db, &b, &parent).unwrap();
+    assert_eq!(view_of(&db, &b, &sp).state, SpanState::Staged);
+}
+
+/// A root's span staged into a plan of a child is stranded when that child leaves: refused.
+#[test]
+fn a_child_carrying_a_plan_its_root_stages_into_cannot_leave() {
+    let db = db();
+    let root = create_in(&db, "jkb", "R", "root words");
+    let child = create_in(&db, "jkb", "C", "c");
+    let other = create_in(&db, "jkb", "P", "p");
+    nest_under(&db, &child, &root).unwrap();
+    let sp = span(&db, &root, "root words", Reviewer::Operator).unwrap();
+    approve_as(&db, &sp, Approver::Operator).unwrap();
+    let step = new_plan(&db, &child, &["build"]).unwrap().steps[0]
+        .uid
+        .clone();
+    stage_into(&db, &sp, &step).unwrap();
+    let err = nest_under(&db, &child, &other).unwrap_err();
+    assert!(err.to_string().contains(&sp), "{err}");
+    assert_eq!(
+        view_of(&db, &root, &sp).state,
+        SpanState::Staged,
+        "nothing moved"
+    );
+}
+
+#[test]
+fn a_nested_design_takes_no_doc_target_of_its_own() {
+    let db = db();
+    let root = create_in(&db, "jkb", "R", "r");
+    let child = create_in(&db, "jkb", "C", "c");
+    nest_under(&db, &child, &root).unwrap();
+    let c = child.clone();
+    let err = db
+        .write_txn("t", move |x, m| {
+            export::set_doc_target(x, m, &c, "docs/c.md")
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("exported twice"), "{err}");
+}
+
+/// A span staged into two plans, one of which the move takes out of its tree, still reads STAGED
+/// through the other — but the first plan would stop counting it, so the move is refused.
+#[test]
+fn a_move_that_takes_away_one_of_two_stagings_is_refused() {
+    let db = db();
+    let root = create_in(&db, "jkb", "R", "r");
+    let child = create_in(&db, "jkb", "C", "c words");
+    let other = create_in(&db, "jkb", "P", "p");
+    nest_under(&db, &child, &root).unwrap();
+    let sp = span(&db, &child, "c words", Reviewer::Operator).unwrap();
+    approve_as(&db, &sp, Approver::Operator).unwrap();
+    let in_root = new_plan(&db, &root, &["r"]).unwrap().steps[0].uid.clone();
+    let in_child = new_plan(&db, &child, &["c"]).unwrap().steps[0].uid.clone();
+    stage_into(&db, &sp, &in_root).unwrap();
+    stage_into(&db, &sp, &in_child).unwrap();
+    let err = nest_under(&db, &child, &other).unwrap_err();
+    assert!(err.to_string().contains(&sp), "{err}");
+    assert_eq!(view_of(&db, &child, &sp).steps.len(), 2, "nothing moved");
+}
+
+// ---- comment threads and approving a selection (operator feedback, 2026-10-11) -----------------
+
+fn quote(find: &str) -> threads::Words {
+    threads::Words::Quote {
+        find: find.to_owned(),
+        occurrence: None,
+    }
+}
+
+fn start_thread(db: &Db, uid: &str, words: threads::Words, text: &str) -> Result<threads::Thread> {
+    let (uid, base, text) = (uid.to_owned(), token(db, uid), text.to_owned());
+    db.write_txn("t", move |c, m| {
+        threads::start(c, m, &uid, &base, &words, "operator", &text)
+    })
+}
+
+fn threads_of(db: &Db, uid: &str) -> Vec<threads::Thread> {
+    let uid = uid.to_owned();
+    db.read(move |c| threads::list(c, &uid)).unwrap()
+}
+
+#[test]
+fn a_thread_follows_its_words_and_takes_replies_until_resolved() {
+    let db = db();
+    let uid = create(&db, "Intro.\n\nThe disputed claim.\n");
+    let t = start_thread(&db, &uid, quote("disputed claim"), "Is this measured?").unwrap();
+    assert_eq!(
+        (t.quote.as_str(), t.status.as_str()),
+        ("disputed claim", "open")
+    );
+    // Text written before it moves the anchor, not the words.
+    edit_at(
+        &db,
+        &uid,
+        &token(&db, &uid),
+        insert_after("Intro.", " More intro."),
+    )
+    .unwrap();
+    let (tid, u) = (t.uid.clone(), uid.clone());
+    db.write_txn("t", move |c, m| {
+        threads::reply(c, m, &tid, "claude", "Yes, see the test.")
+    })
+    .unwrap();
+    let ts = threads_of(&db, &u);
+    assert_eq!(ts.len(), 1);
+    assert_eq!(ts[0].quote, "disputed claim");
+    assert_eq!(
+        ts[0]
+            .comments
+            .iter()
+            .map(|c| (c.by.as_str(), c.text.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("operator", "Is this measured?"),
+            ("claude", "Yes, see the test.")
+        ]
+    );
+    let tid = t.uid.clone();
+    db.write_txn("t", move |c, m| threads::resolve(c, m, &tid, "operator"))
+        .unwrap();
+    let tid = t.uid.clone();
+    let err = db
+        .write_txn("t", move |c, m| {
+            threads::reply(c, m, &tid, "claude", "late")
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("resolved"), "{err}");
+    // A thread is never a span: the text's states are untouched, and spans may cover its words.
+    assert!(cat(&db, &uid).spans.is_empty());
+    span(&db, &uid, "The disputed claim.", Reviewer::Operator).unwrap();
+}
+
+#[test]
+fn a_thread_on_deleted_words_reads_detached_and_undo_takes_a_thread_back() {
+    let db = db();
+    let uid = create(&db, "Keep. Drop this. Keep.");
+    let t = start_thread(
+        &db,
+        &uid,
+        threads::Words::Range { start: 6, end: 16 },
+        "why?",
+    )
+    .unwrap();
+    assert_eq!(t.quote, "Drop this.");
+    edit_at(&db, &uid, &token(&db, &uid), replace(" Drop this.", "")).unwrap();
+    let ts = threads_of(&db, &uid);
+    assert!(!ts[0].anchored);
+    assert_eq!(ts[0].started_on, "Drop this.");
+    let other = start_thread(&db, &uid, quote("Keep."), "x");
+    assert!(
+        other.is_err(),
+        "an ambiguous quote is refused like an edit's"
+    );
+    let t2 = start_thread(
+        &db,
+        &uid,
+        threads::Words::Range { start: 0, end: 5 },
+        "fine",
+    )
+    .unwrap();
+    assert_eq!(threads_of(&db, &uid).len(), 2);
+    undo_last(&db);
+    let left: Vec<String> = threads_of(&db, &uid).into_iter().map(|t| t.uid).collect();
+    assert_eq!(left, vec![t.uid]);
+    let _ = t2;
+}
+
+fn approve_sel(db: &Db, uid: &str, words: threads::Words, who: Approver) -> Result<SpanView> {
+    let (uid, base) = (uid.to_owned(), token(db, uid));
+    db.write_txn("t", move |c, m| {
+        approve_selection(c, m, &uid, &base, &words, &who)
+    })
+}
+
+#[test]
+fn approving_a_selection_approves_its_span_or_makes_one_and_never_cuts_one() {
+    let db = db();
+    let uid = create(&db, "First words. Second words. Third words.");
+    let s = span(&db, &uid, "Second words.", Reviewer::Operator).unwrap();
+    let v = approve_sel(&db, &uid, quote("Second words."), Approver::Operator).unwrap();
+    assert_eq!((v.uid.as_str(), v.state), (s.as_str(), SpanState::Approved));
+    let made = approve_sel(&db, &uid, quote("First words."), Approver::Operator).unwrap();
+    assert_eq!(
+        (made.text.as_str(), made.state),
+        ("First words.", SpanState::Approved)
+    );
+    assert_eq!(made.reviewer, Reviewer::Operator);
+    let err = approve_sel(&db, &uid, quote("words. Third"), Approver::Operator).unwrap_err();
+    assert!(err.to_string().contains("crosses the edge"), "{err}");
+    let err = approve_sel(
+        &db,
+        &uid,
+        quote("Third words."),
+        Approver::Claude("c".into()),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("operator's"), "{err}");
+    assert_eq!(cat(&db, &uid).spans.len(), 2, "a refusal makes no span");
+}
+
+/// Approving a selection read at an old version never approves words written inside it since.
+#[test]
+fn approving_a_selection_refuses_words_inserted_inside_it_since_it_was_read() {
+    let db = db();
+    let uid = create(&db, "alpha beta gamma");
+    let read = token(&db, &uid);
+    edit_at(&db, &uid, &token(&db, &uid), insert_after("beta", " EVIL")).unwrap();
+    let (u, r) = (uid.clone(), read.clone());
+    let err = db
+        .write_txn("t", move |c, m| {
+            approve_selection(c, m, &u, &r, &quote("beta gamma"), &Approver::Operator)
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("changed after the version you read"),
+        "{err}"
+    );
+    assert!(
+        cat(&db, &uid).spans.is_empty(),
+        "the refusal takes the span back"
+    );
+    // Selected at that old version, words nobody touched since are still approvable.
+    let (u, r) = (uid.clone(), read);
+    let v = db
+        .write_txn("t", move |c, m| {
+            approve_selection(c, m, &u, &r, &quote("alpha"), &Approver::Operator)
+        })
+        .unwrap();
+    assert_eq!((v.text.as_str(), v.state), ("alpha", SpanState::Approved));
+}
+
+#[test]
+fn a_split_is_refused_while_an_open_thread_sits_on_text_it_would_move() {
+    let db = db();
+    let uid = create(&db, SPLIT_BODY);
+    let t = start_thread(&db, &uid, quote("Alpha text."), "why?").unwrap();
+    let err = split_at(&db, &uid, &token(&db, &uid), 2).unwrap_err();
+    assert!(err.to_string().contains(&t.uid), "{err}");
+    let tid = t.uid.clone();
+    db.write_txn("t", move |c, m| threads::resolve(c, m, &tid, "operator"))
+        .unwrap();
+    assert_eq!(
+        split_at(&db, &uid, &token(&db, &uid), 2)
+            .unwrap()
+            .children
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn undoing_a_reply_is_announced_on_the_designs_topic() {
+    let db = db();
+    let uid = create(&db, "Some words.");
+    let t = start_thread(&db, &uid, quote("words"), "why?").unwrap();
+    let tid = t.uid.clone();
+    db.write_txn("t", move |c, m| {
+        threads::reply(c, m, &tid, "claude", "because")
+    })
+    .unwrap();
+    undo_last(&db);
+    let name = topic(&uid);
+    let msgs = db
+        .read(move |c| crate::mq::tail(c, &name, 50, crate::mq::now_ms()))
+        .unwrap();
+    let last = msgs.last().unwrap();
+    assert_eq!(
+        (last.kind.as_str(), last.payload["what"].as_str()),
+        ("thread", Some("undone"))
+    );
+    assert_eq!(
+        threads_of(&db, &uid)[0].comments.len(),
+        1,
+        "the reply is gone"
+    );
+}
+
+/// The review bar's counts: non-whitespace characters per span state, a demoted span counted whole
+/// as PROPOSED, blank space between spans weighing nothing.
+#[test]
+fn state_counts_weigh_each_state_by_its_non_whitespace_characters() {
+    let db = db();
+    let uid = create(&db, "Alpha.\n\nBeta words.\n\nLoose");
+    let a = span(&db, &uid, "Alpha.", Reviewer::Operator).unwrap();
+    approve_as(&db, &a, Approver::Operator).unwrap();
+    let b = span(&db, &uid, "Beta words.", Reviewer::Operator).unwrap();
+    approve_as(&db, &b, Approver::Operator).unwrap();
+    let c = cat(&db, &uid).state_counts();
+    assert_eq!(
+        (c.approved, c.proposed, c.staged, c.implemented),
+        (16, 5, 0, 0)
+    );
+    // Editing Beta demotes it: its words count as PROPOSED now.
+    edit_at(&db, &uid, &token(&db, &uid), replace("words", "texts")).unwrap();
+    let c = cat(&db, &uid).state_counts();
+    assert_eq!((c.approved, c.proposed), (6, 15));
+}

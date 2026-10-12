@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   decodeDesignPrompts,
@@ -34,10 +34,13 @@ export function PromptsPane({
   design,
   repo,
   onNotice,
+  onCount,
 }: {
   readonly design: Design;
   readonly repo: string;
   readonly onNotice: (message: string) => void;
+  /** How many prompts are listed, once they are: the Prompts tab's count. */
+  readonly onCount?: (count: number | undefined) => void;
 }): React.JSX.Element {
   const terminals = useTerminals();
   const [listing, setListing] = useState<Listing>({ kind: "loading" });
@@ -53,6 +56,12 @@ export function PromptsPane({
     setListing({ kind: "loading" });
     void load();
   }, [load]);
+
+  const counted = useRef(onCount);
+  counted.current = onCount;
+  useEffect(() => {
+    counted.current?.(listing.kind === "loaded" ? listing.prompts.length : undefined);
+  }, [listing]);
 
   // A recorded prompt is announced on the design's topic, which the open document already hears;
   // a gap may have dropped one.
@@ -111,7 +120,7 @@ export function PromptsPane({
   };
 
   return (
-    <section className="prompts-pane" aria-label="Prompts">
+    <section className="view prompts-pane" aria-label="Prompts">
       <header className="pane-bar">
         <h2>Prompts</h2>
         <span className="spacer" />
@@ -119,7 +128,7 @@ export function PromptsPane({
           ↻
         </button>
       </header>
-      <div className="pane-body">
+      <div className="view-body">
         <form
           className="prompt-new"
           onSubmit={(e) => {

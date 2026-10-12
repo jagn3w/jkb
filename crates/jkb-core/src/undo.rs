@@ -1171,6 +1171,9 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     // An approval or a staging is announced on its design's topic when made; its reversal must be
     // too, or an open editor keeps drawing the span APPROVED or STAGED (D53.5).
     let spans = crate::design::spans_touched(conn, &entries)?;
+    // So is a thread's start, reply or resolve: read which designs' threads the entries touch while
+    // the items are still there, and announce on their topics once inverted.
+    let threads = crate::design::threads::designs_touched(conn, &entries)?;
 
     let mut reverted = 0;
     for (op, table, entity_id, before) in entries {
@@ -1192,6 +1195,7 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
 
     record_status_restores(conn, meta, &statuses_before)?;
     crate::design::announce_spans(conn, meta, &spans)?;
+    crate::design::threads::announce_undone(conn, meta, &threads)?;
 
     changelog::append(
         conn,

@@ -150,6 +150,36 @@ export function partitionPlans(plans: readonly ExecPlan[]): { live: ExecPlan[]; 
   return { live, archived };
 }
 
+/** A task row the Tasks list draws, and whether it is there only as an ancestor of one shown. */
+export interface TaskLine {
+  readonly task: PlanTask;
+  /** Not itself shown (finished), kept so a shown subtask is drawn under its real parent. */
+  readonly muted: boolean;
+}
+
+/**
+ * The rows of a depth-first task list (`depth` 0 for a step's own task) with the ones `shown` drops
+ * left out, **except** each ancestor of a task that stays: it is kept, muted. Dropping it drew an
+ * open subtask of a finished task indented under whichever task came before it (review round 1).
+ */
+export function visibleTasks(tasks: readonly PlanTask[], shown: (t: PlanTask) => boolean): TaskLine[] {
+  const out: TaskLine[] = [];
+  // Walked from the end: a kept row at depth d needs the nearest earlier row shallower than d.
+  let want = Number.POSITIVE_INFINITY;
+  for (let i = tasks.length - 1; i >= 0; i -= 1) {
+    const t = tasks[i];
+    if (t === undefined) continue;
+    if (shown(t)) {
+      out.push({ task: t, muted: false });
+      want = t.depth;
+    } else if (want !== Number.POSITIVE_INFINITY && t.depth < want) {
+      out.push({ task: t, muted: true });
+      want = t.depth;
+    }
+  }
+  return out.reverse();
+}
+
 /** Every task of a plan, in step order. */
 export function planTasks(plan: ExecPlan): PlanTask[] {
   return plan.steps.flatMap((s) => s.tasks);

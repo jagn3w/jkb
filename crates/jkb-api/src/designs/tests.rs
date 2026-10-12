@@ -947,3 +947,91 @@ fn an_attested_reviewer_subagent_approves_a_span_naming_claude() {
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
 }
+
+fn thread_of(r: Response) -> crate::designs::Thread {
+    match r {
+        Response::DesignThread { thread } => *thread,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The operator starts and resolves threads and approves selections; a designer (Claude) replies.
+#[test]
+fn the_operator_starts_threads_and_approves_selections_and_a_designer_replies() {
+    let kb = Kb::new();
+    let uid = create(&kb.op, "Alpha words. Beta words.");
+    let designer = kb.as_role("designer");
+    let base = cat(&kb.op, &uid).version;
+    let start = json!({ "op": "design.thread_start", "uid": uid, "base": base,
+                        "start": 0, "end": 12, "text": "Why alpha?" });
+    let refused = call(&designer, start.clone()).unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Forbidden, "{refused:?}");
+    let t = thread_of(ok(&kb.op, start));
+    assert_eq!(
+        (t.quote.as_str(), t.comments[0].by.as_str()),
+        ("Alpha words.", "operator")
+    );
+    let replied = thread_of(ok(
+        &designer,
+        json!({ "op": "design.thread_reply", "thread": t.uid, "text": "Because." }),
+    ));
+    assert!(
+        replied.comments[1].by.starts_with("grant:"),
+        "{:?}",
+        replied.comments[1]
+    );
+    let resolve = json!({ "op": "design.thread_resolve", "thread": t.uid });
+    assert_eq!(
+        call(&designer, resolve.clone()).unwrap_err().code,
+        ErrorCode::Forbidden
+    );
+    assert_eq!(thread_of(ok(&kb.op, resolve)).status, "resolved");
+    match ok(&kb.op, json!({ "op": "design.threads", "uid": uid })) {
+        Response::DesignThreadList { threads, .. } => assert_eq!(threads.len(), 1),
+        other => panic!("{other:?}"),
+    }
+    let approve = json!({ "op": "design.approve_selection", "uid": uid,
+                          "base": cat(&kb.op, &uid).version, "find": "Beta words." });
+    assert_eq!(
+        call(&designer, approve.clone()).unwrap_err().code,
+        ErrorCode::Forbidden
+    );
+    match ok(&kb.op, approve) {
+        Response::DesignSpan { span } => assert_eq!(span.text, "Beta words."),
+        other => panic!("{other:?}"),
+    }
+    let both = json!({ "op": "design.approve_selection", "uid": uid, "base": base,
+                       "find": "x", "start": 0, "end": 1 });
+    assert_eq!(call(&kb.op, both).unwrap_err().code, ErrorCode::Invalid);
+}
+
+#[test]
+fn the_listing_carries_review_counts_only_when_asked() {
+    let kb = Kb::new();
+    let uid = create(&kb.op, "Some words.");
+    let listed = |review: bool| match ok(&kb.op, json!({ "op": "design.list", "review": review })) {
+        Response::Designs { designs } => designs.into_iter().find(|d| d.uid == uid).unwrap(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(listed(false).review, None);
+    let r = listed(true).review.unwrap();
+    assert_eq!((r.proposed, r.approved), (10, 0));
+}
+
+/// A client newer than the daemon still lists: `review` is never sent unless asked, so a daemon
+/// that predates it (and refuses unknown fields) reads the same request it always did.
+#[test]
+fn a_listing_that_asks_no_counts_sends_no_review_field() {
+    let plain = serde_json::to_value(crate::Request::DesignList {
+        repo: None,
+        review: false,
+    })
+    .unwrap();
+    assert!(plain.get("review").is_none(), "{plain}");
+    let asked = serde_json::to_value(crate::Request::DesignList {
+        repo: None,
+        review: true,
+    })
+    .unwrap();
+    assert_eq!(asked["review"], json!(true));
+}

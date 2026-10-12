@@ -257,7 +257,11 @@ fn separate(out: &mut String, gap: &str) {
 /// (an editor or formatter adds one, and that alone must not read as drift).
 #[must_use]
 pub fn render(design: &DesignText) -> String {
-    let mut body = approved_text(design);
+    render_body(design, approved_text(design))
+}
+
+/// The generated file for `design` with `body` as its approved text.
+fn render_body(design: &DesignText, mut body: String) -> String {
     if !body.is_empty() && !body.ends_with('\n') {
         body.push('\n');
     }
@@ -265,6 +269,25 @@ pub fn render(design: &DesignText) -> String {
     out.push('\n');
     out.push_str(&body);
     out
+}
+
+/// `design`'s approved text followed by each nested design's, depth first, in order, a blank line
+/// between them: a split design exports to the one file it did before it was split, so `docs/` and
+/// the table that points at it do not change.
+fn tree_text(conn: &Connection, id: ItemId, design: &DesignText) -> Result<String> {
+    let mut body = approved_text(design);
+    for (_, child) in super::tree::descendants(conn, id)? {
+        let text = approved_text(&super::read(conn, &child)?);
+        if text.trim().is_empty() {
+            continue;
+        }
+        body.truncate(body.trim_end().len());
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&text);
+    }
+    Ok(body)
 }
 
 /// The repo a design belongs to: the segment after `designs/` in its primary namespace.
@@ -350,6 +373,9 @@ pub fn set_doc_target(
     uid: &str,
     path: &str,
 ) -> Result<()> {
+    if super::tree::parent_of(conn, design_id(conn, uid)?)?.is_some() {
+        return Err(super::tree::exported_twice(uid));
+    }
     let path = repo_path(path, "a doc target")?;
     if !path.starts_with(DOCS_DIR) || path.len() == DOCS_DIR.len() {
         return Err(invalid(format!(
@@ -502,7 +528,7 @@ pub fn export(conn: &Connection, uid: &str) -> Result<Exported> {
         }
     }
     Ok(Exported {
-        text: render(&design),
+        text: render_body(&design, tree_text(conn, id, &design)?),
         repo,
         uid: design.uid,
         title: design.title,

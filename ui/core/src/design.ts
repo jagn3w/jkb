@@ -23,6 +23,23 @@ export interface Design {
   readonly seq: number;
   /** The `mq` topic its updates are announced on. */
   readonly topic: string;
+  /** The design it is nested under, or `null` at the top level. Absent from a daemon older than nesting. */
+  readonly parent?: string | null;
+  /** Non-whitespace characters per span state, when the listing was asked for them. */
+  readonly review?: ReviewCounts;
+}
+
+/** `jkb_api::designs::ReviewCounts`: how much of a design is in each state. */
+export interface ReviewCounts {
+  readonly proposed: number;
+  readonly approved: number;
+  readonly staged: number;
+  readonly implemented: number;
+}
+
+/** Whether a design has anything left to review: unknown counts are assumed to. */
+export function hasUnreviewed(d: Design): boolean {
+  return d.review === undefined || d.review.proposed > 0;
 }
 
 /** `jkb_api::designs::Piece`. */
@@ -102,7 +119,11 @@ export interface DesignPrompt {
 
 /** The `design.*` requests the Document pane makes, as `jkb_api::Request` serializes them. */
 export const designOps = {
-  list: (repo?: string) => (repo === undefined ? { op: "design.list" } : { op: "design.list", repo }),
+  list: (repo?: string, review = false) => ({
+    op: "design.list",
+    ...(repo === undefined ? {} : { repo }),
+    ...(review ? { review: true } : {}),
+  }),
   cat: (uid: string) => ({ op: "design.cat", uid }),
   state: (uid: string, since?: string) =>
     since === undefined ? { op: "design.state", uid } : { op: "design.state", uid, since },
@@ -149,6 +170,10 @@ function isSpan(v: unknown): v is Span {
   );
 }
 
+function isCounts(v: unknown): v is ReviewCounts {
+  return isObject(v) && ["proposed", "approved", "staged", "implemented"].every((k) => isNumber(v[k]));
+}
+
 function isDesign(v: unknown): v is Design {
   return (
     isObject(v) &&
@@ -156,7 +181,9 @@ function isDesign(v: unknown): v is Design {
     isString(v["title"]) &&
     (v["namespace"] === null || isString(v["namespace"])) &&
     isNumber(v["seq"]) &&
-    isString(v["topic"])
+    isString(v["topic"]) &&
+    (v["parent"] === undefined || v["parent"] === null || isString(v["parent"])) &&
+    (v["review"] === undefined || isCounts(v["review"]))
   );
 }
 
@@ -221,6 +248,11 @@ export function decodeDesignWritten(o: Outcome<OpResponse>): Outcome<DesignWritt
       Array.isArray(v["demoted"]) &&
       v["demoted"].every(isString),
   );
+}
+
+/** A span op's answer (`design.approve`, `design.approve_selection`, `design.stage`): the span after it. */
+export function decodeDesignSpan(o: Outcome<OpResponse>): Outcome<Span> {
+  return field(o, "design_span", (r) => r["span"], isSpan);
 }
 
 export function decodeDesignPrompt(o: Outcome<OpResponse>): Outcome<DesignPrompt> {

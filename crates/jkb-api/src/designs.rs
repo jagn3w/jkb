@@ -48,6 +48,25 @@ pub struct Design {
     /// The files it was made from, each with the blake3 of its content then (D55.5).
     #[serde(default)]
     pub sources: Vec<Source>,
+    /// The design it is nested under, or `None` at the top level.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// How much of its text is in each state, when the listing was asked for it (`review`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewCounts>,
+}
+
+/// Non-whitespace characters per span state (`jkb_core::design::StateCounts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewCounts {
+    /// Uncovered or PROPOSED.
+    pub proposed: u64,
+    /// APPROVED.
+    pub approved: u64,
+    /// STAGED.
+    pub staged: u64,
+    /// IMPLEMENTED.
+    pub implemented: u64,
 }
 
 impl From<DesignRow> for Design {
@@ -60,6 +79,8 @@ impl From<DesignRow> for Design {
             seq: d.seq,
             doc_target: d.meta.doc_target,
             sources: d.meta.sources.into_iter().map(Source::from).collect(),
+            parent: d.parent,
+            review: None,
         }
     }
 }
@@ -326,11 +347,23 @@ impl From<EditAsk> for Edit {
 ///
 /// # Errors
 /// A database error.
-pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<Design>, ApiError> {
-    Ok(design::list(conn, repo)?
-        .into_iter()
-        .map(Design::from)
-        .collect())
+pub fn list(conn: &Connection, repo: Option<&str>, review: bool) -> Result<Vec<Design>, ApiError> {
+    let mut out = Vec::new();
+    for row in design::list(conn, repo)? {
+        let mut d = Design::from(row);
+        // Opt-in: it reads every design's document and derives every span's state.
+        if review {
+            let c = design::read(conn, &d.uid)?.state_counts();
+            d.review = Some(ReviewCounts {
+                proposed: c.proposed,
+                approved: c.approved,
+                staged: c.staged,
+                implemented: c.implemented,
+            });
+        }
+        out.push(d);
+    }
+    Ok(out)
 }
 
 /// `design.create`.
@@ -345,6 +378,58 @@ pub fn create(
     body: &str,
 ) -> Result<Design, ApiError> {
     Ok(design::create(conn, meta, repo, title, body)?.into())
+}
+
+/// What `design.split` made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Split {
+    /// The design split, as it lists now.
+    pub parent: Design,
+    /// One child design per section, in order.
+    pub children: Vec<Design>,
+    /// Spans moved into a child.
+    pub moved: usize,
+    /// Of those, the ones whose approval was carried over.
+    pub carried: usize,
+}
+
+/// The heading level `design.split` splits at when none is named: `##`.
+#[must_use]
+pub const fn default_split_level() -> usize {
+    2
+}
+
+/// `design.move`: nest a design under another design of its repo.
+///
+/// # Errors
+/// An unknown design, a parent in another repo, or a cycle (`design::tree::nest`).
+pub fn nest(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    under: &str,
+) -> Result<Design, ApiError> {
+    Ok(design::tree::nest(conn, meta, uid, under)?.into())
+}
+
+/// `design.split`: one child design per heading of `level`, approvals carried.
+///
+/// # Errors
+/// As `design::tree::split`.
+pub fn split(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    base: &str,
+    level: usize,
+) -> Result<Split, ApiError> {
+    let s = design::tree::split(conn, meta, uid, base, level)?;
+    Ok(Split {
+        parent: s.parent.into(),
+        children: s.children.into_iter().map(Design::from).collect(),
+        moved: s.moved,
+        carried: s.carried,
+    })
 }
 
 /// `design.export`: one design rendered for its doc target, or — with no `uid` — every design (of
@@ -506,6 +591,173 @@ pub fn approve(
         Approver::Claude(principal.label.clone())
     };
     Ok(design::approve(conn, meta, span, base, &approver)?.into())
+}
+
+/// One comment in a thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Comment {
+    /// Its uid.
+    pub uid: String,
+    /// Who wrote it: `operator`, or the Claude principal's label.
+    pub by: String,
+    /// When.
+    pub at: String,
+    /// What it says.
+    pub text: String,
+}
+
+/// A comment thread as it reads now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Thread {
+    /// Its uid.
+    pub uid: String,
+    /// The design it is on.
+    pub design: String,
+    /// Whether its words are still in the text.
+    pub anchored: bool,
+    /// UTF-16 start of its words now.
+    pub start: u32,
+    /// UTF-16 end.
+    pub end: u32,
+    /// Its words now.
+    pub quote: String,
+    /// The words it was started on.
+    pub started_on: String,
+    /// `open` or `resolved`.
+    pub status: String,
+    /// Its comments, in order.
+    pub comments: Vec<Comment>,
+}
+
+impl From<design::threads::Thread> for Thread {
+    fn from(t: design::threads::Thread) -> Self {
+        Self {
+            uid: t.uid,
+            design: t.design,
+            anchored: t.anchored,
+            start: t.start,
+            end: t.end,
+            quote: t.quote,
+            started_on: t.started_on,
+            status: t.status,
+            comments: t
+                .comments
+                .into_iter()
+                .map(|c| Comment {
+                    uid: c.uid,
+                    by: c.by,
+                    at: c.at,
+                    text: c.text,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The words a thread or a selection's approval names: a quote, or a UTF-16 range — exactly one.
+///
+/// # Errors
+/// Both or neither given, or half a range.
+pub fn words(
+    find: Option<String>,
+    occurrence: Option<usize>,
+    start: Option<u32>,
+    end: Option<u32>,
+) -> Result<design::threads::Words, ApiError> {
+    match (find, start, end) {
+        (Some(find), None, None) => Ok(design::threads::Words::Quote { find, occurrence }),
+        (None, Some(start), Some(end)) if occurrence.is_none() => {
+            Ok(design::threads::Words::Range { start, end })
+        }
+        _ => Err(invalid(
+            "name the words once: `find` (with an optional `occurrence`), or `start` and `end`",
+        )),
+    }
+}
+
+/// Who a comment is by: `operator`, or the principal's label.
+fn author(principal: &Principal) -> String {
+    if principal.is_operator() {
+        "operator".to_owned()
+    } else {
+        principal.label.clone()
+    }
+}
+
+/// `design.threads`.
+///
+/// # Errors
+/// An unknown design.
+pub fn threads(conn: &Connection, uid: &str) -> Result<(Vec<Thread>, String), ApiError> {
+    let (threads, version) = design::threads::list_at(conn, uid)?;
+    Ok((
+        threads.into_iter().map(Thread::from).collect(),
+        version.token(),
+    ))
+}
+
+/// `design.thread_start`.
+///
+/// # Errors
+/// The engine's refusal.
+pub fn thread_start(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    base: &str,
+    words: &design::threads::Words,
+    principal: &Principal,
+    text: &str,
+) -> Result<Thread, ApiError> {
+    Ok(design::threads::start(conn, meta, uid, base, words, &author(principal), text)?.into())
+}
+
+/// `design.thread_reply`.
+///
+/// # Errors
+/// The engine's refusal.
+pub fn thread_reply(
+    conn: &Connection,
+    meta: &WriteMeta,
+    thread: &str,
+    principal: &Principal,
+    text: &str,
+) -> Result<Thread, ApiError> {
+    Ok(design::threads::reply(conn, meta, thread, &author(principal), text)?.into())
+}
+
+/// `design.thread_resolve`.
+///
+/// # Errors
+/// The engine's refusal.
+pub fn thread_resolve(
+    conn: &Connection,
+    meta: &WriteMeta,
+    thread: &str,
+    principal: &Principal,
+) -> Result<Thread, ApiError> {
+    Ok(design::threads::resolve(conn, meta, thread, &author(principal))?.into())
+}
+
+/// `design.approve_selection`: the operator's alone (RBAC holds it to `Admin`, and the engine to
+/// the operator approver).
+///
+/// # Errors
+/// The engine's refusal.
+pub fn approve_selection(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    base: &str,
+    words: &design::threads::Words,
+    principal: &Principal,
+) -> Result<Span, ApiError> {
+    let approver = if principal.is_operator() {
+        Approver::Operator
+    } else {
+        Approver::Claude(principal.label.clone())
+    };
+    Ok(design::approve_selection(conn, meta, uid, base, words, &approver)?.into())
 }
 
 /// `design.stage`.

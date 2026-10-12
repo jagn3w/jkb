@@ -38,6 +38,8 @@ use crate::Result;
 pub const BODY: &str = "body";
 /// The root `Y.Map` holding each span's anchors, keyed by the span's uid.
 pub const SPANS: &str = "spans";
+/// The root map comment threads are anchored in.
+pub const THREADS: &str = "threads";
 /// A span entry's start anchor: an encoded `RelativePosition` (`Y.encodeRelativePosition`).
 const START: &str = "start";
 /// A span entry's end anchor.
@@ -118,6 +120,9 @@ pub struct Crdt {
     doc: Doc,
     body: TextRef,
     spans: MapRef,
+    /// Comment threads' anchors, kept apart from the spans' so a thread never takes part in the
+    /// spans' rules (no overlap, one state per character): two threads may cover the same words.
+    threads: MapRef,
 }
 
 impl Crdt {
@@ -137,7 +142,13 @@ impl Crdt {
         });
         let body = doc.get_or_insert_text(BODY);
         let spans = doc.get_or_insert_map(SPANS);
-        Self { doc, body, spans }
+        let threads = doc.get_or_insert_map(THREADS);
+        Self {
+            doc,
+            body,
+            spans,
+            threads,
+        }
     }
 
     /// An empty document whose client id appears nowhere in `known` — what an edit built against an
@@ -259,11 +270,41 @@ impl Crdt {
         uids
     }
 
+    /// Run `f` over the body and the threads map in one transaction, as [`Crdt::change`] does over
+    /// the spans map.
+    ///
+    /// # Errors
+    /// What `f` answers.
+    pub fn change_threads<T>(
+        &self,
+        f: impl FnOnce(&mut TransactionMut<'_>, &TextRef, &MapRef) -> Result<T>,
+    ) -> Result<(T, Option<Vec<u8>>)> {
+        let mut txn = self.doc.transact_mut();
+        let out = f(&mut txn, &self.body, &self.threads)?;
+        let wrote = !txn.insert_set().is_empty() || !txn.delete_set().is_empty();
+        let update = wrote.then(|| txn.encode_update_v1());
+        Ok((out, update))
+    }
+
+    /// Where a comment thread's anchor lies now, as [`Crdt::range`] reads a span's.
+    #[must_use]
+    pub fn thread_range(&self, uid: &str) -> Option<(u32, u32)> {
+        let (start, end) = Self::anchors_in(&self.doc, &self.threads, uid)?;
+        let txn = self.doc.transact();
+        let s = start.get_offset(&txn)?.index;
+        let e = end.get_offset(&txn)?.index;
+        Some((s, e.max(s)))
+    }
+
     /// A span's two anchors, if the document has an entry for it that reads as one.
     #[must_use]
     pub fn anchors(&self, uid: &str) -> Option<(StickyIndex, StickyIndex)> {
-        let txn = self.doc.transact();
-        let Some(Out::Any(Any::Map(entry))) = self.spans.get(&txn, uid) else {
+        Self::anchors_in(&self.doc, &self.spans, uid)
+    }
+
+    fn anchors_in(doc: &Doc, map: &MapRef, uid: &str) -> Option<(StickyIndex, StickyIndex)> {
+        let txn = doc.transact();
+        let Some(Out::Any(Any::Map(entry))) = map.get(&txn, uid) else {
             return None;
         };
         let read = |key: &str| match entry.get(key) {
@@ -484,6 +525,7 @@ impl Crdt {
         });
         manager.expand_scope(&self.doc, &self.body);
         manager.expand_scope(&self.doc, &self.spans);
+        manager.expand_scope(&self.doc, &self.threads);
         let written: Rc<RefCell<Option<Vec<u8>>>> = Rc::default();
         let sink = Rc::clone(&written);
         self.doc

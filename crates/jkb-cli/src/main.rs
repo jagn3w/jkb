@@ -541,12 +541,41 @@ enum DesignCmd {
     },
     /// Approve a span — as the reviewer it names, at the version you read it in.
     Approve {
-        /// The span.
+        /// The span — or, with `--find`, the design whose quoted words to approve.
         span: String,
         /// The version token `jkb design cat` printed when you read the span. Refused when the
         /// span's words changed since: an approval is of the words you read, never of the latest.
         #[arg(long)]
         base: String,
+        /// Approve exactly these words of the design (the operator's alone): the span that is
+        /// exactly them, or a new span over them. A quote crossing a span's edge is refused.
+        #[arg(long)]
+        find: Option<String>,
+        /// Which match of `--find`, from 1.
+        #[arg(long, requires = "find")]
+        occurrence: Option<usize>,
+    },
+    /// Nest a design under another design of its repo: the sidebar shows it there, and the
+    /// parent's export inlines it.
+    Mv {
+        /// The design to nest.
+        uid: String,
+        /// The design it goes under.
+        #[arg(long)]
+        under: String,
+    },
+    /// Split a design into child designs, one per heading of `--level` (2: `##`), against the
+    /// version you read. Approved spans keep their approval and their plan steps; the parent's
+    /// export still writes the whole text to its one `docs/` file.
+    Split {
+        /// The design.
+        uid: String,
+        /// The version token `jkb design cat` printed.
+        #[arg(long)]
+        base: String,
+        /// The heading level to split at.
+        #[arg(long, default_value_t = 2)]
+        level: usize,
     },
     /// Stage an approved span into an execution plan's step.
     Stage {
@@ -585,6 +614,50 @@ enum DesignCmd {
     Plan {
         #[command(subcommand)]
         what: DesignPlanCmd,
+    },
+    /// Comment threads on a design's text: the operator starts and resolves them; Claude replies.
+    Thread {
+        #[command(subcommand)]
+        what: DesignThreadCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DesignThreadCmd {
+    /// A design's threads, in text order, with their comments.
+    Ls {
+        /// The design.
+        uid: String,
+    },
+    /// Start a thread on quoted words (the operator's).
+    Start {
+        /// The design.
+        uid: String,
+        /// The version token `jkb design cat` printed.
+        #[arg(long)]
+        base: String,
+        /// The words it is about.
+        #[arg(long)]
+        find: String,
+        /// Which match of `--find`, from 1.
+        #[arg(long)]
+        occurrence: Option<usize>,
+        /// The first comment.
+        #[arg(long)]
+        text: String,
+    },
+    /// Reply in a thread.
+    Reply {
+        /// The thread.
+        thread: String,
+        /// The reply (`-` reads it from stdin).
+        #[arg(long)]
+        text: String,
+    },
+    /// Resolve a thread (the operator's).
+    Resolve {
+        /// The thread.
+        thread: String,
     },
 }
 

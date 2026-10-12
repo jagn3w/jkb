@@ -127,7 +127,10 @@ fn same_repo(uid: &str, repo: Option<&str>, here: &str) -> Result<()> {
 /// `export --to` (the remedy that refusal names) and `design source` must work on exactly that
 /// design.
 fn design_is_here(ops: &Ops<'_>, uid: &str, here: &str) -> Result<()> {
-    let designs = match ops.call(Request::DesignList { repo: None })? {
+    let designs = match ops.call(Request::DesignList {
+        repo: None,
+        review: false,
+    })? {
         Response::Designs { designs } => designs,
         other => return unexpected("design.list", &other),
     };

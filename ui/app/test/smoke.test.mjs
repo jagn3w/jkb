@@ -199,7 +199,9 @@ for (const [id, label] of [
     const pane = page.locator(`#pane-${id}`);
     await pane.waitFor({ state: "visible" });
     assert.equal(await tab.getAttribute("aria-selected"), "true");
-    assert.equal(await pane.getByRole("heading", { level: 1 }).innerText(), label);
+    // The text, not innerText: a pane may style its title (the Design sidebar's is an uppercase
+    // label), and what is asserted is the heading's name.
+    assert.equal((await pane.getByRole("heading", { level: 1 }).textContent())?.trim(), label);
     assert.equal(await page.locator('.panes > [role="tabpanel"]:visible').count(), 1, "only one pane is shown");
   });
 }
@@ -211,7 +213,8 @@ test("the Design tab says why it has no designs when the daemon is unreachable",
   await page.getByRole("tab", { name: "Design", exact: true }).click();
   const pane = page.locator("#pane-design");
   await pane.locator(".design-empty", { hasText: "Cannot list designs" }).waitFor();
-  assert.equal(await pane.getByRole("combobox", { name: "Repo" }).isDisabled(), true);
+  // The design tree says so too, rather than offering an empty list.
+  await pane.locator(".design-sidebar .sidebar-hint", { hasText: "Cannot list designs" }).waitFor();
 });
 
 // The Workflows tab (D53.7): with no daemon there are no templates to draw, and the pane says why.
@@ -277,7 +280,13 @@ test("the terminal opens in the container by default, and a host terminal is a l
   await page.keyboard.press("Control+Backquote");
   assert.equal(await page.locator(".drawer-toggle").getAttribute("aria-expanded"), "true", "and opens it");
 
-  // Closing ends each program first; a tab goes once its end is confirmed.
+  // Closing ends each program first; a tab goes once its end is confirmed. There is no dev container
+  // here, so the container terminal's `docker exec` fails by itself; wait for that before closing it.
+  // Closed while that exec is still failing, its end is run inside the container, cannot be
+  // confirmed, and the tab rightly stays ("Close the tab again to forget it") -- the CI flake this
+  // wait removes: the test reaches here ~0.4 s after the open, which a loaded runner's docker
+  // round trip did not always beat.
+  await tab.locator(".terminal-status[data-failed]").waitFor({ timeout: 15_000 });
   for (const t of [hostTab, tab]) await t.getByRole("button", { name: /^Close / }).click();
   await page.waitForFunction(() => document.querySelectorAll(".terminal-tab").length === 0, undefined, { timeout: 15_000 });
 });

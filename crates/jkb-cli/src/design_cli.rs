@@ -8,11 +8,11 @@
 
 use anyhow::{bail, Context as _, Result};
 use jkb_api::designs::plans::{Plan, PlanTask};
-use jkb_api::designs::{DesignDoc, EditAsk, PromptAsk, Span, Written};
+use jkb_api::designs::{DesignDoc, EditAsk, PromptAsk, Span, Thread, Written};
 use jkb_api::{Request, Response};
 
 use crate::ops_cli::{unexpected, Ops};
-use crate::{DesignCmd, DesignPlanCmd, DesignPromptCmd};
+use crate::{DesignCmd, DesignPlanCmd, DesignPromptCmd, DesignThreadCmd};
 
 /// The text `value` names: itself, or stdin for `-`.
 fn text_arg(value: String) -> Result<String> {
@@ -170,6 +170,78 @@ fn print_plan(p: &Plan) {
 }
 
 /// `jkb design plan …` (D53.6).
+fn print_thread(t: &Thread) {
+    let place = if t.anchored {
+        format!("[{}, {})", t.start, t.end)
+    } else {
+        "detached".to_owned()
+    };
+    println!("{}  {}  {place}  {:?}", t.uid, t.status, t.quote);
+    for c in &t.comments {
+        println!("  {} ({}): {}", c.by, c.at, c.text);
+    }
+}
+
+fn thread_cmd(ops: &Ops<'_>, what: DesignThreadCmd) -> Result<()> {
+    let one = |op: &str, request: Request| -> Result<()> {
+        match ops.call(request)? {
+            Response::DesignThread { thread } => {
+                if ops.json {
+                    println!("{}", serde_json::to_string_pretty(&thread)?);
+                } else {
+                    print_thread(&thread);
+                }
+                Ok(())
+            }
+            other => unexpected(op, &other),
+        }
+    };
+    match what {
+        DesignThreadCmd::Ls { uid } => match ops.call(Request::DesignThreads { uid })? {
+            Response::DesignThreadList { threads, .. } => {
+                if ops.json {
+                    println!("{}", serde_json::to_string_pretty(&threads)?);
+                } else if threads.is_empty() {
+                    println!("(no threads)");
+                } else {
+                    threads.iter().for_each(print_thread);
+                }
+                Ok(())
+            }
+            other => unexpected("design.threads", &other),
+        },
+        DesignThreadCmd::Start {
+            uid,
+            base,
+            find,
+            occurrence,
+            text,
+        } => one(
+            "design.thread_start",
+            Request::DesignThreadStart {
+                uid,
+                base,
+                find: Some(find),
+                occurrence,
+                start: None,
+                end: None,
+                text: text_arg(text)?,
+            },
+        ),
+        DesignThreadCmd::Reply { thread, text } => one(
+            "design.thread_reply",
+            Request::DesignThreadReply {
+                thread,
+                text: text_arg(text)?,
+            },
+        ),
+        DesignThreadCmd::Resolve { thread } => one(
+            "design.thread_resolve",
+            Request::DesignThreadResolve { thread },
+        ),
+    }
+}
+
 fn plan_cmd(ops: &Ops<'_>, what: DesignPlanCmd) -> Result<()> {
     let plan = match what {
         DesignPlanCmd::Ls { uid, all } => {
@@ -406,7 +478,10 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
                     None => ops.ambient_repo()?,
                 }
             };
-            let designs = match ops.call(Request::DesignList { repo })? {
+            let designs = match ops.call(Request::DesignList {
+                repo,
+                review: false,
+            })? {
                 Response::Designs { designs } => designs,
                 other => return unexpected("design.list", &other),
             };
@@ -417,11 +492,12 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             } else {
                 for d in designs {
                     println!(
-                        "{}  {}  [{}] seq={}{}",
+                        "{}  {}  [{}] seq={}{}{}",
                         d.uid,
                         d.title,
                         d.namespace.unwrap_or_default(),
                         d.seq,
+                        d.parent.map(|p| format!("  under {p}")).unwrap_or_default(),
                         d.doc_target
                             .map(|t| format!("  exports to {t}"))
                             .unwrap_or_default()
@@ -532,9 +608,73 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             }
             Ok(())
         }
-        DesignCmd::Approve { span, base } => {
+        DesignCmd::Approve {
+            span,
+            base,
+            find: None,
+            ..
+        } => {
             let s = span_answer(ops, "design.approve", Request::DesignApprove { span, base })?;
             print_span(ops, &s)
+        }
+        DesignCmd::Approve {
+            span: uid,
+            base,
+            find: Some(find),
+            occurrence,
+        } => {
+            let s = span_answer(
+                ops,
+                "design.approve_selection",
+                Request::DesignApproveSelection {
+                    uid,
+                    base,
+                    find: Some(find),
+                    occurrence,
+                    start: None,
+                    end: None,
+                },
+            )?;
+            print_span(ops, &s)
+        }
+        DesignCmd::Mv { uid, under } => match ops.call(Request::DesignMove { uid, under })? {
+            Response::DesignMeta { design } => {
+                if ops.json {
+                    println!("{}", serde_json::to_string_pretty(&design)?);
+                } else {
+                    // A move always names a parent; there is no un-nesting yet (`--top` is not built).
+                    println!(
+                        "{}  {}  nested under {}",
+                        design.uid,
+                        design.title,
+                        design.parent.unwrap_or_default()
+                    );
+                }
+                Ok(())
+            }
+            other => unexpected("design.move", &other),
+        },
+        DesignCmd::Split { uid, base, level } => {
+            match ops.call(Request::DesignSplit { uid, base, level })? {
+                Response::DesignSplit { split } => {
+                    if ops.json {
+                        println!("{}", serde_json::to_string_pretty(&split)?);
+                    } else {
+                        println!(
+                            "split {} into {} designs; {} spans moved, {} approvals carried",
+                            split.parent.uid,
+                            split.children.len(),
+                            split.moved,
+                            split.carried
+                        );
+                        for c in &split.children {
+                            println!("  {}  {}", c.uid, c.title);
+                        }
+                    }
+                    Ok(())
+                }
+                other => unexpected("design.split", &other),
+            }
         }
         DesignCmd::Stage { span, step } => {
             let s = span_answer(ops, "design.stage", Request::DesignStage { span, step })?;
@@ -584,6 +724,7 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
         DesignCmd::Source { uid, paths } => crate::design_export::source(ops, uid, &paths),
         DesignCmd::Prompt { what } => prompt_cmd(ops, what),
         DesignCmd::Plan { what } => plan_cmd(ops, what),
+        DesignCmd::Thread { what } => thread_cmd(ops, what),
         DesignCmd::Compact { uid } => {
             match ops.call(Request::DesignCompact { uid: uid.clone() })? {
                 Response::DesignCompacted { through, removed } => {

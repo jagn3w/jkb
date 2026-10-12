@@ -7,7 +7,7 @@ import * as Y from "yjs";
 
 import { stateRuns, type DesignDoc } from "@jkb/core";
 
-import { discussOnSelection, livePreview, setStateMap, spanStates } from "./editor";
+import { livePreview, selectionActions, setStateMap, spanStates } from "./editor";
 import type { DesignSession } from "./session";
 
 /**
@@ -18,13 +18,38 @@ import type { DesignSession } from "./session";
 export function DocumentEditor({
   session,
   onDiscuss,
+  onComment,
+  onApprove,
+  onView,
+  onCursor,
+  onGeometry,
 }: {
   readonly session: DesignSession;
   readonly onDiscuss: (from: number, to: number, text: string) => void;
+  /** Start a thread on the selection; `text` is the document the offsets are into. */
+  readonly onComment: (from: number, to: number, text: string) => void;
+  /** Approve exactly the selection (the operator's). */
+  readonly onApprove: (from: number, to: number, text: string) => void;
+  /** The editor once it exists, and `undefined` once it is gone: what *See next* moves. */
+  readonly onView?: (view: EditorView | undefined) => void;
+  /** Where the cursor is, each time it moves: the place *See next* walks from. */
+  readonly onCursor?: (head: number) => void;
+  /** Called when the editor's lines may have moved: what the thread margin is placed against. */
+  readonly onGeometry?: () => void;
 }): React.JSX.Element {
   const host = useRef<HTMLDivElement>(null);
   const discuss = useRef(onDiscuss);
   discuss.current = onDiscuss;
+  const comment = useRef(onComment);
+  comment.current = onComment;
+  const approve = useRef(onApprove);
+  approve.current = onApprove;
+  const viewed = useRef(onView);
+  viewed.current = onView;
+  const cursor = useRef(onCursor);
+  cursor.current = onCursor;
+  const geometry = useRef(onGeometry);
+  geometry.current = onGeometry;
 
   useEffect(() => {
     const parent = host.current;
@@ -41,10 +66,21 @@ export function DocumentEditor({
           keymap.of([...yUndoManagerKeymap, indentWithTab, ...defaultKeymap]),
           livePreview,
           spanStates,
-          discussOnSelection((from, to) => discuss.current(from, to, view.state.doc.toString()), writable),
+          selectionActions(
+            () => ({
+              comment: (from, to) => comment.current(from, to, view.state.doc.toString()),
+              approve: (from, to) => approve.current(from, to, view.state.doc.toString()),
+              discuss: (from, to) => discuss.current(from, to, view.state.doc.toString()),
+            }),
+            writable,
+          ),
           yCollab(session.text, null, { undoManager: undo }),
           editable.of([EditorView.editable.of(writable()), EditorState.readOnly.of(!writable())]),
           EditorView.contentAttributes.of({ "aria-label": "Design document", spellcheck: "true" }),
+          EditorView.updateListener.of((u) => {
+            if (u.selectionSet || u.docChanged) cursor.current?.(u.state.selection.main.head);
+            if (u.geometryChanged || u.heightChanged || u.docChanged) geometry.current?.();
+          }),
         ],
       }),
     });
@@ -52,10 +88,10 @@ export function DocumentEditor({
     let drawn: DesignDoc | undefined;
     let wasWritable = writable();
     const sync = (): void => {
-      const current = session.current;
-      // The session keeps an answer only when its text was the document's, and the editor shows
-      // the document, so the answer's offsets are the editor's.
-      if (current !== undefined && current !== drawn && current.text === view.state.doc.toString()) {
+      // Only an answer whose text is still the document's (`onScreen`): the editor shows the
+      // document, so that answer's offsets are the editor's.
+      const current = session.onScreen();
+      if (current !== undefined && current !== drawn) {
         drawn = current;
         view.dispatch({ effects: setStateMap.of(stateRuns(view.state.doc.length, current.spans)) });
       }
@@ -68,8 +104,10 @@ export function DocumentEditor({
     };
     sync();
     const off = session.onChange(sync);
+    viewed.current?.(view);
     return () => {
       off();
+      viewed.current?.(undefined);
       view.destroy();
       undo.destroy();
     };
