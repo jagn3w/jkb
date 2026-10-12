@@ -29,7 +29,7 @@ pub use error::{Error, Result};
 pub use fts::FtsIndexer;
 pub use vector::{
     count_orphan_vectors, count_stale, drop_orphan_vectors, register, sweep_stale, vector_tables,
-    StaleRows, VectorIndexer,
+    vector_tables_without_gc_trigger, StaleRows, VectorIndexer,
 };
 
 /// The item fields an [`Indexer`] needs to (re)index a single item.

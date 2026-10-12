@@ -283,22 +283,12 @@ pub(crate) fn run(
 
     report_claims(kb, fix)?;
 
-    match (host, fix) {
-        (Some(h), true) if health.vector_tables > 0 => println!(
-            "vector index: removed {} stale row(s)",
-            crate::sweep_stale(h.db)?.vectors
-        ),
-        _ if health.vector_tables == 0 => println!("vector index: no vector table yet"),
-        _ if health.stale_vectors == 0 => println!("vector index: ok"),
-        _ => {
-            println!(
-                "vector index: {} stale row(s) whose item is gone",
-                health.stale_vectors
-            );
-            println!(
-                "  run `jkb index --sweep` (or `jkb doctor --fix`) on the host to remove them"
-            );
-        }
+    let swept = match (host, fix) {
+        (Some(h), true) if health.vector_tables > 0 => Some(crate::sweep_stale(h.db)?.vectors),
+        _ => None,
+    };
+    for line in vector_report(&health, swept) {
+        println!("{line}");
     }
 
     // Task sessions in this repo (design D36.6). A session's worktree keeps its claim on purpose, so a
@@ -316,9 +306,112 @@ pub(crate) fn run(
     Ok(())
 }
 
+/// The vector-index lines of `jkb doctor`. `swept` is the stale-row count `--fix` removed, when it
+/// ran.
+///
+/// Healthy needs two things, not one: no stale rows now, and the delete-GC trigger on every vector
+/// table so no more appear. A database written before the trigger can have no stale rows today and
+/// still orphan a vector on every item delete, and reporting it `ok` on the row count alone hid
+/// exactly that. The repair (`sweep_stale`, behind both `jkb index --sweep` and `--fix`) installs
+/// the trigger, so the `--fix` arm reports the tables it guarded.
+fn vector_report(health: &jkb_api::health::Health, swept: Option<usize>) -> Vec<String> {
+    if health.vector_tables == 0 {
+        return vec!["vector index: no vector table yet".to_owned()];
+    }
+    let unguarded = health.unguarded_vector_tables.as_deref();
+    if let Some(removed) = swept {
+        let mut lines = vec![format!("vector index: removed {removed} stale row(s)")];
+        if let Some(tables) = unguarded.filter(|t| !t.is_empty()) {
+            lines.push(format!(
+                "vector index: installed the delete-GC trigger on {}",
+                tables.join(", ")
+            ));
+        }
+        return lines;
+    }
+    let mut lines = Vec::new();
+    if health.stale_vectors > 0 {
+        lines.push(format!(
+            "vector index: {} stale row(s) whose item is gone",
+            health.stale_vectors
+        ));
+    }
+    match unguarded {
+        Some([]) => {}
+        Some(tables) => lines.push(format!(
+            "vector index: no delete-GC trigger on {}, so every item delete leaves its vector behind",
+            tables.join(", ")
+        )),
+        None => lines.push(
+            "vector index: the GC trigger was not checked (the daemon predates the check)"
+                .to_owned(),
+        ),
+    }
+    if lines.is_empty() {
+        return vec!["vector index: ok".to_owned()];
+    }
+    if health.stale_vectors > 0 || unguarded.is_some_and(|t| !t.is_empty()) {
+        lines.push(
+            "  run `jkb index --sweep` (or `jkb doctor --fix`) on the host to repair it".to_owned(),
+        );
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{free, probe_with};
+    use super::{free, probe_with, vector_report};
+    use jkb_api::health::Health;
+
+    fn health(vector_tables: usize, stale: usize, unguarded: Option<&[&str]>) -> Health {
+        Health {
+            schema_version: 0,
+            fts_ok: true,
+            flagged: Vec::new(),
+            flagged_count: 0,
+            vector_tables,
+            stale_vectors: stale,
+            unguarded_vector_tables: unguarded.map(|t| t.iter().map(|s| (*s).to_owned()).collect()),
+        }
+    }
+
+    /// A legacy database with no stale rows yet but no GC trigger is NOT reported ok: the row count
+    /// alone hid that every item delete still orphans a vector.
+    #[test]
+    fn a_missing_gc_trigger_is_not_reported_ok() {
+        let lines = vector_report(&health(1, 0, Some(&["vec_items_16"])), None);
+        assert!(
+            !lines.iter().any(|l| l.ends_with(": ok")),
+            "an unguarded table was reported healthy: {lines:?}"
+        );
+        assert!(lines[0].contains("no delete-GC trigger on vec_items_16"));
+        assert!(lines.last().unwrap().contains("jkb index --sweep"));
+
+        // Healthy needs both: no stale rows AND every table guarded.
+        assert_eq!(
+            vector_report(&health(1, 0, Some(&[])), None),
+            ["vector index: ok"]
+        );
+        // Stale rows and a missing trigger are both reported, with one repair hint.
+        let both = vector_report(&health(1, 3, Some(&["vec_items_16"])), None);
+        assert_eq!(both.len(), 3, "{both:?}");
+        // An older daemon that cannot say is not read as healthy either.
+        let unknown = vector_report(&health(1, 0, None), None);
+        assert!(unknown[0].contains("not checked"), "{unknown:?}");
+        // `--fix` installs it, and says so.
+        let fixed = vector_report(&health(1, 2, Some(&["vec_items_16"])), Some(2));
+        assert_eq!(
+            fixed,
+            [
+                "vector index: removed 2 stale row(s)",
+                "vector index: installed the delete-GC trigger on vec_items_16"
+            ]
+        );
+        assert_eq!(
+            vector_report(&health(0, 0, Some(&[])), None),
+            ["vector index: no vector table yet"]
+        );
+    }
     use crate::session_cli::Kb;
     use jkb_api::{Backend as _, LocalBackend};
     use jkb_core::Db;

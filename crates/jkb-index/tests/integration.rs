@@ -660,12 +660,28 @@ fn a_repair_installs_the_trigger_on_a_legacy_database() {
         stale.vectors, 1,
         "setup: the legacy delete should orphan a row"
     );
+    // The detection `jkb doctor` reads: the unguarded table is named.
+    let unguarded = db
+        .read(|conn| Ok(jkb_index::vector_tables_without_gc_trigger(conn).unwrap()))
+        .unwrap();
+    assert_eq!(
+        unguarded,
+        ["vec_items_16"],
+        "the missing trigger went unseen"
+    );
 
     // Repair.
     db.write_txn("test", |conn, _meta| {
         Ok(jkb_index::sweep_stale(conn).unwrap())
     })
     .unwrap();
+    let unguarded = db
+        .read(|conn| Ok(jkb_index::vector_tables_without_gc_trigger(conn).unwrap()))
+        .unwrap();
+    assert!(
+        unguarded.is_empty(),
+        "the repair installed the trigger but the check still reports {unguarded:?}"
+    );
 
     // The harm: a second delete after the repair must NOT orphan another row.
     let id2 = db

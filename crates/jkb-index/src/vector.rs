@@ -152,12 +152,44 @@ pub fn sweep_stale(conn: &Connection) -> Result<StaleRows> {
 fn ensure_gc_trigger(conn: &Connection, table: &str) -> Result<()> {
     // `table` comes from `sqlite_master` filtered to our own prefix, or from a `VectorIndexer`'s
     // own dim — never from input.
+    let trigger = gc_trigger_name(table);
     conn.execute_batch(&format!(
-        "CREATE TRIGGER IF NOT EXISTS {table}_gc AFTER DELETE ON items BEGIN
+        "CREATE TRIGGER IF NOT EXISTS {trigger} AFTER DELETE ON items BEGIN
              DELETE FROM {table} WHERE item_id = old.id;
          END;"
     ))?;
     Ok(())
+}
+
+/// The name of the delete-GC trigger guarding one `vec_items_<dim>` table: the one spelling, so
+/// the installer and [`vector_tables_without_gc_trigger`] cannot disagree about it.
+fn gc_trigger_name(table: &str) -> String {
+    format!("{table}_gc")
+}
+
+/// Every `vec_items_<dim>` table that has no delete-GC trigger beside it.
+///
+/// Empty on a database whose vector tables were created or repaired by this version, since
+/// `ensure_ready` and [`sweep_stale`] both install the trigger. A table listed here belongs to a
+/// database written before the trigger existed, which still orphans a vector on every item
+/// delete — so a store with no stale rows *today* is not healthy if this is non-empty, and
+/// `jkb doctor` reports it. Checked by name, the same test `CREATE TRIGGER IF NOT EXISTS`
+/// applies when installing it.
+///
+/// # Errors
+/// Returns an error if a query fails.
+pub fn vector_tables_without_gc_trigger(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT 1 FROM sqlite_master
+          WHERE type = 'trigger' AND name = ?1 AND tbl_name = 'items'",
+    )?;
+    let mut missing = Vec::new();
+    for table in vector_tables(conn)? {
+        if !stmt.exists([gc_trigger_name(&table)])? {
+            missing.push(table);
+        }
+    }
+    Ok(missing)
 }
 
 /// Every `vec_items_<dim>` table in this database — one per embedding dimension the store has

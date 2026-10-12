@@ -40,6 +40,11 @@ pub struct Health {
     pub vector_tables: usize,
     /// Vector rows whose item is gone.
     pub stale_vectors: usize,
+    /// Vector tables with no delete-GC trigger, so every item delete still orphans a row: a
+    /// database written before the trigger existed. `None` from a daemon too old to report it,
+    /// which `jkb doctor` says rather than reading as healthy.
+    #[serde(default)]
+    pub unguarded_vector_tables: Option<Vec<String>>,
 }
 
 /// `kb.health`. Not an agent read: FTS5's integrity check is spelled as an `INSERT`, which the
@@ -73,6 +78,8 @@ pub fn health(conn: &Connection) -> Result<Health, ApiError> {
             .map_err(|e| index_error(&e))?
             .vectors
     };
+    let unguarded_vector_tables =
+        jkb_index::vector_tables_without_gc_trigger(conn).map_err(|e| index_error(&e))?;
     Ok(Health {
         schema_version,
         fts_ok,
@@ -80,6 +87,7 @@ pub fn health(conn: &Connection) -> Result<Health, ApiError> {
         flagged_count,
         vector_tables,
         stale_vectors,
+        unguarded_vector_tables: Some(unguarded_vector_tables),
     })
 }
 
@@ -121,6 +129,7 @@ mod tests {
         assert_eq!(h.flagged_count, super::MAX_FLAGGED + 1);
         assert!(h.fts_ok);
         assert_eq!((h.vector_tables, h.stale_vectors), (0, 0));
+        assert_eq!(h.unguarded_vector_tables, Some(Vec::new()));
         assert_eq!(h.flagged[0].detail.as_deref(), Some("bad"));
     }
 }
