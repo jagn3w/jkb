@@ -8,10 +8,11 @@
 //! each iteration the watcher also asks the changelog whether anyone but sync has written since its last
 //! look (at most once per debounce), and if so reconciles the bound files whose knowledge-base side
 //! changed ([`crate::sync_kb_changes`]), at most once per three debounces.
-//! Only two situations fall back to a full [`crate::sync`]:
-//! the initial reconcile on startup (to catch drift from while the watcher was off),
-//! and a watcher error or dropped-events signal (`need_rescan`), where we can no
-//! longer trust the incremental path list.
+//! Three situations fall back to a full [`crate::sync`]: the initial reconcile on startup (to
+//! catch drift from while the watcher was off); a watcher error or dropped-events signal
+//! (`need_rescan`), where the incremental path list can no longer be trusted, which runs at once;
+//! and the retry a failed pass owes ([`RetryDebt`]), which runs once its backoff has elapsed —
+//! on the next event or idle tick, whichever comes first.
 //!
 //! Stopping is via a shared `Arc<AtomicBool>` flag (checked each idle tick), so one
 //! signal (e.g. the CLI's Ctrl-C handler) can stop a single [`watch`] or the
@@ -278,7 +279,9 @@ enum Work {
     Paths(Vec<PathBuf>),
 }
 
-/// Run one reconcile pass, reporting whatever happens. **Never returns an error.**
+/// Run one reconcile pass, reporting whatever happens. **Never returns an error.** Answers whether
+/// the pass owes a retry: `true` when it failed outright or any file in it failed, which the caller
+/// records as [`RetryDebt`] and settles with a full pass once the backoff allows.
 ///
 /// The watcher's unit of failure is a pass, not the thread. Making the per-file reconcile
 /// non-fatal was not enough: `outcome_reason`, `settle_out_of_scope` and the trailing
@@ -309,9 +312,11 @@ where
             // A pass can fail AFTER per-file transactions have committed — the trailing
             // `ensure_all_mirrors` is its own transaction — so the batch's remaining paths and
             // the mirror derivation are lost while the files read as settled. Returning `true`
-            // makes the next tick a full re-scan, so the work is picked up rather than waiting
-            // for someone to touch those files again.
-            eprintln!("sync {mount_ns}: pass failed ({e}); re-scanning on the next event");
+            // owes a full re-scan, run once the retry backoff has elapsed, so the work is picked up
+            // rather than waiting for someone to touch those files again.
+            eprintln!(
+                "sync {mount_ns}: pass failed ({e}); re-scanning the mount after the retry backoff"
+            );
             // A pass-level error says nothing about which files are healthy, so the debt is
             // owed unconditionally. The caller decides *when* to settle it: a dropped-event
             // rescan runs immediately, a retry waits for the backoff.

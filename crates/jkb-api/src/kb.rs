@@ -669,13 +669,21 @@ pub fn contained_children(
 /// children — "container" is a behaviour, not a node kind. Terminal items are hidden unless `all`.
 ///
 /// # Errors
-/// Returns an error if a read fails.
+/// `NotFound` for a path that is neither a namespace nor an item uid, or an error if a read fails.
 pub fn children(conn: &Connection, path: Option<&str>, all: bool) -> jkb_core::Result<Vec<Child>> {
     if let Some(p) = path {
         if ns::get(conn, p)?.is_none() {
             if let Some(id) = item::id_for_uid(conn, p)? {
                 return contained_children(conn, id, all);
             }
+            // Neither a namespace nor an item: a typo, not an empty folder. Every namespace's
+            // ancestors have rows (`ns::ensure`), and children are found through their parent's
+            // row, so nothing could be listed here anyway — answering an empty list made the two
+            // indistinguishable, where `ns type` already says the path does not exist.
+            return Err(jkb_types::Error::NotFound(format!(
+                "`{p}` is neither a namespace nor an item uid"
+            ))
+            .into());
         }
     }
     let mut out = Vec::new();
@@ -747,7 +755,8 @@ pub fn children(conn: &Connection, path: Option<&str>, all: bool) -> jkb_core::R
 /// row naming the namespace it was listed under — until a row does not fit `budget`.
 ///
 /// # Errors
-/// Returns an error if a read fails.
+/// `NotFound` for a path that is neither a namespace nor an item uid ([`children`]), or an error
+/// if a read fails.
 pub fn ls(
     conn: &Connection,
     path: Option<&str>,
@@ -791,7 +800,8 @@ pub fn ls(
 /// not fit `budget` or past [`MAX_TREE_NODES`]; the returned [`TreeCut`] says which, if either.
 ///
 /// # Errors
-/// Returns an error if a read fails.
+/// `NotFound` for a path that is neither a namespace nor an item uid ([`children`]), or an error
+/// if a read fails.
 pub fn tree(
     conn: &Connection,
     path: Option<&str>,

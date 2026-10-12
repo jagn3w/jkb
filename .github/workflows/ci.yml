@@ -15,6 +15,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # A CI build is thrown away, so incremental compilation's bookkeeping is pure cost (and bloats
+  # the cache), and full debuginfo only slows the link and the cache upload: keep line tables, so
+  # a panic's backtrace still names the line.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   check:
@@ -27,18 +33,10 @@ jobs:
         with:
           persist-credentials: false
 
-      # The SAME code check.sh runs, not a second copy of the list: the two hand-written
-      # copies drifted by a `*.md` skip within one commit of each other — green locally, red
-      # here, on the same tree. A broken PreToolUse hook is the sharp case: bash exits 2 on a
-      # syntax error and a PreToolUse hook exiting 2 reads as DENY, so it does not fail open
-      # the way its header promises.
-      - name: shell syntax
-        run: bash -c '. scripts/lib.sh; check_shell_syntax "$PWD"'
-
       # The workspace pulls heavy transitive deps (fastembed/ONNX, headless_chrome,
-      # rav1e/image) and builds them twice (default + --features fastembed) plus a
-      # --all-features cargo-deny graph, which overflows the runner's ~14 GB free disk
-      # ("No space left on device"). Reclaim ~25 GB from preinstalled SDKs first.
+      # rav1e/image) and checks them twice (default, and the fastembed clippy and tests), which
+      # overflowed the runner's ~14 GB free disk ("No space left on device"). Reclaim ~25 GB from
+      # preinstalled SDKs first. (cargo-deny now runs in its own job.)
       - name: Free disk space
         run: |
           df -h /
@@ -60,15 +58,16 @@ jobs:
           rustup show
           rustup component add rustfmt clippy
 
-      - name: Cache cargo registry, git, and target
-        uses: actions/cache@v4
+      # rust-cache rather than a hand-keyed actions/cache of the whole target/: it keys on the
+      # toolchain as well as the lockfile (a toolchain bump no longer restores artifacts it cannot
+      # use) and prunes the workspace's own crates before saving, so the cache is the dependencies a
+      # build reuses rather than a target/ that only grows. Like actions/cache it does not re-save on
+      # an exact key hit. Saved from `main` only: a branch restores main's cache, and a branch that
+      # changes Cargo.lock does not spend the repository's 10 GB quota on a multi-GB cache of its own.
+      - name: Cache cargo registry and dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -76,14 +75,19 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # Workspace-wide, because the feature changes jkb-embed's public API (it adds an
+      # `EmbedderConfig` variant), so a dependent can fail to compile only with it on.
       - name: clippy (fastembed)
         run: cargo clippy --all-targets --features fastembed -- -D warnings
 
       - name: test
         run: cargo test --all
 
+      # The tests, though, are jkb-embed's alone: its one `cfg(feature)` is the only code the feature
+      # turns on, and the clippy above has already compiled every dependent's tests with it.
+      # Workspace-wide, this re-ran every other crate's tests against identical code.
       - name: test (fastembed)
-        run: cargo test --all --features fastembed
+        run: cargo test -p jkb-embed --features fastembed
 
       # setup.sh's installs are not reachable from a Rust test, and one of them replaces the
       # very hook that runs it. No `-e` guard on the glob, unlike check.sh: here, finding no
@@ -130,6 +134,24 @@ jobs:
       # a runner with no jkb store judges it exactly as a developer's machine does.
       - name: generated docs (jkb design export --check)
         run: cargo run -q -p jkb-cli --bin jkb -- design export --check
+
+  # Everything that needs no Rust build, in parallel with `check` rather than after its tests: the
+  # shell and container checks take seconds but waited behind the whole compile, and fail fast here.
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The SAME code check.sh runs, not a second copy of the list: the two hand-written
+      # copies drifted by a `*.md` skip within one commit of each other — green locally, red
+      # here, on the same tree. A broken PreToolUse hook is the sharp case: bash exits 2 on a
+      # syntax error and a PreToolUse hook exiting 2 reads as DENY, so it does not fail open
+      # the way its header promises.
+      - name: shell syntax
+        run: bash -c '. scripts/lib.sh; check_shell_syntax "$PWD"'
 
       # The auto-mode posture's tests (design D48). Hermetic and seconds-long: no Rust, no
       # session, no network — they only exercise the JSON merge/subset logic against a temp
@@ -192,6 +214,16 @@ jobs:
       # build, and the two are repaired by looking at different diffs.
       - name: vendored policies are reproducible from upstream
         run: ./.container/check-drift.sh
+
+  # The dependency audit reads Cargo.lock and the advisory database; it builds nothing, so it does
+  # not wait for `check`'s compile either.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # The action defaults to `cargo deny check --all-features`, so feature-gated deps
       # (e.g. the `fastembed` graph) are audited — matching `scripts/check.sh`.
