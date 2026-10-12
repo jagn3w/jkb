@@ -313,8 +313,7 @@ fn launchd_plist(exe: &Path, db: &Path) -> String {
 
 /// A systemd **user** unit running the all-mounts watcher, restarted on failure.
 fn systemd_unit(exe: &Path, db: &Path) -> String {
-    let exe = systemd_quote(&exe.to_string_lossy());
-    let db = systemd_quote(&db.to_string_lossy());
+    let command = systemd_command(exe, db);
     format!(
         "[Unit]\n\
          Description=jkb knowledge base file-sync watcher\n\
@@ -322,7 +321,7 @@ fn systemd_unit(exe: &Path, db: &Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={exe} --db {db} sync --watch\n\
+         ExecStart={command} sync --watch\n\
          Restart=on-failure\n\
          \n\
          [Install]\n\
@@ -425,8 +424,7 @@ fn systemd_reap_unit(exe: &Path, db: &Path, container: Option<&str>) -> String {
             crate::transcripts::CONTAINER_NAME_VAR
         )
     });
-    let exe = systemd_quote(&exe.to_string_lossy());
-    let db = systemd_quote(&db.to_string_lossy());
+    let command = systemd_command(exe, db);
     format!(
         "[Unit]\n\
          Description=jkb session worktree archiver\n\
@@ -434,7 +432,7 @@ fn systemd_reap_unit(exe: &Path, db: &Path, container: Option<&str>) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={exe} --db {db} task reap --watch\n\
+         ExecStart={command} task reap --watch\n\
          {container_env}Restart=on-failure\n\
          \n\
          [Install]\n\
@@ -478,8 +476,7 @@ fn launchd_serve_plist(exe: &Path, db: &Path) -> String {
 
 /// A systemd **user** unit running `jkb serve`, restarted on failure.
 fn systemd_serve_unit(exe: &Path, db: &Path) -> String {
-    let exe = systemd_quote(&exe.to_string_lossy());
-    let db = systemd_quote(&db.to_string_lossy());
+    let command = systemd_command(exe, db);
     format!(
         "[Unit]\n\
          Description=jkb knowledge base daemon (serves the dev container)\n\
@@ -487,7 +484,7 @@ fn systemd_serve_unit(exe: &Path, db: &Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={exe} --db {db} serve\n\
+         ExecStart={command} serve\n\
          Restart=on-failure\n\
          \n\
          [Install]\n\
@@ -495,18 +492,43 @@ fn systemd_serve_unit(exe: &Path, db: &Path) -> String {
     )
 }
 
-/// One argument of a systemd `ExecStart=` line, spelled so systemd hands the process exactly `s`.
+/// The start of a systemd `ExecStart=` value: `jkb --db <db>`, each path one quoted word.
+///
+/// Every unit builds its command line here, so the one rule that differs between the program word
+/// and its arguments (see [`Word`]) cannot be forgotten by a unit that spells its own.
+fn systemd_command(exe: &Path, db: &Path) -> String {
+    format!(
+        "{} --db {}",
+        systemd_quote(&exe.to_string_lossy(), Word::Program),
+        systemd_quote(&db.to_string_lossy(), Word::Argument)
+    )
+}
+
+/// Which word of an `ExecStart=` line [`systemd_quote`] is spelling.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Word {
+    /// The executable. systemd never environment-expands it ("the first argument (i.e. the
+    /// program to execute) may not be a variable", systemd.service(5)): it is looked up from the
+    /// unescaped path as is, so a `$` in it is literal and must NOT be doubled — `$$` there names
+    /// a file that does not exist, and the service fails with 203/EXEC.
+    Program,
+    /// Any later argument, which systemd does expand `$VAR`/`${VAR}` in at exec time.
+    Argument,
+}
+
+/// One word of a systemd `ExecStart=` line, spelled so systemd runs (for [`Word::Program`]) or
+/// passes (for [`Word::Argument`]) exactly `s`.
 ///
 /// `ExecStart=` is not a shell line, but it is not literal either: systemd splits it into words at
 /// whitespace, unquotes and C-unescapes each word, expands `%` specifiers in it, and at exec time
-/// expands `$VAR`/`${VAR}` (systemd.service(5), "Command lines"; systemd.syntax(7), "Quoting").
-/// So a bare path is right only until it holds a space (two arguments: the wrong executable, or
-/// `--db` pointing at a truncated path) or a `%` (`%h`, `%u` … silently substituted, or a unit
-/// that fails to load on an unknown specifier). The word is therefore always double-quoted, with
-/// `\` and `"` backslash-escaped, `%` doubled to the specifier escape `%%`, `$` doubled to the
-/// literal-dollar escape `$$`, and control characters (a newline would end the line) written as
-/// `\xNN`, which the C-unescape step turns back into the byte.
-fn systemd_quote(s: &str) -> String {
+/// expands `$VAR`/`${VAR}` in the arguments (systemd.service(5), "Command lines"; systemd.syntax(7),
+/// "Quoting"). So a bare path is right only until it holds a space (two arguments: the wrong
+/// executable, or `--db` pointing at a truncated path) or a `%` (`%h`, `%u` … silently substituted,
+/// or a unit that fails to load on an unknown specifier). The word is therefore always
+/// double-quoted, with `\` and `"` backslash-escaped, `%` doubled to the specifier escape `%%`,
+/// control characters (a newline would end the line) written as `\xNN`, which the C-unescape step
+/// turns back into the byte, and — in an argument only — `$` doubled to the literal-dollar `$$`.
+fn systemd_quote(s: &str, word: Word) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -515,7 +537,7 @@ fn systemd_quote(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '%' => out.push_str("%%"),
-            '$' => out.push_str("$$"),
+            '$' if word == Word::Argument => out.push_str("$$"),
             c if c.is_ascii_control() => {
                 let _ = write!(out, "\\x{:02x}", u32::from(c));
             }
@@ -540,7 +562,7 @@ mod tests {
     use super::{
         install_units, launchd_log, launchd_plist, launchd_reap_plist, launchd_serve_plist,
         systemd_quote, systemd_reap_unit, systemd_serve_unit, systemd_unit, xml_escape, Manager,
-        LABEL, REAP_LABEL, SERVE_LABEL,
+        Word, LABEL, REAP_LABEL, SERVE_LABEL,
     };
     use std::path::Path;
 
@@ -654,14 +676,34 @@ mod tests {
     #[test]
     fn systemd_exec_start_quotes_and_escapes_the_exe_and_db() {
         assert_eq!(
-            systemd_quote(r#"/a b/100%h$HOME"q"\n"#),
+            systemd_quote(r#"/a b/100%h$HOME"q"\n"#, Word::Argument),
             r#""/a b/100%%h$$HOME\"q\"\\n""#
         );
-        assert_eq!(systemd_quote("a\nb\tc"), r#""a\x0ab\x09c""#);
+        assert_eq!(
+            systemd_quote(r#"/a b/100%h$HOME"q"\n"#, Word::Program),
+            r#""/a b/100%%h$HOME\"q\"\\n""#
+        );
+        assert_eq!(systemd_quote("a\nb\tc", Word::Argument), r#""a\x0ab\x09c""#);
 
         let exe = Path::new("/opt/my apps/jkb");
         let db = Path::new("/home/u/100% sure/jkb.db");
         let want = r#"ExecStart="/opt/my apps/jkb" --db "/home/u/100%% sure/jkb.db""#;
+        for (unit, tail) in [
+            (systemd_unit(exe, db), " sync --watch\n"),
+            (systemd_serve_unit(exe, db), " serve\n"),
+            (systemd_reap_unit(exe, db, None), " task reap --watch\n"),
+        ] {
+            assert!(unit.contains(&format!("{want}{tail}")), "{unit}");
+        }
+    }
+
+    /// systemd looks the program up from its path without expanding `$`, so doubling it there
+    /// names a missing file (203/EXEC); in the `--db` argument it IS expanded, so it must double.
+    #[test]
+    fn systemd_exec_start_doubles_dollar_in_the_db_argument_but_never_in_the_program() {
+        let exe = Path::new("/opt/$x/jkb");
+        let db = Path::new("/home/u/$y/jkb.db");
+        let want = r#"ExecStart="/opt/$x/jkb" --db "/home/u/$$y/jkb.db""#;
         for (unit, tail) in [
             (systemd_unit(exe, db), " sync --watch\n"),
             (systemd_serve_unit(exe, db), " serve\n"),
