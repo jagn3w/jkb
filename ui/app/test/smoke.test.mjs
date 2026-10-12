@@ -199,7 +199,9 @@ for (const [id, label] of [
     const pane = page.locator(`#pane-${id}`);
     await pane.waitFor({ state: "visible" });
     assert.equal(await tab.getAttribute("aria-selected"), "true");
-    assert.equal(await pane.getByRole("heading", { level: 1 }).innerText(), label);
+    // The text, not innerText: a pane may style its title (the Design sidebar's is an uppercase
+    // label), and what is asserted is the heading's name.
+    assert.equal((await pane.getByRole("heading", { level: 1 }).textContent())?.trim(), label);
     assert.equal(await page.locator('.panes > [role="tabpanel"]:visible').count(), 1, "only one pane is shown");
   });
 }
