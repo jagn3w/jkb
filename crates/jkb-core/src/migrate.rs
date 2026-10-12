@@ -154,12 +154,18 @@ mod tests {
         )
         .unwrap();
 
-        // A valid task status inserts.
-        conn.execute(
-            "INSERT INTO items (uid, kind, status) VALUES ('t1', 'task', 'in_progress')",
-            [],
-        )
-        .unwrap();
+        // Every status the enum has inserts. Walking the generated list rather than naming a
+        // case is what makes a new `TaskStatus` variant fail HERE, naming itself, when the
+        // migrations' hand-written CHECK set was not widened to match — instead of passing
+        // every test and failing at runtime on a bare CHECK violation.
+        for status in jkb_types::TaskStatus::ALL {
+            let status = status.as_str();
+            conn.execute(
+                "INSERT INTO items (uid, kind, status) VALUES (?1, 'task', ?2)",
+                rusqlite::params![format!("t-{status}"), status],
+            )
+            .unwrap_or_else(|e| panic!("status {status:?} must pass the items CHECK: {e}"));
+        }
 
         // An out-of-set status is rejected by the DB (the CHECK), not just the Rust layer.
         assert!(

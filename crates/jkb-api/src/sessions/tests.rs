@@ -498,7 +498,7 @@ fn a_session_state_is_read_from_the_registry() {
 }
 
 /// **A claim is compared as stored.** An owner written in a spelling `AgentId` would render differently
-/// (`agent:a:b` renders `agent:a-b`) is reported verbatim by `task.facts`, so sending it back as
+/// (`host:007` renders `host:7`) is reported verbatim by `task.facts`, so sending it back as
 /// `displace` or `observed` matches it — a re-rendered owner never would, and the verb would loop on
 /// "run it again" for ever.
 #[test]
@@ -511,14 +511,14 @@ fn a_claim_in_a_non_canonical_spelling_is_compared_as_stored() {
         let uid = uid.clone();
         db.write_txn("t", move |c, m| {
             let id = jkb_core::task::resolve_ref(c, &uid)?.expect("task");
-            jkb_core::claim::claim(c, m, id, "agent:reviewer:G3")?;
+            jkb_core::claim::claim(c, m, id, "host:007")?;
             Ok(())
         })
         .unwrap();
     };
     plant(&db);
     let held = facts(&b, &uid).claim.unwrap();
-    assert_eq!(held, "agent:reviewer:G3");
+    assert_eq!(held, "host:007");
     assert!(start(&b, &uid, "host:1", Some(&held)).unwrap());
     assert_eq!(facts(&b, &uid).claim.as_deref(), Some("host:1"));
 
@@ -528,19 +528,19 @@ fn a_claim_in_a_non_canonical_spelling_is_compared_as_stored() {
     )
     .unwrap();
     plant(&db);
-    let a = abandon(&b, &uid, Some("agent:reviewer:G3"));
+    let a = abandon(&b, &uid, Some("host:007"));
     assert!(a.reopened, "the stored claim was released: {a:?}");
     assert_eq!(facts(&b, &uid).claim, None);
 }
 
-/// **A claim is taken only in the spelling it is stored in.** `agent:reviewer:G3` is stored
-/// `agent:reviewer-G3`, so a worker that took it under the first spelling could never release or
+/// **A claim is taken only in the spelling it is stored in.** `host:007` is stored
+/// `host:7`, so a worker that took it under the first spelling could never release or
 /// compare-and-set its own claim again. Each op that takes a claim refuses it, before writing.
 #[test]
 fn a_claim_is_taken_only_in_its_stored_spelling() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
     let uid = add(&b, "spelled +tasks/x");
-    let odd = "agent:reviewer:G3";
+    let odd = "host:007";
     let refused = |r: Result<Response, ApiError>| {
         let e = r.expect_err("a non-canonical owner is refused");
         assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
@@ -560,7 +560,37 @@ fn a_claim_is_taken_only_in_its_stored_spelling() {
                 "place": { "branch": "feat", "repo": "proj", "onto": "batch" } }),
     ));
     assert_eq!(facts(&b, &uid).claim, None, "nothing was taken");
-    assert!(start(&b, &uid, "agent:reviewer-G3", None).unwrap());
+    assert!(start(&b, &uid, "host:7", None).unwrap());
+}
+
+/// **An agent id with an inner colon is its own spelling.** `jkb task claim --owner agent:cloud:run-3`
+/// stores the string verbatim; when `AgentId::parse` rejoined an agent tail with `-`, the same runner
+/// re-asserting its claim was refused as non-canonical, and anything built from the parsed owner
+/// compared `agent:cloud-run-3` against the stored bytes and matched nothing.
+#[test]
+fn an_agent_owner_with_a_colon_keeps_its_claim() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let uid = add(&b, "colon agent +tasks/x");
+    let owner = "agent:cloud:run-3";
+    let u = uid.clone();
+    db.write_txn("t", move |c, m| {
+        let id = jkb_core::task::resolve_ref(c, &u)?.expect("task");
+        jkb_core::claim::claim(c, m, id, owner)?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        start(&b, &uid, owner, None).unwrap(),
+        "the holder re-asserts"
+    );
+    assert_eq!(facts(&b, &uid).claim.as_deref(), Some(owner));
+    call(
+        &b,
+        json!({ "op": "task.release", "uid": uid, "owner": owner }),
+    )
+    .unwrap();
+    assert_eq!(facts(&b, &uid).claim, None, "the release cleared it");
 }
 
 /// **A claim held in an older spelling is refused with the way out, not reported as a race.** Its holder,
@@ -574,31 +604,31 @@ fn a_claim_held_in_an_older_spelling_is_refused_with_the_way_out() {
     let u = uid.clone();
     db.write_txn("t", move |c, m| {
         let id = jkb_core::task::resolve_ref(c, &u)?.expect("task");
-        jkb_core::claim::claim(c, m, id, "agent:reviewer:G3")?;
+        jkb_core::claim::claim(c, m, id, "host:007")?;
         Ok(())
     })
     .unwrap();
     match call(
         &b,
-        json!({ "op": "task.claim", "uid": uid, "owner": "agent:reviewer-G3" }),
+        json!({ "op": "task.claim", "uid": uid, "owner": "host:7" }),
     )
     .unwrap()
     {
         Response::Claimed { claimed } => {
             assert!(!claimed.acquired);
             let why = claimed.refusal.unwrap();
-            assert!(why.contains("--owner 'agent:reviewer:G3'"), "{why}");
+            assert!(why.contains("--owner 'host:007'"), "{why}");
         }
         other => panic!("{other:?}"),
     }
     call(
         &b,
-        json!({ "op": "task.release", "uid": uid, "owner": "agent:reviewer:G3" }),
+        json!({ "op": "task.release", "uid": uid, "owner": "host:007" }),
     )
     .unwrap();
     match call(
         &b,
-        json!({ "op": "task.claim", "uid": uid, "owner": "agent:reviewer-G3" }),
+        json!({ "op": "task.claim", "uid": uid, "owner": "host:7" }),
     )
     .unwrap()
     {

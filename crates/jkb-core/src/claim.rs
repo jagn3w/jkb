@@ -92,7 +92,7 @@ pub fn claim(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -> 
         .ok_or_else(|| Error::Types(TypeError::NotFound(format!("task {item}"))))?;
     // A finished task must not be resurrected by a claim (design D27.7: `done`/`cancelled`
     // are terminal). Refuse with a clear error rather than silently re-opening it.
-    if matches!(before.status.as_deref(), Some("done" | "cancelled")) {
+    if jkb_types::TaskStatus::is_terminal_str(before.status.as_deref()) {
         let status = before.status.as_deref().unwrap_or("terminal");
         return Err(Error::Types(TypeError::Validation(format!(
             "cannot claim task {item}: it is already {status}"
@@ -141,8 +141,8 @@ pub fn claim(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -> 
 /// Clear a claim **only** when it is still held by `expected_owner`, returning whether it was.
 ///
 /// The compare-and-set half of a takeover. Whether an owner may be displaced is decided by
-/// probing it (`owner::is_alive`, which forks `ps`) or by removing its worktree — work that
-/// happens outside the write transaction, so between reading the owner and clearing it
+/// probing it (`owner::is_alive` — a session's worktree on disk, a process's `kill(pid, 0)`) or by
+/// removing its worktree — work that happens outside the write transaction, so between reading the owner and clearing it
 /// somebody else can claim the task. A bare [`clear`] would then discard a claim nobody
 /// examined, which is how a live session's claim gets replaced by a process about to exit and
 /// its task freed by the next `doctor --fix`. Naming the owner you judged makes that

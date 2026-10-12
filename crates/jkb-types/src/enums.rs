@@ -276,10 +276,12 @@ impl TaskStatus {
     /// Whether a raw `items.status` string is terminal.
     ///
     /// The string-level spelling of [`TaskStatus::is_terminal`], for the callers that read a
-    /// status straight out of the database. `matches!(s, "done" | "cancelled")` was written by
-    /// hand in five places, including the two guards that stop a landing and an abandon from
-    /// reopening finished work — which are exactly the places where getting the set wrong is
-    /// most expensive, and the places least likely to be revisited when the set changes.
+    /// status straight out of the database. `matches!(s, "done" | "cancelled")` used to be
+    /// written by hand at each such caller, including the guards that stop a landing, an abandon
+    /// and a claim from reopening finished work — exactly the places where getting the set wrong
+    /// is most expensive, and the places least likely to be revisited when the set changes.
+    /// Rust code asks this; SQL that filters on the set (`status NOT IN ('done', 'cancelled')`)
+    /// cannot call it and still spells the set out.
     #[must_use]
     pub fn is_terminal_str(status: Option<&str>) -> bool {
         status
@@ -469,13 +471,8 @@ mod tests {
                 format!("\"{}\"", resolution.as_str())
             );
         }
-        for status in [
-            TaskStatus::Open,
-            TaskStatus::InProgress,
-            TaskStatus::NeedsReview,
-            TaskStatus::Done,
-            TaskStatus::Cancelled,
-        ] {
+        // The generated list, so a new status is held to its serde form without an edit here.
+        for status in TaskStatus::ALL.iter().copied() {
             assert_eq!(
                 serde_json::to_string(&status).unwrap(),
                 format!("\"{}\"", status.as_str())
