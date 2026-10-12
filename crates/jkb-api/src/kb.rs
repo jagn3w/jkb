@@ -907,6 +907,14 @@ pub enum TreeCut {
     NodeCap,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// How many levels [`TreeWalk::level`] has listed on this thread — one `children` read each: the
+    /// work count that pins a walk's cost without a clock. A `Db` runs every call on its own thread,
+    /// so a test reads it there.
+    pub(crate) static LEVELS_LISTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct TreeWalk<'c, 'b> {
     conn: &'c Connection,
     all: bool,
@@ -921,6 +929,8 @@ struct TreeWalk<'c, 'b> {
 
 impl TreeWalk<'_, '_> {
     fn level(&mut self, path: Option<&str>, depth: usize) -> jkb_core::Result<Vec<TreeNode>> {
+        #[cfg(test)]
+        LEVELS_LISTED.set(LEVELS_LISTED.get() + 1);
         let mut out = Vec::new();
         for child in children(self.conn, path, self.all)? {
             if self.cut != TreeCut::Whole {

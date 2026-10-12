@@ -1426,10 +1426,25 @@ fn a_tree_does_not_descend_into_a_node_that_lists_its_own_ancestor() {
     })
     .unwrap();
     let b = LocalBackend::new(db);
-    let started = std::time::Instant::now();
+    // Counted, not timed: the walk runs on the `Db`'s own thread, and the count is read there. A 5 s
+    // bound here would fail on a loaded machine rather than on the walk.
+    b.db.read(|_| {
+        super::kb::LEVELS_LISTED.set(0);
+        Ok(())
+    })
+    .unwrap();
     let nodes = tree_of(&b, "a");
+    let listed = b.db.read(|_| Ok(super::kb::LEVELS_LISTED.get())).unwrap();
+    // One level for `a`, and one for document `b` under it (which lists namespace `b`); every other
+    // node names an ancestor and is not descended into. Two, where the walk without the check
+    // listed a level per node to the node cap.
+    assert_eq!(
+        listed,
+        2,
+        "levels listed; {} nodes: {nodes:#?}",
+        count(&nodes)
+    );
     assert!(count(&nodes) <= 6, "{} nodes: {nodes:#?}", count(&nodes));
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
 
 #[test]
@@ -1658,6 +1673,41 @@ fn a_task_s_subtasks_carry_their_titles_not_their_bodies() {
     assert_eq!(task.subtasks[0].title, "Child title");
 }
 
+/// A `Db`'s thread held inside a read until [`Held::release`]: what proves an op does not wait on that
+/// connection is the op answering while it is still held — an ordering, not a duration.
+struct Held(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>);
+
+/// How long a hold waits for its release before letting go by itself. Only a hang guard: an op that
+/// wrongly waits on the held connection runs once it lets go, and [`Held::release`] reports that it
+/// was not released — the assertion is that, never the time an op took.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_mins(1);
+
+impl Held {
+    /// Hold `db`'s thread, returning once the hold is in place.
+    fn hold(db: &Db) -> Self {
+        let db = db.clone();
+        let (held, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            db.read(move |_| {
+                held.send(()).unwrap();
+                Ok(released.recv_timeout(HANG_GUARD).is_ok())
+            })
+            .unwrap()
+        });
+        holding.recv().unwrap();
+        Self(release, thread)
+    }
+
+    /// Let go: whether the hold was still in place, i.e. had not let go by itself because whatever ran
+    /// in the meantime was waiting on it.
+    fn release(self) -> bool {
+        // Fails only when the hold already let go and dropped its end — which the join reports.
+        let _ = self.0.send(());
+        self.1.join().unwrap()
+    }
+}
+
 #[test]
 fn a_long_read_on_the_reader_does_not_hold_up_a_write() {
     // `Db` runs every call on one thread. Measured before `with_reader`: a read holding it made a
@@ -1670,30 +1720,14 @@ fn a_long_read_on_the_reader_does_not_hold_up_a_write() {
         json!({ "op": "mq.topic_create", "topic": "claude/notify" }),
     )
     .unwrap();
-    let reads = b.reads.clone();
-    let (held, holding) = std::sync::mpsc::channel();
-    let long_read = std::thread::spawn(move || {
-        reads
-            .read(move |_| {
-                held.send(()).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                Ok(())
-            })
-            .unwrap();
-    });
-    holding.recv().unwrap();
-    let started = std::time::Instant::now();
+    // The write is issued while the reader is held and must answer before the hold is let go.
+    let read = Held::hold(&b.reads);
     call(
         &b,
         json!({ "op": "notify.event", "session": "s", "event": "needed" }),
     )
     .unwrap();
-    let took = started.elapsed();
-    long_read.join().unwrap();
-    assert!(
-        took < std::time::Duration::from_millis(700),
-        "a write waited {took:?} behind a read"
-    );
+    assert!(read.release(), "a write waited behind a read");
 
     // And the reader cannot write.
     let e = b
@@ -1777,18 +1811,6 @@ fn every_op_is_served_on_the_connection_its_class_names() {
             );
         }
     }
-    let writer = b.db.clone();
-    let (held, holding) = std::sync::mpsc::channel();
-    let blocker = std::thread::spawn(move || {
-        writer
-            .read(move |_| {
-                held.send(()).unwrap();
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                Ok(())
-            })
-            .unwrap();
-    });
-    holding.recv().unwrap();
     for request in samples() {
         assert_eq!(
             request.is_agent_read(),
@@ -1797,43 +1819,22 @@ fn every_op_is_served_on_the_connection_its_class_names() {
             request.op()
         );
     }
+    // With the writer's thread held, every read answers before the hold is let go.
     for request in samples().into_iter().filter(|r| READS.contains(&r.op())) {
         let op = request.op();
-        let at = std::time::Instant::now();
+        let writer = Held::hold(&b.db);
         let _ = b.call(request);
-        assert!(
-            at.elapsed() < std::time::Duration::from_secs(1),
-            "{op} waited {:?} behind the writer",
-            at.elapsed()
-        );
+        assert!(writer.release(), "{op} waited behind the writer");
     }
-    blocker.join().unwrap();
 
     // And the other way: with the reader held — a container's long grep — every op outside the read
-    // set still answers at once. The hook's `notify.open_sessions` sweep has 1 s.
-    let reader = b.reads.clone();
-    let (held, holding) = std::sync::mpsc::channel();
-    let blocker = std::thread::spawn(move || {
-        reader
-            .read(move |_| {
-                held.send(()).unwrap();
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                Ok(())
-            })
-            .unwrap();
-    });
-    holding.recv().unwrap();
+    // set still answers before it is let go. The hook's `notify.open_sessions` sweep has 1 s.
     for request in samples().into_iter().filter(|r| !READS.contains(&r.op())) {
         let op = request.op();
-        let at = std::time::Instant::now();
+        let reader = Held::hold(&b.reads);
         let _ = b.call(request);
-        assert!(
-            at.elapsed() < std::time::Duration::from_secs(1),
-            "{op} waited {:?} behind the reader",
-            at.elapsed()
-        );
+        assert!(reader.release(), "{op} waited behind the reader");
     }
-    blocker.join().unwrap();
 }
 
 #[test]
@@ -2362,12 +2363,17 @@ fn a_namespace_path_too_long_or_too_deep_is_refused_before_any_row_is_written() 
         "x".repeat(jkb_core::ns::MAX_PATH_BYTES + 1),
         vec!["a"; 500_000].join("/"),
     ] {
-        let started = std::time::Instant::now();
+        // Rows written, counted on the writer's own connection: SQLite's total never goes back down,
+        // so it sees a row written and then rolled back with the refusal — the half-million-row
+        // transaction this guards — where a look at the tables afterwards would not. Counted rather
+        // than timed, so a loaded machine cannot fail it.
+        let written = || b.db.read(|c| Ok(c.total_changes())).unwrap();
+        let before = written();
         let e = call(&b, json!({ "op": "task.place", "uid": managed, "ns": ns })).unwrap_err();
         assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         let e = call(&b, json!({ "op": "task.add", "text": "t", "home": ns })).unwrap_err();
         assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+        assert_eq!(written(), before, "a refused path wrote rows");
     }
     let deepest = vec!["a"; jkb_core::ns::MAX_DEPTH].join("/");
     call(
