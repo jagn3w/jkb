@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:namespaces-18dcd5bda1dce798858c69, edit there (version 66.QYCbtJ2e474NAYGhk6zryPEBAf-4_azcsMoFAYnEiZzUubsOgPECip3usezp-w8BiZSAmbL_7g0BjOmAk7GMwAMBjtWo9_nAuw8Bj4GL_ufeiwEBkLGb8_3CnAwBkvjUhJDTqQEBlJHuxo6sjwQBmPv2l67ksAMBqefihKOnuA8Brd-MganIvwkBrtevofrfywcBrr-WoazRlQUBsJKU_8qh2QUBscO73MKTxgwBsqi29p_U9gIBsrC52vi-jQsBu_rpp-CkwgcBvI7Li7GJtQ0BwO6rtf_TyAEBwrir0PbCswMBwuuKl7_iVwHE8cbi9u8bAcTKj82RoOwCAcbC74-ix_wOAcODlOKRp3YByJHZ_p7PnwcBysv7reaPngkBytbB0qD_hwsBzLfbwJPKyQMBy5OFiqqK0gUBzrzgqPeVnwIB0ZGdpavwug4B05X6s6Or8QIB1sLnqtDruQIB2fy-lumW0AQB2uuaj52S3QoB2rWdo-rbng4B3J-tvPXp8wsB2vqrs-fdyQQB4IjM7K75pA4B4JGG0NyujAsB45n9ourfgAEB45vW0ZOT2wcB5Nv7yK64jAcB6tXa-bvpjQsB7dupluG9JgHu8NvqndOwBQHu1K7B3rp8AfLLweHIxcAOAfKNwc6v6OgIAfbvwcWV4a8GAffut-zDw4MNAfjQ35S4ydQPAfni4Oum0MIGAfqnp6v_xI4PAffUusnOktsFAffUufPww7IFAfn1x_PYjfkFAfqsqL_o5tAHAf_ioaCM6_kJAQ, blake3 487f6d6ef03c9b241248d2b768aeeffd83bc2d422750dc8876d0eb3ee5583553) -->
+<!-- generated from jkb design design:namespaces-18dcd5bda1dce798858c69, edit there (version 74.QoCbtJ2e474NAYGhk6zryPEBAf-4_azcsMoFAYnEiZzUubsOgPECip3usezp-w8BiZSAmbL_7g0BjOmAk7GMwAMBjtWo9_nAuw8Bj4GL_ufeiwEBkLGb8_3CnAwBkvjUhJDTqQEBlJHuxo6sjwQBmPv2l67ksAMBqefihKOnuA8Brd-MganIvwkBrtevofrfywcBrr-WoazRlQUBsJKU_8qh2QUBscO73MKTxgwBsqi29p_U9gIBsrC52vi-jQsBu_rpp-CkwgcBvI7Li7GJtQ0BwO6rtf_TyAEBwrir0PbCswMBwuuKl7_iVwHE8cbi9u8bAcTKj82RoOwCAcbC74-ix_wOAcODlOKRp3YByJHZ_p7PnwcBysv7reaPngkBytbB0qD_hwsBzLfbwJPKyQMBy5OFiqqK0gUBzrzgqPeVnwIBzr2G5QgW0ZGdpavwug4B05X6s6Or8QIB1sLnqtDruQIB2fy-lumW0AQB2uuaj52S3QoB2rWdo-rbng4B3J-tvPXp8wsB2vqrs-fdyQQB4IjM7K75pA4B4JGG0NyujAsB45n9ourfgAEB45vW0ZOT2wcB5Nv7yK64jAcB6tXa-bvpjQsB7dupluG9JgHu8NvqndOwBQHu1K7B3rp8AfLLweHIxcAOAfKNwc6v6OgIAfbvwcWV4a8GAffut-zDw4MNAfjQ35S4ydQPAfni4Oum0MIGAfqnp6v_xI4PAffUusnOktsFAffUufPww7IFAfn1x_PYjfkFAfqsqL_o5tAHAf_ioaCM6_kJAQ, blake3 146264ec4c73f2c9a9f60d8e83528edcf4142edaf047168950d7bc19c7a3fdf9) -->
 # Namespaces
 
 jkb is one global database (`~/.jkb/jkb.db`) meant to span every repo and project, to serve
@@ -13,14 +13,13 @@ round-tripped to disk by a serializer. Every decision below keeps the two axes i
 How files map onto namespaces, and what keeps file sync from losing data, is the file-sync
 design; the storage substrate itself is the foundation design.
 
-## The global layout
-
 The layout was set in an audit and design session on 2026-07-24. The audit found the store
 repo-specific at the global top level (see History): a second repo would have collided with
 the first. Only `tasks/`, already partitioned per repo by task homing, was organized for a
 global tool, and nothing put new data in a sensible place automatically. The decisions below
 generalize the one pattern that already scaled.
 
+## The global layout
 ### Repo content lives under `repos/<repo>/…`
 
 A repo's file-synced content (its `openspec/`, its code-review logs, source-derived
