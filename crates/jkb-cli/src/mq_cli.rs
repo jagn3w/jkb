@@ -1016,9 +1016,12 @@ fn message_event(m: &Message) -> Value {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
-    use std::sync::mpsc::channel;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     use jkb_api::{Backend, LocalBackend, Request};
     use jkb_core::Db;
@@ -1069,17 +1072,21 @@ mod tests {
         })
         .unwrap();
         for i in 0..n {
-            b.call(Request::MqSend {
-                topic: "t".to_owned(),
-                key: "k".to_owned(),
-                kind: "k.m".to_owned(),
-                payload: json!(i),
-                ttl_ms: None,
-                producer: "test".to_owned(),
-            })
-            .unwrap();
+            send(&b, json!(i));
         }
         b
+    }
+
+    fn send(b: &LocalBackend, payload: Value) {
+        b.call(Request::MqSend {
+            topic: "t".to_owned(),
+            key: "k".to_owned(),
+            kind: "k.m".to_owned(),
+            payload,
+            ttl_ms: None,
+            producer: "test".to_owned(),
+        })
+        .unwrap();
     }
 
     fn opts(at_most_once: bool) -> SubscribeOpts {
@@ -1094,8 +1101,21 @@ mod tests {
         }
     }
 
+    /// `opts`, with an `eof_ack_wait` no loaded machine outlasts: for a test whose held ack is
+    /// expected to APPLY within the wait, so the wait is a deadline, not what is under test.
+    fn patient(at_most_once: bool) -> SubscribeOpts {
+        SubscribeOpts {
+            eof_ack_wait: Duration::from_secs(30),
+            ..opts(at_most_once)
+        }
+    }
+
+    /// The complete lines written so far: the stream is read while it is still being written, so a
+    /// line not yet ended is not an event yet.
     fn events(out: &[u8]) -> Vec<Value> {
-        String::from_utf8_lossy(out)
+        let text = String::from_utf8_lossy(out);
+        let complete = text.rfind('\n').map_or("", |end| &text[..end]);
+        complete
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
@@ -1109,6 +1129,10 @@ mod tests {
             .collect()
     }
 
+    fn has_event(events: &[Value], kind: &str) -> bool {
+        events.iter().any(|e| e["event"] == kind)
+    }
+
     #[test]
     fn stdin_commands_parse_strictly() {
         assert_eq!(parse_input(r#"{"ack": 7}"#), Input::Ack(7));
@@ -1120,67 +1144,193 @@ mod tests {
         assert!(matches!(parse_input("ack 7"), Input::Bad(_)));
     }
 
+    /// How long a step may wait for what it waits on before the test fails as hung. Generous on
+    /// purpose: every step waits on an event, never on time, so a step that does arrive costs only as
+    /// long as it takes, and the deadline is reached only by a stream that is actually stuck.
+    const STEP_DEADLINE: Duration = Duration::from_mins(1);
+
+    /// What the consumer on the other end of stdin does, in order, while the stream runs.
+    enum Step<'a> {
+        /// Write this command to stdin. Leading `Send`s are queued before the subscription starts,
+        /// so which step of the stream reads them is not a race.
+        Send(Input),
+        /// Wait until this holds of the events emitted so far and of the backend.
+        Until(&'static str, Cond<'a>),
+        /// Wait for this many more polls: the stream has gone on idling, so an assertion that
+        /// something did NOT happen (a redelivery, a second `caught_up`) has had its chance to fail.
+        Polls(usize),
+        /// Do this — as a producer or an operator would, from outside the stream.
+        Do(Box<dyn FnOnce() + Send + 'a>),
+        /// Let this much time pass: only for a test whose assertion is a rate.
+        Sleep(Duration),
+    }
+
+    type Cond<'a> = Box<dyn Fn(&[Value], &Scripted) -> bool + Send + 'a>;
+
+    fn until<'a>(
+        what: &'static str,
+        cond: impl Fn(&[Value], &Scripted) -> bool + Send + 'a,
+    ) -> Step<'a> {
+        Step::Until(what, Box::new(cond))
+    }
+
+    fn act<'a>(f: impl FnOnce() + Send + 'a) -> Step<'a> {
+        Step::Do(Box::new(f))
+    }
+
+    /// The stream's stdout, readable while it is written.
+    struct Tap<'a>(&'a Mutex<Vec<u8>>);
+
+    impl std::io::Write for Tap<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run a subscription over `b`, playing `steps` on its stdin, then closing it; the exit code and
+    /// the events.
+    ///
+    /// Every wait is on something observable — an event, the backend's state, a count of polls — so
+    /// a loaded machine slows the test down rather than failing it. A wait that runs past
+    /// [`STEP_DEADLINE`] still closes stdin, so the stream ends and the test fails naming the step,
+    /// rather than hanging. A stream that ends by itself (a fatal refusal) ends every wait.
+    fn drive(b: &Scripted, o: &SubscribeOpts, mut steps: Vec<Step<'_>>) -> (i32, Vec<Value>) {
+        steps.push(Step::Send(Input::Eof));
+        let (tx, rx) = channel();
+        let mut steps = steps.into_iter().peekable();
+        while let Some(Step::Send(input)) = steps.next_if(|s| matches!(s, Step::Send(_))) {
+            tx.send(input).unwrap();
+        }
+        let out = Mutex::new(Vec::new());
+        let done = AtomicBool::new(false);
+        let (code, stuck) = std::thread::scope(|scope| {
+            let (tx, out, done) = (&tx, &out, &done);
+            let driver = scope.spawn(move || play(b, steps, tx, out, done));
+            let code = subscribe(b, o, &rx, &mut Tap(out)).unwrap();
+            done.store(true, Ordering::SeqCst);
+            (code, driver.join().unwrap())
+        });
+        let ev = events(&out.into_inner().unwrap());
+        if let Some(what) = stuck {
+            // The tail only: a stream that loops can emit millions of events by the deadline.
+            let tail = &ev[ev.len().saturating_sub(20)..];
+            panic!(
+                "timed out waiting for {what}; {} events, the last {}: {tail:?}",
+                ev.len(),
+                tail.len()
+            );
+        }
+        (code, ev)
+    }
+
+    /// Closes stdin when dropped, so the stream ends however the steps do — a step that panics
+    /// included — and the test fails rather than hangs.
+    struct CloseOnDrop<'a>(&'a Sender<Input>);
+
+    impl Drop for CloseOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.send(Input::Eof);
+        }
+    }
+
+    /// The stdin side of [`drive`]: `Some(step)` when a wait ran past its deadline.
+    fn play<'a>(
+        b: &Scripted,
+        steps: impl Iterator<Item = Step<'a>>,
+        tx: &Sender<Input>,
+        out: &Mutex<Vec<u8>>,
+        done: &AtomicBool,
+    ) -> Option<&'static str> {
+        let _close = CloseOnDrop(tx);
+        let wait = |what: &'static str, cond: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + STEP_DEADLINE;
+            while !cond() && !done.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline {
+                    return Some(what);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            None
+        };
+        let mut stuck = None;
+        for step in steps {
+            stuck = match step {
+                Step::Send(input) => {
+                    // Refused only once the stream is over, which the assertions then report.
+                    let _ = tx.send(input);
+                    None
+                }
+                Step::Until(what, cond) => wait(what, &|| {
+                    let ev = events(&out.lock().unwrap());
+                    cond(&ev, b)
+                }),
+                Step::Polls(n) => {
+                    let target = b.polls() + n;
+                    wait("more polls", &|| b.polls() >= target)
+                }
+                Step::Do(f) => {
+                    f();
+                    None
+                }
+                Step::Sleep(d) => {
+                    std::thread::sleep(d);
+                    None
+                }
+            };
+            if stuck.is_some() {
+                break;
+            }
+        }
+        stuck
+    }
+
+    /// The stream delivered message `seq`.
+    fn delivered<'a>(seq: i64) -> Step<'a> {
+        until("a delivery", move |ev, _| seqs(ev).contains(&seq))
+    }
+
     #[test]
     fn each_message_is_emitted_once_per_run_and_unacked_ones_come_back_next_run() {
-        let b = backend_with(5);
+        let b = Scripted::plain(backend_with(5));
         // Run 1: emit everything, ack only through the second message, then EOF.
-        let (tx, rx) = channel();
-        let mut out = Vec::new();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
-            tx.send(Input::Ack(2)).unwrap();
-            std::thread::sleep(Duration::from_millis(30));
-            tx.send(Input::Eof).unwrap();
-        });
-        assert_eq!(subscribe(&b, &opts(false), &rx, &mut out).unwrap(), 0);
-        handle.join().unwrap();
-        let first = seqs(&events(&out));
+        let (exit, ev) = drive(
+            &b,
+            &opts(false),
+            vec![
+                delivered(5),
+                Step::Send(Input::Ack(2)),
+                // Idle polls after the backlog: none of them may hand a message over again.
+                Step::Polls(3),
+            ],
+        );
+        assert_eq!(exit, 0, "{ev:?}");
         assert_eq!(
-            first,
+            seqs(&ev),
             vec![1, 2, 3, 4, 5],
             "emitted once each though polled repeatedly"
         );
 
         // Run 2 resumes after the ack: 3, 4, 5 are delivered again — at-least-once.
-        let (tx, rx) = channel();
-        tx.send(Input::Eof).unwrap();
-        let mut out = Vec::new();
         // EOF is read before the first poll, so this run ends at once...
-        assert_eq!(subscribe(&b, &opts(false), &rx, &mut out).unwrap(), 0);
-        assert!(seqs(&events(&out)).is_empty());
-        // ...and a run that stays open sees the unacked messages.
-        let (tx, rx) = channel();
-        let mut out = Vec::new();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
-            tx.send(Input::Eof).unwrap();
-        });
-        subscribe(&b, &opts(false), &rx, &mut out).unwrap();
-        h.join().unwrap();
-        assert_eq!(seqs(&events(&out)), vec![3, 4, 5]);
+        let (exit, ev) = drive(&b, &opts(false), vec![]);
+        assert_eq!(exit, 0, "{ev:?}");
+        assert!(seqs(&ev).is_empty(), "{ev:?}");
+        // ...and a run that stays open sees the unacked messages, and only those.
+        let (_, ev) = drive(&b, &opts(false), vec![delivered(5), Step::Polls(3)]);
+        assert_eq!(seqs(&ev), vec![3, 4, 5]);
     }
 
     #[test]
     fn at_most_once_commits_before_emitting() {
-        let b = backend_with(3);
-        let (tx, rx) = channel();
-        let mut out = Vec::new();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
-            tx.send(Input::Eof).unwrap();
-        });
-        subscribe(&b, &opts(true), &rx, &mut out).unwrap();
-        h.join().unwrap();
-        assert_eq!(seqs(&events(&out)), vec![1, 2, 3]);
-        let (tx, rx) = channel();
-        let mut out = Vec::new();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
-            tx.send(Input::Eof).unwrap();
-        });
-        subscribe(&b, &opts(true), &rx, &mut out).unwrap();
-        h.join().unwrap();
-        assert!(seqs(&events(&out)).is_empty(), "nothing is redelivered");
+        let b = Scripted::plain(backend_with(3));
+        let (_, ev) = drive(&b, &opts(true), vec![delivered(3), Step::Polls(3)]);
+        assert_eq!(seqs(&ev), vec![1, 2, 3]);
+        let (_, ev) = drive(&b, &opts(true), vec![Step::Polls(3)]);
+        assert!(seqs(&ev).is_empty(), "nothing is redelivered: {ev:?}");
     }
 
     use jkb_api::ErrorCode::{self, Busy, NoSuchGroup, SchemaNewer, Unavailable};
@@ -1212,12 +1362,33 @@ mod tests {
                 ),
             }
         }
-    }
 
-    impl Scripted {
+        /// Serves every call: only counted, so a test can wait on polls.
+        fn plain(inner: LocalBackend) -> Self {
+            Self::new(inner, &[])
+        }
+
         fn remote(mut self) -> Self {
             self.remote = true;
             self
+        }
+
+        fn polls(&self) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .get("mq.poll")
+                .copied()
+                .unwrap_or(0)
+        }
+
+        /// Every scripted answer has been given.
+        fn drained(&self) -> bool {
+            self.script
+                .lock()
+                .unwrap()
+                .values()
+                .all(std::collections::VecDeque::is_empty)
         }
     }
 
@@ -1242,31 +1413,18 @@ mod tests {
         }
     }
 
-    /// Run a subscription over `b` until stdin closes after `ms`, sending `acks` first; its events.
-    fn run_scripted(
-        b: &dyn Backend,
-        o: &SubscribeOpts,
-        acks: &[(u64, i64)],
-        ms: u64,
-    ) -> (i32, Vec<Value>) {
-        let (tx, rx) = channel();
-        // An ack at 0 ms is queued before the subscription starts, so which step reads it is not a race.
-        let (now, later): (Vec<_>, Vec<_>) = acks.iter().partition(|(at, _)| *at == 0);
-        for (_, seq) in now {
-            tx.send(Input::Ack(seq)).unwrap();
-        }
-        let h = std::thread::spawn(move || {
-            for (at, seq) in later {
-                std::thread::sleep(Duration::from_millis(at));
-                tx.send(Input::Ack(seq)).unwrap();
-            }
-            std::thread::sleep(Duration::from_millis(ms));
-            tx.send(Input::Eof).unwrap();
-        });
-        let mut out = Vec::new();
-        let code = subscribe(b, o, &rx, &mut out).unwrap();
-        h.join().unwrap();
-        (code, events(&out))
+    /// Every scripted answer has been given, and message `seq` delivered. The refusals' events are
+    /// emitted by the stream's own thread before it reads stdin again, so closing stdin on this
+    /// cannot cut them off.
+    fn drained_and_delivered<'a>(seq: i64) -> Step<'a> {
+        until("the script and a delivery", move |ev, b| {
+            b.drained() && seqs(ev).contains(&seq)
+        })
+    }
+
+    /// The group's committed position has reached `seq`.
+    fn committed<'a>(seq: i64) -> Step<'a> {
+        until("the ack to commit", move |_, b| position(&b.inner) >= seq)
     }
 
     fn errors(ev: &[Value]) -> Vec<&Value> {
@@ -1293,7 +1451,11 @@ mod tests {
             let script = [Some(code), Some(code), None, Some(code), Some(code)];
             // Remote: only a daemon's `schema_newer` can clear while this process keeps running.
             let b = Scripted::new(backend_with(1), &[("mq.poll", &script)]).remote();
-            let (exit, ev) = run_scripted(&b, &opts(false), &[], 150);
+            let (exit, ev) = drive(
+                &b,
+                &opts(false),
+                vec![drained_and_delivered(1), Step::Polls(3)],
+            );
             assert_eq!(exit, 0, "{code:?}: {ev:?}");
             let errs = errors(&ev);
             assert_eq!(errs.len(), reported, "{code:?}: {ev:?}");
@@ -1309,7 +1471,8 @@ mod tests {
     #[test]
     fn schema_newer_in_process_is_fatal_so_the_supervisor_starts_the_newer_binary() {
         let b = Scripted::new(backend_with(1), &[("mq.poll", &[Some(SchemaNewer)])]);
-        let (exit, ev) = run_scripted(&b, &opts(false), &[], 150);
+        // The stream ends by itself on the first poll; were it to go on, these polls would end it.
+        let (exit, ev) = drive(&b, &opts(false), vec![Step::Polls(3)]);
         assert_eq!(exit, 1, "{ev:?}");
         let last = ev.last().unwrap();
         assert_eq!(
@@ -1322,36 +1485,50 @@ mod tests {
     fn an_outage_begun_by_a_held_ack_ends_only_when_the_ack_succeeds() {
         // Acks refused for a while, polls answered throughout (a read can pass while writes cannot):
         // one outage, one event — not one per poll that happened to succeed in between.
-        let inner = backend_with(1);
         let refused = [Some(Unavailable); 20];
-        let b = Scripted::new(inner.clone(), &[("mq.ack", &refused)]);
-        let (exit, ev) = run_scripted(&b, &opts(false), &[(40, 1)], 250);
+        let b = Scripted::new(backend_with(1), &[("mq.ack", &refused)]);
+        let (exit, ev) = drive(
+            &b,
+            &opts(false),
+            vec![
+                delivered(1),
+                Step::Send(Input::Ack(1)),
+                committed(1),
+                Step::Polls(3),
+            ],
+        );
         assert_eq!(exit, 0, "{ev:?}");
         assert_eq!(errors(&ev).len(), 1, "{ev:?}");
-        assert_eq!(position(&inner), 1, "applied once the outage ended");
+        assert_eq!(position(&b.inner), 1, "applied once the outage ended");
     }
 
     #[test]
     fn stdin_closing_waits_for_a_held_ack_and_says_so_if_it_cannot_be_applied() {
         // Refused twice, then applied: EOF right behind the ack still commits it.
-        let inner = backend_with(1);
         let b = Scripted::new(
-            inner.clone(),
+            backend_with(1),
             &[("mq.ack", &[Some(Unavailable), Some(Unavailable)])],
         );
-        let (exit, ev) = run_scripted(&b, &opts(false), &[(40, 1)], 0);
+        let (exit, ev) = drive(
+            &b,
+            &patient(false),
+            vec![delivered(1), Step::Send(Input::Ack(1))],
+        );
         assert_eq!(exit, 0, "{ev:?}");
         assert_eq!(
-            position(&inner),
+            position(&b.inner),
             1,
             "the ack before EOF was applied: {ev:?}"
         );
 
         // Refused past the wait: a fatal event naming the seq, never a silent exit 0.
-        let inner = backend_with(1);
         let refused = [Some(Unavailable); 1000];
-        let b = Scripted::new(inner.clone(), &[("mq.ack", &refused)]);
-        let (exit, ev) = run_scripted(&b, &opts(false), &[(40, 1)], 0);
+        let b = Scripted::new(backend_with(1), &[("mq.ack", &refused)]);
+        let (exit, ev) = drive(
+            &b,
+            &opts(false),
+            vec![delivered(1), Step::Send(Input::Ack(1))],
+        );
         assert_eq!(exit, 1, "{ev:?}");
         let last = ev.last().unwrap();
         assert_eq!(last["fatal"], true, "{ev:?}");
@@ -1359,7 +1536,7 @@ mod tests {
             last["reason"].as_str().unwrap().contains("through 1"),
             "{last}"
         );
-        assert_eq!(position(&inner), 0);
+        assert_eq!(position(&b.inner), 0);
     }
 
     #[test]
@@ -1378,9 +1555,18 @@ mod tests {
             group: "fresh".to_owned(),
             ..opts(false)
         };
-        let b = Scripted::new(inner.clone(), &[("mq.group_create", &[Some(Unavailable)])]);
-        // At 0 ms: queued before the subscription starts, so it is read while `join` waits.
-        let (exit, ev) = run_scripted(&b, &fresh, &[(0, 1)], 150);
+        let b = Scripted::new(inner, &[("mq.group_create", &[Some(Unavailable)])]);
+        // Queued before the subscription starts, so it is read while `join` waits.
+        let (exit, ev) = drive(
+            &b,
+            &fresh,
+            vec![
+                Step::Send(Input::Ack(1)),
+                until("a delivery or a regroup", |ev, _| {
+                    seqs(ev).contains(&2) || errors(ev).iter().any(|e| e["code"] == "no_such_group")
+                }),
+            ],
+        );
         assert_eq!(exit, 0, "{ev:?}");
         assert!(
             errors(&ev).iter().all(|e| e["code"] != "no_such_group"),
@@ -1398,7 +1584,11 @@ mod tests {
         // taken for a refusal about that one ack. Likewise a code nobody planned for.
         for code in [SchemaNewer, ErrorCode::Internal] {
             let b = Scripted::new(backend_with(1), &[("mq.ack", &[Some(code)])]);
-            let (exit, ev) = run_scripted(&b, &opts(false), &[(40, 1)], 150);
+            let (exit, ev) = drive(
+                &b,
+                &opts(false),
+                vec![delivered(1), Step::Send(Input::Ack(1)), Step::Polls(3)],
+            );
             assert_eq!(exit, 1, "{code:?}: {ev:?}");
             assert_eq!(ev.last().unwrap()["fatal"], true, "{code:?}: {ev:?}");
         }
@@ -1406,24 +1596,31 @@ mod tests {
 
     #[test]
     fn stdin_closing_during_a_startup_outage_still_applies_the_held_ack() {
-        let inner = backend_with(1);
         let b = Scripted::new(
-            inner.clone(),
+            backend_with(1),
             &[(
                 "mq.group_create",
                 &[Some(Unavailable), Some(Unavailable), Some(Unavailable)],
             )],
         );
-        let (exit, ev) = run_scripted(&b, &opts(false), &[(0, 1)], 0);
+        let (exit, ev) = drive(&b, &patient(false), vec![Step::Send(Input::Ack(1))]);
         assert_eq!(exit, 0, "{ev:?}");
-        assert_eq!(position(&inner), 1, "created, then the ack applied: {ev:?}");
+        assert_eq!(
+            position(&b.inner),
+            1,
+            "created, then the ack applied: {ev:?}"
+        );
     }
 
     #[test]
     fn giving_up_on_a_held_ack_names_the_refusal_that_held_it() {
         let refused = [Some(Busy); 1000];
         let b = Scripted::new(backend_with(1), &[("mq.ack", &refused)]);
-        let (exit, ev) = run_scripted(&b, &opts(false), &[(40, 1)], 0);
+        let (exit, ev) = drive(
+            &b,
+            &opts(false),
+            vec![delivered(1), Step::Send(Input::Ack(1))],
+        );
         assert_eq!(exit, 1, "{ev:?}");
         assert_eq!(ev.last().unwrap()["code"], "busy", "{ev:?}");
     }
@@ -1439,7 +1636,11 @@ mod tests {
                 ("mq.group_create", &[None, Some(Unavailable)]),
             ],
         );
-        let (exit, ev) = run_scripted(&b, &opts(false), &[], 150);
+        let (exit, ev) = drive(
+            &b,
+            &opts(false),
+            vec![until("the script", |_, b| b.drained()), Step::Polls(3)],
+        );
         assert_eq!(exit, 0, "{ev:?}");
         let errs = errors(&ev);
         assert_eq!(errs.len(), 2, "one per outage: {ev:?}");
@@ -1461,9 +1662,14 @@ mod tests {
                 ),
             ],
         );
-        let (exit, ev) = run_scripted(&b, &opts(false), &[], 100);
+        // A rate, so measured over time: load only slows the stream, which cannot fail a ceiling.
+        let (exit, ev) = drive(
+            &b,
+            &opts(false),
+            vec![Step::Sleep(Duration::from_millis(100))],
+        );
         assert_eq!(exit, 0, "{ev:?}");
-        let polls = b.calls.lock().unwrap()["mq.poll"];
+        let polls = b.polls();
         // At a 5 ms interval, 100 ms is ~20 polls; straight back to the poll it was thousands.
         assert!(polls < 100, "{polls} polls in 100 ms");
     }
@@ -1483,8 +1689,8 @@ mod tests {
             eof_ack_wait: Duration::from_millis(400),
             ..opts(false)
         };
-        let started = std::time::Instant::now();
-        let (exit, ev) = run_scripted(&b, &o, &[(0, 1)], 0);
+        let started = Instant::now();
+        let (exit, ev) = drive(&b, &o, vec![Step::Send(Input::Ack(1))]);
         let took = started.elapsed();
         assert_eq!(exit, 1, "{ev:?}");
         // The group comes up late in the wait and the ack never applies: given up at ~400 ms, not
@@ -1498,7 +1704,11 @@ mod tests {
             backend_with(1),
             &[("mq.group_create", &[Some(Unavailable), Some(Unavailable)])],
         );
-        let (exit, ev) = run_scripted(&b, &opts(false), &[], 150);
+        let (exit, ev) = drive(
+            &b,
+            &opts(false),
+            vec![drained_and_delivered(1), Step::Polls(3)],
+        );
         assert_eq!(exit, 0, "{ev:?}");
         assert_eq!(errors(&ev).len(), 1, "{ev:?}");
         assert_eq!(seqs(&ev), vec![1]);
@@ -1506,26 +1716,37 @@ mod tests {
 
     #[test]
     fn an_ack_made_during_an_outage_is_held_and_applied_after_it() {
-        let inner = backend_with(1);
-        let b = Scripted::new(inner.clone(), &[("mq.ack", &[Some(Unavailable)])]);
-        let (exit, ev) = run_scripted(&b, &opts(false), &[(40, 1)], 120);
+        let b = Scripted::new(backend_with(1), &[("mq.ack", &[Some(Unavailable)])]);
+        let (exit, ev) = drive(
+            &b,
+            &opts(false),
+            vec![
+                delivered(1),
+                Step::Send(Input::Ack(1)),
+                // The ack applies while the stream runs — not by stdin closing, a separate path.
+                committed(1),
+            ],
+        );
         assert_eq!(exit, 0, "{ev:?}");
         assert!(errors(&ev).iter().all(|e| e["fatal"] == false), "{ev:?}");
-        assert_eq!(position(&inner), 1, "the held ack was applied: {ev:?}");
+        assert_eq!(position(&b.inner), 1, "the held ack was applied: {ev:?}");
     }
 
     #[test]
     fn at_most_once_does_not_emit_a_message_it_could_not_ack_yet() {
-        let inner = backend_with(1);
-        let b = Scripted::new(inner.clone(), &[("mq.ack", &[Some(Unavailable)])]);
-        let (exit, ev) = run_scripted(&b, &opts(true), &[], 120);
+        let b = Scripted::new(backend_with(1), &[("mq.ack", &[Some(Unavailable)])]);
+        let (exit, ev) = drive(
+            &b,
+            &opts(true),
+            vec![drained_and_delivered(1), Step::Polls(3)],
+        );
         assert_eq!(exit, 0, "{ev:?}");
         assert_eq!(
             seqs(&ev),
             vec![1],
             "emitted once, after its ack went through"
         );
-        assert_eq!(position(&inner), 1);
+        assert_eq!(position(&b.inner), 1);
     }
 
     #[test]
@@ -1537,7 +1758,11 @@ mod tests {
                 ("mq.group_create", &[None, Some(Unavailable)]),
             ],
         );
-        let (exit, ev) = run_scripted(&b, &opts(false), &[], 150);
+        let (exit, ev) = drive(
+            &b,
+            &opts(false),
+            vec![drained_and_delivered(1), Step::Polls(3)],
+        );
         assert_eq!(exit, 0, "{ev:?}");
         assert!(errors(&ev).iter().all(|e| e["fatal"] == false), "{ev:?}");
         assert_eq!(seqs(&ev), vec![1]);
@@ -1545,42 +1770,31 @@ mod tests {
 
     #[test]
     fn a_bad_command_and_a_bad_ack_are_reported_without_ending_the_stream() {
-        let b = backend_with(1);
-        let (tx, rx) = channel();
-        tx.send(Input::Bad("hello".to_owned())).unwrap();
-        tx.send(Input::Ack(999)).unwrap();
-        let mut out = Vec::new();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
-            tx.send(Input::Eof).unwrap();
-        });
-        assert_eq!(subscribe(&b, &opts(false), &rx, &mut out).unwrap(), 0);
-        h.join().unwrap();
-        let ev = events(&out);
-        let errors: Vec<&Value> = ev.iter().filter(|e| e["event"] == "error").collect();
-        assert_eq!(errors.len(), 2);
+        let b = Scripted::plain(backend_with(1));
+        let (exit, ev) = drive(
+            &b,
+            &opts(false),
+            vec![
+                Step::Send(Input::Bad("hello".to_owned())),
+                Step::Send(Input::Ack(999)),
+                delivered(1),
+                Step::Polls(3),
+            ],
+        );
+        assert_eq!(exit, 0, "{ev:?}");
+        let errors = errors(&ev);
+        assert_eq!(errors.len(), 2, "{ev:?}");
         assert_eq!(errors[0]["code"], "bad_request");
         assert_eq!(errors[1]["code"], "ack_beyond_end");
         assert!(errors.iter().all(|e| e["fatal"] == false));
         assert_eq!(seqs(&ev), vec![1]);
     }
 
-    fn run_for(b: &LocalBackend, o: &SubscribeOpts, ms: u64) -> Vec<Value> {
-        let (tx, rx) = channel();
-        let mut out = Vec::new();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(ms));
-            let _ = tx.send(Input::Eof);
-        });
-        subscribe(b, o, &rx, &mut out).unwrap();
-        h.join().unwrap();
-        events(&out)
-    }
-
     #[test]
     fn caught_up_marks_the_end_of_a_backlog_and_of_each_burst() {
-        let b = backend_with(5);
-        let ev = run_for(&b, &opts(false), 60);
+        let caught_up = || until("caught_up", |ev, _| has_event(ev, "caught_up"));
+        let b = Scripted::plain(backend_with(5));
+        let (_, ev) = drive(&b, &opts(false), vec![caught_up(), Step::Polls(3)]);
         let kinds: Vec<&str> = ev.iter().map(|e| e["event"].as_str().unwrap()).collect();
         // batch 2: [1,2] [3,4] [5]+caught_up, then idle polls announce nothing more.
         assert_eq!(
@@ -1596,9 +1810,9 @@ mod tests {
         );
         assert_eq!(ev[5]["seq"], 5);
         // An empty topic announces caught_up once, straight away.
-        let b = backend_with(0);
-        let ev = run_for(&b, &opts(false), 40);
-        assert_eq!(ev.len(), 1);
+        let b = Scripted::plain(backend_with(0));
+        let (_, ev) = drive(&b, &opts(false), vec![caught_up(), Step::Polls(3)]);
+        assert_eq!(ev.len(), 1, "{ev:?}");
         assert_eq!(
             (ev[0]["event"].clone(), ev[0]["seq"].clone()),
             (json!("caught_up"), json!(0))
@@ -1608,45 +1822,41 @@ mod tests {
     #[test]
     fn an_unreadable_message_is_reported_once_with_its_seq_and_an_ack_moves_past_it() {
         let db = Db::open_in_memory().unwrap();
-        let b = LocalBackend::new(db.clone());
-        b.call(Request::MqTopicCreate {
-            topic: "t".to_owned(),
-            spec: jkb_api::SpecInput::default(),
-        })
-        .unwrap();
-        b.call(Request::MqGroupCreate {
-            topic: "t".to_owned(),
-            group: "g".to_owned(),
-            from_start: true,
-        })
-        .unwrap();
-        for i in 0..2 {
-            b.call(Request::MqSend {
+        let inner = LocalBackend::new(db.clone());
+        inner
+            .call(Request::MqTopicCreate {
                 topic: "t".to_owned(),
-                key: "k".to_owned(),
-                kind: "k.m".to_owned(),
-                payload: json!(i),
-                ttl_ms: None,
-                producer: "test".to_owned(),
+                spec: jkb_api::SpecInput::default(),
             })
             .unwrap();
+        inner
+            .call(Request::MqGroupCreate {
+                topic: "t".to_owned(),
+                group: "g".to_owned(),
+                from_start: true,
+            })
+            .unwrap();
+        for i in 0..2 {
+            send(&inner, json!(i));
         }
         db.write_txn("t", |c, _| {
             c.execute("UPDATE mq_messages SET payload = 'x' WHERE seq = 1", [])?;
             Ok(())
         })
         .unwrap();
-        let (tx, rx) = channel();
-        let mut out = Vec::new();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            tx.send(Input::Ack(1)).unwrap();
-            std::thread::sleep(Duration::from_millis(50));
-            tx.send(Input::Eof).unwrap();
-        });
-        subscribe(&b, &opts(false), &rx, &mut out).unwrap();
-        h.join().unwrap();
-        let ev = events(&out);
+        let b = Scripted::plain(inner);
+        let (_, ev) = drive(
+            &b,
+            &opts(false),
+            vec![
+                until("the unreadable event", |ev, _| has_event(ev, "unreadable")),
+                // Polls that meet the unreadable message again: it is still reported only once.
+                Step::Polls(3),
+                Step::Send(Input::Ack(1)),
+                delivered(2),
+                Step::Polls(3),
+            ],
+        );
         let unreadable: Vec<&Value> = ev.iter().filter(|e| e["event"] == "unreadable").collect();
         assert_eq!(unreadable.len(), 1, "reported once, not every poll: {ev:?}");
         assert_eq!(unreadable[0]["seq"], 1);
@@ -1656,39 +1866,36 @@ mod tests {
     #[test]
     fn a_group_removed_mid_stream_is_recreated_with_a_non_fatal_event() {
         let db = Db::open_in_memory().unwrap();
-        let b = LocalBackend::new(db.clone());
-        b.call(Request::MqTopicCreate {
-            topic: "t".to_owned(),
-            spec: jkb_api::SpecInput::default(),
-        })
-        .unwrap();
-        let (tx, rx) = channel();
-        let mut out = Vec::new();
-        let db2 = db.clone();
-        let b2 = b.clone();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
-            db2.write_txn("t", |c, _| {
-                c.execute("DELETE FROM mq_groups", [])?;
-                Ok(())
-            })
-            .unwrap();
-            std::thread::sleep(Duration::from_millis(40));
-            b2.call(Request::MqSend {
+        let inner = LocalBackend::new(db.clone());
+        inner
+            .call(Request::MqTopicCreate {
                 topic: "t".to_owned(),
-                key: "k".to_owned(),
-                kind: "k.m".to_owned(),
-                payload: json!("after"),
-                ttl_ms: None,
-                producer: "test".to_owned(),
+                spec: jkb_api::SpecInput::default(),
             })
             .unwrap();
-            std::thread::sleep(Duration::from_millis(40));
-            tx.send(Input::Eof).unwrap();
-        });
-        assert_eq!(subscribe(&b, &opts(false), &rx, &mut out).unwrap(), 0);
-        h.join().unwrap();
-        let ev = events(&out);
+        let producer = inner.clone();
+        let b = Scripted::plain(inner);
+        let (exit, ev) = drive(
+            &b,
+            &opts(false),
+            vec![
+                // The group exists and has been polled: removing it now is removing it mid-stream.
+                until("caught_up", |ev, _| has_event(ev, "caught_up")),
+                act(move || {
+                    db.write_txn("t", |c, _| {
+                        c.execute("DELETE FROM mq_groups", [])?;
+                        Ok(())
+                    })
+                    .unwrap();
+                }),
+                until("the regroup", |ev, _| has_event(ev, "error")),
+                // Sent after the group is recreated from now, so it is the stream's to deliver.
+                act(move || send(&producer, json!("after"))),
+                until("a delivery", |ev, _| has_event(ev, "message")),
+                Step::Polls(3),
+            ],
+        );
+        assert_eq!(exit, 0, "{ev:?}");
         let err = ev
             .iter()
             .find(|e| e["event"] == "error")
