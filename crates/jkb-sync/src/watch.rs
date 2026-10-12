@@ -284,11 +284,10 @@ enum Work {
 /// records as [`RetryDebt`] and settles with a full pass once the backoff allows.
 ///
 /// The watcher's unit of failure is a pass, not the thread. Making the per-file reconcile
-/// non-fatal was not enough: `outcome_reason`, `settle_out_of_scope` and the trailing
-/// `ensure_all_mirrors` transaction still propagate out of `sync`/`sync_paths`, and a single
-/// `Err` here used to exit this mount's thread for good — `watch_all` does not set `stop`, so the
-/// process stayed alive joining the others, launchd never restarted it, and that mount silently
-/// stopped syncing.
+/// non-fatal was not enough: `outcome_reason` and `settle_out_of_scope` still propagate out of
+/// `sync`/`sync_paths`, and a single `Err` here used to exit this mount's thread for good —
+/// `watch_all` does not set `stop`, so the process stayed alive joining the others, launchd never
+/// restarted it, and that mount silently stopped syncing.
 fn run_pass<F>(mount_ns: &str, pass: F) -> bool
 where
     F: FnOnce() -> crate::Result<engine::SyncReport>,
@@ -309,11 +308,11 @@ where
             !report.failed().is_empty()
         }
         Err(e) => {
-            // A pass can fail AFTER per-file transactions have committed — the trailing
-            // `ensure_all_mirrors` is its own transaction — so the batch's remaining paths and
-            // the mirror derivation are lost while the files read as settled. Returning `true`
-            // owes a full re-scan, run once the retry backoff has elapsed, so the work is picked up
-            // rather than waiting for someone to touch those files again.
+            // A pass can fail AFTER per-file transactions have committed — `outcome_reason` reads
+            // the journal after each file's — so the batch's remaining paths are lost while the
+            // files before them read as settled. Returning `true` owes a full re-scan, run once
+            // the retry backoff has elapsed, so the work is picked up rather than waiting for
+            // someone to touch those files again.
             eprintln!(
                 "sync {mount_ns}: pass failed ({e}); re-scanning the mount after the retry backoff"
             );

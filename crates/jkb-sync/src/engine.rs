@@ -529,6 +529,13 @@ fn judge_kb_side(conn: &Connection, ctx: &Ctx, path: &Path) -> KbSide {
 }
 
 /// Reconcile each path in its own audited transaction, collecting the outcomes.
+///
+/// **Never discards a result.** Every per-file transaction, the `tasks/**` mirror derivation
+/// included, is a result in the report; nothing runs after them that could turn the report into an
+/// `Err`. The mirror derivation used to be one trailing transaction after every file had committed,
+/// propagated with `?`: its failure threw away every file's outcome — refusals, conflicts,
+/// `disk_wins` resolutions the caller exists to report — and left the imported tasks unmirrored
+/// while their files read as settled, so the retry found nothing to do and never derived them.
 fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> {
     let mut results = Vec::with_capacity(paths.len());
     for path in paths {
@@ -552,67 +559,62 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
             Ok(bytes) => bytes,
             Err(e) => {
                 let reason = format!("could not archive the current bytes before syncing: {e}");
-                let (p2, msg, ser) = (path.clone(), reason.clone(), ctx.serializer.clone());
-                let _ =
-                    db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
-                        let uri = file_uri(&p2);
-                        let prev = sync_state::get(conn, &uri)?;
-                        flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
-                    });
-                results.push(FileResult {
-                    path,
-                    outcome: Outcome::Failed,
-                    reason: Some(reason),
-                });
+                results.push(failed_file(db, ctx, path, reason));
                 continue;
             }
         };
-        let ser_name = ctx.serializer.clone();
-        let ctx = ctx.clone();
+        let txn_ctx = ctx.clone();
         let p = path.clone();
         // A per-file failure is a RESULT, not a run-ending error. `reconcile_all` used to
         // propagate with `?`, so a single unreadable file — a PNG dropped into a `document`
         // mount, whose serializer does not quarantine — returned `Err` out of the watcher
         // thread. `watch_all` then blocked joining the other threads until stop, launchd never
         // restarted the still-alive process, and that mount silently stopped syncing forever.
-        let outcome = db
-            .write_txn_with::<Outcome, Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
-                reconcile(conn, meta, &ctx, &p, archived)
+        let outcome =
+            db.write_txn_with::<Outcome, Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
+                let outcome = reconcile(conn, meta, &txn_ctx, &p, archived)?;
+                // Tasks this file just brought in from `repos/<repo>/…/tasks.md` get their
+                // `tasks/…` mirror IN THE SAME TRANSACTION, so `tasks/**` stays the complete task
+                // index. Atomic with the import, a failure rolls the import back and journals the
+                // file as failed, and the retry re-imports it and derives the mirrors again. Only
+                // when items came in: a no-op reconcile must not write, or the watcher would
+                // re-fire on its own commit and spin (the file-watch feedback loop).
+                if brought_items_in(outcome) {
+                    task::ensure_all_mirrors(conn, meta)?;
+                }
+                Ok(outcome)
             });
-        let (outcome, reason) = match outcome {
-            Ok(o) => (o, outcome_reason(db, &path)?),
-            Err(e) => {
-                // Flag the journal in its OWN transaction: the reconcile's rolled back, so
-                // without this the row keeps `status='ok'` and the failure is invisible to
-                // `jkb doctor` — leaving one stderr line under the watcher as its only trace.
-                let (p2, msg) = (path.clone(), e.to_string());
-                let ser = ser_name.clone();
-                let _ =
-                    db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
-                        let uri = file_uri(&p2);
-                        let prev = sync_state::get(conn, &uri)?;
-                        flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
-                    });
-                (Outcome::Failed, Some(e.to_string()))
-            }
-        };
-        results.push(FileResult {
-            path,
-            outcome,
-            reason,
-        });
-    }
-    // Any tasks just imported from `repos/<repo>/…/tasks.md` get a `tasks/…` mirror so
-    // `tasks/**` stays the complete task index. Only run when a file actually changed —
-    // a pure-no-op reconcile must not open a write txn, or the watcher would re-fire on
-    // its own commit and spin (the file-watch feedback loop).
-    let imported = results.iter().any(|r| brought_items_in(r.outcome));
-    if imported {
-        db.write_txn_with::<usize, Error, _>(sync_state::SYNC_ACTOR, |conn, meta| {
-            Ok(task::ensure_all_mirrors(conn, meta)?)
-        })?;
+        match outcome {
+            Ok(outcome) => results.push(FileResult {
+                reason: outcome_reason(db, &path)?,
+                path,
+                outcome,
+            }),
+            Err(e) => results.push(failed_file(db, ctx, path, e.to_string())),
+        }
     }
     Ok(SyncReport { results })
+}
+
+/// A file that failed before or during its reconcile: flag its journal `needs_attention` with
+/// `reason` in a transaction of its OWN, and report it [`Outcome::Failed`].
+///
+/// Its own transaction because the failure may have rolled the reconcile's back: without it the
+/// row keeps `status='ok'` and the failure is invisible to `jkb doctor`, one stderr line under the
+/// watcher its only trace. The flag is best-effort — the database that just failed the file may
+/// fail this too — and the result is reported whether or not it lands.
+fn failed_file(db: &Db, ctx: &Ctx, path: PathBuf, reason: String) -> FileResult {
+    let (p, msg, ser) = (path.clone(), reason.clone(), ctx.serializer.clone());
+    let _ = db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
+        let uri = file_uri(&p);
+        let prev = sync_state::get(conn, &uri)?;
+        flag(conn, meta, &uri, &ser, prev.as_ref(), Flag::Blocked(&msg))
+    });
+    FileResult {
+        path,
+        outcome: Outcome::Failed,
+        reason: Some(reason),
+    }
 }
 
 /// Store the file's current bytes in the blob archive, in their own transaction.
@@ -1225,7 +1227,14 @@ fn reconcile(
             if ctx.imports() {
                 return finish_import(conn, meta, &f, disk_doc, Outcome::Imported);
             }
-            flag_refused(conn, meta, &bare_uri, &ser_name, &reason, journal.as_ref())?;
+            flag(
+                conn,
+                meta,
+                &bare_uri,
+                &ser_name,
+                journal.as_ref(),
+                Flag::Blocked(&reason),
+            )?;
             return Ok(Outcome::Refused);
         }
     }
@@ -1491,7 +1500,14 @@ fn finish_export(
     // — `export_or_skip` and `three_way_resolve`'s `kb_wins` — and a guard at the `(false, true)`
     // arm would let both past (design D45.5).
     if let Some(reason) = export_blocker(conn, f, expected)? {
-        flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
+        flag(
+            conn,
+            meta,
+            bare_uri,
+            ser_name,
+            journal,
+            Flag::Blocked(&reason),
+        )?;
         return Ok(Outcome::Refused);
     }
 
@@ -1774,43 +1790,53 @@ fn populate_document(
     }))
 }
 
-/// Journal a refusal: nothing was written, and `jkb doctor` must be able to say why.
-fn flag_refused(
-    conn: &Connection,
-    meta: &WriteMeta,
-    bare_uri: &str,
-    ser_name: &str,
-    reason: &str,
-    journal: Option<&sync_state::SyncState>,
-) -> Result<()> {
-    flag_needs_attention(conn, meta, bare_uri, ser_name, reason, journal)
+/// Why [`flag`] marks a file, and so what it writes to the journal's two flag columns.
+#[derive(Clone, Copy)]
+enum Flag<'a> {
+    /// A refusal or a failure: nothing was written, and `jkb doctor` must be able to say why.
+    /// `needs_attention` with the reason; a stash an earlier quarantine left is kept.
+    Blocked(&'a str),
+    /// The bytes did not parse: the reason, and the hash of the stashed bytes.
+    ParseFailed { error: &'a str, stash: &'a str },
+    /// A `manual` conflict: neither side overwritten. No reason, and no stash.
+    Conflicted,
 }
 
-/// Mark a file `needs_attention` with `reason`, carrying every other journal field forward.
+/// Flag a file's journal, carrying the last-good fields forward.
 ///
-/// The ONE spelling of this write. It restates the full [`sync_state::SyncStateWrite`] field
-/// list, and that list has already been got wrong once — an earlier version of the undo snapshot
-/// dropped `parse_error` and `quarantine_blob_hash` — so a second hand-written copy is a second
-/// chance to drop a field.
-fn flag_needs_attention(
+/// The ONE spelling of this write. A flag learns nothing about the file — not its synced hash,
+/// not its base, not its structure — so those come forward from `journal` unchanged, and only
+/// the status and the two flag columns depend on [`Flag`]. The full
+/// [`sync_state::SyncStateWrite`] field list has already been got wrong once — an earlier version
+/// of the undo snapshot dropped `parse_error` and `quarantine_blob_hash` — and refusal,
+/// quarantine and conflict each used to hand-write it, three chances to drop a field.
+fn flag(
     conn: &Connection,
     meta: &WriteMeta,
     bare_uri: &str,
     ser_name: &str,
-    reason: &str,
     journal: Option<&sync_state::SyncState>,
+    why: Flag<'_>,
 ) -> Result<()> {
+    let carried_stash = journal.and_then(|j| j.quarantine_blob_hash.as_deref());
+    let (event, parse_error, quarantine_blob_hash) = match why {
+        Flag::Blocked(reason) => (FileEvent::WriteBlocked, Some(reason), carried_stash),
+        Flag::ParseFailed { error, stash } => (FileEvent::ParseFailed, Some(error), Some(stash)),
+        Flag::Conflicted => (FileEvent::Conflicted, None, None),
+    };
     sync_state::upsert(
         conn,
         meta,
         &sync_state::SyncStateWrite {
             uri: bare_uri,
             serializer: ser_name,
-            status: journal_status(conn, bare_uri, FileEvent::WriteBlocked)?,
+            status: journal_status(conn, bare_uri, event)?,
             last_synced_hash: journal.and_then(|j| j.last_synced_hash.as_deref()),
             base_blob_hash: journal.and_then(|j| j.base_blob_hash.as_deref()),
-            parse_error: Some(reason),
-            quarantine_blob_hash: journal.and_then(|j| j.quarantine_blob_hash.as_deref()),
+            parse_error,
+            quarantine_blob_hash,
+            // A flag keeps the last-good structure exactly as it keeps the last-good hashes:
+            // nothing was learned about the file's shape.
             document: journal.and_then(|j| j.document.as_deref()),
         },
     )?;
@@ -1855,7 +1881,14 @@ fn three_way_resolve(
             // what routes a refused file into this arm. Following the tool's instructions
             // deleted the line the refusal had just protected.
             if let Some(reason) = export_blocker(conn, f, Some(disk_doc))? {
-                flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
+                flag(
+                    conn,
+                    meta,
+                    bare_uri,
+                    ser_name,
+                    journal,
+                    Flag::Blocked(&reason),
+                )?;
                 return Ok(Outcome::Refused);
             }
             let resolved = apply_doc(conn, meta, ctx, path, bare_uri, &merged)?;
@@ -1887,24 +1920,7 @@ fn three_way_resolve(
             ),
             _ => {
                 // manual: overwrite neither side; flag the file so `doctor` can surface it.
-                let base = journal.and_then(|j| j.base_blob_hash.clone());
-                let last = journal.and_then(|j| j.last_synced_hash.clone());
-                sync_state::upsert(
-                    conn,
-                    meta,
-                    &sync_state::SyncStateWrite {
-                        uri: bare_uri,
-                        serializer: ser_name,
-                        status: journal_status(conn, bare_uri, FileEvent::Conflicted)?,
-                        last_synced_hash: last.as_deref(),
-                        base_blob_hash: base.as_deref(),
-                        parse_error: None,
-                        quarantine_blob_hash: None,
-                        // manual overwrites neither side, so neither side's structure is
-                        // adopted; the journal keeps what it had.
-                        document: journal.and_then(|j| j.document.as_deref()),
-                    },
-                )?;
+                flag(conn, meta, bare_uri, ser_name, journal, Flag::Conflicted)?;
                 Ok(Outcome::Conflict)
             }
         },
@@ -1924,22 +1940,16 @@ fn quarantine(
 ) -> Result<Outcome> {
     let qhash = blob::hash_bytes(bytes);
     blob::store(conn, &qhash, bytes, None)?;
-    let base = journal.and_then(|j| j.base_blob_hash.clone());
-    let last = journal.and_then(|j| j.last_synced_hash.clone());
-    sync_state::upsert(
+    let error = err.to_string();
+    flag(
         conn,
         meta,
-        &sync_state::SyncStateWrite {
-            uri: bare_uri,
-            serializer: ser_name,
-            status: journal_status(conn, bare_uri, FileEvent::ParseFailed)?,
-            last_synced_hash: last.as_deref(),
-            base_blob_hash: base.as_deref(),
-            parse_error: Some(&err.to_string()),
-            quarantine_blob_hash: Some(&qhash),
-            // A quarantine keeps the last-good structure exactly as it keeps the last-good
-            // hashes: the file failed to parse, so nothing was learned about its shape.
-            document: journal.and_then(|j| j.document.as_deref()),
+        bare_uri,
+        ser_name,
+        journal,
+        Flag::ParseFailed {
+            error: &error,
+            stash: &qhash,
         },
     )?;
     Ok(Outcome::Quarantined)

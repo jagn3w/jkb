@@ -2113,13 +2113,11 @@ fn undoing_a_sync_then_re_syncing_does_not_strip_the_file() {
     assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Created), 1);
     assert_eq!(task_count(&db), 3, "setup: the tasks should have imported");
 
-    // Undo the sync the way a user reaching for `jkb undo` would: the trailing mirror
-    // transaction, then the reconcile itself. Not more — a third would start unwinding the mount
-    // and the test would be measuring something else.
-    for _ in 0..2 {
-        db.write_txn("cli", jkb_core::undo::undo_last)
-            .expect("undo should succeed");
-    }
+    // Undo the sync the way a user reaching for `jkb undo` would: once, which takes the
+    // reconcile and the `tasks/**` mirrors it derived in the same transaction. Not more — a second
+    // would start unwinding the mount and the test would be measuring something else.
+    db.write_txn("cli", jkb_core::undo::undo_last)
+        .expect("undo should succeed");
 
     // Whatever the undo did to the KB, the next reconcile must not damage the file.
     let report = sync(&db, "docs/plan").unwrap();
@@ -2238,12 +2236,10 @@ fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, S
         .unwrap();
     }
     if matches!(stage, Stage::PostUndo) {
-        // The trailing mirror transaction, then the reconcile itself — exactly what a user
-        // reaching for `jkb undo` after a sync unwinds.
-        for _ in 0..2 {
-            db.write_txn("cli", jkb_core::undo::undo_last)
-                .expect("undo should succeed");
-        }
+        // The reconcile, with the mirrors it derived in the same transaction — exactly what a
+        // user reaching for `jkb undo` after a sync unwinds.
+        db.write_txn("cli", jkb_core::undo::undo_last)
+            .expect("undo should succeed");
         assert_eq!(
             task_count(&db),
             0,
@@ -3373,4 +3369,120 @@ fn a_disk_reindent_that_swaps_parent_and_child_is_applied() {
             "round {round}: the old edge is gone"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The `tasks/**` mirror derivation.
+// ---------------------------------------------------------------------------------------------
+
+/// Make every `tasks/…` mirror placement fail, as a contended or broken database would, until
+/// [`allow_mirrors`] lifts it. A trigger rather than a contrived namespace: the failure has to be
+/// transient, or there is no retry to observe.
+fn refuse_mirrors(db: &Db) {
+    db.write_txn("t", |conn, _meta| {
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_mirrors BEFORE INSERT ON placements
+             WHEN (SELECT path FROM namespaces WHERE id = NEW.namespace_id) LIKE 'tasks/%'
+             BEGIN SELECT RAISE(ABORT, 'mirror placement refused by the test'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn allow_mirrors(db: &Db) {
+    db.write_txn("t", |conn, _meta| {
+        conn.execute_batch("DROP TRIGGER refuse_mirrors")?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Tasks that have a `tasks/…` placement, of those the KB holds.
+fn mirrored_task_count(db: &Db) -> i64 {
+    db.read(|conn| {
+        Ok(conn.query_row(
+            "SELECT count(DISTINCT p.item_id) FROM placements p
+             JOIN items i ON i.id = p.item_id
+             JOIN namespaces n ON n.id = p.namespace_id
+             WHERE i.kind = 'task' AND n.path LIKE 'tasks/%'",
+            [],
+            |r| r.get(0),
+        )?)
+    })
+    .unwrap()
+}
+
+/// A failed mirror derivation is one file's result, not the pass's.
+///
+/// It used to be a trailing transaction after every file had committed, propagated with `?`, so
+/// its failure threw away the whole report — every other file's refusal, conflict and policy
+/// resolution — which is what the watcher and `jkb sync` exist to say.
+#[test]
+fn a_failed_mirror_derivation_is_a_file_result_not_a_lost_report() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, TASKS_MD).unwrap();
+    let readme = dir.path().join("notes.md");
+    fs::write(&readme, "## Notes\n\n- [ ] Write the notes ^notes\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    refuse_mirrors(&db);
+
+    let report = match sync(&db, "docs/plan") {
+        Ok(report) => report,
+        Err(e) => panic!("a failed mirror derivation discarded the whole report: {e}"),
+    };
+    let failed: Vec<_> = report.failed().into_iter().map(|(p, _)| p).collect();
+    assert_eq!(
+        failed.len(),
+        2,
+        "each importing file should report its own failure: {:?}",
+        report.results
+    );
+    // The import and its mirrors are one transaction, so the failure left nothing half-done: no
+    // unmirrored task, and a journal that says so rather than `ok`.
+    assert_eq!(
+        task_count(&db),
+        0,
+        "the import must roll back with its mirrors"
+    );
+    assert_eq!(
+        journal(&db, &uri_for(&tasks)).map(|(status, _)| status),
+        Some("needs_attention".to_owned()),
+        "the failure must be visible to `jkb doctor`"
+    );
+}
+
+/// The retry after a failed mirror derivation derives it.
+///
+/// With the derivation after the per-file commits, its failure left the imported tasks unmirrored
+/// while their files read as settled, so the retry found every file up to date, never ran the
+/// derivation, and `jkb task next` — scoped to `tasks/**` — never saw the work.
+#[test]
+fn the_retry_after_a_failed_mirror_derivation_mirrors_the_import() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, TASKS_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    refuse_mirrors(&db);
+    // Whatever the failed pass returns, the next one must finish the work.
+    let _ = sync(&db, "docs/plan");
+    allow_mirrors(&db);
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "the retry failed: {:?}",
+        report.failed()
+    );
+    assert_eq!(task_count(&db), 3, "the retry should hold the file's tasks");
+    assert_eq!(
+        mirrored_task_count(&db),
+        3,
+        "every imported task needs its `tasks/…` mirror after the retry"
+    );
 }
