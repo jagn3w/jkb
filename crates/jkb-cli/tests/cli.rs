@@ -5221,6 +5221,106 @@ fn a_plan_is_built_and_played_through_the_cli() {
         .stdout(predicate::str::contains(&plan_uid));
 }
 
+/// `jkb task show` names the plan step, plan and design a task sits under — and the root when the
+/// plan's design is nested — in both outputs; a subtask reports its parent's; a task under no
+/// design shows none of it, without an error.
+#[test]
+fn task_show_names_the_step_plan_and_design_a_task_sits_under() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = jkb(&db).arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let uid_of = |v: serde_json::Value| v["uid"].as_str().unwrap().to_owned();
+    let root = uid_of(json(&["design", "create", "Factory", "--repo", "jkb"]));
+    let child = uid_of(json(&["design", "create", "Storage", "--repo", "jkb"]));
+    jkb(&db)
+        .args(["design", "mv", &child, "--under", &root])
+        .assert()
+        .success();
+    let plan = json(&[
+        "design", "plan", "create", &child, "First", "cut", "--step", "scaffold", "--step",
+        "database",
+    ]);
+    let plan_uid = plan["uid"].as_str().unwrap().to_owned();
+    let step = plan["steps"][1]["uid"].as_str().unwrap().to_owned();
+    let task = uid_of(json(&[
+        "task",
+        "add",
+        "Build",
+        "the",
+        "schema",
+        "--under",
+        &step,
+        "--managed",
+    ]));
+    let sub = uid_of(json(&[
+        "task",
+        "add",
+        "Write",
+        "a",
+        "migration",
+        "--under",
+        &task,
+        "--managed",
+    ]));
+
+    for t in [&task, &sub] {
+        let shown = json(&["task", "show", t]);
+        let place = &shown["place"];
+        assert_eq!(place["step"]["uid"], step.as_str(), "{shown}");
+        assert_eq!(place["step"]["title"], "database");
+        assert_eq!(place["step"]["number"], 2);
+        assert_eq!(place["plan"]["uid"], plan_uid.as_str());
+        assert_eq!(place["plan"]["title"], "First cut");
+        assert_eq!(place["design"]["uid"], child.as_str());
+        assert_eq!(place["design"]["title"], "Storage");
+        assert_eq!(place["root"]["uid"], root.as_str());
+        assert_eq!(place["root"]["title"], "Factory");
+        // Additive: the fields consumers already read are still there.
+        assert_eq!(shown["uid"], t.as_str());
+        jkb(&db)
+            .args(["task", "show", t])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "plan:      First cut · step 2. database ({step})"
+            )))
+            .stdout(predicate::str::contains(format!(
+                "design:    Storage ({child}), under Factory ({root})"
+            )));
+    }
+
+    let loose = uid_of(json(&["task", "add", "Loose", "end", "--managed"]));
+    assert!(json(&["task", "show", &loose])["place"].is_null());
+    jkb(&db)
+        .args(["task", "show", &loose])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("plan:").not())
+        .stdout(predicate::str::contains("design:").not());
+
+    // Remote mode: the same answer crosses the daemon's wire, from the op and not a client read.
+    let token = dir.path().join("daemon/token");
+    let (_serve, url) = Daemon::start(&db, &token);
+    let out = assert_cmd::Command::from_std(jkb_bare())
+        .env("HOME", dir.path())
+        .env("JKB_REMOTE", &url)
+        .env("JKB_REMOTE_TOKEN_FILE", &token)
+        .env_remove("JKB_DB")
+        .args(["--json", "task", "show", &sub])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let remote: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(remote["place"]["step"]["uid"], step.as_str(), "{remote}");
+    assert_eq!(remote["place"]["root"]["uid"], root.as_str(), "{remote}");
+}
+
 /// Design prompts (D53.6) through the CLI: the *New prompt* text, a launch recording its session
 /// from the directory it runs in, and the listing with the command that resumes it.
 #[test]

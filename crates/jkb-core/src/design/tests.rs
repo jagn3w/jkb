@@ -1080,6 +1080,76 @@ fn a_step_lists_the_spans_staged_into_it_and_a_task_knows_its_place() {
         .is_none());
 }
 
+/// `jkb task show`'s ancestry: a task's step (numbered in its plan), the plan, the design, and the
+/// design's root when the plan belongs to a nested design; a subtask reports its parent's.
+#[test]
+fn a_task_knows_its_step_plan_design_and_root() {
+    let db = db();
+    let root = create_in(&db, "jkb", "Factory", "The whole app.");
+    let child = create_in(&db, "jkb", "Storage", "Where it lives.");
+    nest_under(&db, &child, &root).unwrap();
+    let p = new_plan(&db, &child, &["scaffold", "database"]).unwrap();
+    let step = step_id(&db, &p.steps[1].uid);
+    let parent = task_under(&db, step, "task:p");
+    let sub = task_under(&db, parent, "task:q");
+    for t in [parent, sub] {
+        let a = db
+            .read(move |c| plan::ancestry_of(c, t))
+            .unwrap()
+            .expect("under a step");
+        let s = a.step.expect("a step");
+        assert_eq!(s.step.uid, p.steps[1].uid);
+        assert_eq!(s.step.text, "database");
+        assert_eq!(s.number, 2);
+        assert_eq!(
+            (s.plan.uid.as_str(), s.plan.text.as_str()),
+            (p.uid.as_str(), "Ship it")
+        );
+        assert_eq!(
+            (a.design.uid.as_str(), a.design.text.as_str()),
+            (child.as_str(), "Storage")
+        );
+        let r = a.root.expect("the plan's design is nested");
+        assert_eq!(
+            (r.uid.as_str(), r.text.as_str()),
+            (root.as_str(), "Factory")
+        );
+    }
+
+    // A plan of a top-level design: no root beside it.
+    let p2 = new_plan(&db, &root, &["only"]).unwrap();
+    let top = task_under(&db, step_id(&db, &p2.steps[0].uid), "task:top");
+    let a = db
+        .read(move |c| plan::ancestry_of(c, top))
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.design.uid, root);
+    assert!(a.root.is_none());
+    assert_eq!(a.step.map(|s| s.number), Some(1));
+
+    // A one-off under the design: the design, no step.
+    let r = root.clone();
+    let d = db.read(move |c| design_id(c, &r)).unwrap();
+    let one_off = task_under(&db, d, "task:one-off");
+    let a = db
+        .read(move |c| plan::ancestry_of(c, one_off))
+        .unwrap()
+        .unwrap();
+    assert!(a.step.is_none());
+    assert_eq!(a.design.uid, root);
+
+    // Under nothing: no ancestry, and no error.
+    let loose = db
+        .write_txn("t", |c, m| {
+            task::create(c, m, &task::NewTask::new("task:loose", "x"))
+        })
+        .unwrap();
+    assert!(db
+        .read(move |c| plan::ancestry_of(c, loose))
+        .unwrap()
+        .is_none());
+}
+
 #[test]
 fn undoing_a_plan_takes_back_the_plan_and_its_steps() {
     let db = db();

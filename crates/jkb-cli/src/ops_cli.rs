@@ -1031,7 +1031,37 @@ fn task_json(task: &TaskDetail) -> serde_json::Value {
         "subtasks": task.subtasks.iter()
             .map(|t| serde_json::json!({ "uid": t.uid, "title": t.title, "status": t.status }))
             .collect::<Vec<_>>(),
+        // Additive: the step, plan and design it sits under (null under none), so an implementer
+        // finds the design that governs it.
+        "place": task.place,
     })
+}
+
+/// `task show`'s `plan:` and `design:` lines: where the task sits, or nothing under no design.
+fn place_lines(place: Option<&jkb_api::kb::TaskPlacement>) -> Vec<String> {
+    let Some(p) = place else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    if let (Some(step), Some(plan)) = (&p.step, &p.plan) {
+        lines.push(format!(
+            "plan:      {} · step {}. {} ({})",
+            first_line(&plan.title),
+            step.number,
+            first_line(&step.title),
+            step.uid
+        ));
+    }
+    let mut design = format!(
+        "design:    {} ({})",
+        first_line(&p.design.title),
+        p.design.uid
+    );
+    if let Some(root) = &p.root {
+        let _ = write!(design, ", under {} ({})", first_line(&root.title), root.uid);
+    }
+    lines.push(design);
+    lines
 }
 
 fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
@@ -1064,6 +1094,9 @@ fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
     }
     if let Some(line) = review_line(&task.review) {
         println!("review:    {line}");
+    }
+    for line in place_lines(task.place.as_ref()) {
+        println!("{line}");
     }
     if !task.transitions.is_empty() {
         println!("recent transitions (`jkb task why` for all):");
@@ -1220,6 +1253,7 @@ mod tests {
                         },
                         transitions: Vec::new(),
                         subtasks: Vec::new(),
+                        place: None,
                     }),
                     truncated: true,
                 },

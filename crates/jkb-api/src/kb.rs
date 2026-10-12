@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use jkb_core::query::{self, Scope};
-use jkb_core::{containment, item, mount, ns, nstype, placement, tag, task, transition, Db};
+use jkb_core::{
+    containment, design, item, mount, ns, nstype, placement, tag, task, transition, Db,
+};
 use jkb_search::{Route, Searcher};
 use jkb_types::{Embedder, ItemId, TaskStatus};
 use rusqlite::{Connection, OptionalExtension};
@@ -389,6 +391,69 @@ pub struct SubtaskSummary {
     pub status: Option<String>,
 }
 
+/// An item a task sits under, as `task.show` names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceRef {
+    /// Its uid.
+    pub uid: String,
+    /// Its title: the first non-blank line of its content (`item::title_from`).
+    pub title: String,
+}
+
+/// The plan step a task sits under, as `task.show` names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepRef {
+    /// Its uid.
+    pub uid: String,
+    /// Its title: the first non-blank line of its words.
+    pub title: String,
+    /// Its place among its plan's steps, from 1.
+    pub number: usize,
+}
+
+/// Where a task sits in a design (`design::plan::ancestry_of`): what an implementer reads to find
+/// the design that governs it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskPlacement {
+    /// The plan step, when the task (or a task it is a subtask of) is under one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<StepRef>,
+    /// That step's plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlaceRef>,
+    /// The design the plan (or the one-off task) belongs to.
+    pub design: PlaceRef,
+    /// The top of the design's tree, when the design is nested under another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PlaceRef>,
+}
+
+impl From<design::plan::Ancestry> for TaskPlacement {
+    fn from(a: design::plan::Ancestry) -> Self {
+        let place = |n: design::plan::Named| PlaceRef {
+            title: item::title_from(&n.uid, Some(&n.text)),
+            uid: n.uid,
+        };
+        let (step, plan) = match a.step {
+            Some(s) => (
+                Some(StepRef {
+                    title: item::title_from(&s.step.uid, Some(&s.step.text)),
+                    uid: s.step.uid,
+                    number: s.number,
+                }),
+                Some(place(s.plan)),
+            ),
+            None => (None, None),
+        };
+        Self {
+            step,
+            plan,
+            design: place(a.design),
+            root: a.root.map(place),
+        }
+    }
+}
+
 /// `task.show`'s answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskDetail {
@@ -404,6 +469,10 @@ pub struct TaskDetail {
         skip_serializing_if = "jkb_core::reviews::ReviewState::is_empty"
     )]
     pub review: jkb_core::reviews::ReviewState,
+    /// The plan step, plan and design it sits under; `None` for a task under no design. Absent
+    /// from an older daemon's answer, which decodes as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<TaskPlacement>,
 }
 
 fn not_found(what: impl Into<String>) -> ApiError {
@@ -1222,6 +1291,7 @@ pub fn task_show(
             .collect(),
         subtasks: Vec::new(),
         review: jkb_core::reviews::state(conn, id)?,
+        place: design::plan::ancestry_of(conn, id)?.map(TaskPlacement::from),
     };
     // The task itself is not charged: it is what was asked for, and charging a large body marked the
     // answer cut when no subtask had been dropped at all.
@@ -1264,7 +1334,46 @@ pub fn subtasks(
 mod tests {
     use std::path::Path;
 
-    use super::rerooted;
+    use super::{rerooted, ItemDetail, PlaceRef, TaskDetail, TaskPlacement};
+
+    /// `place` is additive on the wire: an older daemon's answer, which has no `place`, still
+    /// decodes; and a task under no design sends none.
+    #[test]
+    fn a_task_detail_without_a_place_decodes_and_sends_none() {
+        let mut detail = TaskDetail {
+            item: ItemDetail {
+                id: 1,
+                uid: "task:t".into(),
+                kind: "task".into(),
+                status: None,
+                priority: None,
+                due: None,
+                namespace: None,
+                content: None,
+                tags: Vec::new(),
+            },
+            transitions: Vec::new(),
+            subtasks: Vec::new(),
+            review: jkb_core::reviews::ReviewState::default(),
+            place: None,
+        };
+        let sent = serde_json::to_value(&detail).unwrap();
+        assert!(sent.get("place").is_none(), "{sent}");
+        assert_eq!(serde_json::from_value::<TaskDetail>(sent).unwrap(), detail);
+
+        detail.place = Some(TaskPlacement {
+            step: None,
+            plan: None,
+            design: PlaceRef {
+                uid: "design:d".into(),
+                title: "D".into(),
+            },
+            root: None,
+        });
+        let sent = serde_json::to_value(&detail).unwrap();
+        assert_eq!(sent["place"]["design"]["uid"], "design:d");
+        assert_eq!(serde_json::from_value::<TaskDetail>(sent).unwrap(), detail);
+    }
 
     #[test]
     fn a_client_path_under_its_home_is_looked_up_under_the_server_s() {
