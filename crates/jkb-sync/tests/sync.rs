@@ -464,6 +464,64 @@ fn watch_all_reconciles_every_mount_then_stops() {
     );
 }
 
+/// `watch_all` watches a mount created after it started. It read the mount list once, so a mount
+/// created while the service ran was never watched until the service restarted.
+#[test]
+fn watch_all_watches_a_mount_created_after_it_started() {
+    let db = Db::open_in_memory().unwrap();
+    let early = real_tempdir();
+    let late = real_tempdir();
+    let early_file = early.path().join("early.md");
+    let late_file = late.path().join("late.md");
+    fs::write(&early_file, "early").unwrap();
+    fs::write(&late_file, "late").unwrap();
+    let mount = |ns: &str, dir: &Path| {
+        mount_dir(
+            &db,
+            ns,
+            dir,
+            SyncMode::Bidirectional,
+            "document",
+            Some("**/*.md"),
+            None,
+            ConflictPolicy::Manual,
+        );
+    };
+    mount("docs/early", early.path());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let db = db.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || jkb_sync::watch_all(&db, Duration::from_millis(20), &stop))
+    };
+    let wait_for = |file: &Path, what: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while content_for(&db, &uri_for(file)).is_none() {
+            assert!(
+                !watcher.is_finished() && std::time::Instant::now() < deadline,
+                "{what}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // The early mount's initial reconcile proves `watch_all` has read the mount list, so the
+    // next mount is created strictly after it.
+    wait_for(
+        &early_file,
+        "the mount present at startup was never watched",
+    );
+
+    mount("docs/late", late.path());
+    wait_for(
+        &late_file,
+        "the mount created after `watch_all` started was never watched",
+    );
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    watcher.join().unwrap().unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Multi-item `tasks` serializer (D24) + sync robustness (D25)
 // ---------------------------------------------------------------------------

@@ -354,55 +354,213 @@ fn report_notable(mount_ns: &str, report: &engine::SyncReport) {
 
 /// Watch **every** configured mount concurrently (one thread each), reconciling each
 /// on change until `stop` is set. This is the persistent-daemon entry point
-/// (`jkb sync --watch` with no namespace). Returns once all watchers have stopped;
-/// if several fail, the first error is returned.
+/// (`jkb sync --watch` with no namespace). Returns once every watcher has stopped.
+///
+/// The set of watched mounts is **not** fixed at startup. Every [`MOUNT_SCAN_TICKS`] debounces the
+/// mount list is re-read ([`Watchers::tick`]): a mount created since is armed, a mount deleted
+/// since has its watcher stopped, and a watcher that exited — a mount whose backing directory was
+/// missing when it tried to arm, say — is re-armed after a backoff. Reading the list once made a
+/// mount created while the service ran unwatched until the service restarted, which under launchd
+/// is the next login; and a mount whose watcher failed to arm stayed unwatched even once its
+/// directory came back, with nothing on any surface saying so.
 ///
 /// # Errors
-/// Returns the first watcher **startup** error, or a validation error if a watch thread panics.
-/// Reconcile failures never reach here; each thread reports its own as it goes.
+/// Returns an error only if the mount list cannot be read at startup. A watcher that fails to arm,
+/// exits or panics is reported on stderr and re-armed; reconcile failures never reach here, each
+/// thread reports its own as it goes.
 pub fn watch_all(db: &Db, debounce: Duration, stop: &Arc<AtomicBool>) -> Result<()> {
-    let paths = db.read(mount::all_paths)?;
-    if paths.is_empty() {
-        return Ok(());
-    }
+    let mut mounts: BTreeSet<String> = db.read(mount::all_paths)?.into_iter().collect();
+    let mut watchers = Watchers::new(debounce.saturating_mul(RETRY_TICKS));
+    let mut arm = |path: &str| ThreadWatcher::spawn(db, path, debounce);
 
-    let mut handles = Vec::with_capacity(paths.len());
-    for path in paths {
-        let db = db.clone();
-        let stop = Arc::clone(stop);
-        handles.push(std::thread::spawn(move || {
-            let outcome = watch(&db, &path, debounce, &stop);
-            if let Err(e) = &outcome {
-                // Reported HERE, not at join time. A startup failure — a mount whose backing
-                // directory has been moved or deleted — happens before the first pass, and
-                // `watch_all` blocks joining the other threads until `stop`, which under
-                // launchd is never. So without this the mount is simply never watched, prints
-                // nothing, journals nothing, and `jkb doctor` says `sync journal: ok`.
-                eprintln!("sync {path}: watcher stopped: {e}");
-            }
-            outcome
-        }));
-    }
-
-    let mut result = Ok(());
-    for handle in handles {
-        match handle.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                if result.is_ok() {
-                    result = Err(e);
+    // Armed before `stop` is first read, so every mount gets its initial reconcile even when the
+    // caller stops at once.
+    watchers.tick(&mounts, Instant::now(), &mut arm);
+    let mut ticks: u32 = 0;
+    let mut listing_failed = false;
+    while !stop.load(Ordering::Relaxed) {
+        std::thread::sleep(debounce);
+        ticks = ticks.wrapping_add(1);
+        if ticks.is_multiple_of(MOUNT_SCAN_TICKS) {
+            match db.read(mount::all_paths) {
+                Ok(paths) => {
+                    mounts = paths.into_iter().collect();
+                    listing_failed = false;
                 }
-            }
-            Err(_) => {
-                if result.is_ok() {
-                    result = Err(Error::Types(jkb_types::Error::Validation(
-                        "a watch thread panicked".to_owned(),
-                    )));
+                // Keep the last list: a transient read failure must not stop every watcher.
+                Err(e) => {
+                    if !listing_failed {
+                        eprintln!("sync: cannot re-read the mount list ({e}); retrying");
+                    }
+                    listing_failed = true;
                 }
             }
         }
+        watchers.tick(&mounts, Instant::now(), &mut arm);
     }
-    result
+    watchers.shutdown();
+    Ok(())
+}
+
+/// How many debounce intervals apart `watch_all` re-reads the mount list.
+const MOUNT_SCAN_TICKS: u32 = 10;
+
+/// One running per-mount watcher, as [`Watchers`] sees it. A trait so the supervision rules can
+/// be tested with watchers whose lifetime the test decides, rather than with threads and sleeps.
+trait Running {
+    /// Whether the watcher has exited (and [`Running::join`] will not block).
+    fn finished(&self) -> bool;
+    /// Ask the watcher to stop; it exits at its next idle tick.
+    fn stop(&self);
+    /// Wait for the watcher to exit; `Err` names why it stopped, a panic included.
+    fn join(self) -> Result<()>;
+}
+
+/// A [`watch`] on its own thread with its own stop flag, so a deleted mount's watcher can be
+/// stopped without stopping the others.
+struct ThreadWatcher {
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<Result<()>>,
+}
+
+impl ThreadWatcher {
+    fn spawn(db: &Db, path: &str, debounce: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let db = db.clone();
+        let path = path.to_owned();
+        let thread_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || watch(&db, &path, debounce, &thread_stop));
+        Self { stop, handle }
+    }
+}
+
+impl Running for ThreadWatcher {
+    fn finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    fn join(self) -> Result<()> {
+        self.handle.join().unwrap_or_else(|_| {
+            Err(Error::Types(jkb_types::Error::Validation(
+                "the watch thread panicked".to_owned(),
+            )))
+        })
+    }
+}
+
+/// One mount's place in [`Watchers`]: its watcher if one is running, and when to re-arm it if not.
+struct Slot<H> {
+    running: Option<H>,
+    /// When a mount with no running watcher may be armed again.
+    retry_at: Instant,
+    /// When the running watcher was armed.
+    armed_at: Instant,
+    /// The wait before the next re-arm, doubling while the watcher keeps exiting.
+    backoff: Duration,
+}
+
+/// The per-mount watchers `watch_all` keeps running, reconciled against the mount list.
+///
+/// Exactly one slot per mount path, so a mount is never watched twice however often it is listed:
+/// a duplicate watcher would reconcile every file twice, racing itself on the write seam.
+struct Watchers<H: Running> {
+    slots: std::collections::BTreeMap<String, Slot<H>>,
+    /// Watchers of deleted mounts, stopped and waiting to exit.
+    retiring: Vec<H>,
+    base: Duration,
+}
+
+impl<H: Running> Watchers<H> {
+    fn new(base: Duration) -> Self {
+        Self {
+            slots: std::collections::BTreeMap::new(),
+            retiring: Vec::new(),
+            base,
+        }
+    }
+
+    /// Bring the running watchers in line with `mounts`: stop those of deleted mounts, collect
+    /// any that exited (reporting why, and scheduling a re-arm after a backoff that doubles while
+    /// it keeps exiting), and arm every listed mount that has no watcher and is due one.
+    fn tick(&mut self, mounts: &BTreeSet<String>, now: Instant, arm: &mut impl FnMut(&str) -> H) {
+        self.slots.retain(|path, slot| {
+            if mounts.contains(path) {
+                return true;
+            }
+            if let Some(running) = slot.running.take() {
+                running.stop();
+                self.retiring.push(running);
+            }
+            false
+        });
+        let (done, still): (Vec<H>, Vec<H>) = self.retiring.drain(..).partition(Running::finished);
+        self.retiring = still;
+        for running in done {
+            // A deleted mount's watcher: why it stopped no longer matters.
+            let _ = running.join();
+        }
+
+        for path in mounts {
+            let slot = self.slots.entry(path.clone()).or_insert_with(|| Slot {
+                running: None,
+                retry_at: now,
+                armed_at: now,
+                backoff: self.base,
+            });
+            match slot.running.take() {
+                Some(running) if running.finished() => {
+                    let why = match running.join() {
+                        Ok(()) => "it exited".to_owned(),
+                        Err(e) => e.to_string(),
+                    };
+                    // Reported HERE, as it happens: under launchd `watch_all` never returns, so a
+                    // watcher that stopped silently is a mount that silently stopped syncing.
+                    eprintln!(
+                        "sync {path}: watcher stopped: {why}; re-arming in {}s",
+                        slot.backoff.as_secs_f64()
+                    );
+                    slot.retry_at = now + slot.backoff;
+                    slot.backoff = (slot.backoff * 2).min(MAX_RETRY);
+                }
+                Some(running) => {
+                    // Up for a whole base interval: it armed and is working, so a later exit
+                    // starts again from the base backoff rather than wherever a past failing
+                    // stretch left it.
+                    if now.saturating_duration_since(slot.armed_at) >= self.base {
+                        slot.backoff = self.base;
+                    }
+                    slot.running = Some(running);
+                }
+                None if now >= slot.retry_at => {
+                    slot.armed_at = now;
+                    slot.running = Some(arm(path));
+                }
+                None => {}
+            }
+        }
+    }
+
+    /// Stop every watcher and wait for each to exit.
+    fn shutdown(self) {
+        let running: Vec<H> = self
+            .slots
+            .into_values()
+            .filter_map(|slot| slot.running)
+            .chain(self.retiring)
+            .collect();
+        for r in &running {
+            r.stop();
+        }
+        for r in running {
+            if let Err(e) = r.join() {
+                eprintln!("sync: a watcher stopped with an error: {e}");
+            }
+        }
+    }
 }
 
 /// Accumulate an event's changed paths into `paths`. Returns `true` if a full rescan
@@ -541,6 +699,143 @@ mod tests {
             !writes.pass_due(BASE),
             "every pass restarts the spacing, not only the first"
         );
+    }
+
+    /// A watcher whose lifetime the test decides.
+    #[derive(Default)]
+    struct FakeState {
+        finished: std::cell::Cell<bool>,
+        stopped: std::cell::Cell<bool>,
+        joined: std::cell::Cell<bool>,
+    }
+
+    struct Fake(std::rc::Rc<FakeState>);
+
+    impl super::Running for Fake {
+        fn finished(&self) -> bool {
+            self.0.finished.get()
+        }
+        fn stop(&self) {
+            self.0.stopped.set(true);
+        }
+        fn join(self) -> crate::Result<()> {
+            self.0.joined.set(true);
+            Err(crate::Error::Types(jkb_types::Error::Validation(
+                "backing directory missing".to_owned(),
+            )))
+        }
+    }
+
+    /// Records every arm, keeping a handle on each fake so the test can end or inspect it.
+    #[derive(Default)]
+    struct Arms(Vec<(String, std::rc::Rc<FakeState>)>);
+
+    impl Arms {
+        fn arm(&mut self, path: &str) -> Fake {
+            let state = std::rc::Rc::new(FakeState::default());
+            self.0.push((path.to_owned(), std::rc::Rc::clone(&state)));
+            Fake(state)
+        }
+        fn count(&self, path: &str) -> usize {
+            self.0.iter().filter(|(p, _)| p == path).count()
+        }
+        fn last(&self, path: &str) -> std::rc::Rc<FakeState> {
+            let found = self.0.iter().rev().find(|(p, _)| p == path);
+            std::rc::Rc::clone(&found.expect("armed").1)
+        }
+    }
+
+    fn mounts(paths: &[&str]) -> std::collections::BTreeSet<String> {
+        paths.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    /// A mount created after the watchers started is armed by the next tick, and a mount already
+    /// watched is never armed a second time however often it is listed.
+    #[test]
+    fn a_mount_created_later_is_armed_once() {
+        let now = std::time::Instant::now();
+        let mut arms = Arms::default();
+        let mut w = super::Watchers::new(BASE);
+        w.tick(&mounts(&["docs/a"]), now, &mut |p| arms.arm(p));
+        assert_eq!(arms.count("docs/a"), 1);
+
+        w.tick(&mounts(&["docs/a", "docs/b"]), now, &mut |p| arms.arm(p));
+        w.tick(&mounts(&["docs/a", "docs/b"]), now + BASE, &mut |p| {
+            arms.arm(p)
+        });
+        assert_eq!(arms.count("docs/b"), 1, "the new mount is armed");
+        assert_eq!(
+            arms.count("docs/a"),
+            1,
+            "a watched mount is never armed twice"
+        );
+    }
+
+    /// A watcher that exited — one that failed to arm — is re-armed once its backoff elapses and
+    /// not before, and the backoff doubles while it keeps failing.
+    #[test]
+    fn a_watcher_that_exited_is_re_armed_after_a_backoff() {
+        let now = std::time::Instant::now();
+        let list = mounts(&["docs/a"]);
+        let mut arms = Arms::default();
+        let mut w = super::Watchers::new(BASE);
+        w.tick(&list, now, &mut |p| arms.arm(p));
+        arms.last("docs/a").finished.set(true);
+
+        w.tick(&list, now, &mut |p| arms.arm(p));
+        assert!(arms.last("docs/a").joined.get(), "the exit is collected");
+        assert_eq!(arms.count("docs/a"), 1, "not re-armed before the backoff");
+        w.tick(&list, now + BASE, &mut |p| arms.arm(p));
+        assert_eq!(arms.count("docs/a"), 2, "re-armed once the backoff elapsed");
+
+        // Fails again at once: the next wait is doubled.
+        arms.last("docs/a").finished.set(true);
+        w.tick(&list, now + BASE, &mut |p| arms.arm(p));
+        w.tick(&list, now + BASE * 2, &mut |p| arms.arm(p));
+        assert_eq!(arms.count("docs/a"), 2, "the second wait is longer");
+        w.tick(&list, now + BASE * 3, &mut |p| arms.arm(p));
+        assert_eq!(arms.count("docs/a"), 3);
+    }
+
+    /// A deleted mount's watcher is stopped, and collected once it exits.
+    #[test]
+    fn a_deleted_mount_s_watcher_is_stopped() {
+        let now = std::time::Instant::now();
+        let mut arms = Arms::default();
+        let mut w = super::Watchers::new(BASE);
+        w.tick(&mounts(&["docs/a", "docs/b"]), now, &mut |p| arms.arm(p));
+        w.tick(&mounts(&["docs/a"]), now, &mut |p| arms.arm(p));
+        let b = arms.last("docs/b");
+        assert!(
+            b.stopped.get(),
+            "the deleted mount's watcher was not stopped"
+        );
+        assert!(!arms.last("docs/a").stopped.get());
+
+        b.finished.set(true);
+        w.tick(&mounts(&["docs/a"]), now, &mut |p| arms.arm(p));
+        assert!(
+            b.joined.get(),
+            "the stopped watcher is collected once it exits"
+        );
+        assert_eq!(arms.count("docs/b"), 1, "and is not re-armed");
+    }
+
+    /// Shutdown stops and collects every watcher.
+    #[test]
+    fn shutdown_stops_every_watcher() {
+        let now = std::time::Instant::now();
+        let mut arms = Arms::default();
+        let mut w = super::Watchers::new(BASE);
+        w.tick(&mounts(&["docs/a", "docs/b"]), now, &mut |p| arms.arm(p));
+        for (_, state) in &arms.0 {
+            state.finished.set(true);
+        }
+        w.shutdown();
+        assert!(arms
+            .0
+            .iter()
+            .all(|(_, s)| s.stopped.get() && s.joined.get()));
     }
 
     /// A debt nothing owes is never due, however long the watcher idles.
