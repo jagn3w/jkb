@@ -544,8 +544,11 @@ pub fn rotate_container(conn: &Connection, meta: &WriteMeta) -> Result<(GrantRow
 /// Map a Claude Code `agent_type` (a subagent definition's `name`) to a role, or clear it with
 /// `None`. Operator-only at the op layer: this is what makes an attested subagent a reviewer.
 ///
+/// No agent type may be mapped to [`Role::Operator`]: a mapped role never exceeds the container
+/// credential that minted the ticket, so such a row would sit in the map, listed, granting nothing.
+///
 /// # Errors
-/// [`Error::Types`] for a malformed agent type, or a database error.
+/// [`Error::Types`] for a malformed agent type or a mapping to operator, or a database error.
 pub fn map_agent_type(
     conn: &Connection,
     _meta: &WriteMeta,
@@ -553,6 +556,9 @@ pub fn map_agent_type(
     role: Option<Role>,
 ) -> Result<()> {
     check_agent(agent_type)?;
+    if role == Some(Role::Operator) {
+        return Err(validation("no agent type may be mapped to operator"));
+    }
     match role {
         Some(role) => {
             conn.prepare_cached(

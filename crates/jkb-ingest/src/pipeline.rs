@@ -542,7 +542,8 @@ impl Pipeline {
         Ok(report)
     }
 
-    /// Write a batch of vectors in one transaction, returning how many landed.
+    /// Write a batch of vectors in one transaction, returning how many landed. An item deleted
+    /// since it was read for embedding gets no vector (`upsert_vector` checks) and is not counted.
     ///
     /// Committing per batch rather than once at the end is what makes a long backfill
     /// resumable: interrupting it keeps everything already written, and re-running picks up
@@ -551,16 +552,17 @@ impl Pipeline {
         if embeddings.is_empty() {
             return Ok(0);
         }
-        let count = embeddings.len();
         let vector = VectorIndexer::new(self.embedder.clone());
-        db.write_txn_with::<(), Error, _>("index-pending", move |conn, _meta| {
+        db.write_txn_with::<usize, Error, _>("index-pending", move |conn, _meta| {
             vector.ensure_ready(conn)?;
+            let mut landed = 0;
             for (id, embedding) in &embeddings {
-                vector.upsert_vector(conn, *id, embedding)?;
+                if vector.upsert_vector(conn, *id, embedding)? {
+                    landed += 1;
+                }
             }
-            Ok(())
-        })?;
-        Ok(count)
+            Ok(landed)
+        })
     }
 
     /// Give each document a vector **averaged from its chunks** rather than embedded from

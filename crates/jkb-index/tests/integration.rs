@@ -711,6 +711,36 @@ fn a_repair_installs_the_trigger_on_a_legacy_database() {
     );
 }
 
+/// `upsert_vector` writes nothing for an item that does not exist (one deleted after it was read
+/// for embedding): the GC trigger has already fired, so a vector written now would be an orphan.
+#[test]
+fn upsert_vector_writes_nothing_for_a_missing_item() {
+    let db = open_db();
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let (live, gone) = db
+        .write_txn("test", move |conn, meta| {
+            let vector = VectorIndexer::new(embedder.clone());
+            vector.ensure_ready(conn).unwrap();
+            let id = add_item(conn, meta, "n:gone", "gone content");
+            conn.execute("DELETE FROM items WHERE id = ?1", [id.get()])?;
+            let gone = vector
+                .upsert_vector(conn, id, &embedder.embed("gone content").unwrap())
+                .unwrap();
+            let id = add_item(conn, meta, "n:live", "live content");
+            let live = vector
+                .upsert_vector(conn, id, &embedder.embed("live content").unwrap())
+                .unwrap();
+            Ok((live, gone))
+        })
+        .unwrap();
+    assert!(live, "a live item's vector was not written");
+    assert!(!gone, "a missing item's vector was reported written");
+    let stale = db
+        .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
+        .unwrap();
+    assert_eq!(stale.vectors, 0, "a vector was written for a missing item");
+}
+
 /// A lookup of more ids than `SQLite` binds in one statement (32,766) answers them all: a resume of a
 /// capture with that many chunks asked for every one at once, and failed on every run.
 #[test]
@@ -721,12 +751,21 @@ fn vectors_for_answers_more_ids_than_one_statement_can_bind() {
         .write_txn("test", move |conn, _| {
             let vector = VectorIndexer::new(FakeEmbedder::arc("fake", 2));
             vector.ensure_ready(conn).unwrap();
-            for id in 1..=n {
-                vector
-                    .upsert_vector(conn, ItemId::new(id), &[1.0, 0.5])
-                    .unwrap();
+            // Real items, in one statement: `upsert_vector` writes no vector for an item that
+            // does not exist, and the item repo's per-row changelog would make this slow.
+            conn.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+                 INSERT INTO items (uid, kind) SELECT 'n:' || i, 'note' FROM n",
+                [n],
+            )?;
+            let ids: Vec<ItemId> = conn
+                .prepare("SELECT id FROM items")?
+                .query_map([], |r| r.get(0).map(ItemId::new))?
+                .collect::<rusqlite::Result<_>>()?;
+            assert_eq!(ids.len(), usize::try_from(n).unwrap());
+            for &id in &ids {
+                assert!(vector.upsert_vector(conn, id, &[1.0, 0.5]).unwrap());
             }
-            let ids: Vec<ItemId> = (1..=n).map(ItemId::new).collect();
             Ok(vector.vectors_for(conn, &ids).unwrap().len())
         })
         .unwrap();

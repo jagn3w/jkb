@@ -340,12 +340,20 @@ impl VectorIndexer {
         Ok(())
     }
 
-    /// Add or replace the vector for `id`.
+    /// Add or replace the vector for `id`, if item `id` exists. Returns whether a vector was
+    /// written: `false` means the item is gone and nothing was.
+    ///
+    /// The existence check is here, inside the caller's write transaction, rather than at each
+    /// caller: embedding happens outside any transaction (it is the slow part), so an item can be
+    /// deleted between being read for embedding and its vector being stored. The GC trigger
+    /// removes a vector when its item is deleted, but cannot stop one being written afterwards —
+    /// a long `index_pending` backfill did exactly that, recreating the orphan the trigger exists
+    /// to prevent.
     ///
     /// # Errors
     /// Returns [`crate::Error`] if `embedding`'s length is not the table dim, or a
     /// statement fails.
-    pub fn upsert_vector(&self, conn: &Connection, id: ItemId, embedding: &[f32]) -> Result<()> {
+    pub fn upsert_vector(&self, conn: &Connection, id: ItemId, embedding: &[f32]) -> Result<bool> {
         if embedding.len() != self.dim {
             return Err(TypesError::Validation(format!(
                 "embedding length {} does not match vec table dim {}",
@@ -353,6 +361,12 @@ impl VectorIndexer {
                 self.dim
             ))
             .into());
+        }
+        let exists = conn
+            .prepare_cached("SELECT 1 FROM items WHERE id = ?1")?
+            .exists([id.get()])?;
+        if !exists {
+            return Ok(false);
         }
         let bytes = embedding_to_bytes(embedding);
         // Delete then insert, rather than `INSERT OR REPLACE`: vec0 is a virtual table and
@@ -367,7 +381,7 @@ impl VectorIndexer {
             self.table
         ))?
         .execute(params![id.get(), bytes])?;
-        Ok(())
+        Ok(true)
     }
 
     /// The stored vectors for `ids`, as an `item_id -> embedding` map. Ids with no vector

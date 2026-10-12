@@ -406,6 +406,85 @@ fn index_pending_skips_a_rejected_item_and_keeps_the_rest() {
     assert_eq!(pipe.unembedded_count(&db).unwrap(), 1);
 }
 
+/// An embedder that deletes `victim` the moment it is asked to embed `trigger`: an item removed
+/// while a backfill is between reading it and storing its vector.
+struct DeletingEmbedder {
+    db: Db,
+    trigger: &'static str,
+    victim: &'static str,
+}
+
+impl Embedder for DeletingEmbedder {
+    #[allow(clippy::unnecessary_literal_bound)] // trait fixes the `-> &str` signature
+    fn model(&self) -> &str {
+        "fake"
+    }
+    fn dim(&self) -> usize {
+        16
+    }
+    fn embed(&self, text: &str) -> TypesResult<Vec<f32>> {
+        if text == self.trigger {
+            let victim = self.victim;
+            self.db
+                .write_txn("t", move |conn, meta| {
+                    let id = jkb_core::item::id_for_uid(conn, victim)?
+                        .expect("setup: the victim exists");
+                    jkb_core::item::remove(conn, meta, id, true)
+                })
+                .unwrap();
+        }
+        let mut v = vec![0.0f32; 16];
+        v[text.len() % 16] = 1.0;
+        Ok(v)
+    }
+    fn health_check(&self) -> TypesResult<()> {
+        Ok(())
+    }
+    fn resolved_version(&self) -> TypesResult<Option<String>> {
+        Ok(Some("fake:v1".to_owned()))
+    }
+}
+
+/// An item deleted mid-backfill gets no vector. Embedding runs outside any transaction, so the
+/// item is gone by the time its batch is stored, after the GC trigger has already fired; writing
+/// the vector then recreated exactly the orphan the trigger exists to prevent.
+#[test]
+fn index_pending_writes_no_vector_for_an_item_deleted_mid_run() {
+    let db = open_db();
+    let mk = |uid: &str, content: &str| jkb_core::item::NewItem {
+        uid: uid.to_owned(),
+        kind: "note".to_owned(),
+        content: Some(content.to_owned()),
+        content_hash: None,
+        mime: None,
+    };
+    db.write_txn("t", move |conn, meta| {
+        jkb_core::item::upsert(conn, meta, &mk("note:keep", "kept content"))?;
+        jkb_core::item::upsert(conn, meta, &mk("note:doomed", "doomed content"))?;
+        Ok(())
+    })
+    .unwrap();
+
+    let pipe = Pipeline::new(Arc::new(DeletingEmbedder {
+        db: db.clone(),
+        trigger: "doomed content",
+        victim: "note:doomed",
+    }));
+    let report = pipe.index_pending(&db).unwrap();
+
+    assert_eq!(
+        db.read(|conn| Ok(jkb_index::count_stale(conn).unwrap().vectors))
+            .unwrap(),
+        0,
+        "a vector was written for the deleted item"
+    );
+    assert_eq!(
+        report.embedded, 1,
+        "only the surviving item's vector landed: {report:?}"
+    );
+    assert_eq!(pipe.unembedded_count(&db).unwrap(), 0);
+}
+
 /// A document's vector is the mean of its chunks', not an embedding of its truncated text:
 /// a vector claiming to describe a document while describing only its opening ranks against
 /// queries about the opening and misses everything after it.
