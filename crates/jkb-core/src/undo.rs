@@ -1323,7 +1323,9 @@ fn restore_item(conn: &Connection, snapshot: &Value) -> Result<usize> {
 /// `edges.id` AUTOINCREMENT, so the precondition for restoring the ids again now holds; doing so is
 /// a separate change (the snapshot taken here does not carry the id yet), and the honest fix for
 /// this whole family is still mechanical before-images (`SQLite`'s session extension), which is its
-/// own design pass, not another rule added here.
+/// own design pass, not another rule added here. Until then the lists are held to the schema by a
+/// tripwire rather than a derivation: `undoing_an_item_delete_restores_every_cascaded_row_whole`
+/// compares every cascaded row, every column, before the delete and after the undo.
 ///
 /// **The `WHERE EXISTS` guards are the one sanctioned way a restore in this module reports zero**,
 /// and they say exactly what they skip: a row whose *other* endpoint is not there to point at.
@@ -1872,7 +1874,8 @@ mod tests {
                 Ok((a, b))
             })
             .unwrap();
-        // ONE transaction removing both, so BOTH snapshots name the same edge.
+        // ONE transaction removing both. Only `a`'s snapshot names the edge: removing `a`
+        // cascades it away before `b` is snapshotted (see the doc above).
         db.write_txn("t", move |c, m| {
             item::remove(c, m, a, true)?;
             item::remove(c, m, b, true)?;
@@ -2018,6 +2021,77 @@ mod tests {
         );
     }
 
+    /// A restore skips a **containment** row whose other endpoint is not there, rather than
+    /// failing — the containment counterpart of
+    /// `an_edge_whose_other_endpoint_is_still_deleted_is_skipped_not_a_failure`, one case per
+    /// direction, because [`restore_children`] guards each direction with its own `EXISTS`.
+    ///
+    /// Both are reached only out of order, through `jkb undo <txn>`: the item is restored from a
+    /// snapshot that names a container (or a child) which a later, not-undone transaction removed.
+    /// Without the guard that is a foreign-key failure and the whole undo is refused.
+    #[test]
+    fn a_containment_row_whose_other_endpoint_is_still_deleted_is_skipped_not_a_failure() {
+        use crate::{containment, item};
+
+        // `first` is removed, then `second`, then `first`'s removal is undone on its own. The
+        // assertions are the same whichever end of the containment row `first` was.
+        let out_of_order = |first: &'static str, second: &'static str| {
+            let db = Db::open_in_memory().unwrap();
+            db.write_txn("t", |c, m| {
+                let parent = upsert(c, m, &note("parent"))?;
+                let kid = upsert(c, m, &note("kid"))?;
+                containment::contain(c, m, kid, parent, 4)
+            })
+            .unwrap();
+            let id = |uid: &'static str| {
+                db.read(move |c| item::id_for_uid(c, uid))
+                    .unwrap()
+                    .expect("the item exists")
+            };
+            let (first_id, second_id) = (id(first), id(second));
+            let removed_first = db
+                .write_txn("t", move |c, m| {
+                    item::remove(c, m, first_id, true)?;
+                    Ok(m.txn_id)
+                })
+                .unwrap();
+            db.write_txn("t", move |c, m| {
+                item::remove(c, m, second_id, true).map(|_| ())
+            })
+            .unwrap();
+
+            db.write_txn("t", move |c, m| super::undo(c, m, removed_first))
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "restoring `{first}` raised on a containment row whose other end \
+                         (`{second}`) is still deleted: {e}"
+                    )
+                });
+
+            assert!(
+                db.read(move |c| item::id_for_uid(c, first))
+                    .unwrap()
+                    .is_some(),
+                "`{first}` was not restored"
+            );
+            assert_eq!(
+                db.read(
+                    |c| Ok(c.query_row("SELECT count(*) FROM containment", [], |r| {
+                        r.get::<_, i64>(0)
+                    })?)
+                )
+                .unwrap(),
+                0,
+                "a containment row came back naming `{second}`, which is still deleted"
+            );
+        };
+
+        // The kid's snapshot names its container (`contained_by`).
+        out_of_order("kid", "parent");
+        // The parent's snapshot names what it contained (`contains`).
+        out_of_order("parent", "kid");
+    }
+
     /// Re-linking an existing edge to change its weight is an UPDATE, not an insert. Undoing
     /// it must restore the old weight — not delete an edge that existed beforehand, taking
     /// the knowledge it carried with it.
@@ -2059,6 +2133,62 @@ mod tests {
             (restored - 1.0).abs() < 1e-9,
             "the previous weight is restored, got {restored}"
         );
+    }
+
+    /// `edge::link_weighted` logs its before- and after-states under the columns `edges` has.
+    ///
+    /// It logged `{src, dst, type, weight}` — the arguments it was called with — which is the
+    /// shape [`check_restorable`] was written to reject. It escaped only because an edge update is
+    /// inverted by the hand-written `EdgeWeight`, which [`row_shaped`] excludes from the check, so
+    /// this asserts the payloads against the schema directly: under the generic column arm, where
+    /// [`INVERSES`] says a new table belongs, the old payload is a refused write.
+    #[test]
+    fn link_weighted_logs_its_states_under_the_columns_edges_has() {
+        use crate::edge;
+        use jkb_types::EdgeType;
+
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            let a = upsert(c, m, &note("a"))?;
+            let b = upsert(c, m, &note("b"))?;
+            // The first call inserts the edge, the second updates its weight.
+            edge::link_weighted(c, m, a, b, EdgeType::Supports, Some(1.0), None)?;
+            edge::link_weighted(c, m, a, b, EdgeType::Supports, Some(5.0), None)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let logged = db
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT op, before, after FROM changelog
+                      WHERE entity_type = 'edges' ORDER BY id",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })?;
+                Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        let ops: Vec<&str> = logged.iter().map(|(op, _, _)| op.as_str()).collect();
+        assert_eq!(
+            ops,
+            ["insert", "update"],
+            "setup: one insert, then one update"
+        );
+
+        for (op, before, after) in logged {
+            for state in [before, after].into_iter().flatten() {
+                let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+                let op = op.clone();
+                db.read(move |c| super::check_columns(c, &op, "edges", Some(&state), false))
+                    .unwrap_or_else(|e| panic!("`link_weighted` logged a non-column key: {e}"));
+            }
+        }
     }
 
     /// A delete-only transaction must be what `undo` picks: otherwise `jkb item rm` followed
@@ -2372,6 +2502,222 @@ mod tests {
             edge::unlink(c, m, item, other, EdgeType::Supports)
         });
         delete_round_trips(&db, "namespaces", |c, m| ns::remove(c, m, "x/doomed"));
+    }
+
+    /// The tables an item delete cascades through that [`restore_children`] puts back.
+    const CASCADE_RESTORED: [&str; 5] = [
+        "placements",
+        "tag_applications",
+        "edges",
+        "containment",
+        "bindings",
+    ];
+
+    /// The tables an item delete cascades through that undo does **not** put back, each for a
+    /// stated reason. `task_transitions`: an item's history is not restored (the cost V015
+    /// states). The `design_*` tables: they belong to a design, which `item::remove` refuses to
+    /// delete, so no undo of an item delete ever needs them.
+    const CASCADE_NOT_RESTORED: [&str; 5] = [
+        "task_transitions",
+        "design_updates",
+        "design_snapshots",
+        "design_doc_targets",
+        "design_sources",
+    ];
+
+    /// Every row of `table`, whole except for `skip`, sorted — so two dumps compare equal when
+    /// they hold the same rows whatever rowids a restore gave them. Columns come from the live
+    /// schema, so a column added later is compared without anybody listing it.
+    fn dump_rows(db: &Db, table: &'static str, skip: &'static [&'static str]) -> Vec<Vec<String>> {
+        db.read(move |c| {
+            let columns: Vec<String> = super::table_columns(c, table)?
+                .into_iter()
+                .filter(|col| !skip.contains(&col.as_str()))
+                .map(|col| format!("\"{col}\""))
+                .collect();
+            let mut stmt = c.prepare(&format!("SELECT {} FROM \"{table}\"", columns.join(", ")))?;
+            let width = stmt.column_count();
+            let rows = stmt.query_map([], |r| {
+                (0..width)
+                    .map(|i| {
+                        r.get::<_, rusqlite::types::Value>(i)
+                            .map(|v| format!("{v:?}"))
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })?;
+            let mut rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.sort();
+            Ok(rows)
+        })
+        .unwrap()
+    }
+
+    /// Every table with an `ON DELETE CASCADE` onto `items` is listed in [`CASCADE_RESTORED`] or
+    /// [`CASCADE_NOT_RESTORED`] — read from the live schema, so a table added later fails here until
+    /// somebody decides whether undoing an item delete puts its rows back.
+    fn assert_every_cascade_table_is_accounted_for() {
+        use std::collections::BTreeSet;
+
+        let cascading: BTreeSet<String> = Db::open_in_memory()
+            .unwrap()
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT DISTINCT m.name FROM sqlite_master m,
+                            pragma_foreign_key_list(m.name) f
+                      WHERE m.type = 'table' AND f.\"table\" = 'items'
+                        AND f.on_delete = 'CASCADE'",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                Ok(rows.collect::<std::result::Result<BTreeSet<_>, _>>()?)
+            })
+            .unwrap();
+        let accounted: BTreeSet<String> = CASCADE_RESTORED
+            .iter()
+            .chain(CASCADE_NOT_RESTORED.iter())
+            .map(|t| (*t).to_owned())
+            .collect();
+        assert_eq!(
+            cascading, accounted,
+            "the tables an item delete cascades through changed: decide whether undo restores \
+             each one, and list it in CASCADE_RESTORED or CASCADE_NOT_RESTORED"
+        );
+    }
+
+    /// How many rows of `table` reference item `id` through any of its foreign keys onto `items`.
+    fn rows_naming(db: &Db, table: &'static str, id: i64) -> i64 {
+        db.read(move |c| {
+            let fks: Vec<String> = {
+                let mut stmt = c.prepare(
+                    "SELECT \"from\" FROM pragma_foreign_key_list(?1)
+                      WHERE \"table\" = 'items'",
+                )?;
+                let rows = stmt.query_map([table], |r| r.get::<_, String>(0))?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            let refs = fks
+                .iter()
+                .map(|col| format!("\"{col}\" = ?1"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            Ok(c.query_row(
+                &format!("SELECT count(*) FROM \"{table}\" WHERE {refs}"),
+                [id],
+                |r| r.get::<_, i64>(0),
+            )?)
+        })
+        .unwrap()
+    }
+
+    /// **The tripwire on the item-delete cascade's hand-written column lists.**
+    ///
+    /// `item::snapshot` selects, and [`restore_children`] re-inserts, the rows `ON DELETE CASCADE`
+    /// takes with an item through two separate hand-written column lists per table, and nothing
+    /// else compares them: a column dropped from the snapshot comes back as its default, with the
+    /// restore reporting success. That was verified by mutation — dropping `placements.metadata`
+    /// and `bindings.serializer`/`last_synced_hash` from the snapshot left the suite green, and a
+    /// synced item restored that way re-imports or re-exports its file at the next sync.
+    ///
+    /// So this compares **whole rows** — every column the live schema has, the same shape as
+    /// `undoing_a_delete_restores_the_whole_row_for_every_deleter` — before the removal and after
+    /// the undo, with every column given a non-default value so an omission cannot restore it by
+    /// luck. It also derives the set of cascading tables from the schema, so a table added later
+    /// with an `ON DELETE CASCADE` onto `items` fails here until somebody decides whether undo
+    /// restores it.
+    ///
+    /// **The one deliberate exception is `edges.id`**: the snapshot does not carry it, so a
+    /// restored edge takes a fresh id (the priced cost on
+    /// `an_item_delete_is_undoable_after_its_edge_id_has_been_reissued`).
+    #[test]
+    fn undoing_an_item_delete_restores_every_cascaded_row_whole() {
+        use crate::{binding, containment, edge, item, ns, placement, tag};
+        use jkb_types::{EdgeType, PlacementRole, SyncMode};
+        use serde_json::json;
+
+        const EDGE_ID_EXCEPTION: &[&str] = &["id"];
+
+        assert_every_cascade_table_is_accounted_for();
+
+        let db = Db::open_in_memory().unwrap();
+        let victim = db
+            .write_txn("t", |c, m| {
+                let victim = upsert(c, m, &note("victim"))?;
+                let other = upsert(c, m, &note("other"))?;
+                let parent = upsert(c, m, &note("parent"))?;
+                let kid = upsert(c, m, &note("kid"))?;
+                let home = ns::ensure(c, "notes/home")?;
+                let mirror = ns::ensure(c, "notes/mirror")?;
+                placement::place(c, m, victim, home, PlacementRole::Primary, 3)?;
+                placement::place(c, m, victim, mirror, PlacementRole::Reference, 5)?;
+                tag::apply(c, m, victim, "size", "small")?;
+                edge::link_weighted(
+                    c,
+                    m,
+                    victim,
+                    other,
+                    EdgeType::Supports,
+                    Some(2.5),
+                    Some(&json!({ "why": "evidence" })),
+                )?;
+                edge::link(c, m, other, victim, EdgeType::References, None)?;
+                containment::contain(c, m, victim, parent, 4)?;
+                containment::contain(c, m, kid, victim, 7)?;
+                binding::set(
+                    c,
+                    m,
+                    victim,
+                    "file:///notes/victim.md",
+                    Some(SyncMode::Bidirectional),
+                    Some("document"),
+                )?;
+                binding::mark_synced(c, m, victim, "feedface")?;
+                // Columns no repo call sets to anything but their default, set here so that a
+                // snapshot omitting them cannot restore them by luck. Test fixture only.
+                c.execute(
+                    "UPDATE placements SET metadata = '{\"pinned\":true}' WHERE item_id = ?1",
+                    [victim.get()],
+                )?;
+                c.execute(
+                    "UPDATE tag_applications SET props = '{\"source\":\"fixture\"}'
+                      WHERE item_id = ?1",
+                    [victim.get()],
+                )?;
+                c.execute(
+                    "UPDATE edges SET created_at = '2001-02-03T04:05:06.007Z'",
+                    [],
+                )?;
+                Ok(victim)
+            })
+            .unwrap();
+
+        let skip = |table: &str| -> &'static [&'static str] {
+            if table == "edges" {
+                EDGE_ID_EXCEPTION
+            } else {
+                &[]
+            }
+        };
+        let tables: Vec<&'static str> = std::iter::once("items").chain(CASCADE_RESTORED).collect();
+        let before: Vec<_> = tables.iter().map(|t| dump_rows(&db, t, skip(t))).collect();
+
+        // Not vacuous: every restored table holds a row the removal takes.
+        for table in CASCADE_RESTORED {
+            let held = rows_naming(&db, table, victim.get());
+            assert!(held > 0, "setup: the victim has no row in `{table}`");
+        }
+
+        db.write_txn("t", move |c, m| {
+            item::remove(c, m, victim, true).map(|_| ())
+        })
+        .unwrap();
+        db.write_txn("t", undo_last).unwrap();
+
+        for (table, before) in tables.iter().zip(before) {
+            assert_eq!(
+                dump_rows(&db, table, skip(table)),
+                before,
+                "undoing an item delete did not restore `{table}` row for row, column for column"
+            );
+        }
     }
 
     /// Undoing an edit to an item's body restores the body **and its hash**.

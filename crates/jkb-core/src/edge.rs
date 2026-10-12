@@ -121,7 +121,18 @@ pub fn link_weighted(
             |row| row.get(0),
         )?;
 
-    let describe = |w: Option<f64>| json!({ "src": src.get(), "dst": dst.get(), "type": edge_type.as_str(), "weight": w });
+    // Under the column names `edges` has, as every before-state must be (`check_restorable`).
+    // The `EdgeWeight` inverse reads only `weight`, so `{src, dst}` — the arguments, not the
+    // columns — escaped the check only because that inverse is not the generic one; moving
+    // `edges` onto the generic arm would have made it a refused write.
+    let describe = |w: Option<f64>| {
+        json!({
+            "src_item_id": src.get(),
+            "dst_item_id": dst.get(),
+            "type": edge_type.as_str(),
+            "weight": w,
+        })
+    };
     match existing {
         Some((_, before_weight)) => changelog::append(
             conn,
