@@ -1465,25 +1465,6 @@ pub fn worktrees(dir: &Path) -> Result<Option<Vec<Worktree>>> {
     Ok(Some(out))
 }
 
-/// The worktree in which `branch` is currently checked out, if any. `git` refuses to check
-/// one branch out twice, so this is what decides whether a land can borrow an existing
-/// checkout or must make its own.
-///
-/// # Errors
-/// Returns an error if `git` cannot be executed.
-pub fn worktree_for_branch(dir: &Path, branch: &str) -> Result<Option<PathBuf>> {
-    valid_ref(branch)?;
-    // A DELIBERATE collapse, and the safe direction here: this decides whether a land may borrow
-    // an existing checkout, and "no" means it cuts its own — which git then refuses outright if
-    // the branch really is checked out somewhere. A wrong `None` costs a refusal with git's own
-    // message; it cannot make a land graft into a checkout it does not own.
-    Ok(worktrees(dir)?
-        .unwrap_or_default()
-        .into_iter()
-        .find(|w| w.branch.as_deref() == Some(branch))
-        .map(|w| w.path))
-}
-
 /// Drop git's registration of the worktree at `path`, whose directory is gone.
 ///
 /// **This path only — never `git worktree prune`.** Prune drops every registration whose directory

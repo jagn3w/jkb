@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use jkb_fsm::Fact;
+use jkb_types::TaskStatus;
 
 use crate::repo::{facet_values, RepoCtx, FACET_BRANCH};
 use crate::session_cli::Kb;
@@ -80,9 +81,12 @@ impl State {
     /// The `State`-level counterpart of `jkb_types::TaskStatus::is_terminal_str`, which is the
     /// authority over the raw strings. Kept separate because it answers a different question —
     /// `State` folds a session's existence in beside the status — but the two must agree on
-    /// which statuses end a task, so this is derived from `from_status`, never re-listed.
+    /// which statuses end a task, so this is derived from that authority through `from_status`,
+    /// never re-listed: a state is terminal exactly when some terminal status maps to it.
     pub(crate) fn is_terminal(self) -> bool {
-        matches!(self, Self::Landed | Self::Dropped)
+        TaskStatus::ALL
+            .iter()
+            .any(|s| s.is_terminal() && Self::from_status(s.as_str()) == self)
     }
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -439,34 +443,53 @@ fn stage_task(
     })
 }
 
+/// Which checkout a land onto `onto` grafts in, as [`land_dir_in`] finds it.
+pub(crate) enum LandDir {
+    /// A worktree already has `onto` checked out. `git` refuses to check one branch out twice,
+    /// so borrowing it is not an optimization — it is the only option there is.
+    Checkout(std::path::PathBuf),
+    /// No checkout of `onto`, and jkb's scratch `.jkb/base` is registered: the graft reuses it,
+    /// switched to `onto`, whatever branch it holds now — or none, if it is detached.
+    Base(std::path::PathBuf),
+}
+
+impl LandDir {
+    /// The directory the graft happens in.
+    pub(crate) fn path(&self) -> &std::path::Path {
+        match self {
+            Self::Checkout(p) | Self::Base(p) => p,
+        }
+    }
+}
+
 /// Which checkout a land onto `onto` will graft in, given the worktrees that exist.
 ///
-/// `land_dir_for` resolves this same thing and then *mutates* — creating or switching
-/// `.jkb/base` — so only the lookup lives here, and both it and the row read the same answer
-/// from the same list. `None` means the graft will land in a `.jkb/base` that has to be
-/// created, which cannot be dirty because it does not exist yet.
-fn land_dir_in(
+/// **The one lookup.** `main::land_dir_for` asks this and then *mutates* — switching or creating
+/// `.jkb/base` — and the staging row and the land preflight ask it to decide whether that checkout
+/// is dirty, so the command and the row cannot describe different landings. They used to be two
+/// implementations, and diverged once on a detached base: the command matched `.jkb/base` by
+/// branch and refused, while this matched by path and reported the task landable. `None` means
+/// the graft will land in a `.jkb/base` that has to be created, which cannot be dirty because it
+/// does not exist yet.
+pub(crate) fn land_dir_in(
     worktrees: &[gitrepo::Worktree],
     root: &std::path::Path,
     onto: &str,
-) -> Option<std::path::PathBuf> {
+) -> Option<LandDir> {
     if let Some(w) = worktrees.iter().find(|w| w.branch.as_deref() == Some(onto)) {
-        return Some(w.path.clone());
+        return Some(LandDir::Checkout(w.path.clone()));
     }
-    // No checkout of its own: the graft reuses `.jkb/base`, whatever branch that currently
-    // holds — or none, if it is detached. A dirty one refuses the landing, which is why the
-    // row must consider it too, and did not: it asked only about a checkout of `onto` itself
-    // and reported "Landable" for every task whose target had none.
+    // No checkout of its own: the graft reuses `.jkb/base`. A dirty one refuses the landing,
+    // which is why the row must consider it too, and did not: it asked only about a checkout of
+    // `onto` itself and reported "Landable" for every task whose target had none.
     //
-    // Matched by **path**, exactly as `main::land_dir_for` decides whether to reuse it. Those
-    // two must agree on what counts as a usable base or the row and the command describe
-    // different landings; they diverged once on a detached base, where the command required a
-    // branch and refused while the row matched by path and promised.
+    // Matched by **path**, not by branch: a detached `.jkb/base` has no branch and is still an
+    // ordinary reusable cache, because `switch_to` attaches it either way.
     let base = session::base_worktree(root);
     worktrees
         .iter()
         .find(|w| session::same_path(&w.path, &base))
-        .map(|w| w.path.clone())
+        .map(|w| LandDir::Base(w.path.clone()))
 }
 
 /// Why the land target cannot be grafted into right now, or `None`.
@@ -509,7 +532,7 @@ pub(crate) fn target_dirty_reason(
     let Some(worktrees) = worktrees else {
         return Ok(Some(worktree_listing_refusal(root)));
     };
-    let Some(dir) = land_dir_in(worktrees, root, onto) else {
+    let Some(dir) = land_dir_in(worktrees, root, onto).map(|d| d.path().to_owned()) else {
         return Ok(None);
     };
     // Memoized per directory: staging branches usually have no checkout of their own, so
@@ -673,8 +696,29 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
 mod tests {
     use super::{land_blocker, target_dirty_reason, worktree_listing_refusal, LandFacts, State};
     use jkb_fsm::Fact;
+    use jkb_types::TaskStatus;
     use std::collections::BTreeMap;
     use std::path::Path;
+
+    /// `State::is_terminal` agrees with `TaskStatus::is_terminal` for every status.
+    ///
+    /// `is_terminal` is derived from the status authority through `from_status`, so the only way
+    /// the two can disagree is `from_status` folding a terminal and a non-terminal status into one
+    /// state — which would make that state's answer wrong for one of them. Asked over every status
+    /// the enum has, so a sixth one is covered the day it is added.
+    #[test]
+    fn a_state_is_terminal_exactly_when_its_status_is() {
+        for status in TaskStatus::ALL {
+            assert_eq!(
+                State::from_status(status.as_str()).is_terminal(),
+                status.is_terminal(),
+                "{}",
+                status.as_str()
+            );
+        }
+        // An unrecognised status is live work, never a finished task.
+        assert!(!State::from_status("blocked").is_terminal());
+    }
 
     /// A `git worktree list` that did not answer REFUSES, and says so about the listing.
     ///

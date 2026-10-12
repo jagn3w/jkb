@@ -48,6 +48,9 @@ fn a_task_closes_on_a_merge_its_client_established() {
     assert_eq!((before.pr, before.branch.as_deref()), (None, Some("feat")));
     assert!(before.writable);
     assert!(!before.live_landing);
+    // The location facet is read beside the history's branch, which a session started through the
+    // op records in both places.
+    assert_eq!(before.branch_facet.as_deref(), Some("feat"));
 
     call(
         &b,

@@ -135,10 +135,7 @@ fn discover(facts: &PrFacts) -> Result<Option<i64>> {
         );
     };
     let Some(branch) = &facts.branch else {
-        anyhow::bail!(
-            "this task records no branch, so there is nothing to look a pull request up by — \
-             pass the number: `jkb task pr <uid> <number>`"
-        );
+        anyhow::bail!("{}", no_branch_reason(facts));
     };
     match pr::discover(&ctx.root, branch) {
         pr::Discovery::One(found) => Ok(Some(found.number)),
@@ -306,11 +303,7 @@ fn discover_quietly(
     facts: &PrFacts,
 ) -> Result<Result<Option<i64>, String>> {
     let Some(branch) = &facts.branch else {
-        return Ok(Err(
-            "no branch recorded, so there is no pull request to look up — \
-             `jkb task pr <uid> <number>` to name one"
-                .to_owned(),
-        ));
+        return Ok(Err(no_branch_reason(facts)));
     };
     Ok(match pr::discover(root, branch) {
         pr::Discovery::One(found) => {
@@ -325,6 +318,31 @@ fn discover_quietly(
         )),
         pr::Discovery::Unavailable(why) => Err(why),
     })
+}
+
+/// Why a task whose history names no branch has no pull request to look up — and the remedy for
+/// the cause it actually has, which is one of two.
+///
+/// One sentence used to serve both, and named the wrong one for every task started before the
+/// transition log existed: those carry a `branch=` facet, so "no branch recorded" was false, and
+/// its remedy (`jkb task pr`) did not touch the cause. What such a task lacks is a session in its
+/// history saying where that branch lands, which `jkb task work --onto` records. A hold whose
+/// reason misidentifies the cause sends its reader to a verb that will not help, which is worse
+/// than a vague one. Shared by `task pr` and `close-merged`, so the two cannot drift apart again.
+fn no_branch_reason(facts: &PrFacts) -> String {
+    let uid = &facts.uid;
+    match &facts.branch_facet {
+        None => format!(
+            "this task records no branch, so there is no pull request to look up — name one with \
+             `jkb task pr {uid} <number>`"
+        ),
+        Some(branch) => format!(
+            "this task's `branch=` facet says it is on `{branch}`, but no session in its history \
+             names that branch or where it lands (it was started before jkb recorded sessions as \
+             transitions), so there is no branch to look a pull request up by — record where it \
+             lands with `jkb task work {uid} --onto <land target>`"
+        ),
+    }
 }
 
 /// Print what a `close-merged` run decided: closed, and held with the guard's reason.

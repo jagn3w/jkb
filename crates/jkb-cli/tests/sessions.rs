@@ -5576,3 +5576,167 @@ fn a_shared_doc_target_is_cleared_by_export_to() {
         .stdout(predicate::str::contains("docs/b.md"));
     assert!(f.repo.join("docs/a.md").exists() && f.repo.join("docs/b.md").exists());
 }
+
+/// `jkb task landed` where **every** task on the branch is refused records nothing, and says so:
+/// a non-zero exit, no `recorded:` line, and a message about the refusals rather than one blaming
+/// the caller's permission — the refusal here has nothing to do with who is asking.
+///
+/// Through the daemon, because in-process the CLI is the operator and nothing refuses it. The
+/// refusal is the task's own: it is filed outside the directories the daemon serves, which no
+/// role can change. Without the `refused < uids.len()` guard this run exits zero having recorded
+/// nothing.
+#[test]
+fn a_landing_whose_every_task_is_refused_fails_and_records_nothing() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-qb", "batch"]);
+    let filed = f.add_task("filed elsewhere");
+    for tag in ["branch=task/refused", "repo=proj"] {
+        f.jkb()
+            .args(["task", "tag", "set", &filed, tag])
+            .assert()
+            .success();
+    }
+    f.jkb()
+        .args(["task", "set", &filed, "--status", "in_progress"])
+        .assert()
+        .success();
+    f.jkb()
+        .args([
+            "task",
+            "bind",
+            &filed,
+            "--sync",
+            "file:///nowhere-the-daemon-serves/tasks.md",
+        ])
+        .assert()
+        .success();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+
+    let out = jkb(None)
+        .args(["task", "landed", "task/refused", "--onto", "batch"])
+        .current_dir(&f.repo)
+        .env("JKB_REMOTE", &url)
+        .env("JKB_REMOTE_TOKEN_FILE", &token)
+        .env("HOSTNAME", "container")
+        .env_remove("JKB_DB")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "every task was refused and the run still succeeded: {stdout}{stderr}"
+    );
+    assert!(
+        !stdout.contains("recorded:"),
+        "reported a landing it did not record: {stdout}"
+    );
+    assert!(
+        stderr.contains(&format!("{filed} not closed")),
+        "the refused task's own reason is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("every one of its tasks was refused"),
+        "the failure does not say why nothing was recorded: {stderr}"
+    );
+    assert!(
+        !stderr.contains("this caller may land none"),
+        "the failure blames the caller for a refusal that is about the task: {stderr}"
+    );
+    assert_eq!(f.status_of(&filed), "in_progress", "nothing closed it");
+}
+
+/// `close-merged` holds a task whose history names no branch with the reason it actually has, and
+/// a remedy that addresses it — two causes, two sentences.
+///
+/// A task started before the transition log existed carries a `branch=` facet and nothing in its
+/// history. The one sentence both used to get said *no branch recorded* — false for it — and
+/// pointed at `jkb task pr`, which does not touch the cause. Seen live on the first post-merge run
+/// after the transition log landed, on four such tasks.
+#[test]
+fn close_merged_tells_a_task_with_no_branch_from_one_whose_session_predates_the_log() {
+    let f = Fixture::new();
+    let bare = f.add_task("never started");
+    let legacy = f.add_task("started under an older jkb");
+    // Planted straight through the tag repo, as the older binary left them: a location facet and
+    // no transition naming it.
+    let db = f.db.to_str().unwrap().to_owned();
+    let store = jkb_core::Db::open(&db).unwrap();
+    let ids = store
+        .read({
+            let uids = [bare.clone(), legacy.clone()];
+            move |conn| {
+                uids.iter()
+                    .map(|u| jkb_core::item::id_for_uid(conn, u).map(Option::unwrap))
+                    .collect::<Result<Vec<_>, _>>()
+            }
+        })
+        .unwrap();
+    let (bare_id, legacy_id) = (ids[0], ids[1]);
+    store
+        .write_txn("t", move |conn, meta| {
+            jkb_core::tag::apply(conn, meta, bare_id, "repo", "proj")?;
+            jkb_core::tag::apply(conn, meta, legacy_id, "repo", "proj")?;
+            jkb_core::tag::apply(conn, meta, legacy_id, "branch", "task/old-session")
+        })
+        .unwrap();
+    drop(store);
+
+    let held = |f: &Fixture| -> std::collections::BTreeMap<String, String> {
+        let out = f
+            .jkb()
+            .args(["task", "close-merged", "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "close-merged: {out:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["held"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                (
+                    h["uid"].as_str().unwrap().to_owned(),
+                    h["reason"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let reasons = held(&f);
+
+    let bare_why = &reasons[&bare];
+    assert!(
+        bare_why.contains("records no branch") && bare_why.contains("jkb task pr"),
+        "{bare_why}"
+    );
+    assert!(!bare_why.contains("jkb task work"), "{bare_why}");
+
+    let legacy_why = &reasons[&legacy];
+    assert!(
+        !legacy_why.contains("records no branch"),
+        "a task with a `branch=` facet was told it records no branch: {legacy_why}"
+    );
+    assert!(
+        legacy_why.contains("task/old-session")
+            && legacy_why.contains(&format!("jkb task work {legacy} --onto")),
+        "{legacy_why}"
+    );
+    assert!(
+        !legacy_why.contains("jkb task pr"),
+        "the remedy points at a verb that does not address the cause: {legacy_why}"
+    );
+
+    // The remedy it names is the one that works: once a session records where the work lands, the
+    // pull request is looked up from its branch, and the hold — whatever it now is — is no longer
+    // this one.
+    git(&f.repo, &["branch", "batch"]);
+    f.work_onto(&legacy, "batch");
+    let after = held(&f);
+    assert!(
+        after
+            .get(&legacy)
+            .is_none_or(|why| !why.contains("no session in its history")),
+        "the named remedy did not clear the cause: {after:?}"
+    );
+}

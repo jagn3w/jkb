@@ -6,7 +6,7 @@
 //! statement, as `task.landed` is — and is held to the task-write rules.
 
 use jkb_core::lifecycle::{self, TaskEvent};
-use jkb_core::{item, task, transition, WriteMeta};
+use jkb_core::{item, location, tag, task, transition, WriteMeta};
 use jkb_fsm::Fact;
 use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,12 @@ pub struct PrFacts {
     pub pr: Option<i64>,
     /// The branch it most recently recorded.
     pub branch: Option<String>,
+    /// Its `branch=` location facet, which a session started before the transition log existed
+    /// carries with nothing in the history naming it. Read only to tell *this task records no
+    /// branch* apart from *it records one but no session says where it lands* when `branch` is
+    /// `None` — the two have different remedies. Defaulted, so an older daemon reads as no facet.
+    #[serde(default)]
+    pub branch_facet: Option<String>,
     /// A landing jkb recorded still speaks for the work in flight.
     pub live_landing: bool,
     /// A recorded landing was superseded: `(onto, the event that retired it, when)`.
@@ -57,6 +63,9 @@ pub fn facts(
         uid,
         pr: landing.pr_number(),
         branch: transition::latest_with_branch(conn, id)?.and_then(|r| r.labels.branch),
+        branch_facet: tag::applications(conn, id)?
+            .into_iter()
+            .find_map(|(facet, value)| (facet == location::FACET_BRANCH).then_some(value)),
         live_landing: landing.live().is_some(),
         superseded: landing.superseded().map(|(landed, resumed)| {
             (

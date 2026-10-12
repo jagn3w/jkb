@@ -4206,53 +4206,55 @@ impl Disposal {
 /// landed onto a different branch than the last, and keep failing until the directory was
 /// deleted by hand.
 fn land_dir_for(ctx: &repo::RepoCtx, onto: &str) -> Result<PathBuf> {
-    if let Some(dir) = gitrepo::worktree_for_branch(&ctx.root, onto)? {
-        return Ok(dir);
-    }
+    gitrepo::valid_ref(onto)?;
+    // A DELIBERATE collapse of a listing git did not answer, and the safe direction here: every
+    // arm it can select either borrows nothing or refuses. "No checkout of `onto`" means the land
+    // cuts its own, which git refuses outright if the branch really is checked out somewhere; "no
+    // registered `.jkb/base`" sends an existing one to the bail below. The land preflight
+    // (`staging::target_dirty_reason`) has already refused a silent listing, under the lock.
+    let worktrees = gitrepo::worktrees(&ctx.root)?.unwrap_or_default();
+    // Spelled as jkb spells it rather than as the listing does, as it always was: the gate's
+    // placement maps this path, and a listing may spell the same directory another way.
     let base = session::base_worktree(&ctx.root);
-    // Whether git knows a worktree there — NOT whether it has a branch. A **detached**
-    // `.jkb/base` has no branch, so the branch test sent it to the "exists but git does not
-    // know it" bail below and refused every landing, while `staging::land_dir_in` matched the
-    // same directory by path and reported the task landable. `switch_to` attaches it either
-    // way, so a detached base is an ordinary reusable cache.
-    // Collapsing to "not registered" is the safe direction: the arm it selects only refuses,
-    // with git's own message, rather than reusing a checkout on an unverified premise.
-    let base_registered = gitrepo::worktrees(&ctx.root)?
-        .unwrap_or_default()
-        .iter()
-        .any(|w| session::same_path(&w.path, &base));
-    if base_registered {
-        // It exists and holds some other branch (or none) — if it held `onto`, the lookup
-        // above would have found it. Reuse it: it is a cache, and switching keeps its
-        // build artifacts.
-        //
-        // This is not a second copy of the land gate's dirty rule (that one lives in
-        // `staging::target_dirty_reason` and is asked once, under the lock). It guards the
-        // mutation on the *next* line: `git switch` across branches carries uncommitted changes
-        // over, or refuses outright with a message about neither jkb nor the task. Hence its own
-        // remedy, which is about this scratch checkout rather than about landing.
-        anyhow::ensure!(
-            gitrepo::is_dirty(&base, &ctx.root)?.is_no(),
-            "{} could not be established as clean — it is jkb's own scratch checkout, so commit \
-             or discard any changes, or remove it with `git worktree remove --force` and let \
-             jkb recreate it",
-            base.display()
-        );
-        gitrepo::switch_to(&base, onto)?;
-        return Ok(base);
+    match staging::land_dir_in(&worktrees, &ctx.root, onto) {
+        Some(staging::LandDir::Checkout(dir)) => Ok(dir),
+        Some(staging::LandDir::Base(_)) => {
+            // It exists and holds some other branch (or none) — if it held `onto`, the lookup
+            // would have answered `Checkout`. Reuse it: it is a cache, and switching keeps its
+            // build artifacts.
+            //
+            // This is not a second copy of the land gate's dirty rule (that one lives in
+            // `staging::target_dirty_reason` and is asked once, under the lock). It guards the
+            // mutation on the *next* line: `git switch` across branches carries uncommitted
+            // changes over, or refuses outright with a message about neither jkb nor the task.
+            // Hence its own remedy, which is about this scratch checkout rather than about
+            // landing.
+            anyhow::ensure!(
+                gitrepo::is_dirty(&base, &ctx.root)?.is_no(),
+                "{} could not be established as clean — it is jkb's own scratch checkout, so \
+                 commit or discard any changes, or remove it with `git worktree remove --force` \
+                 and let jkb recreate it",
+                base.display()
+            );
+            gitrepo::switch_to(&base, onto)?;
+            Ok(base)
+        }
+        None => {
+            anyhow::ensure!(
+                !base.exists(),
+                "{} exists but git does not know it as a worktree — look at it, then move it \
+                 out of the way (not `git worktree prune`, which drops every checkout this side \
+                 cannot see)",
+                base.display()
+            );
+            if let Some(parent) = base.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            gitrepo::worktree_add(&ctx.root, &base, onto, onto)?;
+            Ok(base)
+        }
     }
-    anyhow::ensure!(
-        !base.exists(),
-        "{} exists but git does not know it as a worktree — look at it, then move it \
-         out of the way (not `git worktree prune`, which drops every checkout this side cannot see)",
-        base.display()
-    );
-    if let Some(parent) = base.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    gitrepo::worktree_add(&ctx.root, &base, onto, onto)?;
-    Ok(base)
 }
 
 /// The last `n` lines of `text` — enough of a failed gate to act on, without replaying the
