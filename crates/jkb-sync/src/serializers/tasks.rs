@@ -899,6 +899,8 @@ impl Taken {
 
     /// Take `base`, or its first free suffixed form when `base` is taken.
     fn unique(&mut self, base: String) -> String {
+        #[cfg(test)]
+        tests::PROBES.set(tests::PROBES.get() + 1);
         if self.names.insert(base.clone()) {
             return base;
         }
@@ -906,6 +908,8 @@ impl Taken {
         loop {
             let candidate = format!("{base}-{n}");
             *n += 1;
+            #[cfg(test)]
+            tests::PROBES.set(tests::PROBES.get() + 1);
             if self.names.insert(candidate.clone()) {
                 return candidate;
             }
@@ -920,6 +924,32 @@ fn bad(msg: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    std::thread_local! {
+        /// How many names [`super::Taken::unique`] has tried on this thread: the work count that
+        /// pins its cost without a clock.
+        pub(super) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A file of N lines that mint the same id costs N tries for the bare names and one per suffixed
+    /// one, not N²/2: counting up from `-2` for every clash made 16k identical checkbox lines take
+    /// 11 s to parse, and the round-trip probe parses edit text inside the single writer's
+    /// transaction. Counted rather than timed, so a loaded machine cannot fail it.
+    #[test]
+    fn minting_n_identical_ids_tries_each_name_once() {
+        const N: usize = 4096;
+        let text = format!("## S\n{}## S\n## S\n", "- [ ] x\n".repeat(N));
+        PROBES.set(0);
+        let doc = super::parse_text(&text).expect("parses");
+        let mut ids: Vec<&str> = doc.items.iter().map(|i| i.local_id.as_str()).collect();
+        assert_eq!(ids.len(), N);
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), N, "every minted id is distinct");
+        // N task ids, each one try for its base and one more for its suffix past the first; three
+        // sections, the same.
+        assert_eq!(PROBES.get(), (2 * N - 1) + (2 * 3 - 1));
+    }
+
     /// What an edit may leave in a task filed in a tasks.md is what this serializer reads back as
     /// written; each of these came back as something else.
     #[test]

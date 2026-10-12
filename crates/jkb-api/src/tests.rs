@@ -2497,10 +2497,13 @@ fn an_edit_is_judged_by_the_body_it_leaves_and_bounded() {
 }
 
 /// The round-trip probe parses the whole edit inside the single writer's transaction, so an edit is
-/// held to its size before the probe, and the parse is linear in lines that mint the same id: 16k
-/// identical checkbox lines took 11 s to judge.
+/// held to its size before the probe, and one just under the size is judged on what it would read
+/// back as. That the parse is linear in lines that mint the same id (16k identical checkbox lines
+/// once took 11 s to judge) is pinned by a work count in `jkb-sync`
+/// (`minting_n_identical_ids_tries_each_name_once`), not here by a clock: a 5 s bound on this judge
+/// took 10.5 s on a loaded machine and failed an unrelated change's gate.
 #[test]
-fn an_edit_to_a_tasks_md_task_is_sized_before_it_is_parsed_and_parses_in_linear_time() {
+fn an_edit_to_a_tasks_md_task_is_sized_before_it_is_parsed_and_judged_under_its_size() {
     let (db, inside, _outside, _managed) = mutate_fixture();
     let b = rooted(&db);
     let over = format!(
@@ -2517,18 +2520,12 @@ fn an_edit_to_a_tasks_md_task_is_sized_before_it_is_parsed_and_parses_in_linear_
         "t{}",
         "\n- [ ] x".repeat(super::tasks::MAX_CONTENT_BYTES / 8 - 1)
     );
-    let started = std::time::Instant::now();
     let e = call(
         &b,
         json!({ "op": "task.edit", "uid": inside, "text": under }),
     )
     .unwrap_err();
     assert!(e.message.contains("a task of its own"), "{e:?}");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "32k duplicate lines judged in {:?}",
-        started.elapsed()
-    );
 }
 
 /// A tasks-file task's line must come back from the file whatever field a write changed: a due date, a
