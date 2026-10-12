@@ -123,8 +123,26 @@ run() { # run <label> <expect-substring>
         printf '           UNMUTATED tree and would report MISSED about a guard that is fine.\n'
         return
     fi
-    out="$(cd "$work/t" && ./.container/check-config.sh 2>&1)"; rc=$?
-    judge "$label" "$expect" "$out" "$rc"
+    # IN PARALLEL, JUDGED IN ORDER. Each check-config.sh run takes ~2 s and there are ~260, so run
+    # one after another this was the slowest step of CI (~10 min). The mutated tree is moved aside
+    # (every mutation starts from a fresh seed, so nothing reads $work/t after this) and checked in
+    # the background, at most $jobs at a time; settle() judges every result, in the order the
+    # mutations were written, before the pins and the control below.
+    local n="${#LABELS[@]}" dir="$work/m${#LABELS[@]}"
+    mv "$work/t" "$dir"
+    LABELS+=("$label"); RUN_EXPECTS+=("$expect")
+    while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do wait -n 2>/dev/null || wait; done
+    ( cd "$dir" && ./.container/check-config.sh >"$work/out$n" 2>&1; echo $? >"$work/rc$n"; rm -rf "$dir" ) &
+}
+
+LABELS=(); RUN_EXPECTS=()
+jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+settle() { # judge every backgrounded run, in order
+    local i
+    wait
+    for i in "${!LABELS[@]}"; do
+        judge "${LABELS[$i]}" "${RUN_EXPECTS[$i]}" "$(cat "$work/out$i")" "$(cat "$work/rc$i" 2>/dev/null || echo 127)"
+    done
 }
 
 # Separated from executing so the control can judge the SAME run it health-checked, rather than
@@ -2558,6 +2576,7 @@ echo "==> coverage"
 # paths on one line (`grep -q A || bad "…"; grep -q B || bad "…"`, and this file already spells
 # compound `|| { bad "…"; gen_ok=0; }` forms) moved the pin by one, so one of the two shipped with no
 # mutation while the harness printed a coverage number over it.
+settle
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
 PINNED_BAD_SITES=123
