@@ -1071,7 +1071,8 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     // ONCE, AND THE SELECTION ALREADY KNEW IT. `select_work_txn` has never handed back a
     // transaction that has been undone; this form did not ask, so re-running `jkb undo <txn>`
     // re-executed the whole inversion — and `DeleteRow` addresses a row id, which `SQLite`
-    // reissues for every table here except `items` (`AUTOINCREMENT` since D40). The second run
+    // reissues for every table here except the `AUTOINCREMENT` ones (`items` since D40, `edges`
+    // and `namespaces` since V027). The second run
     // therefore unplaced, untagged or unlinked whatever now holds that id. It became reachable
     // when refusals started printing transaction ids and recommending the explicit form.
     if already_undone(conn, txn_id)? {
@@ -1314,14 +1315,15 @@ fn restore_item(conn: &Connection, snapshot: &Value) -> Result<usize> {
 /// **These hand-written INSERTs are deliberate, and re-deriving them from the schema is a change
 /// that has already been tried and backed out.** Driving the snapshot and the re-insert off one
 /// `SELECT *` is the obviously better factoring — it deletes ten column lists across two modules
-/// — and it restored `edges.id` as a side effect. `edges.id` is a plain `INTEGER PRIMARY KEY`
-/// with no AUTOINCREMENT, so `SQLite` reissues a freed one: a restore that wrote the logged id
-/// back collided with a live edge, and undoing the item delete became **permanently refused**.
-/// Omitting the id here is what keeps that undo working, at the priced cost stated on
-/// `an_item_delete_is_undoable_after_its_edge_id_has_been_reissued`. Do not restore the ids again
-/// without first making them unreusable; and the honest fix for this whole family is mechanical
-/// before-images (`SQLite`'s session extension), which is its own design pass, not another rule
-/// added here.
+/// — and it restored `edges.id` as a side effect. `edges.id` was then a plain `INTEGER PRIMARY
+/// KEY` with no AUTOINCREMENT, so `SQLite` reissued a freed one: a restore that wrote the logged
+/// id back collided with a live edge, and undoing the item delete became **permanently refused**.
+/// Omitting the id here is what kept that undo working, at the priced cost stated on
+/// `an_item_delete_is_undoable_after_its_edge_id_has_been_reissued`. V027 has since made
+/// `edges.id` AUTOINCREMENT, so the precondition for restoring the ids again now holds; doing so is
+/// a separate change (the snapshot taken here does not carry the id yet), and the honest fix for
+/// this whole family is still mechanical before-images (`SQLite`'s session extension), which is its
+/// own design pass, not another rule added here.
 ///
 /// **The `WHERE EXISTS` guards are the one sanctioned way a restore in this module reports zero**,
 /// and they say exactly what they skip: a row whose *other* endpoint is not there to point at.
@@ -1891,9 +1893,9 @@ mod tests {
 
     /// An item delete stays undoable however `SQLite` has since handed out `edges.id`.
     ///
-    /// **The pin on this whole area's backed-out cascade work.** `edges.id` is a plain `INTEGER
-    /// PRIMARY KEY` with no AUTOINCREMENT (V001), so the largest freed id is reissued — deleting
-    /// the only edge and creating another gives the new one the dead one's id. A restore that
+    /// **The pin on this whole area's backed-out cascade work.** `edges.id` was a plain `INTEGER
+    /// PRIMARY KEY` with no AUTOINCREMENT until V027, so the largest freed id was reissued —
+    /// deleting the only edge and creating another gave the new one the dead one's id. A restore that
     /// wrote the *logged* id back therefore collided with a live row, and the item delete was
     /// refused with `UNIQUE constraint failed: edges.id` for as long as that row held the id: not
     /// a wrong number but a recovery path closed, and `jkb item rm` exists on the promise that it
@@ -1903,9 +1905,9 @@ mod tests {
     /// The cost is stated rather than hidden: `edge::link_weighted` logs `entity_id = edges.id`,
     /// so undoing a *weight change* on an edge that has been through a delete/restore addresses a
     /// row id that no longer exists and is refused. A refusal on a second, older undo is strictly
-    /// better than the first one being impossible, and closing both needs `edges.id` to stop being
-    /// reusable at all (the D40/V010 treatment `items` already has) — a migration, and a design
-    /// pass, not another rule inside this module.
+    /// better than the first one being impossible, and closing both needed `edges.id` to stop being
+    /// reusable at all (the D40/V010 treatment `items` already had). V027 is that migration: the
+    /// later link below now takes a fresh id, and this test pins both that and the undo.
     #[test]
     fn an_item_delete_is_undoable_after_its_edge_id_has_been_reissued() {
         use crate::edge;
@@ -1937,15 +1939,15 @@ mod tests {
                 Ok((c_id, d_id))
             })
             .unwrap();
-        let reissued = db
+        let later = db
             .read(|c| {
                 Ok(c.prepare("SELECT id FROM edges")?
                     .query_row([], |r| r.get::<_, i64>(0))?)
             })
             .unwrap();
-        assert_eq!(
-            reissued, 1,
-            "the freed edge id was not reissued, so this test cannot see the collision it is for"
+        assert_ne!(
+            later, 1,
+            "the freed edge id was reissued to a later link: edges.id is reusable again (V027)"
         );
 
         // The explicit form, which is what every refusal in this module recommends.
@@ -2516,6 +2518,107 @@ mod tests {
         assert!(
             (weight - 2.5).abs() < 1e-9,
             "the edge came back without the weight it carried, got {weight}"
+        );
+    }
+
+    /// An unlink stays undoable after a later link, and the edge comes back under its own id.
+    ///
+    /// `edges.id` was a plain `INTEGER PRIMARY KEY` until V027, so `SQLite` handed the freed id to
+    /// the next edge, and the restore — which writes the logged row back, id included — failed
+    /// with `UNIQUE constraint failed: edges.id` for as long as the new edge held it. With
+    /// `AUTOINCREMENT` the new edge takes a fresh id and the undo has nothing to collide with.
+    #[test]
+    fn undoing_an_unlink_after_a_later_link_restores_the_edge_under_its_own_id() {
+        use crate::edge;
+        use jkb_types::EdgeType;
+
+        let edge_id = |db: &Db, src: jkb_types::ItemId, dst: jkb_types::ItemId| {
+            db.read(move |c| {
+                Ok(
+                    c.prepare("SELECT id FROM edges WHERE src_item_id = ?1 AND dst_item_id = ?2")?
+                        .query_row([src.get(), dst.get()], |r| r.get::<_, i64>(0))?,
+                )
+            })
+            .unwrap()
+        };
+
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, c_id, d_id) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let b = upsert(c, m, &note("b"))?;
+                let c_id = upsert(c, m, &note("c"))?;
+                let d_id = upsert(c, m, &note("d"))?;
+                edge::link(c, m, a, b, EdgeType::References, None)?;
+                Ok((a, b, c_id, d_id))
+            })
+            .unwrap();
+        let original = edge_id(&db, a, b);
+        let unlinked = db
+            .write_txn("t", move |c, m| {
+                edge::unlink(c, m, a, b, EdgeType::References)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        db.write_txn("t", move |c, m| {
+            edge::link(c, m, c_id, d_id, EdgeType::References, None)?;
+            Ok(())
+        })
+        .unwrap();
+        let later = edge_id(&db, c_id, d_id);
+        assert_ne!(
+            later, original,
+            "the later edge was handed the unlinked edge's id: edges.id is being reused"
+        );
+
+        db.write_txn("t", move |c, m| super::undo(c, m, unlinked))
+            .expect("undoing the unlink collided with an edge id SQLite had reissued");
+
+        assert_eq!(
+            edge_id(&db, a, b),
+            original,
+            "the edge did not come back under its own id"
+        );
+        assert_eq!(
+            edge_id(&db, c_id, d_id),
+            later,
+            "the later edge was disturbed by the restore"
+        );
+    }
+
+    /// `jkb ns rm` then `jkb ns mk` leaves the removal undoable, and the namespace comes back
+    /// under its own id. The `namespaces` half of the reuse V027 closed: before it, the new
+    /// namespace took the removed one's id and the undo failed on `namespaces.id`.
+    #[test]
+    fn undoing_a_namespace_removal_after_a_later_mk_restores_it_under_its_own_id() {
+        use crate::ns;
+
+        let db = Db::open_in_memory().unwrap();
+        let gone = db.write_txn("t", |c, _| ns::ensure(c, "x/gone")).unwrap();
+        let removed = db
+            .write_txn("t", |c, m| {
+                ns::remove(c, m, "x/gone")?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        let other = db.write_txn("t", |c, _| ns::ensure(c, "x/other")).unwrap();
+        assert_ne!(
+            other, gone,
+            "the later namespace was handed the removed one's id: namespaces.id is being reused"
+        );
+
+        db.write_txn("t", move |c, m| super::undo(c, m, removed))
+            .expect("undoing the removal collided with a namespace id SQLite had reissued");
+
+        assert_eq!(
+            db.read(|c| ns::get(c, "x/gone")).unwrap(),
+            Some(gone),
+            "the namespace did not come back under its own id"
+        );
+        assert_eq!(
+            db.read(|c| ns::get(c, "x/other")).unwrap(),
+            Some(other),
+            "the later namespace was disturbed by the restore"
         );
     }
 
