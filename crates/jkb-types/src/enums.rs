@@ -5,101 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The kind of a namespace node (design D3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NamespaceKind {
-    /// A pure virtual folder (`tasks/`, `books/`).
-    Logical,
-    /// A subtree bound to an external backing root with a sync policy.
-    Mount,
-    /// System-internal namespace (`_sys/...`).
-    System,
-}
-
-/// The type of a typed edge between two items.
-///
-/// The first four are the v1 structural set; the rest are the **investigation
-/// vocabulary** (design Dmem.4) — one global set from which a
-/// `NamespaceType` strategy declares the subset it uses. `references` doubles as the
-/// design's `relates_to` untyped associative escape hatch (an edge always exists for
-/// "these are related but I can't say how yet"), so there is no synonym for it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EdgeType {
-    /// Source task depends on the destination task (must be acyclic).
-    DependsOn,
-    /// Source was derived from the destination (e.g. chunk from document, mutation
-    /// from parent candidate, cross-pollinated idea from its origin).
-    DerivedFrom,
-    /// Source references the destination — also the untyped associative escape hatch
-    /// (design Dmem.4's `relates_to`): related, but not yet in a typed way.
-    References,
-    /// Source is a structural parent of the destination.
-    ParentOf,
-    /// Evidence **for** the destination (observation -> hypothesis). Signed: carries an
-    /// optional `weight` (design Dmem.4).
-    Supports,
-    /// Evidence **against** the destination. Signed: carries an optional `weight`.
-    Contradicts,
-    /// The source kills the destination — the destination becomes a tombstone
-    /// (`resolution = dead_end`), retained with this edge as the record of what killed it.
-    Refutes,
-    /// The source replaces/obsoletes the destination (`resolution = superseded`).
-    Supersedes,
-    /// The source (an obstruction/experiment) eliminates a whole region or regime — the
-    /// pruning edge that makes anti-retread cheap.
-    RulesOut,
-    /// The source narrows the destination (a bisection step narrowing a window).
-    Narrows,
-    /// Confirming the source constrains the destination (CSP coupling: one confirmed
-    /// mapping constrains its siblings).
-    Constrains,
-    /// The source (an anchor / ground truth / verified experiment) promotes the
-    /// destination from probable to confirmed.
-    Confirms,
-    /// The source answers (fully or partly) the destination question/goal.
-    Answers,
-    /// The source spawned the destination (a contradiction or discovery creating work).
-    Spawns,
-    /// **Emergent** provenance: the source surfaced *while working on* the destination
-    /// (from gastown/Beads' `discovered-from`), as distinct from being derived from it.
-    DiscoveredFrom,
-    /// Clustering: the source is a member of the destination family / regime / niche.
-    MemberOf,
-    /// The source tests the destination (an experiment testing a hypothesis).
-    Tests,
-    /// The source verifies the destination (an audit or repro-run verifying a claim/fix).
-    Verifies,
-    /// The source fixes the destination (a fix addressing a root cause).
-    Fixes,
-    /// The source reduces to the destination (a route reducing the goal to a lemma).
-    ReducesTo,
-    /// The source is **equivalent in strength** to the destination — the anti-progress
-    /// edge (design Dmem.6): a route that reduces the goal to an equally-strong lemma has
-    /// made no progress.
-    EquivalentInStrengthTo,
-    /// The source explains why the destination failed (a post-mortem of a dead end).
-    ExplainsFailure,
-    /// The source informs the destination's strategy (an obstruction informing a route).
-    Informs,
-    /// The source (an approved design span) is staged into the destination (an execution plan's
-    /// step) — design D53.5/D53.6. A span with one is STAGED; the state is derived from the edge.
-    Stages,
-}
-
-/// How an item is placed within a namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlacementRole {
-    /// The item's primary/home placement.
-    Primary,
-    /// A chunk of a source document, ordered by `position`.
-    Chunk,
-    /// A secondary association (e.g. a task mirrored under a `repos/...` namespace).
-    Reference,
-}
-
 /// Declare a database-facing enum **once**: the variant list, `ALL`, `as_str` and
 /// `from_db_str` are all generated from the same lines, so they cannot be one variant apart.
 ///
@@ -147,6 +52,102 @@ macro_rules! db_enum {
             }
         }
     };
+}
+
+/// The kind of a namespace node (design D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NamespaceKind {
+    /// A pure virtual folder (`tasks/`, `books/`).
+    Logical,
+    /// A subtree bound to an external backing root with a sync policy.
+    Mount,
+    /// System-internal namespace (`_sys/...`).
+    System,
+}
+
+db_enum! {
+    /// The type of a typed edge between two items.
+    ///
+    /// The first four are the v1 structural set; the rest are the **investigation
+    /// vocabulary** (design Dmem.4) — one global set from which a
+    /// `NamespaceType` strategy declares the subset it uses. `references` doubles as the
+    /// design's `relates_to` untyped associative escape hatch (an edge always exists for
+    /// "these are related but I can't say how yet"), so there is no synonym for it.
+    pub enum EdgeType {
+        /// Source task depends on the destination task (must be acyclic).
+        DependsOn => "depends_on",
+        /// Source was derived from the destination (e.g. chunk from document, mutation
+        /// from parent candidate, cross-pollinated idea from its origin).
+        DerivedFrom => "derived_from",
+        /// Source references the destination — also the untyped associative escape hatch
+        /// (design Dmem.4's `relates_to`): related, but not yet in a typed way.
+        References => "references",
+        /// Source is a structural parent of the destination.
+        ParentOf => "parent_of",
+        /// Evidence **for** the destination (observation -> hypothesis). Signed: carries an
+        /// optional `weight` (design Dmem.4).
+        Supports => "supports",
+        /// Evidence **against** the destination. Signed: carries an optional `weight`.
+        Contradicts => "contradicts",
+        /// The source kills the destination — the destination becomes a tombstone
+        /// (`resolution = dead_end`), retained with this edge as the record of what killed it.
+        Refutes => "refutes",
+        /// The source replaces/obsoletes the destination (`resolution = superseded`).
+        Supersedes => "supersedes",
+        /// The source (an obstruction/experiment) eliminates a whole region or regime — the
+        /// pruning edge that makes anti-retread cheap.
+        RulesOut => "rules_out",
+        /// The source narrows the destination (a bisection step narrowing a window).
+        Narrows => "narrows",
+        /// Confirming the source constrains the destination (CSP coupling: one confirmed
+        /// mapping constrains its siblings).
+        Constrains => "constrains",
+        /// The source (an anchor / ground truth / verified experiment) promotes the
+        /// destination from probable to confirmed.
+        Confirms => "confirms",
+        /// The source answers (fully or partly) the destination question/goal.
+        Answers => "answers",
+        /// The source spawned the destination (a contradiction or discovery creating work).
+        Spawns => "spawns",
+        /// **Emergent** provenance: the source surfaced *while working on* the destination
+        /// (from gastown/Beads' `discovered-from`), as distinct from being derived from it.
+        DiscoveredFrom => "discovered_from",
+        /// Clustering: the source is a member of the destination family / regime / niche.
+        MemberOf => "member_of",
+        /// The source tests the destination (an experiment testing a hypothesis).
+        Tests => "tests",
+        /// The source verifies the destination (an audit or repro-run verifying a claim/fix).
+        Verifies => "verifies",
+        /// The source fixes the destination (a fix addressing a root cause).
+        Fixes => "fixes",
+        /// The source reduces to the destination (a route reducing the goal to a lemma).
+        ReducesTo => "reduces_to",
+        /// The source is **equivalent in strength** to the destination — the anti-progress
+        /// edge (design Dmem.6): a route that reduces the goal to an equally-strong lemma has
+        /// made no progress.
+        EquivalentInStrengthTo => "equivalent_in_strength_to",
+        /// The source explains why the destination failed (a post-mortem of a dead end).
+        ExplainsFailure => "explains_failure",
+        /// The source informs the destination's strategy (an obstruction informing a route).
+        Informs => "informs",
+        /// The source (an approved design span) is staged into the destination (an execution
+        /// plan's step) — design D53.5/D53.6. A span with one is STAGED; the state is derived
+        /// from the edge.
+        Stages => "stages",
+    }
+}
+
+/// How an item is placed within a namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementRole {
+    /// The item's primary/home placement.
+    Primary,
+    /// A chunk of a source document, ordered by `position`.
+    Chunk,
+    /// A secondary association (e.g. a task mirrored under a `repos/...` namespace).
+    Reference,
 }
 
 db_enum! {
@@ -198,63 +199,39 @@ pub enum TaskStatus {
 }
 }
 
-/// How a unit of an investigation **ended** — the outcome axis, orthogonal to
-/// [`TaskStatus`] (design Dmem.3).
-///
-/// `status` answers "how far along?"; `resolution` answers "how did it end?". A NULL
-/// `items.resolution` reads as [`Resolution::Unresolved`], so nothing needs back-filling.
-/// The load-bearing property: a `dead_end` or `superseded` unit is **never deleted** — it
-/// is retained together with the edge to whatever killed it, and that graveyard is what
-/// stops a fresh agent from re-treading it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Resolution {
-    /// Still live: on the frontier (or blocked by something that is). The default.
-    Unresolved,
-    /// Resolved affirmatively — a confirmed result, part of the confirmed core.
-    Success,
-    /// Tried and killed. A tombstone: retained, plus the edge to what killed it.
-    DeadEnd,
-    /// Replaced by a better/stronger unit (see [`EdgeType::Supersedes`]).
-    Superseded,
-    /// Dropped without being killed — deprioritized, not refuted.
-    Abandoned,
+db_enum! {
+    /// How a unit of an investigation **ended** — the outcome axis, orthogonal to
+    /// [`TaskStatus`] (design Dmem.3).
+    ///
+    /// `status` answers "how far along?"; `resolution` answers "how did it end?". A NULL
+    /// `items.resolution` reads as [`Resolution::Unresolved`], so nothing needs back-filling.
+    /// The load-bearing property: a `dead_end` or `superseded` unit is **never deleted** — it
+    /// is retained together with the edge to whatever killed it, and that graveyard is what
+    /// stops a fresh agent from re-treading it.
+    pub enum Resolution {
+        /// Still live: on the frontier (or blocked by something that is). The default.
+        Unresolved => "unresolved",
+        /// Resolved affirmatively — a confirmed result, part of the confirmed core.
+        Success => "success",
+        /// Tried and killed. A tombstone: retained, plus the edge to what killed it.
+        DeadEnd => "dead_end",
+        /// Replaced by a better/stronger unit (see [`EdgeType::Supersedes`]).
+        Superseded => "superseded",
+        /// Dropped without being killed — deprioritized, not refuted.
+        Abandoned => "abandoned",
+    }
 }
 
 impl Resolution {
-    /// Every resolution, in declaration order (for `--help` text and validation).
-    pub const ALL: &'static [Self] = &[
-        Self::Unresolved,
-        Self::Success,
-        Self::DeadEnd,
-        Self::Superseded,
-        Self::Abandoned,
-    ];
-
-    /// The `snake_case` string stored in the database (matches the serde form).
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Unresolved => "unresolved",
-            Self::Success => "success",
-            Self::DeadEnd => "dead_end",
-            Self::Superseded => "superseded",
-            Self::Abandoned => "abandoned",
-        }
-    }
-
     /// Parse a resolution string, or `None` if unknown. The empty string and
-    /// `unresolved` both mean [`Resolution::Unresolved`].
+    /// `unresolved` both mean [`Resolution::Unresolved`]; every other spelling is
+    /// [`Self::from_db_str`]'s, so the accepted set follows the variant list.
     #[must_use]
     pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s {
-            "" | "unresolved" => Some(Self::Unresolved),
-            "success" => Some(Self::Success),
-            "dead_end" => Some(Self::DeadEnd),
-            "superseded" => Some(Self::Superseded),
-            "abandoned" => Some(Self::Abandoned),
-            _ => None,
+        if s.is_empty() {
+            return Some(Self::Unresolved);
         }
+        Self::from_db_str(s)
     }
 
     /// Whether this unit is **settled** — anything other than `unresolved`. A settled
@@ -379,75 +356,16 @@ impl TaskStatus {
 }
 
 impl EdgeType {
-    /// Every edge type, in declaration order (the global vocabulary). Used for
-    /// `--help` text, validation, and a descriptor's declared subset.
-    pub const ALL: &'static [Self] = &[
-        Self::DependsOn,
-        Self::DerivedFrom,
-        Self::References,
-        Self::ParentOf,
-        Self::Supports,
-        Self::Contradicts,
-        Self::Refutes,
-        Self::Supersedes,
-        Self::RulesOut,
-        Self::Narrows,
-        Self::Constrains,
-        Self::Confirms,
-        Self::Answers,
-        Self::Spawns,
-        Self::DiscoveredFrom,
-        Self::MemberOf,
-        Self::Tests,
-        Self::Verifies,
-        Self::Fixes,
-        Self::ReducesTo,
-        Self::EquivalentInStrengthTo,
-        Self::ExplainsFailure,
-        Self::Informs,
-        Self::Stages,
-    ];
-
-    /// The `snake_case` string stored in the database (matches the serde form).
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::DependsOn => "depends_on",
-            Self::DerivedFrom => "derived_from",
-            Self::References => "references",
-            Self::ParentOf => "parent_of",
-            Self::Supports => "supports",
-            Self::Contradicts => "contradicts",
-            Self::Refutes => "refutes",
-            Self::Supersedes => "supersedes",
-            Self::RulesOut => "rules_out",
-            Self::Narrows => "narrows",
-            Self::Constrains => "constrains",
-            Self::Confirms => "confirms",
-            Self::Answers => "answers",
-            Self::Spawns => "spawns",
-            Self::DiscoveredFrom => "discovered_from",
-            Self::MemberOf => "member_of",
-            Self::Tests => "tests",
-            Self::Verifies => "verifies",
-            Self::Fixes => "fixes",
-            Self::ReducesTo => "reduces_to",
-            Self::EquivalentInStrengthTo => "equivalent_in_strength_to",
-            Self::ExplainsFailure => "explains_failure",
-            Self::Informs => "informs",
-            Self::Stages => "stages",
-        }
-    }
-
     /// Parse an edge-type string (the stored `snake_case` form), or `None` if unknown.
     /// `relates_to` is accepted as an alias for [`EdgeType::References`], the untyped
-    /// associative escape hatch (design Dmem.4).
+    /// associative escape hatch (design Dmem.4); every other spelling is
+    /// [`Self::from_db_str`]'s, which accepts only the stored form.
     #[must_use]
     pub fn from_str_opt(s: &str) -> Option<Self> {
         if s == "relates_to" {
             return Some(Self::References);
         }
-        Self::ALL.iter().copied().find(|e| e.as_str() == s)
+        Self::from_db_str(s)
     }
 
     /// The sign this edge contributes to a node's **signed-evidence aggregate**
@@ -466,7 +384,7 @@ impl EdgeType {
 
 #[cfg(test)]
 mod round_trip {
-    use super::{ConflictPolicy, SyncMode};
+    use super::{ConflictPolicy, EdgeType, Resolution, SyncMode};
 
     /// Every variant must survive `as_str` -> `from_db_str`.
     ///
@@ -481,8 +399,18 @@ mod round_trip {
         for p in ConflictPolicy::ALL {
             assert_eq!(ConflictPolicy::from_db_str(p.as_str()), Some(*p));
         }
+        for e in EdgeType::ALL {
+            assert_eq!(EdgeType::from_db_str(e.as_str()), Some(*e));
+        }
+        for r in Resolution::ALL {
+            assert_eq!(Resolution::from_db_str(r.as_str()), Some(*r));
+        }
         assert_eq!(SyncMode::from_db_str("nope"), None);
         assert_eq!(ConflictPolicy::from_db_str("nope"), None);
+        // The aliases belong to `from_str_opt` (input parsing), never to the stored form: a
+        // `relates_to` or empty string in the database is not a value `as_str` ever wrote.
+        assert_eq!(EdgeType::from_db_str("relates_to"), None);
+        assert_eq!(Resolution::from_db_str(""), None);
     }
 }
 
