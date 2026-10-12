@@ -363,6 +363,42 @@ fn sync_paths_drops_paths_outside_scope() {
     assert!(content_for(&db, &uri_for(&keep)).is_some());
 }
 
+/// A watch event can name a directory whose name the globs accept (`notes.md/`). The full
+/// sync's `discover` keeps only files, so `sync_paths` must too: reconciling the directory
+/// would try to read it as a file.
+#[test]
+fn sync_paths_ignores_directories_the_globs_accept() {
+    let dir = real_tempdir();
+    let folder = dir.path().join("notes.md");
+    fs::create_dir(&folder).unwrap();
+    let file = dir.path().join("a.md");
+    fs::write(&file, "a").unwrap();
+    let gone = dir.path().join("gone.md");
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/repo",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/repo").unwrap().results.len(), 1);
+
+    let report = sync_paths(&db, "docs/repo", &[folder.clone(), file, gone.clone()]).unwrap();
+    let paths: Vec<_> = report.results.iter().map(|r| r.path.clone()).collect();
+    assert!(
+        !paths.contains(&folder),
+        "a directory is not reconciled: {paths:?}"
+    );
+    // A path that no longer exists still reaches the reconcile (a deletion is an event too).
+    assert!(paths.contains(&gone), "{paths:?}");
+    assert_eq!(report.count(Outcome::Failed), 0, "{:?}", report.results);
+}
+
 #[test]
 fn watch_runs_an_initial_reconcile_then_stops() {
     let dir = real_tempdir();
@@ -1633,6 +1669,53 @@ fn kb_wins_over_a_structurally_changed_disk_keeps_the_items() {
     assert!(
         after.contains("[x] shared"),
         "the KB side won, as kb_wins means: {after}"
+    );
+}
+
+/// `kb_wins` on an import-only mount cannot write the file, so the conflict resolves nothing:
+/// it must report the export's `Skipped`, not a `ResolvedFromKb` claiming the disk's edits
+/// were overwritten when the file was never touched.
+#[test]
+fn kb_wins_on_an_import_only_mount_reports_skipped_not_a_resolution() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] shared !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/plan",
+        dir.path(),
+        SyncMode::Import,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::KbWins,
+    );
+    sync(&db, "docs/plan").unwrap();
+    let settled = fs::read_to_string(&tasks).unwrap();
+
+    // Both sides edit the same task: the disk reprioritizes it, the KB closes it.
+    let disk_edit = settled.replace("!p1", "!p3");
+    assert_ne!(disk_edit, settled);
+    fs::write(&tasks, &disk_edit).unwrap();
+    db.write_txn("t", |conn, _m| {
+        conn.execute(
+            "UPDATE items SET status = 'done' WHERE content LIKE '%shared%'",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(report.count(Outcome::Skipped), 1, "{:?}", report.results);
+    assert_eq!(report.count(Outcome::ResolvedFromKb), 0);
+    assert!(report.resolved().is_empty(), "nothing was resolved");
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        disk_edit,
+        "an import-only mount never writes the file"
     );
 }
 

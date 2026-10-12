@@ -341,7 +341,10 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     let mut bound: Option<BTreeSet<PathBuf>> = None;
     for path in paths {
-        if !filter.accepts(&ctx.dir, path) || seen.contains(path) {
+        // A watch event names directories too (a created or renamed folder whose name the
+        // globs happen to accept). [`discover`] keeps only files, so this does too; a path
+        // that no longer exists is kept, since a deleted file must still reconcile.
+        if !filter.accepts(&ctx.dir, path) || seen.contains(path) || is_dir_nofollow(path) {
             continue;
         }
         if through_link(&ctx.dir, path) {
@@ -1007,6 +1010,12 @@ impl Filter {
 fn is_temp(path: &Path) -> bool {
     path.file_name()
         .is_some_and(jkb_core::nofollow::is_temp_name)
+}
+
+/// Whether `path` is a directory itself, not following a symlink at its leaf (a link is
+/// [`through_link`]'s question). A path that cannot be read, including one just deleted, is not.
+fn is_dir_nofollow(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
 }
 
 /// Whether `path` (under `dir`) is reached through a symlink below the mount directory.
@@ -1867,12 +1876,15 @@ fn three_way_resolve(
         }
         ThreeWay::Conflict => match ctx.conflict_policy.as_str() {
             "disk_wins" => finish_import(conn, meta, f, disk_doc, Outcome::ResolvedFromDisk),
-            "kb_wins" => {
-                if finish_export(conn, meta, f, kb_doc, Some(disk_doc))? == Outcome::Refused {
-                    return Ok(Outcome::Refused);
-                }
-                Ok(Outcome::ResolvedFromKb)
-            }
+            // Only a completed export is a resolution. `finish_export` also answers `Skipped`
+            // (an import-only mount may not write the file) and `Refused`; reporting either as
+            // `ResolvedFromKb` would announce a destructive resolution that never happened.
+            "kb_wins" => Ok(
+                match finish_export(conn, meta, f, kb_doc, Some(disk_doc))? {
+                    Outcome::Exported => Outcome::ResolvedFromKb,
+                    other => other,
+                },
+            ),
             _ => {
                 // manual: overwrite neither side; flag the file so `doctor` can surface it.
                 let base = journal.and_then(|j| j.base_blob_hash.clone());
