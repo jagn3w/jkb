@@ -294,6 +294,8 @@ pub(crate) fn run(
     // Task sessions in this repo (design D36.6). A session's worktree keeps its claim on purpose, so a
     // session is never reported as orphaned; doctor lists every one.
     crate::report_sessions(kb);
+    // Directories under `.jkb/work` git no longer lists: what nothing above is tracking.
+    crate::report_untracked_sessions(kb, fix);
 
     if let Some(h) = host {
         crate::report_worktree_removals(h.db, h.path, fix);

@@ -225,6 +225,114 @@ pub fn discover(repo_root: &Path) -> Result<Vec<Session>> {
     Ok(out)
 }
 
+/// A directory under `<repo>/.jkb/work` that git does not list as a worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Untracked {
+    /// The directory.
+    pub path: PathBuf,
+    /// Provably a stub: empty, or holding nothing but an empty `.claude` — what a removal leaves
+    /// when git's half succeeded and the filesystem's half stopped at the protected policy
+    /// directory. Anything else may be a worktree whose registration was lost while it still holds
+    /// the only copy of real work.
+    pub stub: bool,
+}
+
+/// Every directory under `<repo>/.jkb/work` that `git worktree list` does not name.
+///
+/// `None` when that cannot be established, and the caller reports nothing: an absent registration
+/// is evidence that the directory is untracked only where git answered, and only where the repo
+/// itself is visible from here (D49 — the host and the dev container see one `.jkb` at different
+/// paths). Asked once, above everything that reads an absence.
+///
+/// A registration whose path this process cannot see — a session opened on the other side of the
+/// container bind, registered under that side's path — is matched by directory name, so the live
+/// checkout it names is not reported as untracked from here.
+#[must_use]
+pub fn untracked(repo_root: &Path) -> Option<Vec<Untracked>> {
+    if !matches!(repo_root.try_exists(), Ok(true)) {
+        return None;
+    }
+    let work_root = jkb_dir(repo_root).join(WORK_DIR);
+    let entries = match fs::read_dir(&work_root) {
+        Ok(entries) => entries,
+        // No session was ever opened here: nothing is untracked.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
+    };
+    let listed = gitrepo::worktrees(repo_root).ok().flatten()?;
+    let (seen, unseen): (Vec<_>, Vec<_>) = listed
+        .into_iter()
+        .map(|wt| wt.path)
+        .partition(|p| matches!(p.try_exists(), Ok(true)));
+    let seen: Vec<PathBuf> = seen.iter().map(|p| canonical(p)).collect();
+    let mut out = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { return None };
+        // A real directory only: a file or a link here is not a checkout of anything.
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        let here = canonical(&path);
+        let registered = seen.contains(&here)
+            || unseen
+                .iter()
+                .any(|p| p.file_name() == Some(entry.file_name().as_os_str()));
+        if !registered {
+            out.push(Untracked {
+                stub: is_stub(&path),
+                path,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Some(out)
+}
+
+/// The name of the one entry a stub may hold.
+const POLICY_DIR: &str = ".claude";
+
+/// Whether `dir` is empty, or holds exactly one entry — an empty, real (not linked) `.claude`.
+fn is_stub(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    let mut seen = 0;
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        seen += 1;
+        let empty_policy_dir = entry.file_name() == POLICY_DIR
+            && entry.file_type().is_ok_and(|t| t.is_dir())
+            && fs::read_dir(entry.path()).is_ok_and(|mut d| d.next().is_none());
+        if seen > 1 || !empty_policy_dir {
+            return false;
+        }
+    }
+    true
+}
+
+/// Remove the stub at `dir`: its empty `.claude`, then itself.
+///
+/// Both removals are of an EMPTY directory, so neither can take anything with it: if work appeared
+/// in the stub since it was judged one, the removal answers "not empty" and the directory stays.
+/// A refusal is returned for the caller to report, never escalated — the session's own stub answers
+/// `EPERM` on its `.claude` (D49), and a sweep that failed on that would fail for ever in exactly
+/// the session that noticed the problem.
+///
+/// # Errors
+/// The removal that failed; whatever it did not reach is left as it was.
+pub fn remove_stub(dir: &Path) -> std::io::Result<()> {
+    // Link-free removal walks from `/`, so it is given the resolved path.
+    let dir = dir.canonicalize()?;
+    let policy = dir.join(POLICY_DIR);
+    match fs::symlink_metadata(&policy) {
+        Ok(_) => jkb_core::nofollow::remove_empty_dir(&policy)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    jkb_core::nofollow::remove_empty_dir(&dir)
+}
+
 // ---------------------------------------------------------------------------
 // The gate (design D36.5)
 // ---------------------------------------------------------------------------
@@ -586,7 +694,8 @@ mod tests {
             &[],
         );
     }
-    use super::{branch_for, mint_name, name_from_branch};
+    use super::{branch_for, is_stub, mint_name, name_from_branch, untracked};
+    use std::fs;
 
     #[test]
     fn a_gate_runs_in_the_container_for_a_checkout_it_shares_and_refuses_without_one() {
@@ -743,6 +852,54 @@ mod tests {
         assert_eq!(mint_name("task:fix-ls", |n| n == "fix-ls"), "fix-ls-2");
         // A uid with nothing usable in it still yields a valid path segment.
         assert_eq!(mint_name("task:___", |_| false), "task");
+    }
+
+    /// An absent directory is evidence only where the place it would be is visible (D49): a repo
+    /// this process cannot see answers "cannot tell", never "nothing untracked".
+    #[test]
+    fn an_unreachable_repo_reports_nothing_rather_than_nothing_untracked() {
+        let t = tempfile::TempDir::new().unwrap();
+        assert_eq!(untracked(&t.path().join("not-here")), None);
+    }
+
+    /// Only an empty directory, or one holding nothing but an empty real `.claude`, is a stub.
+    #[test]
+    fn a_stub_is_empty_but_for_an_empty_policy_dir() {
+        let t = tempfile::TempDir::new().unwrap();
+        let d = |name: &str| {
+            let p = t.path().join(name);
+            fs::create_dir_all(&p).unwrap();
+            p
+        };
+        assert!(is_stub(&d("empty")));
+        let only_policy = d("only-policy");
+        fs::create_dir(only_policy.join(".claude")).unwrap();
+        assert!(is_stub(&only_policy));
+
+        let full_policy = d("full-policy");
+        fs::create_dir(full_policy.join(".claude")).unwrap();
+        fs::write(full_policy.join(".claude/settings.json"), "{}").unwrap();
+        assert!(!is_stub(&full_policy), "a .claude with anything in it");
+
+        let beside = d("beside");
+        fs::create_dir(beside.join(".claude")).unwrap();
+        fs::write(beside.join("work.txt"), "x").unwrap();
+        assert!(!is_stub(&beside), "anything beside the .claude");
+
+        let other = d("other");
+        fs::create_dir(other.join("src")).unwrap();
+        assert!(!is_stub(&other), "an empty directory not named .claude");
+
+        let policy_file = d("policy-file");
+        fs::write(policy_file.join(".claude"), "").unwrap();
+        assert!(!is_stub(&policy_file), "a .claude that is not a directory");
+
+        #[cfg(unix)]
+        {
+            let linked = d("linked");
+            std::os::unix::fs::symlink(d("target"), linked.join(".claude")).unwrap();
+            assert!(!is_stub(&linked), "a .claude that is a link");
+        }
     }
 
     #[test]

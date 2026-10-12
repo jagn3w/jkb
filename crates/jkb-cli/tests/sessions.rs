@@ -582,6 +582,155 @@ fn a_session_survives_the_process_that_opened_it_and_is_reported_plainly() {
         .stdout(predicate::str::contains("unattended").not());
 }
 
+/// The untracked-directory lines of a `doctor` run's stdout.
+fn untracked_report(out: &std::process::Output) -> String {
+    assert!(out.status.success(), "doctor: {out:?}");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip_while(|l| !l.starts_with("untracked session directories"))
+        .take_while(|l| l.starts_with("untracked") || l.starts_with("  "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A directory under `.jkb/work` that git does not list is REPORTED, and only a provable stub is
+/// removed, and only under `--fix`.
+///
+/// The stub is what a hand-run `git worktree remove` leaves from inside a sandboxed session: git's
+/// half succeeds, the filesystem's stops at the protected `.claude`. The second directory holds a
+/// file — it may be a worktree whose registration was lost while holding real work — so `--fix`
+/// must leave every byte of it. A live session beside them is not reported at all.
+#[test]
+fn doctor_reports_session_directories_git_does_not_list_and_sweeps_only_stubs() {
+    let f = Fixture::new();
+    let uid = f.add_task("live session task");
+    let live = PathBuf::from(f.work(&uid)["worktree"].as_str().unwrap().to_owned());
+    let work = f.repo.join(".jkb/work");
+    let stub = work.join("removed-by-hand");
+    std::fs::create_dir_all(stub.join(".claude")).unwrap();
+    let lost = work.join("lost-registration");
+    std::fs::create_dir_all(&lost).unwrap();
+    std::fs::write(lost.join("only-copy.txt"), "real work\n").unwrap();
+
+    let report = untracked_report(&f.jkb().args(["doctor"]).output().unwrap());
+    assert!(
+        report.starts_with("untracked session directories: 2 "),
+        "{report}"
+    );
+    assert!(
+        report.contains("removed-by-hand — an empty stub"),
+        "{report}"
+    );
+    assert!(
+        report.contains("lost-registration — holds files"),
+        "{report}"
+    );
+    assert!(
+        !report.contains(live.file_name().unwrap().to_str().unwrap()),
+        "a session git lists is not untracked: {report}"
+    );
+    assert!(stub.exists(), "a plain `doctor` deletes nothing");
+
+    let fixed = untracked_report(&f.jkb().args(["doctor", "--fix"]).output().unwrap());
+    assert!(fixed.contains("removed-by-hand — removed"), "{fixed}");
+    assert!(!stub.exists(), "--fix sweeps the stub");
+    assert_eq!(
+        std::fs::read_to_string(lost.join("only-copy.txt")).unwrap(),
+        "real work\n",
+        "and never a directory that holds anything"
+    );
+    assert!(live.join(".git").exists(), "nor the live session");
+
+    let after = untracked_report(&f.jkb().args(["doctor"]).output().unwrap());
+    assert!(
+        after.starts_with("untracked session directories: 1 "),
+        "{after}"
+    );
+}
+
+/// A stub whose removal is refused is LEFT, said so, and `doctor --fix` still succeeds — the
+/// session's own stub answers `EPERM` on its `.claude` (D49), so a sweep that failed on a refusal
+/// would fail for ever in exactly the session that noticed the problem. The refusal is provoked
+/// with a read-only stub directory, which refuses the unlink of its `.claude` the same way.
+#[cfg(unix)]
+#[test]
+fn doctor_fix_leaves_a_stub_it_cannot_remove_and_says_so() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new();
+    let stub = f.repo.join(".jkb/work/own-session");
+    std::fs::create_dir_all(stub.join(".claude")).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = f.jkb().args(["doctor", "--fix"]).output().unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let report = untracked_report(&out);
+    assert!(
+        report.contains("own-session — an empty stub, left:"),
+        "{report}"
+    );
+    assert!(stub.join(".claude").exists(), "the refusal leaves it whole");
+}
+
+/// A directory a removal record names is the deferred-removal report's, not this one's: these
+/// lines are for directories NOTHING is tracking. The record's checkout is made unknown to git by
+/// dropping its registration, so the only thing that keeps it off this report is the record.
+#[test]
+fn a_directory_a_removal_record_names_is_not_reported_as_untracked() {
+    let f = Fixture::new();
+    let uid = f.add_task("recorded removal task");
+    let wt = PathBuf::from(f.work(&uid)["worktree"].as_str().unwrap().to_owned());
+    std::fs::write(f.repo.join(".jkb/archive"), b"in the way").expect("block the archive");
+    f.jkb().args(["task", "abandon", &uid]).assert().success();
+    assert!(wt.exists(), "the premise: the disposal was deferred");
+    std::fs::remove_dir_all(f.repo.join(".git/worktrees")).unwrap();
+    assert!(
+        !git(&f.repo, &["worktree", "list"]).contains(".jkb/work"),
+        "the premise: git no longer lists it"
+    );
+
+    let out = f.jkb().args(["doctor"]).output().unwrap();
+    assert!(
+        untracked_report(&out).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A registration whose path is not visible here — a session opened on the other side of the
+/// container bind, registered under that side's path — still covers the directory of that name
+/// here. Reproduced by moving a registered worktree out from under git: its registration names a
+/// path that no longer exists, and the directory it names lives on under `.jkb/work`.
+#[test]
+fn a_registration_this_process_cannot_see_still_covers_its_directory() {
+    let f = Fixture::new();
+    let elsewhere = f.home.path().join("other-side/proj/.jkb/work");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "task/across-the-bind",
+            elsewhere.join("across-the-bind").to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir_all(f.repo.join(".jkb/work")).unwrap();
+    std::fs::rename(
+        elsewhere.join("across-the-bind"),
+        f.repo.join(".jkb/work/across-the-bind"),
+    )
+    .unwrap();
+
+    let out = f.jkb().args(["doctor"]).output().unwrap();
+    assert!(
+        untracked_report(&out).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// `.jkb/base` is a reusable checkout. Landing a second batch onto a different branch used to
 /// die on `git worktree add` into the existing directory, and stay dead until it was deleted
 /// by hand.

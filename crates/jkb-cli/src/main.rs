@@ -4517,6 +4517,61 @@ fn report_sessions(kb: &session_cli::Kb<'_>) {
     }
 }
 
+/// The `doctor` lines for directories under this repo's `.jkb/work` that git does not list as
+/// worktrees — directories nothing is tracking.
+///
+/// NOT the deferred-removal report: a removal record names a tree something will finish, and is
+/// reported there. These have no record at all, so a directory a record names is left to that
+/// report rather than counted twice.
+///
+/// REPORTED, NOT DELETED (D34.4). A directory git does not list may be a worktree whose
+/// registration was lost while it still holds the only copy of real work. Only a provable stub —
+/// empty, or an empty `.claude` and nothing else, what a hand-run `git worktree remove` leaves
+/// from inside a sandboxed session — is removed, and only under `--fix`; a stub that refuses (the
+/// session's own answers `EPERM`) is left and said so, never turned into a failure.
+fn report_untracked_sessions(kb: &session_cli::Kb<'_>, fix: bool) {
+    let Ok(ctx) = repo::repo_ctx() else { return };
+    let Some(mut found) = session::untracked(&ctx.root) else {
+        return;
+    };
+    if let Ok(store) = archive::entries(&archive::Stores::new(*kb, None)) {
+        let recorded: Vec<&Path> = store
+            .records
+            .iter()
+            .map(|(_, r)| r.worktree.as_path())
+            .chain(store.rejected.iter().map(|r| r.entry.worktree.as_path()))
+            .collect();
+        found.retain(|u| !recorded.iter().any(|w| session::same_path(w, &u.path)));
+    }
+    if found.is_empty() {
+        return;
+    }
+    println!(
+        "untracked session directories: {} under .jkb/work that git does not list as a worktree",
+        found.len()
+    );
+    for u in &found {
+        let path = u.path.display();
+        match (u.stub, fix) {
+            (true, true) => match session::remove_stub(&u.path) {
+                Ok(()) => println!("  {path} — removed (an empty stub)"),
+                Err(e) => println!(
+                    "  {path} — an empty stub, left: {e} (a session cannot remove its own \
+                     directory; any other process can)"
+                ),
+            },
+            (true, false) => println!(
+                "  {path} — an empty stub (nothing in it but an empty .claude); `jkb doctor --fix` \
+                 removes it"
+            ),
+            (false, _) => println!(
+                "  {path} — holds files: it may be a worktree whose registration was lost; look \
+                 before removing it — jkb will not"
+            ),
+        }
+    }
+}
+
 /// Print a short human/JSON confirmation for a task mutation.
 fn report(json: bool, uid: &str, action: &str) {
     if json {
