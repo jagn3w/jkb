@@ -2367,6 +2367,12 @@ mod tests {
              of, and its `PATH` is empty -- or, for the hidden-jkb oracle, a fake `jkb` plus \
              `/usr/bin:/bin` -- so no row reaches a repository-resolving tool",
         ),
+        (
+            "src/rbac_cli.rs",
+            "test_bash",
+            "spawns each candidate `bash` only to test `BASH_VERSINFO`; it calls `env_clear` and \
+             runs no command, so it is never asked about a repository",
+        ),
     ];
 
     /// The function a declaration line declares, or `UNPARSED` when the line declares one
