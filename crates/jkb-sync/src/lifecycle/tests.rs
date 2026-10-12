@@ -13,9 +13,9 @@
 //! cases: a combination the author did not think of is still generated, as long as its
 //! dimensions are.
 
-use jkb_fsm::{Event, Fact, Reconciliation, State};
+use jkb_fsm::{Acceptance, Dest, Event, Fact, Reconciliation, State, Verdict};
 
-use super::{machine, observe, FileEffect, FileEvent, FileFacts, FileState, Policy};
+use super::{machine, observe, status_for, FileEffect, FileEvent, FileFacts, FileState, Policy};
 
 /// Every observation a sync pass can really make, at every state.
 fn every_observation() -> Vec<FileFacts> {
@@ -134,6 +134,75 @@ fn at_most_one_condition_applies_to_any_observation() {
             "two conditions apply at once: {facts:?}"
         );
     }
+}
+
+/// Every declared row is one some real observation can take.
+///
+/// `check` sees edges and `audit` sees states, so neither notices a row whose guard denies under
+/// every observation of its `from` state: it draws an edge in the diagram, earns `status_for`'s
+/// approval, and can never fire. `untracked -conflicted-> conflicted` was one — a conflict needs
+/// both sides changed since a base, and an untracked file has no base.
+#[test]
+fn every_row_can_be_taken_by_some_observation() {
+    let space = every_observation();
+    let mut untakeable = Vec::new();
+    for t in machine().transitions {
+        let takeable = space.iter().filter(|f| f.state == t.from).any(|f| {
+            t.guard
+                .is_none_or(|guard| matches!(guard(f), Verdict::Allow))
+        });
+        if !takeable {
+            untakeable.push(format!("{} -{}->", t.from.name(), t.event.name()));
+        }
+    }
+    assert!(
+        untakeable.is_empty(),
+        "rows nothing can take: {untakeable:#?}"
+    );
+}
+
+/// `status_for` answers exactly the declared rows, with their destination's spelling, and
+/// refuses everything else — including the conclusion an untracked file cannot reach.
+#[test]
+fn status_for_answers_the_declared_rows_and_nothing_else() {
+    let m = machine();
+    for &from in <FileState as State>::ALL {
+        for &event in <FileEvent as Event>::ALL {
+            let declared = m
+                .transitions
+                .iter()
+                .find(|t| t.from == from && t.event == event);
+            // Absorption needs a row with no guard and no plan; every event here is a guarded
+            // reconciliation, so the table can never answer `Idempotent`. `status_for` relies
+            // on that and refuses it rather than inventing a status for it.
+            assert_ne!(
+                m.accepts(from, event),
+                Acceptance::Idempotent,
+                "{} -{}->",
+                from.name(),
+                event.name()
+            );
+            match declared.map(|t| &t.to) {
+                Some(Dest::To(to)) => {
+                    assert_eq!(
+                        status_for(from, event).ok(),
+                        to.stored(),
+                        "{} -{}->",
+                        from.name(),
+                        event.name()
+                    );
+                }
+                Some(Dest::Stated { .. }) => unreachable!("the sync table states no destination"),
+                None => assert!(
+                    status_for(from, event).is_err(),
+                    "{} -{}-> is undeclared but answered",
+                    from.name(),
+                    event.name()
+                ),
+            }
+        }
+    }
+    assert!(status_for(FileState::Untracked, FileEvent::Conflicted).is_err());
 }
 
 #[test]

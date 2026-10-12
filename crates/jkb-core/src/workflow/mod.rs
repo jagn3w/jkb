@@ -57,6 +57,7 @@ impl State for Phase {
         Self::Landed,
         Self::Cancelled,
     ];
+    const NOUN: &'static str = "a workflow";
 
     fn name(self) -> &'static str {
         match self {
@@ -401,7 +402,10 @@ const fn override_from(from: Phase) -> Row {
     Transition {
         from,
         event: WorkflowEvent::Override,
-        to: Dest::Stated(stated),
+        to: Dest::Stated {
+            pick: stated,
+            among: Phase::ALL,
+        },
         guard: None,
         plan: None,
     }

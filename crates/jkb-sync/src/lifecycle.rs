@@ -58,6 +58,7 @@ impl State for FileState {
         Self::Quarantined,
         Self::Blocked,
     ];
+    const NOUN: &'static str = "a synced file";
 
     fn name(self) -> &'static str {
         match self {
@@ -551,7 +552,10 @@ macro_rules! rows {
 /// `Untracked` is deliberately thin: with no journal row there is no base, so `disk_changed`,
 /// `kb_changed` and `disjoint` cannot be established at all and every event that reads them is
 /// unreachable there. Declaring those rows anyway would put edges in the diagram that nothing
-/// can take.
+/// can take — `conflicted` was one, and `every_row_can_be_taken_by_some_observation` is the test
+/// that now says so for any row whose guard no modelled observation satisfies. (The engine agrees
+/// from the other side: a file with no journal row returns before the three-way merge, the only
+/// place a conflict is flagged.)
 const ROWS: &[Transition<FileState, FileEvent, FileFacts, FileEffect>] = rows! {
     // --- back to rest, from wherever the file was ------------------------------------------
     [Untracked]                                        -Adopted->          Settled : adopting, settle;
@@ -573,8 +577,9 @@ const ROWS: &[Transition<FileState, FileEvent, FileFacts, FileEffect>] = rows! {
     // declared rather than assumed.
     [Untracked, Settled, Conflicted, Quarantined, Blocked]
                                                        -ParseFailed->      Quarantined : parse_failed, stash;
-    [Untracked, Settled, Conflicted, Quarantined, Blocked]
-                                                       -Conflicted->       Conflicted : conflicting, flag_conflict;
+    // Not from `Untracked`: a conflict is both sides changing since the base, and with no
+    // journal row there is no base to have changed since.
+    [Settled, Conflicted, Quarantined, Blocked]        -Conflicted->       Conflicted : conflicting, flag_conflict;
     [Untracked, Settled, Conflicted, Quarantined, Blocked]
                                                        -WriteBlocked->     Blocked : write_blocked, flag_blocked;
 };
@@ -614,12 +619,14 @@ pub fn status_for(from: FileState, event: FileEvent) -> Result<&'static str, Str
                 to.name()
             )
         }),
-        // The destination of a transition absorbs its own event: a file already quarantined that
-        // fails to parse again stays quarantined, and that is a no-op rather than an error.
-        Acceptance::Idempotent => from
-            .stored()
-            .ok_or_else(|| format!("`{}` has no stored spelling", from.name())),
-        Acceptance::MovesAsStated | Acceptance::Undefined => Err(format!(
+        // `Idempotent` is not an answer this table can give, and is refused with the rest rather
+        // than mapped to `from`'s spelling. Implicit absorption applies only to a row with no
+        // guard and no plan, and every event here is a reconciliation, which `check` requires to
+        // be guarded — so a re-observed conclusion is a declared self-loop (a file that fails to
+        // parse again is `quarantined -parse_failed-> quarantined`, and gets its stash), never an
+        // absorbed no-op. Answering it as a no-op would be the repealed rule: a status written
+        // without the plan that goes with it.
+        Acceptance::Idempotent | Acceptance::MovesAsStated | Acceptance::Undefined => Err(format!(
             "the sync journal has no `{}` transition out of `{}` — a reconcile arm reached a \
              conclusion the machine does not declare",
             event.name(),

@@ -18,6 +18,15 @@ pub trait State: Copy + Eq + std::hash::Hash + fmt::Debug + 'static {
     /// The stable, human-facing name (matches the stored spelling where there is one).
     fn name(self) -> &'static str;
 
+    /// What an object in these states is called, **with its indefinite article**: `"a task"`,
+    /// `"an investigation unit"`.
+    ///
+    /// Read by [`Outcome::refusal`] to say what the undeclared event cannot happen *to*. Required
+    /// rather than defaulted, because the default this replaced was `"task"`, hard-coded into a
+    /// crate that knows nothing about tasks, and every other machine's refusals said it. The
+    /// article is part of the value so a noun that wants `an` gets it without a rule for guessing.
+    const NOUN: &'static str;
+
     /// Whether the object is **at rest** here: it owes the system nothing further.
     ///
     /// At least one state must be, and every state must be able to reach one — see
@@ -157,12 +166,25 @@ pub struct Remedy<E> {
 /// the liveness checks** ([`crate::Defect::Wedged`] and [`crate::Defect::DeadEnd`]): a state
 /// whose only exit is somebody naming a different one is wedged, and counting the escape hatch
 /// as an exit would make both checks vacuous for any machine that has one.
-pub enum Dest<S, C> {
+///
+/// It **does** count for reachability, but only as far as it goes: an edge from its `from` to
+/// each state in `among`, exactly like a row of [`Dest::To`] edges. The table cannot see inside
+/// `pick`, so `among` is how the row says where it can lead, and [`Machine::apply`] refuses a
+/// `pick` that names anything else, so the declaration cannot be wider or narrower than what
+/// the row really does without a refusal saying so. Counting every `Stated` row as reaching
+/// every state, which is what this replaced, turned [`crate::Defect::UnreachableState`] off for
+/// the whole machine the moment any one row anywhere was stated.
+pub enum Dest<S: 'static, C> {
     /// The table decides.
     To(S),
-    /// The caller decides, from the context. `None` means it named nothing usable, which is a
-    /// refusal rather than a silent stay.
-    Stated(fn(&C) -> Option<S>),
+    /// The caller decides, from the context.
+    Stated {
+        /// The state the caller named. `None` means it named nothing usable, which is a refusal
+        /// rather than a silent stay.
+        pick: fn(&C) -> Option<S>,
+        /// Every state `pick` may name. A pick outside it is refused.
+        among: &'static [S],
+    },
 }
 
 /// One row of the transition table.
@@ -281,8 +303,9 @@ impl<S: State, E: Event, X> Outcome<S, E, X> {
                 None => denial.reason.clone(),
             }),
             Self::Undefined { state, event } => Some(format!(
-                "`{}` is not something that can happen to a task that is `{}`.",
+                "`{}` is not something that can happen to {} that is `{}`.",
                 event.name(),
+                S::NOUN,
                 state.name()
             )),
             _ => None,
@@ -370,7 +393,7 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
         if let Some(t) = self.row(state, event) {
             return match t.to {
                 Dest::To(to) => Acceptance::Moves(to),
-                Dest::Stated(_) => Acceptance::MovesAsStated,
+                Dest::Stated { .. } => Acceptance::MovesAsStated,
             };
         }
         // Implicit absorption, and **only when there is nothing to absorb**.
@@ -404,7 +427,7 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
     /// The liveness checks ask this: an escape hatch is not an exit (see [`Dest`]).
     pub(crate) fn is_stated(&self, state: S, event: E) -> bool {
         self.row(state, event)
-            .is_some_and(|t| matches!(t.to, Dest::Stated(_)))
+            .is_some_and(|t| matches!(t.to, Dest::Stated { .. }))
     }
 
     /// The declared row for `(from, event)`, if any.
@@ -443,15 +466,29 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
                 };
             }
         }
-        let Some(to) = resolve(&t.to, ctx) else {
-            return Outcome::Refused {
-                state,
-                event,
-                denial: Denial::new(format!(
-                    "`{}` needs a target state and none was given.",
-                    event.name()
-                )),
-            };
+        let to = match resolve(&t.to, ctx) {
+            Resolved::To(to) => to,
+            Resolved::Nothing => {
+                return Outcome::Refused {
+                    state,
+                    event,
+                    denial: Denial::new(format!(
+                        "`{}` needs a target state and none was given.",
+                        event.name()
+                    )),
+                }
+            }
+            Resolved::Undeclared(named) => {
+                return Outcome::Refused {
+                    state,
+                    event,
+                    denial: Denial::new(format!(
+                        "`{}` cannot lead to `{}`.",
+                        event.name(),
+                        named.name()
+                    )),
+                }
+            }
         };
         Outcome::Moved {
             from: state,
@@ -506,9 +543,9 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
             // A destination that resolves to nowhere is not evidence of anything; `apply` would
             // refuse it, so `reconcile` does not offer it as a candidate.
             match resolve(&t.to, ctx) {
-                Some(to) if to == state => loops.push(t.event),
-                Some(_) => moves.push(t.event),
-                None => {}
+                Resolved::To(to) if to == state => loops.push(t.event),
+                Resolved::To(_) => moves.push(t.event),
+                Resolved::Nothing | Resolved::Undeclared(_) => {}
             }
         }
         let chosen = match (moves.len(), loops.len()) {
@@ -560,7 +597,7 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
                     event: t.event.name(),
                     to: match t.to {
                         Dest::To(to) => Some(to.name()),
-                        Dest::Stated(_) => None,
+                        Dest::Stated { .. } => None,
                     },
                     reconciled: t.event.kind() == EventKind::Reconciled,
                     guarded: t.guard.is_some(),
@@ -598,7 +635,7 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
             };
             let to = match t.to {
                 Dest::To(to) => to.name(),
-                Dest::Stated(_) => {
+                Dest::Stated { .. } => {
                     any_stated = true;
                     "*"
                 }
@@ -620,11 +657,25 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
     }
 }
 
-/// The destination a row resolves to in this context, or `None` if the caller stated nothing.
-fn resolve<S: State, C>(dest: &Dest<S, C>, ctx: &C) -> Option<S> {
+/// What a row's destination comes to in one context.
+enum Resolved<S> {
+    /// A destination the row may lead to.
+    To(S),
+    /// A [`Dest::Stated`] row whose caller named nothing.
+    Nothing,
+    /// A [`Dest::Stated`] row whose caller named a state outside its `among`.
+    Undeclared(S),
+}
+
+/// The destination a row resolves to in this context.
+fn resolve<S: State, C>(dest: &Dest<S, C>, ctx: &C) -> Resolved<S> {
     match dest {
-        Dest::To(to) => Some(*to),
-        Dest::Stated(f) => f(ctx),
+        Dest::To(to) => Resolved::To(*to),
+        Dest::Stated { pick, among } => match pick(ctx) {
+            None => Resolved::Nothing,
+            Some(to) if among.contains(&to) => Resolved::To(to),
+            Some(to) => Resolved::Undeclared(to),
+        },
     }
 }
 

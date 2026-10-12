@@ -45,6 +45,7 @@
 //! enum Door { Open, Closed, Welded }
 //! impl State for Door {
 //!     const ALL: &'static [Self] = &[Self::Open, Self::Closed, Self::Welded];
+//!     const NOUN: &'static str = "a door";
 //!     fn name(self) -> &'static str {
 //!         match self { Self::Open => "open", Self::Closed => "closed", Self::Welded => "welded" }
 //!     }
@@ -87,6 +88,13 @@
 //! let unknown = Ctx { at: Door::Closed, latched: Fact::Unknown };
 //! let out = m.apply(&unknown, Act::Weld);
 //! assert_eq!(out.refusal().as_deref(), Some("it is not latched. Shut it first."));
+//!
+//! // And a pair the table does not declare is a named refusal, about a door.
+//! let open = Ctx { at: Door::Open, latched: Fact::No };
+//! assert_eq!(
+//!     m.apply(&open, Act::Weld).refusal().as_deref(),
+//!     Some("`weld` is not something that can happen to a door that is `open`."),
+//! );
 //! ```
 
 //! ## What later machines changed
@@ -112,6 +120,10 @@
 //! 4. **Reachability counts a [`Dest::Stated`] edge; liveness still does not.** *Can the object
 //!    be here* is answered yes by an operator override; *can the lifecycle get it out of here* is
 //!    not. Collapsing them reported a state only a person ever sets as unreachable dead code.
+//!    The edge goes only where the row says it can (its `among`, which `apply` enforces), and
+//!    only once its own `from` is reached. Counting any stated row as reaching every state
+//!    switched [`Defect::UnreachableState`] off for the whole machine, silently, and a green test
+//!    asserted the result.
 //! 5. **[`Defect::UnusedEvent`] is a per-machine statement.** That machine is two tables over one
 //!    event enum, and an event one table does not use is normal. A family checks the union.
 //!

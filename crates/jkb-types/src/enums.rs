@@ -655,6 +655,7 @@ mod tests {
 /// `jkb_core::nstype::lifecycle`.
 impl jkb_fsm::State for Resolution {
     const ALL: &'static [Self] = Self::ALL;
+    const NOUN: &'static str = "an investigation unit";
 
     fn name(self) -> &'static str {
         self.as_str()
@@ -699,6 +700,7 @@ impl Default for TaskStatus {
 /// state enum would put that back. A claim is context, and a claim change is an effect.
 impl jkb_fsm::State for TaskStatus {
     const ALL: &'static [Self] = Self::ALL;
+    const NOUN: &'static str = "a task";
 
     fn name(self) -> &'static str {
         self.as_str()
