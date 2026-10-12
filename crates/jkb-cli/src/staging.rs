@@ -645,7 +645,7 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
     if let Some(reason) = facts.listing_failed {
         return Some(reason.to_owned());
     }
-    if facts.worktree.is_none() {
+    let Some(worktree) = facts.worktree else {
         // A task whose branch exists but has no `.jkb/work` checkout never had a session:
         // that is what a `/task-swarm` task looks like, and this view shows those on purpose.
         // Telling its owner to run `jkb task work` was worse than unhelpful — following the
@@ -660,7 +660,7 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
              with `jkb task work`."
                 .to_owned()
         });
-    }
+    };
     // PROVEN CLEAN, or it does not land. `is_dirty` used to collapse a failed `git status` into
     // `false`, so a session whose `.git` had been unlinked part-way passed every check here,
     // was grafted, and only then hit `archive::dispose`'s refusal to record a session with no
@@ -669,9 +669,12 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
     // live session, with the branch pointing at what had already landed.
     if !facts.dirty.is_no() {
         return Some(if facts.dirty.is_unknown() {
-            "Git could not read its session checkout, so it cannot be established as clean. \
-             `git -C <worktree> status` will say what git makes of the directory."
-                .to_owned()
+            // The real path, so the remedy runs as printed — `target_dirty_reason` does the same.
+            format!(
+                "Git could not read its session checkout, so it cannot be established as clean. \
+                 `git -C {} status` will say what git makes of the directory.",
+                worktree.display()
+            )
         } else {
             "It has uncommitted changes — commit them in the session first.".to_owned()
         });
@@ -811,6 +814,11 @@ mod tests {
         assert!(
             reason.contains("could not read"),
             "refused for being unreadable, not for some other reason: {reason}"
+        );
+        // The remedy names the checkout itself, so it runs as printed.
+        assert!(
+            reason.contains("`git -C /tmp/session status`") && !reason.contains("<worktree>"),
+            "the remedy names the real checkout, not a placeholder: {reason}"
         );
 
         // The polarity, stated as the assertion: `is_no()` and not `!is_yes()`. This is what

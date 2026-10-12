@@ -2988,27 +2988,8 @@ fn land_preflight(
             .filter(|_| dirty.is_yes() && reason.contains("uncommitted changes"))
             .map(|s| (s, gitrepo::deletions_only(&s.worktree, &ctx.root)))
         {
-            Some((s, Ok(d))) => match d.caveat() {
-                None => String::new(),
-                // The remedy is the land path's own, which is why `caveat` does not carry one: it
-                // belongs only to the arm where putting the files back is the answer.
-                Some(c) => {
-                    // By characters, not by bytes. `c[..1]` panics on any caveat whose first
-                    // character is multi-byte, and the wordings live in `Deletions::caveat` where
-                    // nothing warns a future editor that a caller is slicing them.
-                    let mut ch = c.chars();
-                    let capped = ch.next().map_or_else(String::new, |f| {
-                        f.to_uppercase().collect::<String>() + ch.as_str()
-                    });
-                    match d {
-                        gitrepo::Deletions::Only(_) => format!(
-                            " {capped}. `git -C {} restore .` puts them all back.",
-                            s.worktree.display()
-                        ),
-                        _ => format!(" {capped}."),
-                    }
-                }
-            },
+            // The sentence is `Deletions::refusal_suffix`'s, shared with `jkb task abandon`.
+            Some((s, Ok(d))) => d.refusal_suffix(&s.worktree),
             _ => String::new(),
         };
         anyhow::bail!("{uid} cannot land. {reason}{hint}");

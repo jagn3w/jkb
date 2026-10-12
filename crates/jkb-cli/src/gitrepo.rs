@@ -1515,8 +1515,12 @@ pub fn forget_worktree(dir: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Add a worktree at `path` checked out to `branch`, creating that branch from `start` when
-/// it does not exist yet.
+/// Add a worktree at `path` checked out to `branch`. A local `branch` is used as it is; when
+/// there is none, it is created from an existing remote-tracking `origin/<branch>` if there is
+/// one — **in preference to `start`** — and from `start` only when neither exists. This is
+/// [`ensure_branch`]'s rule (adopt the remote, because a session branch may already carry pushed
+/// work), not [`create_branch`]'s: a caller that needs the branch to begin exactly at `start`
+/// must not use this.
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to create the worktree.
@@ -1986,9 +1990,10 @@ impl Deletions {
     /// commit what may be a part-way removal. Three-valued `Deletions` exists so those two cannot
     /// read the same; a renderer per caller is how they came to.
     ///
-    /// Deliberately carries no remedy and no path: the two callers offer different ones (`land`
-    /// suggests `git restore .` inline, the sweep has a [`crate::archive::Remedy`] of its own),
-    /// and folding a remedy in here would have one of them print it twice.
+    /// Deliberately carries no remedy and no path: its readers offer different ones (`land` and
+    /// `abandon` suggest `git restore .` inline, through [`Deletions::refusal_suffix`]; the sweep
+    /// has a [`crate::archive::Remedy`] of its own), and folding a remedy in here would have one
+    /// of them print it twice.
     #[must_use]
     pub fn caveat(self) -> Option<String> {
         match self {
@@ -2002,6 +2007,38 @@ impl Deletions {
                  is unestablished"
                     .to_owned(),
             ),
+        }
+    }
+
+    /// [`Deletions::caveat`] as the sentence a command line appends to its own *"it has
+    /// uncommitted changes"* refusal for the session checkout at `worktree` — with a leading
+    /// space, or empty where there is nothing to add — and, for a part-way removal, the
+    /// `git restore .` that puts it back.
+    ///
+    /// **One rendering for the two refusals that print it inline**, `jkb task land` and `jkb task
+    /// abandon`. Abandon is the verb the sweep's own [`crate::archive::Remedy::CommitOrForce`]
+    /// sends the operator to, and it went on saying "commit them" with no caveat over exactly the
+    /// part-way removal the caveat exists for, because the wording lived inside `land_preflight`.
+    /// The sweep keeps its structured [`crate::archive::Remedy`] instead of this sentence.
+    #[must_use]
+    pub fn refusal_suffix(self, worktree: &Path) -> String {
+        let Some(c) = self.caveat() else {
+            return String::new();
+        };
+        // By characters, not by bytes. `c[..1]` panics on any caveat whose first character is
+        // multi-byte, and nothing in `caveat` warns a future editor that a caller slices it.
+        let mut ch = c.chars();
+        let capped = ch.next().map_or_else(String::new, |f| {
+            f.to_uppercase().collect::<String>() + ch.as_str()
+        });
+        // The remedy belongs only to the arm where putting the files back is the answer, which is
+        // why `caveat` does not carry one.
+        match self {
+            Self::Only(_) => format!(
+                " {capped}. `git -C {} restore .` puts them all back.",
+                worktree.display()
+            ),
+            Self::NotOnly | Self::Unknown => format!(" {capped}."),
         }
     }
 }
@@ -2089,8 +2126,9 @@ pub enum Graft {
 /// does not *move* it: `branch` still points at its pre-rebase commits when this returns.
 ///
 /// # Errors
-/// Returns an error if `git` cannot be executed, or if the working tree cannot be put on
-/// `onto` to begin with.
+/// Returns an error if `git` cannot be executed, if the working tree cannot be put on `onto`
+/// to begin with, or if `branch` cannot be checked out (detached) in it — carrying git's own
+/// message, since that is a fault of the working tree and never a [`Graft::Conflict`].
 pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     valid_ref(branch)?;
     valid_ref(onto)?;
@@ -2128,9 +2166,26 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
         );
     }
 
-    if !git_run(dir, &["checkout", "--detach", branch])?.0 {
-        git_must(dir, &["switch", onto])?;
-        return Ok((Graft::Conflict, pre));
+    // A CHECKOUT THAT FAILS IS NOT A CONFLICT. Nothing has been rebased yet, so whatever stopped
+    // the detach — an untracked file the checkout would overwrite, a held `index.lock`, a
+    // permissions error — is a property of the working tree at `dir`, and `Graft::Conflict` would
+    // send the user to resolve a conflict in a branch that has none. It used to, with git's own
+    // text discarded. The error carries that text instead, the same split `scripts/merge-queue.sh`
+    // makes between a setup failure and a content conflict.
+    let (detached, why) = git_run(dir, &["checkout", "--detach", branch])?;
+    if !detached {
+        // Put the tree back on `onto` if the failure moved it; a refused checkout normally has
+        // not, so this is a no-op whose own failure must not hide the cause above.
+        let back = match git_run(dir, &["switch", onto]) {
+            Ok((true, _)) => String::new(),
+            Ok((false, text)) => format!("\n\nand switching back to {onto} also failed: {text}"),
+            Err(e) => format!("\n\nand switching back to {onto} also failed: {e:#}"),
+        };
+        anyhow::bail!(
+            "could not check out {branch} in {} to rebase it — nothing changed, and this is not a \
+             conflict in {branch}. git said: {why}{back}",
+            dir.display()
+        );
     }
     if !git_run(dir, &["rebase", onto])?.0 {
         let _ = git_run(dir, &["rebase", "--abort"])?;
@@ -3100,6 +3155,37 @@ mod tests {
         assert_eq!(name("v1.0"), NotABranch, "a tag was accepted as a branch");
         assert_eq!(name("HEAD"), NotABranch);
         assert_eq!(name("no-such-thing"), Unknown);
+    }
+
+    /// **A checkout that fails is an error carrying git's text, never a `Graft::Conflict`.** An
+    /// untracked file in the land tree that `unmerged`'s checkout would overwrite stops the
+    /// detach before any rebase runs; this used to come back as `Conflict`, which `jkb task land`
+    /// renders as "does not rebase cleanly — fix the conflict" for a branch that has none.
+    #[test]
+    fn a_checkout_that_fails_is_not_reported_as_a_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fixture(dir);
+        std::fs::write(dir.join("unmerged.txt"), "in the way").unwrap();
+
+        let err = super::graft(dir, "unmerged", "main")
+            .map(|(outcome, _)| outcome)
+            .expect_err("a refused checkout is not an outcome of the graft");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a conflict") && msg.contains("would be overwritten"),
+            "the refusal names itself and carries git's own reason: {msg}"
+        );
+        assert_eq!(
+            current_branch(dir).unwrap().as_deref(),
+            Some("main"),
+            "the land tree is left on the target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("unmerged.txt")).unwrap(),
+            "in the way",
+            "the file in the way is untouched"
+        );
     }
 
     #[test]

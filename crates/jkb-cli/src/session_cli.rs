@@ -1472,10 +1472,28 @@ fn abandon_session(
             // `--force` is the answer to both a dirty tree and an unreadable one: it records
             // that the operator accepts whatever is in there (`Plan::accept_dirty`), which is
             // the same decision either way.
+            //
+            // The two refusals are worded apart, because they want different next steps: a
+            // checkout git could not read may hold nothing to commit at all. And a dirty one gets
+            // the same `Deletions` caveat `jkb task land` appends, through the same renderer —
+            // this is the verb `Remedy::CommitOrForce` sends the operator to, so "commit them"
+            // over a part-way removal here is the 152-deletion advice all over again.
+            let dirty = gitrepo::is_dirty(&sess.worktree, &ctx.root)?;
+            if dirty.is_yes() {
+                let hint = gitrepo::deletions_only(&sess.worktree, &ctx.root)?
+                    .refusal_suffix(&sess.worktree);
+                anyhow::bail!(
+                    "{} has uncommitted changes — commit them, or pass --force to discard \
+                     whatever is there.{hint}",
+                    sess.worktree.display()
+                );
+            }
             anyhow::ensure!(
-                gitrepo::is_dirty(&sess.worktree, &ctx.root)?.is_no(),
-                "{} could not be established as having no uncommitted changes — commit them, \
-                 or pass --force to discard whatever is there",
+                dirty.is_no(),
+                "git could not read {}, so it cannot be established as having no uncommitted \
+                 changes — `git -C {} status` will say what git makes of the directory; pass \
+                 --force to discard whatever is there",
+                sess.worktree.display(),
                 sess.worktree.display()
             );
         }

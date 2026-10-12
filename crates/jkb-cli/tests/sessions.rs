@@ -548,6 +548,41 @@ fn abandoning_reopens_the_task_and_removes_the_worktree() {
     f.jkb().args(["task", "work", &uid]).assert().success();
 }
 
+/// Abandon refuses a dirty session the way land does — **with the deletions caveat**. It is the
+/// verb the disposal sweep's commit-or-force remedy names, and it used to say only "commit them",
+/// over exactly the part-way removal (tracked files missing, nothing else) whose remedy is
+/// `git restore .`. Ordinary edits get no caveat: the control.
+#[test]
+fn abandon_caveats_a_part_way_removal_like_land_does() {
+    let f = Fixture::new();
+    let uid = f.add_task("half removed task");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&wt, "e.txt", "work\n", "add e");
+
+    std::fs::remove_file(wt.join("e.txt")).unwrap();
+    f.jkb()
+        .args(["task", "abandon", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has uncommitted changes"))
+        .stderr(predicate::str::contains("part-way removal"))
+        .stderr(predicate::str::contains(format!(
+            "`git -C {} restore .`",
+            wt.display()
+        )));
+    assert!(wt.exists(), "a refused abandon leaves the checkout alone");
+
+    std::fs::write(wt.join("e.txt"), "edited\n").unwrap();
+    f.jkb()
+        .args(["task", "abandon", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has uncommitted changes"))
+        .stderr(predicate::str::contains("part-way removal").not());
+    assert_eq!(f.status_of(&uid), "in_progress", "nothing was abandoned");
+}
+
 /// A session outlives the process that opened it: the worktree is the liveness signal, and
 /// the claim must survive the owner-existence reclaim.
 ///
