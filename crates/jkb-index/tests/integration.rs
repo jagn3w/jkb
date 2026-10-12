@@ -340,7 +340,7 @@ fn a_deleted_items_vector_is_swept_and_a_successor_gets_a_fresh_id() {
                 remaining, 0,
                 "the trigger must remove the vector with its item, without jkb's help"
             );
-            Ok(jkb_index::drop_orphan_vectors(conn).unwrap())
+            Ok(jkb_index::sweep_stale(conn).unwrap().total())
         })
         .unwrap();
     assert_eq!(

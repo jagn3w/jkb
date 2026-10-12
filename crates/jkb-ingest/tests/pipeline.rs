@@ -485,6 +485,52 @@ fn index_pending_writes_no_vector_for_an_item_deleted_mid_run() {
     assert_eq!(pipe.unembedded_count(&db).unwrap(), 0);
 }
 
+/// A vector row whose item is gone leaves the pending set exactly as if it were not there: the
+/// candidates come from `items`, so an orphan's id names no candidate. Built on a store whose GC
+/// trigger has been dropped, which is how a pre-trigger database comes to hold such a row.
+#[test]
+fn an_orphan_vector_row_neither_hides_nor_adds_a_pending_item() {
+    let db = open_db();
+    let mk = |uid: &str, content: &str| jkb_core::item::NewItem {
+        uid: uid.to_owned(),
+        kind: "note".to_owned(),
+        content: Some(content.to_owned()),
+        content_hash: None,
+        mime: None,
+    };
+    db.write_txn("t", move |conn, meta| {
+        jkb_core::item::upsert(conn, meta, &mk("note:kept", "kept content"))?;
+        jkb_core::item::upsert(conn, meta, &mk("note:gone", "gone content"))?;
+        Ok(())
+    })
+    .unwrap();
+    let pipe = pipeline(true);
+    assert_eq!(pipe.index_pending(&db).unwrap().total(), 2);
+
+    db.write_txn("t", move |conn, meta| {
+        conn.execute_batch("DROP TRIGGER vec_items_16_gc")?;
+        let gone = jkb_core::item::id_for_uid(conn, "note:gone")?.expect("setup: item exists");
+        jkb_core::item::remove(conn, meta, gone, true)?;
+        jkb_core::item::upsert(conn, meta, &mk("note:new", "new content"))?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        db.read(|conn| Ok(jkb_index::count_stale(conn).unwrap().vectors))
+            .unwrap(),
+        1,
+        "setup: the deleted item's vector is left behind"
+    );
+
+    assert_eq!(
+        pipe.unembedded_count(&db).unwrap(),
+        1,
+        "only the new item is pending"
+    );
+    assert_eq!(pipe.index_pending(&db).unwrap().embedded, 1);
+    assert_eq!(pipe.unembedded_count(&db).unwrap(), 0);
+}
+
 /// A document's vector is the mean of its chunks', not an embedding of its truncated text:
 /// a vector claiming to describe a document while describing only its opening ranks against
 /// queries about the opening and misses everything after it.

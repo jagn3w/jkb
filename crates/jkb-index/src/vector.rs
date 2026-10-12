@@ -40,9 +40,12 @@ const VECTOR_LOOKUP_BATCH: usize = 4096;
 /// offline; and it sweeps every dimension's table, because a database whose embedding model
 /// changed has more than one.
 ///
+/// Crate-private: [`sweep_stale`] is the one way in, because it also installs the delete-GC
+/// trigger, and a repair that skips that leaves a pre-trigger database generating more orphans.
+///
 /// # Errors
 /// Returns an error if a statement fails.
-pub fn drop_orphan_vectors(conn: &Connection) -> Result<usize> {
+pub(crate) fn drop_orphan_vectors(conn: &Connection) -> Result<usize> {
     let mut dropped = 0;
     for table in vector_tables(conn)? {
         // The name comes from `sqlite_master`, filtered to our own prefix — never from input.
@@ -61,11 +64,12 @@ pub fn drop_orphan_vectors(conn: &Connection) -> Result<usize> {
 /// `jkb doctor` can report what `jkb doctor --fix` would remove and stay read-only. It lives
 /// here beside the delete because the two must agree on what counts as an orphan and on which
 /// tables are ours; the CLI previously carried its own copy of both queries, including the
-/// `vec0` shadow-table filter that is the non-obvious part.
+/// `vec0` shadow-table filter that is the non-obvious part. Crate-private, like the delete:
+/// [`count_stale`] is the public spelling.
 ///
 /// # Errors
 /// Returns an error if a statement fails.
-pub fn count_orphan_vectors(conn: &Connection) -> Result<i64> {
+pub(crate) fn count_orphan_vectors(conn: &Connection) -> Result<i64> {
     let mut total = 0;
     for table in vector_tables(conn)? {
         total += conn
@@ -86,9 +90,10 @@ pub fn count_orphan_vectors(conn: &Connection) -> Result<i64> {
 /// index that grows monotonically, so it is worth finding and removing on demand.
 ///
 /// A struct rather than a bare count because the set of derived indexes is open: FTS is
-/// trigger-maintained today and a second vector backend is plausible, and a caller that
-/// pattern-matches on fields gets a compile error when one is added rather than a silently
-/// unreported total.
+/// trigger-maintained today and a second vector backend is plausible. [`StaleRows::total`] and
+/// [`StaleRows::is_empty`] cover every field, so a caller asking "is anything stale?" stays
+/// right when one is added; a caller reading a named field such as `vectors` reports only that
+/// index, and nothing will flag it when another appears.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StaleRows {
     /// Rows across every `vec_items_<dim>` table whose item is gone.
