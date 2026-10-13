@@ -50,7 +50,7 @@ pub fn place(
             "INSERT INTO placements (item_id, namespace_id, role, position)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(item_id, namespace_id, role) DO UPDATE SET position = excluded.position
-             RETURNING rowid",
+             RETURNING id",
         )?
         .query_row(
             params![item.get(), namespace.get(), role.as_str(), position],
@@ -99,9 +99,10 @@ pub fn set_primary(
     let stale: Vec<(i64, i64, i64, String)> = {
         // The WHOLE row, not just the key: `undo` puts a deleted placement back from exactly the
         // columns recorded here, and one restored without its `position` or `metadata` is a
-        // different placement in the same slot.
+        // different placement in the same slot. That includes `id` (V030): restored under its own
+        // id, the row is still the one every older entry keyed by that id names.
         let mut stmt = conn.prepare_cached(
-            "SELECT rowid, namespace_id, position, metadata FROM placements
+            "SELECT id, namespace_id, position, metadata FROM placements
              WHERE item_id = ?1 AND role = 'primary' AND namespace_id != ?2",
         )?;
         let rows = stmt.query_map([item.get(), namespace.get()], |r| {
@@ -115,7 +116,7 @@ pub fn set_primary(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (rowid, old_ns, old_position, old_metadata) in stale {
-        conn.prepare_cached("DELETE FROM placements WHERE rowid = ?1")?
+        conn.prepare_cached("DELETE FROM placements WHERE id = ?1")?
             .execute([rowid])?;
         changelog::append(
             conn,
@@ -124,6 +125,7 @@ pub fn set_primary(
             Entity::Placements,
             &rowid.to_string(),
             Some(&json!({
+                "id": rowid,
                 "item_id": item.get(),
                 "namespace_id": old_ns,
                 "role": "primary",
@@ -159,7 +161,7 @@ pub fn unplace(
 ) -> Result<usize> {
     let rows: Vec<(i64, i64, String)> = {
         let mut stmt = conn.prepare_cached(
-            "SELECT rowid, position, metadata FROM placements
+            "SELECT id, position, metadata FROM placements
              WHERE item_id = ?1 AND namespace_id = ?2 AND role = 'reference'",
         )?;
         let rows = stmt.query_map([item.get(), namespace.get()], |r| {
@@ -172,7 +174,7 @@ pub fn unplace(
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (rowid, position, metadata) in &rows {
-        conn.prepare_cached("DELETE FROM placements WHERE rowid = ?1")?
+        conn.prepare_cached("DELETE FROM placements WHERE id = ?1")?
             .execute([rowid])?;
         changelog::append(
             conn,
@@ -182,6 +184,7 @@ pub fn unplace(
             &rowid.to_string(),
             // The whole row — see `set_primary`.
             Some(&json!({
+                "id": rowid,
                 "item_id": item.get(),
                 "namespace_id": namespace.get(),
                 "role": "reference",

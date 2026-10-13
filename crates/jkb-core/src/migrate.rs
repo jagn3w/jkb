@@ -608,6 +608,22 @@ mod edges_namespaces_autoincrement_tests {
             .unwrap()
     }
 
+    /// Every placement, by the columns V027 saw. Not `rows`: the harness below runs every later
+    /// migration too, and V030 gives `placements` an `id` column (its old rowid) that V027 did not
+    /// see, so `SELECT *` would differ for a reason that is not V027's.
+    fn placement_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT item_id, namespace_id, role, position, metadata FROM placements
+                  ORDER BY rowid",
+            )
+            .unwrap();
+        stmt.query_map([], |r| (0..5).map(|i| r.get::<_, Value>(i)).collect())
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
     /// The indexes on `table`, as `(name, sql)` — `sql` is NULL for a constraint's own index.
     fn indexes(conn: &Connection, table: &str) -> Vec<(String, Option<String>)> {
         conn.prepare(
@@ -694,7 +710,7 @@ mod edges_namespaces_autoincrement_tests {
             rows(&conn, "edges"),
             rows(&conn, "namespaces"),
             rows(&conn, "mounts"),
-            rows(&conn, "placements"),
+            placement_rows(&conn),
             indexes(&conn, "edges"),
             indexes(&conn, "namespaces"),
             foreign_keys(&conn),
@@ -707,7 +723,7 @@ mod edges_namespaces_autoincrement_tests {
             rows(&conn, "edges"),
             rows(&conn, "namespaces"),
             rows(&conn, "mounts"),
-            rows(&conn, "placements"),
+            placement_rows(&conn),
             indexes(&conn, "edges"),
             indexes(&conn, "namespaces"),
             foreign_keys(&conn),
@@ -848,6 +864,143 @@ mod edges_namespaces_autoincrement_tests {
             plan.iter()
                 .any(|d| d.contains("USING INDEX idx_task_transitions_item")),
             "the history read no longer uses its index: {plan:?}"
+        );
+    }
+
+    /// V030 gives `placements` and `tag_applications` an AUTOINCREMENT `id` equal to each row's old
+    /// rowid — so every changelog entry already keyed by one still names the same row — keeps the
+    /// natural key unique and the cascades firing, and sets each high-water mark above every rowid
+    /// the changelog names for the table, including ones deleted off the top of the range.
+    ///
+    /// Seeded at V028 so the rowids exist and are already deleted when V030 runs.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one migration scenario, seeded and read back top to bottom
+    fn v030_makes_placement_and_tag_ids_unreusable_and_keeps_their_rowids() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // V027 rebuilds tables other rows reference, so the partial run needs the harness's
+        // `foreign_keys = OFF` as well; the full run below is the harness itself.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(28))
+            .run(&mut conn)
+            .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO items (id, uid, kind) VALUES (1, 'u1', 'note'), (2, 'u2', 'note');
+             INSERT INTO namespaces (id, path, kind) VALUES (30, 'p', 'logical'), (31, 'q', 'logical');
+             INSERT INTO placements (rowid, item_id, namespace_id, role, position, metadata)
+                  VALUES (4, 1, 30, 'primary', 2, '{\"m\":1}'), (6, 2, 31, 'reference', 0, '{}');
+             INSERT INTO tag_applications (rowid, item_id, facet, value, props)
+                  VALUES (3, 1, 'size', 'small', '{\"p\":1}');
+             -- Placement 9 and tag application 8 were inserted, then deleted off the top: only
+             -- the changelog remembers them.
+             INSERT INTO changelog (txn_id, op, entity_type, entity_id, after)
+                  VALUES (1, 'insert', 'placements', '9', '{}'),
+                         (1, 'update', 'tag_applications', '8', '{}');",
+        )
+        .unwrap();
+        let placements = rows(&conn, "placements");
+        let tags = rows(&conn, "tag_applications");
+
+        super::run(&mut conn).expect("V030 applied, with no dangling foreign key");
+
+        // Each row's id is its old rowid, followed by the columns it had.
+        let with_id = |old: Vec<Vec<Value>>, ids: &[i64]| -> Vec<Vec<Value>> {
+            old.into_iter()
+                .zip(ids)
+                .map(|(row, id)| std::iter::once(Value::Integer(*id)).chain(row).collect())
+                .collect()
+        };
+        assert_eq!(
+            rows(&conn, "placements"),
+            with_id(placements, &[4, 6]),
+            "a placement's id is not its old rowid, or a column changed"
+        );
+        assert_eq!(
+            rows(&conn, "tag_applications"),
+            with_id(tags, &[3]),
+            "a tag application's id is not its old rowid, or a column changed"
+        );
+
+        for (table, issued) in [("placements", 9), ("tag_applications", 8)] {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                sql.contains("AUTOINCREMENT"),
+                "{table} is not AUTOINCREMENT: {sql}"
+            );
+            let seq: i64 = conn
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                seq >= issued,
+                "{table}'s high-water mark {seq} is below the id {issued} the changelog names"
+            );
+        }
+        let names = |table: &str| -> Vec<String> {
+            indexes(&conn, table).into_iter().map(|(n, _)| n).collect()
+        };
+        assert!(names("placements").contains(&"idx_placements_ns".to_owned()));
+        assert!(names("placements").contains(&"idx_placements_item".to_owned()));
+        assert!(names("tag_applications").contains(&"idx_tag_applications_facet".to_owned()));
+        assert!(names("tag_applications").contains(&"idx_tag_applications_item".to_owned()));
+
+        // A new row is not handed an id the changelog still names.
+        let fresh: i64 = conn
+            .query_row(
+                "INSERT INTO placements (item_id, namespace_id, role) VALUES (2, 30, 'primary')
+                 RETURNING id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fresh > 9, "placement id {fresh} was reissued");
+        let fresh: i64 = conn
+            .query_row(
+                "INSERT INTO tag_applications (item_id, facet, value) VALUES (2, 'size', 'big')
+                 RETURNING id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fresh > 8, "tag application id {fresh} was reissued");
+
+        // The natural keys stay unique, and the upserts that name them still resolve.
+        assert!(conn
+            .execute(
+                "INSERT INTO placements (item_id, namespace_id, role) VALUES (1, 30, 'primary')",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO tag_applications (item_id, facet, value) VALUES (1, 'size', 'small')
+             ON CONFLICT(item_id, facet, value) DO UPDATE SET value = value",
+            [],
+        )
+        .unwrap();
+
+        // …and the cascades still fire: enforcement is back on after the harness.
+        conn.execute("DELETE FROM items WHERE id = 1", []).unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM placements WHERE item_id = 1)
+                      + (SELECT count(*) FROM tag_applications WHERE item_id = 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "placements or tags did not cascade with their item"
         );
     }
 }

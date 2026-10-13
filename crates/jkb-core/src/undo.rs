@@ -1072,7 +1072,7 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     // transaction that has been undone; this form did not ask, so re-running `jkb undo <txn>`
     // re-executed the whole inversion — and `DeleteRow` addresses a row id, which `SQLite`
     // reissues for every table here except the `AUTOINCREMENT` ones (`items` since D40, `edges`
-    // and `namespaces` since V027). The second run
+    // and `namespaces` since V027, `placements` and `tag_applications` since V030). The second run
     // therefore unplaced, untagged or unlinked whatever now holds that id. It became reachable
     // when refusals started printing transaction ids and recommending the explicit form.
     if already_undone(conn, txn_id)? {
@@ -1324,6 +1324,14 @@ fn restore_item(conn: &Connection, snapshot: &Value) -> Result<usize> {
 /// `undoing_an_item_delete_restores_every_cascaded_row_whole` compares every cascaded row, every
 /// column — `edges.id` included — before the delete and after the undo.
 ///
+/// **A cascaded placement or tag application comes back under its own id**, captured by the
+/// snapshot since V030 gave both tables an unreusable one. Before that neither id was captured,
+/// and both were reusable rowids: a restored row came back under a new rowid while a later row had
+/// been handed its old one, so undoing the transaction that created the original — keyed by that
+/// old rowid — deleted the later row and reported success. No other row can hold a captured id
+/// (it was never reissued), so these are plain inserts; a snapshot from before V030 names no id
+/// and binds NULL, which takes a fresh one.
+///
 /// **A cascaded edge comes back under its own id when that id is free** — which, for an edge
 /// created after V027 made `edges.id` AUTOINCREMENT, it always is: a freed id is never reissued,
 /// so the only row that ever held it is the one being restored. That keeps the changelog rows
@@ -1372,8 +1380,8 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
     for placement in rows("placements") {
         put_back += conn
             .prepare_cached(
-                "INSERT INTO placements (item_id, namespace_id, role, position, metadata)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO placements (item_id, namespace_id, role, position, metadata, id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?
             .execute(params![
                 id,
@@ -1387,19 +1395,21 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
                     .get("metadata")
                     .and_then(Value::as_str)
                     .unwrap_or("{}"),
+                snapshot_row_id("a placement", placement)?,
             ])?;
     }
     for tag in rows("tags") {
         put_back += conn
             .prepare_cached(
-                "INSERT INTO tag_applications (item_id, facet, value, props)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO tag_applications (item_id, facet, value, props, id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?
             .execute(params![
                 id,
                 tag.get("facet").and_then(Value::as_str),
                 tag.get("value").and_then(Value::as_str).unwrap_or(""),
                 tag.get("props").and_then(Value::as_str).unwrap_or("{}"),
+                snapshot_row_id("a tag application", tag)?,
             ])?;
     }
     for edge in rows("edges") {
@@ -1475,21 +1485,22 @@ fn restore_edge(conn: &Connection, edge: &Value) -> Result<usize> {
             edge.get("props").and_then(Value::as_str).unwrap_or("{}"),
             edge.get("weight").and_then(Value::as_f64),
             edge.get("created_at").and_then(Value::as_str),
-            snapshot_edge_id(edge)?,
+            snapshot_row_id("an edge", edge)?,
         ])?)
 }
 
-/// The id a cascade snapshot logged for an edge, or `None` for a snapshot written before edge ids
-/// were captured — bound as NULL, which gives the restored edge a fresh id.
+/// The id a cascade snapshot logged for one cascaded row (`what` names its kind, for the
+/// refusal), or `None` for a snapshot written before that table's ids were captured — bound as
+/// NULL, which gives the restored row a fresh id.
 ///
 /// An `id` that is present but not an integer is refused rather than read as absent: binding NULL
-/// for it would restore the edge under a new id while reporting the restore whole.
-fn snapshot_edge_id(edge: &Value) -> Result<Option<i64>> {
-    match edge.get("id") {
+/// for it would restore the row under a new id while reporting the restore whole.
+fn snapshot_row_id(what: &str, row: &Value) -> Result<Option<i64>> {
+    match row.get("id") {
         None | Some(Value::Null) => Ok(None),
         Some(v) => v.as_i64().map(Some).ok_or_else(|| {
             TypeError::Validation(format!(
-                "an edge in this item snapshot logs `id` as {v}, which is not an edge id"
+                "{what} in this item snapshot logs `id` as {v}, which is not a row id"
             ))
             .into()
         }),
@@ -2248,23 +2259,136 @@ mod tests {
         );
     }
 
+    /// The same for placements and tag applications, whose ids a snapshot has captured only since
+    /// V030 gave them unreusable ones: an older snapshot lacks them, and still undoes — each row
+    /// back under a fresh id.
+    #[test]
+    fn an_item_snapshot_without_placement_or_tag_ids_still_undoes() {
+        use crate::{item, ns, placement, tag};
+        use jkb_types::PlacementRole;
+
+        let db = Db::open_in_memory().unwrap();
+        let home = db.write_txn("t", |c, _| ns::ensure(c, "x/home")).unwrap();
+        let a = db
+            .write_txn("t", move |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                placement::place(c, m, a, home, PlacementRole::Primary, 2)?;
+                tag::apply(c, m, a, "size", "small")?;
+                Ok(a)
+            })
+            .unwrap();
+        let removed = db
+            .write_txn("t", move |c, m| {
+                item::remove(c, m, a, true)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        // Rewrite the logged snapshot into the old shape. Test fixture only.
+        db.write_txn("t", move |c, _| {
+            let (row, before): (i64, String) = c.query_row(
+                "SELECT id, before FROM changelog
+                  WHERE txn_id = ?1 AND entity_type = 'items' AND op = 'delete'",
+                [removed],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let mut snapshot: serde_json::Value = serde_json::from_str(&before).unwrap();
+            for key in ["placements", "tags"] {
+                let rows = snapshot[key].as_array_mut().unwrap();
+                assert!(!rows.is_empty(), "setup: the snapshot logs no {key}");
+                for r in rows {
+                    assert!(
+                        r.as_object_mut().unwrap().remove("id").is_some(),
+                        "setup: the snapshot did not log the {key} id it is meant to lack"
+                    );
+                }
+            }
+            c.execute(
+                "UPDATE changelog SET before = ?1 WHERE id = ?2",
+                rusqlite::params![snapshot.to_string(), row],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        db.write_txn("t", move |c, m| super::undo(c, m, removed))
+            .expect("an item snapshot without placement or tag ids was refused");
+        assert_eq!(
+            placed_and_tagged(&db, a, home, "size", "small"),
+            (true, true),
+            "the old-format snapshot's placement or tag did not come back"
+        );
+    }
+
+    /// A placement or tag removal logged before V030 named no `id`, so it cannot put the row back
+    /// under the id older entries key it by. It is refused, naming the missing column, rather than
+    /// restored under a fresh id that would leave those entries addressing nothing — or, on a
+    /// database whose old ids were reissued, some other row.
+    #[test]
+    fn a_placement_removal_logged_without_its_id_is_refused_by_name() {
+        use crate::{ns, placement};
+        use jkb_types::PlacementRole;
+
+        let db = Db::open_in_memory().unwrap();
+        let (a, mirror) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let mirror = ns::ensure(c, "x/mirror")?;
+                placement::place(c, m, a, mirror, PlacementRole::Reference, 0)?;
+                Ok((a, mirror))
+            })
+            .unwrap();
+        // A pre-V030 removal: the row deleted, and logged with every column it had then.
+        // Written raw because `changelog::append` refuses this shape now. Test fixture only.
+        let removed = db
+            .write_txn("t", move |c, m| {
+                c.execute("DELETE FROM placements WHERE item_id = ?1", [a.get()])?;
+                c.execute(
+                    "INSERT INTO changelog (txn_id, op, entity_type, entity_id, before, actor)
+                     VALUES (?1, 'delete', 'placements', '1', ?2, 't')",
+                    rusqlite::params![
+                        m.txn_id,
+                        serde_json::json!({
+                            "item_id": a.get(), "namespace_id": mirror.get(),
+                            "role": "reference", "position": 0, "metadata": "{}",
+                        })
+                        .to_string()
+                    ],
+                )?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+
+        let err = db
+            .write_txn("t", move |c, m| super::undo(c, m, removed))
+            .expect_err("a removal logged without the row's id was restored anyway")
+            .to_string();
+        assert!(
+            err.contains("does not name id") && err.contains("Nothing was changed"),
+            "the refusal does not name the missing id: {err}"
+        );
+        assert!(
+            !placed_and_tagged(&db, a, mirror, "f", "v").0,
+            "the refused undo restored the placement"
+        );
+    }
+
     /// A snapshot edge whose `id` is present but not an integer is refused, not restored under a
     /// fresh id as if it had been absent.
     #[test]
     fn a_snapshot_edge_id_that_is_not_an_integer_is_refused() {
         assert_eq!(
-            super::snapshot_edge_id(&serde_json::json!({})).unwrap(),
+            super::snapshot_row_id("an edge", &serde_json::json!({})).unwrap(),
             None
         );
         assert_eq!(
-            super::snapshot_edge_id(&serde_json::json!({ "id": null })).unwrap(),
+            super::snapshot_row_id("an edge", &serde_json::json!({ "id": null })).unwrap(),
             None
         );
         assert_eq!(
-            super::snapshot_edge_id(&serde_json::json!({ "id": 7 })).unwrap(),
+            super::snapshot_row_id("an edge", &serde_json::json!({ "id": 7 })).unwrap(),
             Some(7)
         );
-        assert!(super::snapshot_edge_id(&serde_json::json!({ "id": "7" })).is_err());
+        assert!(super::snapshot_row_id("an edge", &serde_json::json!({ "id": "7" })).is_err());
     }
 
     /// A restore skips an edge whose **other endpoint** is not there, rather than failing.
@@ -3360,6 +3484,147 @@ mod tests {
         );
     }
 
+    /// Whether `item` is placed under `ns` (any role), and whether it carries `facet = value`.
+    fn placed_and_tagged(
+        db: &Db,
+        item: jkb_types::ItemId,
+        ns: jkb_types::NamespaceId,
+        facet: &'static str,
+        value: &'static str,
+    ) -> (bool, bool) {
+        db.read(move |c| {
+            let placed = c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM placements WHERE item_id = ?1 AND namespace_id = ?2)",
+                [item.get(), ns.get()],
+                |r| r.get(0),
+            )?;
+            let tagged = c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM tag_applications
+                                 WHERE item_id = ?1 AND facet = ?2 AND value = ?3)",
+                rusqlite::params![item.get(), facet, value],
+                |r| r.get(0),
+            )?;
+            Ok((placed, tagged))
+        })
+        .unwrap()
+    }
+
+    /// An item delete's restored placements and tags keep their row ids, so an older entry keyed
+    /// by one still addresses them — not whichever later row `SQLite` handed the freed id to.
+    ///
+    /// The cascade snapshot used to capture no id for either table, and both were rowid tables
+    /// whose freed rowids `SQLite` reissues. Placing A (rowid 1), removing A, then placing B (rowid
+    /// 1 again) and undoing the removal put A back under rowid 2; undoing A's creation then ran
+    /// its `DELETE … WHERE rowid = 1`, unplaced and untagged B, and reported success.
+    #[test]
+    fn undoing_an_item_creation_after_its_delete_was_undone_leaves_a_later_items_rows_alone() {
+        use crate::{item, ns, placement, tag};
+        use jkb_types::PlacementRole;
+
+        let db = Db::open_in_memory().unwrap();
+        let home = db.write_txn("t", |c, _| ns::ensure(c, "x/home")).unwrap();
+        let (a, created) = db
+            .write_txn("t", move |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                placement::place(c, m, a, home, PlacementRole::Primary, 0)?;
+                tag::apply(c, m, a, "size", "small")?;
+                Ok((a, m.txn_id))
+            })
+            .unwrap();
+        let removed = db
+            .write_txn("t", move |c, m| {
+                item::remove(c, m, a, true)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        let b = db
+            .write_txn("t", move |c, m| {
+                let b = upsert(c, m, &note("b"))?;
+                placement::place(c, m, b, home, PlacementRole::Primary, 0)?;
+                tag::apply(c, m, b, "size", "small")?;
+                Ok(b)
+            })
+            .unwrap();
+
+        db.write_txn("t", move |c, m| super::undo(c, m, removed))
+            .unwrap();
+        assert_eq!(
+            placed_and_tagged(&db, a, home, "size", "small"),
+            (true, true),
+            "setup: undoing the removal did not put A's placement and tag back"
+        );
+        db.write_txn("t", move |c, m| super::undo(c, m, created))
+            .unwrap();
+
+        assert_eq!(
+            placed_and_tagged(&db, b, home, "size", "small"),
+            (true, true),
+            "undoing A's creation unplaced or untagged B, whose rows had been handed A's freed ids"
+        );
+    }
+
+    /// The same reuse through the direct removals: `placement::unplace` and `tag::remove` log the
+    /// row they delete, its undo puts it back, and an older insert entry keyed by the row's id
+    /// must address the restored row rather than a later one holding the reissued id.
+    #[test]
+    fn undoing_a_placement_and_tag_after_their_removal_was_undone_leaves_a_later_items_rows_alone()
+    {
+        use crate::{ns, placement, tag};
+        use jkb_types::PlacementRole;
+
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, home, mirror) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let b = upsert(c, m, &note("b"))?;
+                let home = ns::ensure(c, "x/home")?;
+                let mirror = ns::ensure(c, "x/mirror")?;
+                placement::place(c, m, a, home, PlacementRole::Primary, 0)?;
+                placement::place(c, m, b, home, PlacementRole::Primary, 0)?;
+                Ok((a, b, home, mirror))
+            })
+            .unwrap();
+        let added = db
+            .write_txn("t", move |c, m| {
+                placement::place(c, m, a, mirror, PlacementRole::Reference, 0)?;
+                tag::apply(c, m, a, "f", "v")?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        let removed = db
+            .write_txn("t", move |c, m| {
+                placement::unplace(c, m, a, mirror)?;
+                tag::remove(c, m, a, "f", "v")?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        db.write_txn("t", move |c, m| {
+            placement::place(c, m, b, mirror, PlacementRole::Reference, 0)?;
+            tag::apply(c, m, b, "f", "v")
+        })
+        .unwrap();
+
+        db.write_txn("t", move |c, m| super::undo(c, m, removed))
+            .unwrap();
+        db.write_txn("t", move |c, m| super::undo(c, m, added))
+            .unwrap();
+
+        assert_eq!(
+            placed_and_tagged(&db, b, mirror, "f", "v"),
+            (true, true),
+            "undoing A's placement and tag removed B's, which had been handed A's freed ids"
+        );
+        assert_eq!(
+            placed_and_tagged(&db, a, mirror, "f", "v"),
+            (false, false),
+            "undoing A's placement and tag did not remove A's restored rows"
+        );
+        assert!(
+            placed_and_tagged(&db, a, home, "f", "v").0,
+            "A's home placement was disturbed"
+        );
+    }
+
     /// Undoing a `jkb task start` puts the claim back the way it was, rather than refusing or —
     /// worse — reaching past the claim for somebody's earlier transaction.
     ///
@@ -3393,6 +3658,54 @@ mod tests {
                 .and_then(|m| m.status),
             Some("open".to_owned()),
             "undoing a claim left the task in the status the claim set"
+        );
+    }
+
+    /// A bare undo after a status change restores the status — it does not reach past the status
+    /// change and revert the task's creation instead.
+    ///
+    /// That was the retarget: `undo_last` picked the newest transaction it could invert, a status
+    /// change had no inverse then, so `jkb undo` after `jkb task set --status` deleted the task
+    /// and reported success. Selection now asks only which transaction is the newest work, and
+    /// the status change is inverted by the generic column restore.
+    #[test]
+    fn undo_last_after_a_status_change_restores_the_status_and_keeps_the_task() {
+        use crate::{item, task};
+        use jkb_types::TaskStatus;
+
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |c, m| {
+                task::create(
+                    c,
+                    m,
+                    &task::NewTask::from_quick_add(
+                        "task:status-undo",
+                        task::parse_quick_add("a task")?,
+                    ),
+                )
+            })
+            .unwrap();
+        let set = db
+            .write_txn("t", move |c, m| {
+                task::set_status(c, m, id, TaskStatus::InProgress)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+
+        db.write_txn("t", undo_last)
+            .expect("undo after a status change refused instead of restoring the status");
+
+        assert_eq!(
+            db.read(move |c| item::get(c, id))
+                .unwrap()
+                .map(|t| t.status),
+            Some(Some("open".to_owned())),
+            "undo after a status change did not restore the status, or deleted the task"
+        );
+        assert!(
+            db.read(move |c| super::already_undone(c, set)).unwrap(),
+            "the transaction undone was not the status change"
         );
     }
 
@@ -3444,7 +3757,7 @@ mod tests {
                     Entity::TagApplications,
                     "1",
                     Some(&serde_json::json!({
-                        "item_id": 1, "facet": "size", "value": "small",
+                        "id": 1, "item_id": 1, "facet": "size", "value": "small",
                     })),
                     None,
                 )

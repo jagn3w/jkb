@@ -567,7 +567,7 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
 
     let placements = {
         let mut stmt = conn.prepare_cached(
-            "SELECT namespace_id, role, position, metadata FROM placements WHERE item_id = ?1",
+            "SELECT namespace_id, role, position, metadata, id FROM placements WHERE item_id = ?1",
         )?;
         let rows = stmt.query_map([id], |r| {
             Ok(json!({
@@ -575,19 +575,25 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
                 "role": r.get::<_, String>(1)?,
                 "position": r.get::<_, i64>(2)?,
                 "metadata": r.get::<_, String>(3)?,
+                // Restored as-is (`undo::restore_children`), so the changelog rows keyed by it —
+                // `placement::place`'s insert among them — still address this placement after
+                // an undo. V030 made it unreusable, so no other row can hold it by then.
+                "id": r.get::<_, i64>(4)?,
             }))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let tags = {
         let mut stmt = conn.prepare_cached(
-            "SELECT facet, value, props FROM tag_applications WHERE item_id = ?1",
+            "SELECT facet, value, props, id FROM tag_applications WHERE item_id = ?1",
         )?;
         let rows = stmt.query_map([id], |r| {
             Ok(json!({
                 "facet": r.get::<_, String>(0)?,
                 "value": r.get::<_, String>(1)?,
                 "props": r.get::<_, String>(2)?,
+                // Restored as-is, for the same reason as a placement's.
+                "id": r.get::<_, i64>(3)?,
             }))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?

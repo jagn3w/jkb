@@ -136,8 +136,9 @@ mod tests {
         // V026 a design's doc target and sources out of its metadata (design_doc_targets,
         // design_sources),
         // V027 edges.id and namespaces.id AUTOINCREMENT (a freed id is never reissued),
-        // V028 drops the unread task_transitions branch index.
-        assert_eq!(user_version, 28);
+        // V028 drops the unread task_transitions branch index; V030 gives placements and tag
+        // applications unreusable ids.
+        assert_eq!(user_version, 30);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -301,8 +302,9 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        // V028 drops the unread task_transitions branch index.
-        assert_eq!(user_version, 28);
+        // V028 drops the unread task_transitions branch index; V030 gives placements and tag
+        // applications unreusable ids.
+        assert_eq!(user_version, 30);
         assert_eq!(
             crate::supported_schema_version(),
             user_version,

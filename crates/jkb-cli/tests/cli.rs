@@ -435,6 +435,28 @@ fn task_set_status_priority_due_roundtrips_and_is_undoable() {
     jkb(&db).args(["undo"]).assert().success();
 }
 
+/// `jkb undo` after `jkb task set --status` puts the status back. It used to reach past the
+/// status change, which it could not invert, and revert the task's creation instead — deleting
+/// the task and reporting success.
+#[test]
+fn undo_after_a_status_change_restores_the_status_rather_than_deleting_the_task() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let uid = add_task(&db, "a task whose status is undone");
+
+    jkb(&db)
+        .args(["task", "set", &uid, "--status", "in_progress"])
+        .assert()
+        .success();
+    jkb(&db).args(["undo"]).assert().success();
+
+    assert_eq!(
+        task_status(&db, &uid),
+        "open",
+        "undo did not restore the status (task_status also fails if the task was deleted)"
+    );
+}
+
 #[test]
 fn task_set_blocked_status_is_rejected() {
     let dir = TempDir::new().unwrap();
