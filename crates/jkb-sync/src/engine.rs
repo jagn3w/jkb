@@ -1157,12 +1157,38 @@ fn outcome_reason(db: &Db, path: &Path) -> Result<Option<String>> {
 }
 
 /// Reconcile a single file within the current transaction.
+fn reconcile(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ctx: &Ctx,
+    path: &Path,
+    disk_bytes: Option<Vec<u8>>,
+    warnings: &mut Vec<String>,
+) -> Result<Outcome> {
+    let mut cycles = Vec::new();
+    let outcome = reconcile_sides(conn, meta, ctx, path, disk_bytes, warnings, &mut cycles)?;
+    // A parked need left parked because it would close a cycle is judged on the store the pass
+    // starts from, and an import can drop it (the disk edit that breaks the cycle), so the warning
+    // is judged again on the store the import left. Only then: the common pass reads nothing more.
+    if !cycles.is_empty() && brought_items_in(outcome) {
+        let bare_uri = file_uri(path);
+        let journal = sync_state::get(conn, &bare_uri)?;
+        cycles = assemble_kb_doc_parts(conn, ctx, path, &bare_uri, journal.as_ref())?
+            .1
+            .warnings;
+    }
+    warnings.extend(cycles);
+    Ok(outcome)
+}
+
+/// [`reconcile`], with the warnings for parked needs left parked because they would close a cycle
+/// in `cycles`, judged on the store the pass started from.
 // A linear pipeline — read disk, assemble KB, decide direction, act — ending in one arm per
 // direction. Splitting it further would mean threading the same seven parameters through more
 // helpers than it saves; the stages that carry real logic (`decide_direction`, `export_or_skip`)
 // are already extracted and separately testable.
 #[allow(clippy::too_many_lines)]
-fn reconcile(
+fn reconcile_sides(
     conn: &Connection,
     meta: &WriteMeta,
     ctx: &Ctx,
@@ -1173,6 +1199,7 @@ fn reconcile(
     disk_bytes: Option<Vec<u8>>,
     // Filled with the disk parse's warnings, for the file's `FileResult`.
     warnings: &mut Vec<String>,
+    cycles: &mut Vec<String>,
 ) -> Result<Outcome> {
     let bare_uri = file_uri(path);
     let (ser_name, serializer) = resolve_serializer(conn, ctx, &bare_uri)?;
@@ -1230,8 +1257,9 @@ fn reconcile(
     // Assemble the KB side and render it, so we can hash it against the base.
     // A parked `needs:^id` this file now defines becomes the dependency it names, here and in the
     // store, before anything is decided from the KB side (see `assemble_kb_doc_parts`).
-    let (kb_doc, heals) = assemble_kb_doc_parts(conn, ctx, path, &bare_uri, journal.as_ref())?;
-    record_resolved_needs(conn, meta, &heals)?;
+    let (kb_doc, resolution) = assemble_kb_doc_parts(conn, ctx, path, &bare_uri, journal.as_ref())?;
+    record_resolved_needs(conn, meta, &resolution.heals)?;
+    *cycles = resolution.warnings;
     let kb_bytes = serializer.render(&kb_doc)?;
     let kb_hash = hash(&kb_bytes);
 
@@ -1449,7 +1477,11 @@ fn decide_direction(
         return Ok((false, false, None));
     }
 
-    let base_doc = load_base_doc(conn, journal, serializer)?;
+    // A base that no longer parses compares as bytes, like a missing one, rather than failing the
+    // file: the KB can export text its own parser refuses (a parked `needs:^id` on each of two tasks
+    // naming the other is an in-file cycle once both are in the file), and the disk edit that breaks
+    // the cycle is the remedy, which a failed reconcile would never import.
+    let base_doc = load_base_bytes(conn, journal)?.and_then(|bytes| serializer.parse(&bytes).ok());
     match &base_doc {
         Some(doc) => {
             let canonical = serializer.render(doc)?;
@@ -2551,6 +2583,15 @@ fn assemble_kb_doc(
     Ok(assemble_kb_doc_parts(conn, ctx, path, bare_uri, journal)?.0)
 }
 
+/// What [`resolve_parked_needs`] concluded about a doc's parked needs.
+#[derive(Default)]
+struct Resolution {
+    /// What the store must record to agree with the doc.
+    heals: Vec<ResolvedNeeds>,
+    /// One per need left parked because its dependency would close a cycle.
+    warnings: Vec<String>,
+}
+
 /// A task in the assembled doc whose parked `needs:^id`s ([`item::UNRESOLVED_NEEDS`]) name tasks
 /// its file now defines: the dependencies to record and the parked ids that stay parked.
 struct ResolvedNeeds {
@@ -2579,7 +2620,7 @@ fn assemble_kb_doc_parts(
     path: &Path,
     bare_uri: &str,
     journal: Option<&sync_state::SyncState>,
-) -> Result<(SyncDoc, Vec<ResolvedNeeds>)> {
+) -> Result<(SyncDoc, Resolution)> {
     let file_ns_path = namespace_for(ctx, path);
     let mut doc = SyncDoc::default();
 
@@ -2655,16 +2696,31 @@ fn assemble_kb_doc_parts(
     // subsequent disk edit came back as a conflict. Re-homing a file-backed item therefore
     // does not move it between sections in its file; editing the file does.
     apply_layout_sections(&mut doc);
-    let heals = resolve_parked_needs(&mut doc, &in_doc);
-    Ok((doc, heals))
+    let resolution = resolve_parked_needs(conn, &mut doc, &in_doc)?;
+    Ok((doc, resolution))
 }
 
 /// Turn each parked need in `doc` that names an item of the doc (`in_doc`) into a `depends_on` edge
-/// of the doc, returning what the store must record to agree. A need naming its own task stays
-/// parked: an edge to itself is no dependency, and dropping the word would lose the line's text.
-fn resolve_parked_needs(doc: &mut SyncDoc, in_doc: &HashMap<String, ItemId>) -> Vec<ResolvedNeeds> {
-    let mut heals = Vec::new();
+/// of the doc, returning what the store must record to agree. Read-only: it decides, and
+/// [`record_resolved_needs`] writes.
+///
+/// A need stays parked, and the line keeps it as it reads, when the dependency is not one the store
+/// can hold: one naming its own task, and one that would close a `depends_on` cycle with the edges
+/// the store has PLUS the ones this pass has already resolved (a task moved beside the task its
+/// parked need names can find that task's own parked need naming it back). That one is warned
+/// about, by `^id`. Resolving it anyway made `edge::link` refuse inside the reconcile, so the file
+/// failed on every pass with nothing to edit away, because the need lives in the store, not in a
+/// line the file still had to read. Needs resolve in the doc's item order (by binding uri, so by
+/// local id), so the same need is chosen each pass.
+fn resolve_parked_needs(
+    conn: &Connection,
+    doc: &mut SyncDoc,
+    in_doc: &HashMap<String, ItemId>,
+) -> Result<Resolution> {
+    let mut out = Resolution::default();
     let mut new_edges: Vec<SyncEdge> = Vec::new();
+    // The edges this pass has resolved, by item, for the cycle check.
+    let mut pending: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
     for item in &mut doc.items {
         if item.unresolved_needs.is_empty() {
             continue;
@@ -2672,44 +2728,78 @@ fn resolve_parked_needs(doc: &mut SyncDoc, in_doc: &HashMap<String, ItemId>) -> 
         let Some(&src) = in_doc.get(&item.local_id) else {
             continue;
         };
-        let (now, still): (Vec<String>, Vec<String>) = std::mem::take(&mut item.unresolved_needs)
-            .into_iter()
-            .partition(|dep| *dep != item.local_id && in_doc.contains_key(dep));
-        item.unresolved_needs.clone_from(&still);
-        if now.is_empty() {
-            continue;
-        }
         let mut link = Vec::new();
-        for dep in now {
+        let mut still = Vec::new();
+        let mut resolved_any = false;
+        for dep in std::mem::take(&mut item.unresolved_needs) {
+            let Some(&dst) = in_doc.get(&dep).filter(|_| dep != item.local_id) else {
+                still.push(dep);
+                continue;
+            };
             let has = |e: &SyncEdge| {
                 e.edge_type == EdgeType::DependsOn && e.src == item.local_id && e.dst == dep
             };
             if doc.edges.iter().any(has) || new_edges.iter().any(has) {
+                resolved_any = true;
                 continue;
             }
-            link.push(in_doc[&dep]);
+            if reaches(conn, &pending, dst, src)? {
+                out.warnings.push(format!(
+                    "task `^{}`: `needs:^{dep}` would close a dependency cycle, so no dependency \
+                     was recorded; the line keeps it until the cycle is broken",
+                    item.local_id
+                ));
+                still.push(dep);
+                continue;
+            }
+            resolved_any = true;
+            pending.entry(src).or_default().push(dst);
+            link.push(dst);
             new_edges.push(SyncEdge {
                 src: item.local_id.clone(),
                 dst: dep,
                 edge_type: EdgeType::DependsOn,
             });
         }
-        heals.push(ResolvedNeeds {
-            item: src,
-            link,
-            still_parked: still,
-        });
+        item.unresolved_needs.clone_from(&still);
+        if resolved_any {
+            out.heals.push(ResolvedNeeds {
+                item: src,
+                link,
+                still_parked: still,
+            });
+        }
     }
     doc.edges.extend(new_edges);
-    heals
+    Ok(out)
+}
+
+/// Whether `to` can be reached from `from` along `depends_on` edges: the store's, plus `pending`.
+fn reaches(
+    conn: &Connection,
+    pending: &HashMap<ItemId, Vec<ItemId>>,
+    from: ItemId,
+    to: ItemId,
+) -> Result<bool> {
+    let mut seen = HashSet::from([from]);
+    let mut stack = vec![from];
+    while let Some(at) = stack.pop() {
+        if at == to {
+            return Ok(true);
+        }
+        let mut next = edge::edges_from(conn, at, EdgeType::DependsOn)?;
+        next.extend(pending.get(&at).into_iter().flatten().copied());
+        stack.extend(next.into_iter().filter(|n| seen.insert(*n)));
+    }
+    Ok(false)
 }
 
 /// Record what [`assemble_kb_doc_parts`] resolved: each new `depends_on` edge, and the parked needs
 /// that are left. Inside the file's reconcile transaction, so it commits with the pass that renders
-/// the dependency, and both writes are changelogged (and undone) like any other. A dependency that
-/// would close a cycle with edges outside the file is refused by [`edge::link`]: that file's
-/// reconcile fails and rolls back, leaving the file and the store as they were, rather than a cycle
-/// being recorded.
+/// the dependency, and both writes are changelogged (and undone) like any other. Cannot close a
+/// cycle: [`resolve_parked_needs`] left any such need parked. Recorded before the direction is
+/// chosen, and harmless to an import, which then sets the task's edges and parked needs to exactly
+/// what the disk line says, so a need the disk has since dropped is not brought back.
 fn record_resolved_needs(
     conn: &Connection,
     meta: &WriteMeta,
@@ -3117,13 +3207,21 @@ fn load_base_doc(
     journal: Option<&sync_state::SyncState>,
     serializer: &dyn SyncSerializer,
 ) -> Result<Option<SyncDoc>> {
-    let Some(hash) = journal.and_then(|j| j.base_blob_hash.as_deref()) else {
-        return Ok(None);
-    };
-    match blob::load(conn, hash)? {
+    match load_base_bytes(conn, journal)? {
         Some(bytes) => Ok(Some(serializer.parse(&bytes)?)),
         None => Ok(None),
     }
+}
+
+/// The bytes of the file's last-synced base, if its blob is stored.
+fn load_base_bytes(
+    conn: &Connection,
+    journal: Option<&sync_state::SyncState>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(hash) = journal.and_then(|j| j.base_blob_hash.as_deref()) else {
+        return Ok(None);
+    };
+    Ok(blob::load(conn, hash)?)
 }
 
 // ---------------------------------------------------------------------------

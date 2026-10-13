@@ -528,6 +528,20 @@ fn a_parked_needs_resolves_when_its_task_moves_into_a_file_that_defines_the_id()
         .success()
         .stdout(predicate::str::contains("1 up-to-date"));
 
+    // The heal is undone with the sync that recorded it, and the next sync records it again.
+    jkb(&db).arg("undo").assert().success();
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!(["ghost", "phantom"])
+    );
+    assert!(ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
+    sync_ok(&db, "oth");
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!(["phantom"])
+    );
+    assert!(!ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
+
     // The file and the knowledge base agree from either side: the dependency survives the line
     // being re-read from disk.
     std::fs::write(
@@ -600,6 +614,186 @@ fn a_task_rebound_managed_keeps_its_parked_needs_and_says_where_they_stand() {
         .success()
         .stdout(predicate::str::contains("this task is in no tasks.md"))
         .stdout(predicate::str::contains("named in its tasks.md").not());
+}
+
+/// `jkb sync <mount>`, asserting no file failed; returns whether it exited zero, and its output.
+fn sync_run(db: &Path, mount: &str) -> (bool, String) {
+    let out = jkb(db).args(["sync", mount]).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains(" 0 failed"), "{text}");
+    (out.status.success(), text)
+}
+
+/// [`sync_run`], asserting it exited zero.
+fn sync_ok(db: &Path, mount: &str) -> String {
+    let (ok, text) = sync_run(db, mount);
+    assert!(ok, "{text}");
+    text
+}
+
+/// A parked need whose dependency would close a cycle stays parked, with a warning, and the file
+/// keeps syncing. Here `^ghost`'s parked `needs:^fix` and `^fix`'s parked `needs:^ghost` both come
+/// to name tasks of one file when `^fix` moves in: resolving both is a cycle. Resolving them
+/// regardless made `edge::link` refuse inside the reconcile, so the file failed on every pass, its
+/// journal never flagged, and no edit to the file could clear it, because the need was in the store.
+#[test]
+fn a_parked_needs_that_would_close_a_cycle_stays_parked_and_the_file_still_syncs() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let root = dir.path().canonicalize().unwrap();
+    let (proj, other) = (root.join("proj"), root.join("other"));
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let (pfile, ofile) = (proj.join("tasks.md"), other.join("tasks.md"));
+    std::fs::write(
+        &pfile,
+        "## Backend\n- [ ] Fix flaky test needs:^ghost ^fix\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &ofile,
+        "## X\n- [ ] Ghost needs:^fix ^ghost\n- [ ] Other ^oth1\n",
+    )
+    .unwrap();
+    for (name, path) in [("work", &proj), ("oth", &other)] {
+        jkb(&db)
+            .args(["mount", "create", name, path.to_str().unwrap()])
+            .args(["--serializer", "tasks"])
+            .assert()
+            .success();
+        sync_ok(&db, name);
+    }
+    let fix = format!("file://{}#fix", pfile.display());
+    let ghost = format!("file://{}#ghost", ofile.display());
+    jkb(&db)
+        .args(["task", "place", &fix, "oth/tasks.md/x", "--home"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "bind", &fix, "--sync"])
+        .arg(format!("file://{}#fix", ofile.display()))
+        .assert()
+        .success();
+
+    // One need resolves (the first by local id); the one that would close the cycle stays parked
+    // and is named.
+    let first = sync_ok(&db, "oth");
+    assert!(
+        first.contains("`^ghost`: `needs:^fix` would close a dependency cycle"),
+        "{first}"
+    );
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        task_json(&db, &ghost)["unresolved_needs"],
+        serde_json::json!(["fix"])
+    );
+    let text = std::fs::read_to_string(&ofile).unwrap();
+    assert!(
+        text.contains("- [ ] Fix flaky test needs:^ghost ^fix"),
+        "{text}"
+    );
+
+    // The file now holds both `needs:` words, which its parser reads as an in-file dependency cycle
+    // once both ids are in it, and an in-file cycle quarantines (`docs/file-sync.md`): flagged, never
+    // failed, so the file is not overwritten and its last good tasks are kept, with or without an
+    // edit elsewhere in it.
+    for edit in [None, Some(("Other ^oth1", "Other edited ^oth1"))] {
+        if let Some((from, to)) = edit {
+            std::fs::write(&ofile, text.replace(from, to)).unwrap();
+        }
+        let (ok, out) = sync_run(&db, "oth");
+        assert!(!ok && out.contains("1 quarantined"), "{out}");
+        assert!(out.contains("needs attention"), "{out}");
+    }
+
+    // Breaking the cycle on disk imports, and the need the disk dropped is not brought back.
+    let broken = std::fs::read_to_string(&ofile)
+        .unwrap()
+        .replace("Ghost needs:^fix ^ghost", "Ghost ^ghost");
+    std::fs::write(&ofile, &broken).unwrap();
+    let healed = sync_ok(&db, "oth");
+    assert!(healed.contains("1 imported"), "{healed}");
+    assert!(!healed.contains("cycle"), "{healed}");
+    sync_ok(&db, "oth");
+    assert_eq!(std::fs::read_to_string(&ofile).unwrap(), broken);
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!([])
+    );
+    let ready = ready_tasks(&db);
+    assert!(
+        ready.contains("#ghost") && !ready.contains("#fix"),
+        "{ready}"
+    );
+    let other = jkb(&db)
+        .args(["task", "show"])
+        .arg(format!("file://{}#oth1", ofile.display()))
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&other.stdout).contains("Other edited"),
+        "the unrelated edit came in with the fix"
+    );
+}
+
+/// A parked need whose dependency would close a cycle through edges outside its file stays parked:
+/// `^ghost` waits on a task in no file, which waits on `^fix`.
+#[test]
+fn a_parked_needs_closing_a_cycle_through_another_file_stays_parked() {
+    let dir = TempDir::new().unwrap();
+    let (db, pfile, ofile) = two_tasks_files(&dir);
+    let fix = format!("file://{}#fix", pfile.display());
+    let ghost = format!("file://{}#ghost", ofile.display());
+    let out = jkb(&db)
+        .args(["--json", "task", "add", "Between"])
+        .output()
+        .unwrap();
+    let between: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let between = between["uid"].as_str().expect("a uid").to_owned();
+    for (task, dep) in [(&ghost, &between), (&between, &fix)] {
+        jkb(&db)
+            .args(["task", "depend", task, dep])
+            .assert()
+            .success();
+    }
+    jkb(&db)
+        .args(["task", "place", &fix, "oth/tasks.md/x", "--home"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "bind", &fix, "--sync"])
+        .arg(format!("file://{}#fix", ofile.display()))
+        .assert()
+        .success();
+    let first = sync_ok(&db, "oth");
+    assert!(
+        first.contains("`^fix`: `needs:^ghost` would close a dependency cycle"),
+        "{first}"
+    );
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!(["ghost", "phantom"])
+    );
+    let again = sync_ok(&db, "oth");
+    assert!(again.contains("1 up-to-date"), "{again}");
+
+    // An edit elsewhere in the file imports without failing.
+    let text = std::fs::read_to_string(&ofile).unwrap();
+    std::fs::write(&ofile, text.replace("- [ ] Ghost", "- [ ] Ghost town")).unwrap();
+    let edited = sync_ok(&db, "oth");
+    assert!(edited.contains("1 imported"), "{edited}");
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!(["phantom"])
+    );
+    assert!(!ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
 }
 
 #[test]
