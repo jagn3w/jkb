@@ -193,6 +193,62 @@ pub(crate) fn check_restorable(
     table: &str,
     before: Option<&Value>,
 ) -> Result<()> {
+    check_restorable_as(conn, op, table, before, Reading::Write)
+}
+
+/// Who is asking whether a before-state can restore its row: the writer about to log it, or
+/// `undo` about to replay one that is already in the log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// Every column the table has now — the rule for anything logged from here on.
+    Write,
+    /// The same rule, less the columns a table gained after rows were logged without them and
+    /// that a restore can do without ([`LATER_ID_COLUMNS`]).
+    Replay,
+}
+
+/// The tables whose `id` column was added after deletes of them had been logged, and logged
+/// whole, without one: `placements` and `tag_applications` until V030.
+///
+/// A replayed delete of either that names no `id` is put back under a fresh one, which `INSERT`
+/// assigns when the column is omitted. Refusing it instead was measured to buy nothing: the row
+/// was lost, and the refusal's own recommended escape (`jkb undo <older txn>`) then reached the
+/// same row the refusal was protecting, through the old insert's reused rowid. A fresh id is
+/// above every id the changelog names (V030 set the high-water mark there), so it collides with
+/// nothing. **Replay only**: a writer logging a delete of either table without its `id` is still
+/// refused at the write.
+const LATER_ID_COLUMNS: &[Entity] = &[Entity::Placements, Entity::TagApplications];
+
+/// The columns a before-state may leave out of a whole-row delete when read for `reading`.
+fn tolerated_missing(op: &str, table: &str, reading: Reading) -> &'static [&'static str] {
+    let later = reading == Reading::Replay
+        && op == DELETE
+        && Entity::parse(table).is_some_and(|e| LATER_ID_COLUMNS.contains(&e));
+    if later {
+        &["id"]
+    } else {
+        &[]
+    }
+}
+
+/// [`check_restorable`] for a before-state already in the log — what `undo` itself asks.
+fn check_replayable(
+    conn: &Connection,
+    op: &str,
+    table: &str,
+    before: Option<&Value>,
+) -> Result<()> {
+    check_restorable_as(conn, op, table, before, Reading::Replay)
+}
+
+/// The shared body of [`check_restorable`] and [`check_replayable`].
+fn check_restorable_as(
+    conn: &Connection,
+    op: &str,
+    table: &str,
+    before: Option<&Value>,
+    reading: Reading,
+) -> Result<()> {
     // THE ONE PAIR `row_shaped` DECLINES, CHECKED ANYWAY. An item delete's before-state is a
     // whole-cascade snapshot, so it is not a column map and `row_shaped` answers `None` — which
     // left `items`, the one table carrying a bespoke inverse, as the one table nothing validated.
@@ -202,22 +258,30 @@ pub(crate) fn check_restorable(
     // and this module's restore) and the next column added to the table would have been dropped
     // by both, silently, on every restore.
     if is_cascade_snapshot(op, table) {
-        return check_columns(conn, op, table, column_map(op, table, before), true);
+        return check_columns(conn, op, table, column_map(op, table, before), true, &[]);
     }
     let Some(inverse) = row_shaped(op, table) else {
         return Ok(());
     };
-    check_columns(conn, op, table, before, inverse == Inverse::ReinsertRow)
+    check_columns(
+        conn,
+        op,
+        table,
+        before,
+        inverse == Inverse::ReinsertRow,
+        tolerated_missing(op, table, reading),
+    )
 }
 
 /// The shared body: `before` must be a non-empty object naming only columns of `table`, and —
-/// when `whole_row` — **every** column of it.
+/// when `whole_row` — **every** column of it but those in `may_omit`.
 fn check_columns(
     conn: &Connection,
     op: &str,
     table: &str,
     before: Option<&Value>,
     whole_row: bool,
+    may_omit: &[&str],
 ) -> Result<()> {
     let fields = before.and_then(Value::as_object).filter(|o| !o.is_empty());
     let Some(fields) = fields else {
@@ -254,7 +318,7 @@ fn check_columns(
     if whole_row {
         let missing: Vec<&str> = columns
             .iter()
-            .filter(|c| !fields.contains_key(*c))
+            .filter(|c| !fields.contains_key(*c) && !may_omit.contains(&c.as_str()))
             .map(String::as_str)
             .collect();
         if !missing.is_empty() {
@@ -298,7 +362,7 @@ fn restorable_fields(
     table: &str,
     before: Option<&Value>,
 ) -> Result<Vec<(String, SqlValue)>> {
-    check_restorable(conn, op, table, before)?;
+    check_replayable(conn, op, table, before)?;
     Ok(column_map(op, table, before)
         .and_then(Value::as_object)
         .map(|fields| {
@@ -895,7 +959,7 @@ fn blocker(
     };
     // Covers what `row_shaped` declines to shape as well as what it accepts — the item-snapshot
     // arm included, since `check_restorable` now dispatches on the pair rather than on the shape.
-    if let Err(e) = check_restorable(conn, op, table, snapshot.as_ref()) {
+    if let Err(e) = check_replayable(conn, op, table, snapshot.as_ref()) {
         return Some(e.to_string());
     }
     // The inverses that address a row by `rowid`. `SyncStateRow`'s key is a file uri and
@@ -2319,13 +2383,12 @@ mod tests {
         );
     }
 
-    /// A placement or tag removal logged before V030 named no `id`, so it cannot put the row back
-    /// under the id older entries key it by. It is refused, naming the missing column, rather than
-    /// restored under a fresh id that would leave those entries addressing nothing — or, on a
-    /// database whose old ids were reissued, some other row.
+    /// A placement or tag removal logged before V030 named no `id` — the column did not exist —
+    /// and it still undoes: the row comes back whole, under a fresh id. The tolerance is for
+    /// replay only; [`a_new_placement_or_tag_removal_must_log_its_id`] keeps the writer strict.
     #[test]
-    fn a_placement_removal_logged_without_its_id_is_refused_by_name() {
-        use crate::{ns, placement};
+    fn a_placement_and_tag_removal_logged_before_v030_still_undoes() {
+        use crate::{ns, placement, tag};
         use jkb_types::PlacementRole;
 
         let db = Db::open_in_memory().unwrap();
@@ -2333,42 +2396,165 @@ mod tests {
             .write_txn("t", |c, m| {
                 let a = upsert(c, m, &note("a"))?;
                 let mirror = ns::ensure(c, "x/mirror")?;
-                placement::place(c, m, a, mirror, PlacementRole::Reference, 0)?;
+                placement::place(c, m, a, mirror, PlacementRole::Reference, 3)?;
+                tag::apply(c, m, a, "f", "v")?;
+                c.execute(
+                    "UPDATE placements SET metadata = '{\"pinned\":true}' WHERE item_id = ?1",
+                    [a.get()],
+                )?;
+                c.execute(
+                    "UPDATE tag_applications SET props = '{\"p\":1}' WHERE item_id = ?1",
+                    [a.get()],
+                )?;
                 Ok((a, mirror))
             })
             .unwrap();
-        // A pre-V030 removal: the row deleted, and logged with every column it had then.
-        // Written raw because `changelog::append` refuses this shape now. Test fixture only.
+        // Pre-V030 removals: each row deleted and logged with every column it had then, keyed as
+        // the old writers keyed them. Written raw because `changelog::append` refuses this shape
+        // now. Test fixture only.
         let removed = db
             .write_txn("t", move |c, m| {
                 c.execute("DELETE FROM placements WHERE item_id = ?1", [a.get()])?;
-                c.execute(
-                    "INSERT INTO changelog (txn_id, op, entity_type, entity_id, before, actor)
-                     VALUES (?1, 'delete', 'placements', '1', ?2, 't')",
-                    rusqlite::params![
-                        m.txn_id,
+                c.execute("DELETE FROM tag_applications WHERE item_id = ?1", [a.get()])?;
+                for (table, key, before) in [
+                    (
+                        "placements",
+                        "1",
                         serde_json::json!({
                             "item_id": a.get(), "namespace_id": mirror.get(),
-                            "role": "reference", "position": 0, "metadata": "{}",
-                        })
-                        .to_string()
-                    ],
-                )?;
+                            "role": "reference", "position": 3, "metadata": "{\"pinned\":true}",
+                        }),
+                    ),
+                    (
+                        "tag_applications",
+                        &*a.get().to_string(),
+                        serde_json::json!({
+                            "item_id": a.get(), "facet": "f", "value": "v", "props": "{\"p\":1}",
+                        }),
+                    ),
+                ] {
+                    c.execute(
+                        "INSERT INTO changelog (txn_id, op, entity_type, entity_id, before, actor)
+                         VALUES (?1, 'delete', ?2, ?3, ?4, 't')",
+                        rusqlite::params![m.txn_id, table, key, before.to_string()],
+                    )?;
+                }
                 Ok(m.txn_id)
             })
             .unwrap();
 
-        let err = db
+        let reverted = db
             .write_txn("t", move |c, m| super::undo(c, m, removed))
-            .expect_err("a removal logged without the row's id was restored anyway")
-            .to_string();
-        assert!(
-            err.contains("does not name id") && err.contains("Nothing was changed"),
-            "the refusal does not name the missing id: {err}"
+            .expect("a removal logged before V030 was refused");
+        assert_eq!(reverted, 2, "both rows should have been put back");
+        let rows = db
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT p.position, p.metadata, t.props
+                       FROM placements p JOIN tag_applications t ON t.item_id = p.item_id
+                      WHERE p.item_id = ?1 AND p.namespace_id = ?2 AND p.role = 'reference'
+                        AND t.facet = 'f' AND t.value = 'v'",
+                    [a.get(), mirror.get()],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )?)
+            })
+            .expect("the placement or the tag did not come back");
+        assert_eq!(
+            rows,
+            (3, "{\"pinned\":true}".to_owned(), "{\"p\":1}".to_owned()),
+            "the old removal came back without the columns it logged"
+        );
+    }
+
+    /// …and the tolerance above is not a hole in the writer: a delete of either table logged
+    /// **now** without its `id` is refused at the write, naming the column.
+    #[test]
+    fn a_new_placement_or_tag_removal_must_log_its_id() {
+        use crate::changelog::{self, Entity, Op};
+
+        let db = Db::open_in_memory().unwrap();
+        for (entity, before) in [
+            (
+                Entity::Placements,
+                serde_json::json!({
+                    "item_id": 1, "namespace_id": 1, "role": "primary", "position": 0,
+                    "metadata": "{}",
+                }),
+            ),
+            (
+                Entity::TagApplications,
+                serde_json::json!({ "item_id": 1, "facet": "f", "value": "v", "props": "{}" }),
+            ),
+        ] {
+            let err = db
+                .write_txn("t", move |c, m| {
+                    changelog::append(c, m, Op::Delete, entity, "1", Some(&before), None)
+                })
+                .expect_err("a delete was logged without the row's id");
+            assert!(
+                err.to_string().contains("does not name id"),
+                "the refusal does not name the missing id: {err}"
+            );
+        }
+    }
+
+    /// An item delete's snapshot restores its placements and tags under their **own** ids, so the
+    /// entries that created them still address them: undoing the transaction that added a mirror
+    /// placement and a tag, after the item's removal was undone, takes exactly those two rows
+    /// away. Restored under fresh ids, the two `DELETE … WHERE rowid = ?` match nothing — and an
+    /// insert's inverse may honestly report zero, so that was a silent `Ok(0)` leaving both.
+    #[test]
+    fn rows_restored_from_an_item_snapshot_are_the_ones_their_inserts_name() {
+        use crate::{item, ns, placement, tag};
+        use jkb_types::PlacementRole;
+
+        let db = Db::open_in_memory().unwrap();
+        let (a, home, mirror) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let home = ns::ensure(c, "x/home")?;
+                let mirror = ns::ensure(c, "x/mirror")?;
+                placement::place(c, m, a, home, PlacementRole::Primary, 0)?;
+                Ok((a, home, mirror))
+            })
+            .unwrap();
+        let added = db
+            .write_txn("t", move |c, m| {
+                placement::place(c, m, a, mirror, PlacementRole::Reference, 0)?;
+                tag::apply(c, m, a, "f", "v")?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        let removed = db
+            .write_txn("t", move |c, m| {
+                item::remove(c, m, a, true)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        db.write_txn("t", move |c, m| super::undo(c, m, removed))
+            .unwrap();
+
+        let reverted = db
+            .write_txn("t", move |c, m| super::undo(c, m, added))
+            .unwrap();
+        assert_eq!(
+            reverted, 2,
+            "undoing the additions did not address the restored placement and tag"
+        );
+        assert_eq!(
+            placed_and_tagged(&db, a, mirror, "f", "v"),
+            (false, false),
+            "the restored mirror placement or tag survived the undo of the transaction that added it"
         );
         assert!(
-            !placed_and_tagged(&db, a, mirror, "f", "v").0,
-            "the refused undo restored the placement"
+            placed_and_tagged(&db, a, home, "f", "v").0,
+            "the home placement was disturbed"
         );
     }
 
@@ -2601,7 +2787,7 @@ mod tests {
             for state in [before, after].into_iter().flatten() {
                 let state: serde_json::Value = serde_json::from_str(&state).unwrap();
                 let op = op.clone();
-                db.read(move |c| super::check_columns(c, &op, "edges", Some(&state), false))
+                db.read(move |c| super::check_columns(c, &op, "edges", Some(&state), false, &[]))
                     .unwrap_or_else(|e| panic!("`link_weighted` logged a non-column key: {e}"));
             }
         }
