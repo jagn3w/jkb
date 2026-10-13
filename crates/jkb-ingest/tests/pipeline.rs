@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use jkb_core::Db;
-use jkb_index::{FtsIndexer, VectorIndexer};
+use jkb_index::{FtsIndexer, StaleRows, VectorIndexer};
 use jkb_ingest::adapter::ParsedDocument;
 use jkb_ingest::chunk::ChunkConfig;
 use jkb_ingest::{blob, Pipeline};
@@ -473,8 +473,11 @@ fn index_pending_writes_no_vector_for_an_item_deleted_mid_run() {
     let report = pipe.index_pending(&db).unwrap();
 
     assert_eq!(
-        db.read(|conn| Ok(jkb_index::count_stale(conn).unwrap().vectors))
-            .unwrap(),
+        db.read(|conn| {
+            let StaleRows { vectors } = jkb_index::count_stale(conn).unwrap();
+            Ok(vectors)
+        })
+        .unwrap(),
         0,
         "a vector was written for the deleted item"
     );
@@ -516,8 +519,11 @@ fn an_orphan_vector_row_neither_hides_nor_adds_a_pending_item() {
     })
     .unwrap();
     assert_eq!(
-        db.read(|conn| Ok(jkb_index::count_stale(conn).unwrap().vectors))
-            .unwrap(),
+        db.read(|conn| {
+            let StaleRows { vectors } = jkb_index::count_stale(conn).unwrap();
+            Ok(vectors)
+        })
+        .unwrap(),
         1,
         "setup: the deleted item's vector is left behind"
     );

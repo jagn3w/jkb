@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use jkb_core::item::{upsert, NewItem};
 use jkb_core::Db;
-use jkb_index::{Dispatcher, FtsIndexer, IndexItem, Indexer, VectorIndexer};
+use jkb_index::{Dispatcher, FtsIndexer, IndexItem, Indexer, StaleRows, VectorIndexer};
 use jkb_types::{Embedder, ItemId, Result as TypesResult};
 
 /// A deterministic, offline embedder: content maps to a fixed unit vector, so the
@@ -583,27 +583,27 @@ fn the_sweep_finds_and_removes_orphan_vector_rows() {
     let before = db
         .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
         .unwrap();
-    assert_eq!(before.vectors, 1, "count_stale did not see the orphan row");
+    let StaleRows { vectors } = before;
+    assert_eq!(vectors, 1, "count_stale did not see the orphan row");
     assert!(!before.is_empty());
 
-    let still_there = db
+    let StaleRows {
+        vectors: still_there,
+    } = db
         .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
         .unwrap();
     assert_eq!(
-        still_there.vectors, 1,
+        still_there, 1,
         "count_stale removed a row — it is the detect half and must not mutate"
     );
 
     // ...and the sweep removes exactly it, reporting what it removed.
-    let swept = db
+    let StaleRows { vectors: swept } = db
         .write_txn("test", |conn, _meta| {
             Ok(jkb_index::sweep_stale(conn).unwrap())
         })
         .unwrap();
-    assert_eq!(
-        swept.vectors, 1,
-        "sweep_stale did not report the row it removed"
-    );
+    assert_eq!(swept, 1, "sweep_stale did not report the row it removed");
 
     let after = db
         .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
@@ -653,13 +653,10 @@ fn a_repair_installs_the_trigger_on_a_legacy_database() {
         Ok(())
     })
     .unwrap();
-    let stale = db
+    let StaleRows { vectors: stale } = db
         .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
         .unwrap();
-    assert_eq!(
-        stale.vectors, 1,
-        "setup: the legacy delete should orphan a row"
-    );
+    assert_eq!(stale, 1, "setup: the legacy delete should orphan a row");
     // The detection `jkb doctor` reads: the unguarded table is named.
     let unguarded = db
         .read(|conn| Ok(jkb_index::vector_tables_without_gc_trigger(conn).unwrap()))
@@ -735,10 +732,10 @@ fn upsert_vector_writes_nothing_for_a_missing_item() {
         .unwrap();
     assert!(live, "a live item's vector was not written");
     assert!(!gone, "a missing item's vector was reported written");
-    let stale = db
+    let StaleRows { vectors: stale } = db
         .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
         .unwrap();
-    assert_eq!(stale.vectors, 0, "a vector was written for a missing item");
+    assert_eq!(stale, 0, "a vector was written for a missing item");
 }
 
 /// A lookup of more ids than `SQLite` binds in one statement (32,766) answers them all: a resume of a
