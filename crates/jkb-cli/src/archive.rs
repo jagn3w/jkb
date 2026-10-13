@@ -2193,6 +2193,30 @@ impl Tip {
     }
 }
 
+/// Where branch `branch` is, for a caller that goes on to ACT on the answer: `Ok(None)` when it is
+/// proven absent, its full object id when it is present, and an error when git did not answer.
+///
+/// [`branch_tip`] read as a value. It is the one read both `task land`'s authorization and `task
+/// review record` take, so neither spells its own: both used to ask `rev-parse <branch>`, which
+/// ranks a same-named tag above the branch, and which reads "git could not say" as "no branch" —
+/// so an unreadable ref store let a review be recorded against no commit at all.
+///
+/// # Errors
+/// Git did not answer about `refs/heads/<branch>` in `root`.
+pub(crate) fn branch_head(root: &Path, branch: &str) -> Result<Option<String>> {
+    match branch_tip(root, branch) {
+        Tip::Absent => Ok(None),
+        Tip::At(oid) => Ok(Some(oid)),
+        Tip::Unanswered => anyhow::bail!(
+            "git did not answer in {} about where branch {branch} is — refusing rather than \
+             reading that as no branch. `git -C {} for-each-ref refs/heads/{branch}` shows what \
+             git says.",
+            root.display(),
+            root.display(),
+        ),
+    }
+}
+
 /// Where branch `branch` is, asked of **the ref a delete removes**: `refs/heads/<b>` and never the
 /// bare name. `rev-parse <b>` is a DWIM lookup that ranks `refs/tags/<b>` above `refs/heads/<b>`
 /// (measured on git 2.51.1): a tag `<b>` left at the recorded head beside a branch that has moved
@@ -3361,6 +3385,59 @@ pub(crate) mod tests {
         );
         assert_eq!(r.kept_branches.len(), 1, "but it is reported: {r:?}");
         assert!(r.kept_branches[0].1.contains(&e.branch), "{r:?}");
+    }
+
+    /// `branch_head` reads the branch, not a same-named tag pointing elsewhere — the read `task
+    /// land` authorizes with and `task review record` records.
+    #[test]
+    fn branch_head_reads_the_branch_beside_a_same_named_tag() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, head) = moved_branch(t.path());
+        git(&repo, &["tag", &e.branch, &head]);
+        let tip = git(&repo, &["rev-parse", &format!("refs/heads/{}", e.branch)]);
+        assert_ne!(tip, head, "the premise: the branch moved past the tag");
+        assert_eq!(
+            git(&repo, &["rev-parse", &e.branch]),
+            head,
+            "the premise: the bare name resolves to the tag"
+        );
+
+        assert_eq!(branch_head(&repo, &e.branch).expect("answered"), Some(tip));
+    }
+
+    /// A tag alone is not a branch: absent, not the tag's commit.
+    #[test]
+    fn branch_head_reads_a_tag_with_no_branch_as_absent() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, _e, head) = moved_branch(t.path());
+        git(&repo, &["tag", "task/tag-only", &head]);
+        assert_eq!(
+            git(&repo, &["rev-parse", "task/tag-only"]),
+            head,
+            "the premise: the bare name resolves"
+        );
+
+        assert_eq!(branch_head(&repo, "task/tag-only").expect("answered"), None);
+    }
+
+    /// Git not answering is an error, never `None` — `None` is what lets a review be recorded
+    /// against no commit and a landing be authorized for an "unknown" head.
+    #[test]
+    fn branch_head_refuses_when_git_does_not_answer() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, _head) = moved_branch(t.path());
+        let config = repo.join(".git/config");
+        let good = fs::read(&config).expect("read config");
+        fs::write(&config, "[core\n").expect("break config");
+        let read = branch_head(&repo, &e.branch);
+        fs::write(&config, good).expect("restore config");
+
+        let err = format!(
+            "{:#}",
+            read.expect_err("an unanswered read must not be a value")
+        );
+        assert!(err.contains("git did not answer"), "{err}");
+        assert!(err.contains(&e.branch), "{err}");
     }
 
     /// A session that CAN be archived is archived, even when its HEAD cannot be read.

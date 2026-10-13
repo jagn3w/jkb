@@ -1385,6 +1385,134 @@ fn no_review_lands_but_records_a_waiver() {
     );
 }
 
+/// Commit `file` on a side line off `main` in `repo`, tag that commit `tag`, and return it — a tag
+/// named like a work branch, pointing somewhere the branch never was.
+fn tag_side_commit(repo: &Path, tag: &str, file: &str) -> String {
+    git(repo, &["checkout", "-q", "-b", "side-line"]);
+    commit_in(
+        repo,
+        file,
+        "the tag's content",
+        "a commit only the tag names",
+    );
+    git(repo, &["tag", tag]);
+    git(repo, &["checkout", "-q", "main"]);
+    git(repo, &["rev-parse", &format!("refs/tags/{tag}")])
+}
+
+/// A tag named like the work branch does not stand in for it when a review is recorded. Asked by
+/// bare name, `rev-parse` ranks `refs/tags/<b>` above `refs/heads/<b>`, so the review was recorded
+/// against the tag's commit — a SHA the branch never had.
+#[test]
+fn a_review_is_recorded_against_the_branch_not_a_same_named_tag() {
+    let f = Fixture::new();
+    let uid = f.add_task("reviewed beside a tag");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    let tip = git(&f.repo, &["rev-parse", &format!("refs/heads/{branch}")]);
+    let tagged = tag_side_commit(&f.repo, &branch, "tag.txt");
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &branch]),
+        tagged,
+        "the premise: the bare name resolves to the tag"
+    );
+
+    f.add_concern("reviews/tagged", "a concern, not a must-fix");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/tagged"])
+        .assert()
+        .success();
+    let t = &f.staging(&[])[0]["tasks"][0];
+    assert_eq!(t["uid"].as_str().unwrap(), uid);
+    assert_eq!(t["reviewed"].as_str().unwrap(), tip);
+}
+
+/// A git that cannot read the branch's ref refuses the recording. It read as "no branch", and
+/// the review was filed against no commit at all.
+#[test]
+fn a_review_is_refused_when_git_cannot_read_the_branch() {
+    let f = Fixture::new();
+    let uid = f.add_task("reviewed over a broken ref store");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    f.add_concern("reviews/unread", "a concern, not a must-fix");
+    // A corrupt `packed-refs`: every ref read exits 128 (measured on git 2.51.1), while finding
+    // the repository itself — `rev-parse --show-toplevel` — still works.
+    git(&f.repo, &["pack-refs", "--all"]);
+    let packed = f.repo.join(".git/packed-refs");
+    let mut text = std::fs::read_to_string(&packed).unwrap();
+    text.push_str("garbage line\n");
+    std::fs::write(&packed, text).unwrap();
+
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/unread"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("git did not answer"));
+}
+
+/// The land reads the branch it lands, not a same-named tag on another line: the head it is
+/// authorized and waived for is the branch's. Asked by bare name it was the tag's commit, while
+/// `checkout --detach` (which prefers a branch) grafted the branch — so the waiver, the land check
+/// and `landed_head` named a commit that never landed. The graft's own reads are pinned by
+/// `gitrepo`'s unit tests.
+#[test]
+fn a_land_lands_the_branch_not_a_same_named_tag() {
+    let f = Fixture::new();
+    let uid = f.add_task("landed beside a tag");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "branch.txt",
+        "the branch's content",
+        "the branch's work",
+    );
+    let tip = git(&f.repo, &["rev-parse", &format!("refs/heads/{branch}")]);
+    let tagged = tag_side_commit(&f.repo, &branch, "tag.txt");
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &branch]),
+        tagged,
+        "the premise: the bare name resolves to the tag"
+    );
+
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &uid,
+            "--no-gate",
+            "--no-review",
+            "--keep-worktree",
+        ])
+        .assert()
+        .success();
+
+    let t = &f.staging(&["--all"])[0]["tasks"][0];
+    assert_eq!(t["review_waived"].as_str().unwrap(), tip);
+    let landed = git(
+        &f.repo,
+        &["ls-tree", "--name-only", &format!("refs/heads/{onto}")],
+    );
+    assert!(landed.lines().any(|l| l == "branch.txt"), "{landed}");
+    assert!(!landed.lines().any(|l| l == "tag.txt"), "{landed}");
+}
+
 /// `tag add` appends and `tag set` replaces. The distinction is load-bearing: `/task-swarm`
 /// re-tags a group on every pass, and an appending `repo=` would leave the task claiming two
 /// repositories at once — while a command named `add` must not silently delete a value.

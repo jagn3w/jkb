@@ -3175,7 +3175,10 @@ pub(crate) fn cmd_task_land(
 /// landed in git, not in jkb.
 ///
 /// Returns the branch's head — read here, so the head this asks about is the head that lands, and
-/// `"unknown"` when the branch has none, which is what the waiver string carries.
+/// `"unknown"` when the branch has none, which is what the waiver string carries. Read as
+/// `refs/heads/<branch>` through [`archive::branch_head`], never the bare name, which git resolves
+/// to a same-named TAG first — so the head authorized and recorded was not the head that lands —
+/// and a git that does not answer refuses the landing rather than reading as "no head".
 fn refuse_unless_may_land(
     kb: &session_cli::Kb<'_>,
     root: &Path,
@@ -3183,7 +3186,7 @@ fn refuse_unless_may_land(
     branch: &str,
     onto: &str,
 ) -> Result<String> {
-    let head = gitrepo::rev(root, branch)?;
+    let head = archive::branch_head(root, branch)?;
     kb.land_check(
         uid,
         &jkb_api::sessions::Landed {

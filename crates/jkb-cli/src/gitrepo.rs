@@ -2160,6 +2160,16 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     valid_ref(onto)?;
     git_must(dir, &["switch", onto])?;
     let pre = rev(dir, "HEAD")?.context("target branch has no commits to graft onto")?;
+    // BOTH NAMES FULLY QUALIFIED for every question asked with them below. `branch` and `onto` are
+    // branches, and a bare name is a DWIM lookup that ranks `refs/tags/<name>` above
+    // `refs/heads/<name>` (measured on git 2.51.1). A tag named like the work branch was what the
+    // count below measured — a tag at `onto` refused two real commits as "nothing to land", a tag
+    // ahead of it waved an empty branch through — and a tag named like `onto` was what the branch
+    // was rebased onto, commits `onto` never had. (`checkout --detach <name>` happens to prefer the
+    // branch, also measured, but is qualified too rather than relied on.) `switch` above takes
+    // only branches, so it is the one place the bare name is exact.
+    let branch_ref = format!("refs/heads/{branch}");
+    let onto_ref = format!("refs/heads/{onto}");
 
     // NOTHING TO GRAFT IS NOT A LANDING. A branch sitting at `onto`'s tip rebases to a no-op and
     // `merge --ff-only` then answers "Already up to date." with exit 0 — so this returned
@@ -2184,7 +2194,7 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     // unattended, which is where the harm was, and the same fix here needs a `Graft` variant and
     // a `do_land` arm deciding whether a task with no content should be marked done at all. Filed
     // rather than guessed at.
-    if ahead_count(dir, onto, branch)? == 0 {
+    if ahead_count(dir, &onto_ref, &branch_ref)? == 0 {
         anyhow::bail!(
             "{branch} has no commits ahead of {onto} — there is nothing to land. If its work is \
              already in {onto} under someone else's commit, close it with `jkb task landed \
@@ -2198,7 +2208,7 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     // send the user to resolve a conflict in a branch that has none. It used to, with git's own
     // text discarded. The error carries that text instead, the same split `scripts/merge-queue.sh`
     // makes between a setup failure and a content conflict.
-    let (detached, why) = git_run(dir, &["checkout", "--detach", branch])?;
+    let (detached, why) = git_run(dir, &["checkout", "--detach", &branch_ref])?;
     if !detached {
         // Put the tree back on `onto` if the failure moved it; a refused checkout normally has
         // not, so this is a no-op whose own failure must not hide the cause above.
@@ -2213,7 +2223,7 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
             dir.display()
         );
     }
-    if !git_run(dir, &["rebase", onto])?.0 {
+    if !git_run(dir, &["rebase", &onto_ref])?.0 {
         let _ = git_run(dir, &["rebase", "--abort"])?;
         git_must(dir, &["switch", onto])?;
         return Ok((Graft::Conflict, pre));
@@ -3211,6 +3221,61 @@ mod tests {
             std::fs::read_to_string(dir.join("unmerged.txt")).unwrap(),
             "in the way",
             "the file in the way is untouched"
+        );
+    }
+
+    /// The graft counts the BRANCH's commits, not a same-named tag's. A tag `unmerged` left at
+    /// `main`'s tip outranks `refs/heads/unmerged` in `rev-list`'s lookup, so the branch's two
+    /// commits counted as none and the landing was refused as having nothing to land.
+    #[test]
+    fn a_tag_named_like_the_branch_does_not_stand_in_for_it_in_a_graft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fixture(dir);
+        let git_ok = |args: &[&str]| assert!(fixture_git(dir, args).status().unwrap().success());
+        // The rebase commits, and the graft's own git sees no global identity.
+        git_ok(&["config", "user.name", "t"]);
+        git_ok(&["config", "user.email", "t@example.com"]);
+        git_ok(&["tag", "unmerged", "main"]);
+
+        let (outcome, _) = super::graft(dir, "unmerged", "main").expect("grafted");
+        assert!(
+            matches!(outcome, super::Graft::Landed { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            dir.join("unmerged.txt").exists(),
+            "the branch's work is on main"
+        );
+    }
+
+    /// The graft rebases onto the TARGET BRANCH, not a same-named tag elsewhere. A tag `main` at
+    /// `squash`'s tip outranks `refs/heads/main`, so the branch was rebased onto commits `main`
+    /// never had, and the fast-forward then refused.
+    #[test]
+    fn a_tag_named_like_the_target_does_not_stand_in_for_it_in_a_graft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fixture(dir);
+        let git_ok = |args: &[&str]| assert!(fixture_git(dir, args).status().unwrap().success());
+        // The rebase commits, and the graft's own git sees no global identity.
+        git_ok(&["config", "user.name", "t"]);
+        git_ok(&["config", "user.email", "t@example.com"]);
+        git_ok(&["tag", "main", "squash"]);
+
+        let (outcome, _) = super::graft(dir, "unmerged", "main").expect("grafted");
+        assert!(
+            matches!(outcome, super::Graft::Landed { .. }),
+            "{outcome:?}"
+        );
+        let log = fixture_git(dir, &["log", "--format=%s", "refs/heads/main"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(log.contains("unmerged c2"), "{log}");
+        assert!(
+            !log.contains("squash c1"),
+            "the tag's line was not landed: {log}"
         );
     }
 

@@ -468,7 +468,9 @@ pub(crate) fn record_cmd(
     };
     let sha = match sha {
         Some(s) => Some(s),
-        None => crate::gitrepo::rev(&ctx.root, &branch)?,
+        // `refs/heads/<branch>`, not the bare name: a same-named tag outranks the branch in git's
+        // lookup, and the review would be recorded against the tag's commit. Unanswered refuses.
+        None => crate::archive::branch_head(&ctx.root, &branch)?,
     };
     let recording = kb.review_record(jkb_api::review::RecordAsk {
         repo: ctx.key.clone(),
