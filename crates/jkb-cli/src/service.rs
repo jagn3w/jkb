@@ -72,8 +72,8 @@ pub fn print(db: &Path) -> Result<()> {
 ///
 /// A systemd unit takes a leading `#` line. A plist cannot: the XML declaration must be the
 /// document's first bytes, so the `<!-- … -->` comment goes on the line after it, in the prolog,
-/// where XML allows one. `--` may not appear inside an XML comment, so a path containing it is
-/// spelled `- -` there.
+/// where XML allows one. `--` may not appear inside an XML comment, so a run of hyphens in a path
+/// is spelled with spaces between them there ([`xml_comment_safe`]).
 fn render_print(manager: Manager, units: &[Unit]) -> String {
     let mut sections = Vec::with_capacity(units.len());
     for (_, path, unit) in units {
@@ -81,7 +81,7 @@ fn render_print(manager: Manager, units: &[Unit]) -> String {
         let mut section = match manager {
             Manager::Systemd => format!("# {path}\n{unit}"),
             Manager::Launchd => {
-                let comment = format!("<!-- {} -->\n", path.replace("--", "- -"));
+                let comment = format!("<!-- {} -->\n", xml_comment_safe(&path));
                 match unit.split_once('\n') {
                     Some((decl, rest)) if decl.starts_with("<?xml") => {
                         format!("{decl}\n{comment}{rest}")
@@ -96,6 +96,22 @@ fn render_print(manager: Manager, units: &[Unit]) -> String {
         sections.push(section);
     }
     sections.join("\n")
+}
+
+/// `text` with no `--` in it, which an XML comment may not contain: every hyphen in a run is
+/// followed by a space. One left-to-right `replace("--", "- -")` was not enough — it skips past
+/// each match, so `---` became `- --`.
+fn xml_comment_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_hyphen = false;
+    for c in text.chars() {
+        if c == '-' && prev_hyphen {
+            out.push(' ');
+        }
+        prev_hyphen = c == '-';
+        out.push(c);
+    }
+    out
 }
 
 /// Write the service units to their platform locations and print the activation commands.
@@ -649,25 +665,43 @@ mod tests {
                 Path::new("/Users/a--b").join(format!("{SERVE_LABEL}.plist")),
                 launchd_serve_plist(exe, db),
             ),
+            (
+                REAP_LABEL,
+                Path::new("/Users/a---b").join(format!("{REAP_LABEL}.plist")),
+                launchd_reap_plist(exe, db, None),
+            ),
+            (
+                LABEL,
+                Path::new("/Users/a----b-").join(format!("{LABEL}.plist")),
+                launchd_plist(exe, db),
+            ),
         ];
         let out = render_print(Manager::Launchd, &units);
         // The XML declaration must be a document's first bytes, so every section starts with it
         // and names its path on the very next line.
         let docs: Vec<&str> = out.split("<?xml ").filter(|d| !d.is_empty()).collect();
-        assert_eq!(docs.len(), 2, "{out}");
+        assert_eq!(docs.len(), 4, "{out}");
         assert!(out.starts_with("<?xml "));
         let comments = [
             format!("<!-- /Users/u/Library/LaunchAgents/{LABEL}.plist -->"),
             format!("<!-- /Users/a- -b/{SERVE_LABEL}.plist -->"),
+            format!("<!-- /Users/a- - -b/{REAP_LABEL}.plist -->"),
+            format!("<!-- /Users/a- - - -b-/{LABEL}.plist -->"),
         ];
         for ((doc, comment), (_, _, unit)) in docs.iter().zip(&comments).zip(&units) {
             let mut lines = doc.lines();
             lines.next();
-            assert_eq!(lines.next(), Some(comment.as_str()));
+            let line = lines.next().expect("a comment line after the declaration");
+            assert_eq!(line, comment.as_str());
+            // The comment's body, as printed, holds no `--`: XML forbids it inside a comment.
+            let body = line
+                .strip_prefix("<!--")
+                .and_then(|l| l.strip_suffix("-->"))
+                .expect("an XML comment");
+            assert!(!body.contains("--"), "{line}");
             // Taking the comment line back out leaves exactly the unit `install` writes.
             let restored = format!("<?xml {}", doc.replacen(&format!("{comment}\n"), "", 1));
             assert_eq!(restored.trim_end(), unit.trim_end());
-            assert!(!comment[4..comment.len() - 3].contains("--"));
         }
     }
 
