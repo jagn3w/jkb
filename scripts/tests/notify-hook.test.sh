@@ -83,6 +83,10 @@ printf '\n' >> "$tmp/jkbcalls"
 # This stub is a direct child of the shim, so OUR parent IS the shim — the discriminator the
 # owner assertion needs, and it is free.
 printf 'shim=%s\n' "\$PPID" >> "$tmp/jkbcalls"
+# NOISY ON STDOUT, on purpose: the "silent on stdout" assertions below measure the SHIM's
+# redirect, and a stub that printed nothing left them green with that redirect deleted. The real
+# binary may well print (a log line, a clap error), and this is what it would look like.
+echo "jkb-stub: this line must never reach the hook's stdout"
 exit 0
 STUB
 chmod +x "$tmp/goodjkb/jkb"
@@ -106,7 +110,8 @@ hook_run "$PAYLOAD" "$tmp/goodjkb:/usr/bin:/bin"
 check "a working jkb still exits 0" "$?" "0"
 
 # 2. Silent on stdout: a hook's stdout lands in the transcript, and on UserPromptSubmit it is
-#    injected into the conversation as context.
+#    injected into the conversation as context. The stub prints a line to stdout every call, so
+#    these fail if the shim stops discarding what jkb writes.
 for ev in Notification PostToolUse UserPromptSubmit Stop SessionEnd; do
   hook_run "$(payload "$ev" s1 'm')" "$tmp/goodjkb:/usr/bin:/bin"
   check "$ev is silent on stdout" "$hook_out" ""
