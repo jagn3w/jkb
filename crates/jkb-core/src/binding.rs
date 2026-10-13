@@ -11,7 +11,7 @@ use serde_json::json;
 use jkb_types::{ItemId, SyncMode};
 
 use crate::changelog::{Entity, Op};
-use crate::sql::{prefix_like, subtree_like};
+use crate::sql::{prefix_glob, subtree_glob};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -119,15 +119,13 @@ pub fn items_for_uris(conn: &Connection, uris: &[String]) -> Result<HashMap<Stri
 /// # Errors
 /// Returns an error if the query fails.
 pub fn synced_uris_under(conn: &Connection, ns_path: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare_cached(concat!(
+    let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT b.uri FROM bindings b
          JOIN placements p ON p.item_id = b.item_id
          JOIN namespaces n ON n.id = p.namespace_id
-         WHERE b.uri LIKE 'file://%' AND (n.path = ?1 OR n.path LIKE ?2 ",
-        crate::like_escape_clause!(),
-        ")"
-    ))?;
-    let rows = stmt.query_map(params![ns_path, subtree_like(ns_path)], |row| {
+         WHERE b.uri GLOB 'file://*' AND (n.path = ?1 OR n.path GLOB ?2)",
+    )?;
+    let rows = stmt.query_map(params![ns_path, subtree_glob(ns_path)], |row| {
         row.get::<_, String>(0)
     })?;
     let mut out = Vec::new();
@@ -146,21 +144,19 @@ pub fn synced_uris_under(conn: &Connection, ns_path: &str) -> Result<Vec<String>
 /// # Errors
 /// Returns an error if the query fails.
 pub fn synced_uris_for_file(conn: &Connection, bare_uri: &str) -> Result<Vec<String>> {
-    // File uris commonly contain `_` (`my_file.md`); `prefix_like` escapes it, so the `<uri>#%`
-    // pattern cannot gather a *different* file's item bindings.
-    let mut stmt = conn.prepare_cached(concat!(
-        "SELECT uri FROM bindings WHERE uri = ?1 OR uri LIKE ?2 ",
-        crate::like_escape_clause!(),
-        " ORDER BY uri"
-    ))?;
-    let rows = stmt.query_map(params![bare_uri, prefix_like(bare_uri, '#')], |row| {
+    // `prefix_glob` escapes the uri's own metacharacters and matches case-exactly, so the
+    // `<uri>#*` pattern cannot gather a *different* file's item bindings — not `my?file.md`'s,
+    // nor `Tasks.md`'s for `tasks.md`.
+    let mut stmt =
+        conn.prepare_cached("SELECT uri FROM bindings WHERE uri = ?1 OR uri GLOB ?2 ORDER BY uri")?;
+    let rows = stmt.query_map(params![bare_uri, prefix_glob(bare_uri, '#')], |row| {
         row.get::<_, String>(0)
     })?;
     let file = bare_uri.strip_prefix("file://");
     let uris = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::new();
     for uri in uris {
-        // `LIKE '<uri>#%'` also matches a document whose own name continues past a `#` (`C#.md` or
+        // `GLOB '<uri>#*'` also matches a document whose own name continues past a `#` (`C#.md` or
         // `C#42` for the file `C`); only a uri whose fragment [`file_of`] takes off belongs to this file.
         if uri == bare_uri || file_of(conn, &uri)?.as_deref() == file {
             out.push(uri);
@@ -439,6 +435,7 @@ mod tests {
                 ("b", "file:///repo/a_b.md#two"),
                 ("c", "file:///repo/axb.md#three"), // sibling: `x` where the other has `_`
                 ("d", "file:///repo/a_b.md#.bak"),  // a document named `a_b.md#.bak`, no fragment
+                ("e", "file:///repo/A_B.md#four"),  // a case variant: another file on Linux
             ] {
                 let item = upsert(
                     conn,
@@ -475,6 +472,47 @@ mod tests {
             ],
             "the `axb.md` sibling must not be gathered via the `_` wildcard"
         );
+    }
+
+    /// The files synced under a namespace are those of its own subtree, case-exactly: `docs/Plan`
+    /// is another namespace than `docs/plan`, as `n.path = ?` already says.
+    #[test]
+    fn synced_uris_under_does_not_fold_namespace_case() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            for (uid, ns_path, uri) in [
+                ("a", "docs/plan/x", "file:///repo/plan/x.md"),
+                ("b", "docs/Plan/x", "file:///repo/Plan/x.md"),
+            ] {
+                let item = upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: uid.to_owned(),
+                        kind: "note".to_owned(),
+                        content: None,
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                let at = crate::ns::ensure(conn, ns_path)?;
+                crate::placement::place(
+                    conn,
+                    meta,
+                    item,
+                    at,
+                    jkb_types::PlacementRole::Primary,
+                    0,
+                )?;
+                set(conn, meta, item, uri, Some(SyncMode::Bidirectional), None)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let uris = db
+            .read(|conn| super::synced_uris_under(conn, "docs/plan"))
+            .unwrap();
+        assert_eq!(uris, ["file:///repo/plan/x.md"]);
     }
 
     #[test]

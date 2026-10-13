@@ -742,28 +742,25 @@ fn document_id(conn: &Connection, hash: &str) -> Result<ItemId> {
     Ok(ItemId::new(id))
 }
 
-/// The `LIKE` pattern matching every chunk uid of `hash` (`b3:<hash>:<idx>`); bind it with
-/// [`jkb_core::like_escape_clause!`] after the `LIKE ?`.
+/// The `GLOB` pattern matching every chunk uid of `hash` (`b3:<hash>:<idx>`); bind it to
+/// `uid GLOB ?`.
 ///
-/// `hash` is blake3 hex today (`blob::hash_bytes` or [`text_address`]), which holds no `LIKE`
+/// `hash` is blake3 hex today (`blob::hash_bytes` or [`text_address`]), which holds no `GLOB`
 /// metacharacter, so the escape is a no-op for every value ingest produces. It is escaped anyway,
-/// through the same [`jkb_core::sql::prefix_like`] every other prefix match uses, so that safety
+/// through the same [`jkb_core::sql::prefix_glob`] every other prefix match uses, so that safety
 /// is a property of this one function rather than of what each caller happens to pass, and these
 /// sites read like their siblings instead of like the unescaped patterns that were bugs.
-fn chunk_uid_like(hash: &str) -> String {
-    jkb_core::sql::prefix_like(&format!("b3:{hash}"), ':')
+fn chunk_uid_glob(hash: &str) -> String {
+    jkb_core::sql::prefix_glob(&format!("b3:{hash}"), ':')
 }
 
 /// Items left over from a previous ingestion of `hash` — its chunks, and the document if it
 /// is somehow still there — so a re-capture can start from nothing.
 fn surviving_fragments(conn: &Connection, hash: &str) -> Result<Vec<ItemId>> {
-    let mut stmt = conn.prepare_cached(concat!(
-        "SELECT id FROM items WHERE uid = ?1 OR uid LIKE ?2 ",
-        jkb_core::like_escape_clause!(),
-        " ORDER BY id DESC"
-    ))?;
+    let mut stmt =
+        conn.prepare_cached("SELECT id FROM items WHERE uid = ?1 OR uid GLOB ?2 ORDER BY id DESC")?;
     let rows = stmt.query_map(
-        rusqlite::params![format!("b3:{hash}"), chunk_uid_like(hash)],
+        rusqlite::params![format!("b3:{hash}"), chunk_uid_glob(hash)],
         |r| r.get::<_, i64>(0),
     )?;
     Ok(rows
@@ -776,11 +773,8 @@ fn surviving_fragments(conn: &Connection, hash: &str) -> Result<Vec<ItemId>> {
 /// The number of chunk items for `hash` (uid `b3:<hash>:<idx>`).
 fn count_chunks(conn: &Connection, hash: &str) -> Result<usize> {
     let n: i64 = conn
-        .prepare_cached(concat!(
-            "SELECT count(*) FROM items WHERE uid LIKE ?1 ",
-            jkb_core::like_escape_clause!()
-        ))?
-        .query_row([chunk_uid_like(hash)], |r| r.get(0))?;
+        .prepare_cached("SELECT count(*) FROM items WHERE uid GLOB ?1")?
+        .query_row([chunk_uid_glob(hash)], |r| r.get(0))?;
     Ok(usize::try_from(n).unwrap_or(0))
 }
 
@@ -792,13 +786,11 @@ fn load_items(conn: &Connection, hash: &str) -> Result<(ItemId, Vec<(ItemId, Str
         .query_row([document.get()], |r| r.get(0))?;
     let mut items = vec![(document, doc_content)];
 
-    let mut stmt = conn.prepare_cached(concat!(
-        "SELECT id, content FROM items WHERE uid LIKE ?1 ",
-        jkb_core::like_escape_clause!(),
-        " AND content IS NOT NULL ORDER BY id"
-    ))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, content FROM items WHERE uid GLOB ?1 AND content IS NOT NULL ORDER BY id",
+    )?;
     let chunks = stmt
-        .query_map([chunk_uid_like(hash)], |r| {
+        .query_map([chunk_uid_glob(hash)], |r| {
             Ok((ItemId::new(r.get(0)?), r.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -821,29 +813,31 @@ mod tests {
     }
 
     /// A chunk-uid prefix match takes `hash` literally. Ingest only ever passes blake3 hex, so
-    /// this pins the property of [`chunk_uid_like`] rather than a reachable input: a `_` in
-    /// `hash` must not act as `LIKE`'s one-character wildcard and pull in a sibling document's
-    /// chunks, which would let a re-capture delete them and a resume embed them as its own.
+    /// this pins the property of [`chunk_uid_glob`] rather than a reachable input: a `?` in
+    /// `hash` must not act as a one-character wildcard, nor its case fold, and pull in a sibling
+    /// document's chunks, which would let a re-capture delete them and a resume embed them as its
+    /// own.
     #[test]
     fn chunk_uid_matches_take_the_hash_literally() {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
-            item::upsert(conn, meta, &note("b3:a_c", "the document"))?;
-            item::upsert(conn, meta, &note("b3:a_c:0", "its chunk"))?;
+            item::upsert(conn, meta, &note("b3:a?c", "the document"))?;
+            item::upsert(conn, meta, &note("b3:a?c:0", "its chunk"))?;
             item::upsert(conn, meta, &note("b3:abc", "a sibling document"))?;
             item::upsert(conn, meta, &note("b3:abc:0", "the sibling's chunk"))?;
+            item::upsert(conn, meta, &note("b3:A?C:0", "a case variant's chunk"))?;
             Ok(())
         })
         .unwrap();
 
         db.read(|conn| {
-            assert_eq!(count_chunks(conn, "a_c").unwrap(), 1);
+            assert_eq!(count_chunks(conn, "a?c").unwrap(), 1);
             assert_eq!(
-                surviving_fragments(conn, "a_c").unwrap().len(),
+                surviving_fragments(conn, "a?c").unwrap().len(),
                 2,
                 "the document and its own chunk, not the sibling's"
             );
-            let (_, items) = load_items(conn, "a_c").unwrap();
+            let (_, items) = load_items(conn, "a?c").unwrap();
             let texts: Vec<&str> = items.iter().map(|(_, c)| c.as_str()).collect();
             assert_eq!(texts, ["the document", "its chunk"]);
             Ok(())

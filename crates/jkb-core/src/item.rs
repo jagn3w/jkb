@@ -8,7 +8,7 @@ use serde_json::json;
 use jkb_types::{Error as TypeError, ItemId, Resolution};
 
 use crate::changelog::{Entity, Op};
-use crate::sql::subtree_like;
+use crate::sql::subtree_glob;
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
 
@@ -163,14 +163,12 @@ pub fn grep_each(
         params.push(Value::Text(pattern.to_owned()));
     }
     if let Some(s) = scope {
-        sql.push_str(concat!(
+        sql.push_str(
             " AND EXISTS (SELECT 1 FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-                          WHERE p.item_id = i.id AND (n.path = ? OR n.path LIKE ? ",
-            crate::like_escape_clause!(),
-            "))"
-        ));
+                          WHERE p.item_id = i.id AND (n.path = ? OR n.path GLOB ?))",
+        );
         params.push(Value::Text(s.to_owned()));
-        params.push(Value::Text(subtree_like(s)));
+        params.push(Value::Text(subtree_glob(s)));
     }
     sql.push_str(" ORDER BY i.uid");
 
@@ -1159,6 +1157,39 @@ mod tests {
             hits.iter().map(|h| h.uid.as_str()).collect::<Vec<_>>(),
             ["n:accent"],
             "the `_sys` scope must not match the sibling `xsys`"
+        );
+    }
+
+    /// A grep scope is case-exact, as namespace identity is (`Notes` and `notes` are two
+    /// namespaces): under a `LIKE` subtree, scope `notes` also took `Notes/…`.
+    #[test]
+    fn grep_scope_does_not_fold_case() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            for (uid, ns_path) in [("n:lower", "notes/a"), ("n:upper", "Notes/a")] {
+                let at = ns::ensure(conn, ns_path)?;
+                let item = upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: uid.to_owned(),
+                        kind: "note".to_owned(),
+                        content: Some("needle".to_owned()),
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                placement::place(conn, meta, item, at, PlacementRole::Primary, 0)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let hits = db
+            .read(|conn| grep(conn, "needle", Some("notes"), false))
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.uid.as_str()).collect::<Vec<_>>(),
+            ["n:lower"]
         );
     }
 

@@ -2747,15 +2747,14 @@ fn mirror_rows_for(
     // them back into the file, or they'd leak in as `+tasks/…` and break byte-stability.
     let sql = format!(
         "SELECT p.item_id, n.id, n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-         WHERE p.role = 'reference' AND n.path != ? AND n.path NOT LIKE ? {escape}
-           AND n.path != 'tasks' AND n.path NOT LIKE 'tasks/%'
+         WHERE p.role = 'reference' AND n.path != ? AND n.path NOT GLOB ?
+           AND n.path != 'tasks' AND n.path NOT GLOB 'tasks/*'
            AND p.item_id IN ({placeholders})
          ORDER BY p.item_id, n.path",
-        escape = jkb_core::like_escape_clause!(),
     );
     let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
     params.push(rusqlite::types::Value::Text(file_ns_path.to_owned()));
-    params.push(rusqlite::types::Value::Text(jkb_core::sql::subtree_like(
+    params.push(rusqlite::types::Value::Text(jkb_core::sql::subtree_glob(
         file_ns_path,
     )));
     params.extend(

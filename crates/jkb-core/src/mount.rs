@@ -148,7 +148,7 @@ pub fn covering(
         "SELECT n.path, m.backing_uri, m.sync_mode, m.serializer, m.include_glob, m.exclude_glob,
                 m.conflict_policy
          FROM mounts m JOIN namespaces n ON n.id = m.namespace_id
-         WHERE m.backing_uri LIKE 'file://%'
+         WHERE m.backing_uri GLOB 'file://*'
          ORDER BY n.path",
     )?;
     let mounts = stmt

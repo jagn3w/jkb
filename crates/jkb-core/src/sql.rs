@@ -1,68 +1,57 @@
 //! Small SQL helpers shared across repositories.
 
-/// The `ESCAPE` clause every pattern from [`subtree_like`] and [`prefix_like`] must be paired with:
-/// `ESCAPE '\'`. A macro rather than a `const` so it splices into a static SQL literal through
-/// `concat!` as well as into a built one through `format!`:
+/// The `GLOB` pattern matching every strict descendant of the namespace path `path`, i.e.
+/// `<path>/*` with `path`'s own `GLOB` metacharacters escaped. Bind it to `n.path GLOB ?`; pair
+/// it with an `n.path = ?` bound to `path` itself when the subtree includes its root.
 ///
-/// ```
-/// let sql = concat!("SELECT 1 WHERE ?1 LIKE ?2 ", jkb_core::like_escape_clause!());
-/// assert_eq!(sql, r"SELECT 1 WHERE ?1 LIKE ?2 ESCAPE '\'");
-/// ```
+/// `GLOB`, not `LIKE`, because `LIKE` folds ASCII case (`SQLite`'s `case_sensitive_like` is off by
+/// default, and it is a deprecated connection-global switch) while every identity it was matched
+/// against — a namespace path, a `file://` uri, a uid — is compared case-exactly by `=`. The two
+/// arms of one `path = ? OR path LIKE ?` disagreed: syncing `tasks.md` gathered the bindings of a
+/// `Tasks.md` beside it and cancelled them as tasks the file no longer held. A `GLOB` is
+/// case-exact and needs no `ESCAPE` clause, so there is nothing for a caller to pair it with.
 ///
-/// Without it `\` is an ordinary character in a `LIKE` pattern, so an escaped `\_` matches only
-/// a literal backslash followed by any character: the predicate silently matches nothing for any
-/// path holding a metacharacter, rather than erroring.
-#[macro_export]
-macro_rules! like_escape_clause {
-    () => {
-        r"ESCAPE '\'"
-    };
+/// The escape matters because real paths hold metacharacters (`*`, `?` and `[` for `GLOB`); an
+/// unescaped `a?b/*` would also match `axb/…`.
+#[must_use]
+pub fn subtree_glob(path: &str) -> String {
+    prefix_glob(path, '/')
 }
 
-/// The `LIKE` pattern matching every strict descendant of the namespace path `path`, i.e.
-/// `<path>/%` with `path`'s own `LIKE` metacharacters escaped. Bind it to
-/// `n.path LIKE ? ESCAPE '\'` (the clause is [`like_escape_clause!`]); pair it with an
-/// `n.path = ?` bound to `path` itself when the subtree includes its root.
+/// The `GLOB` pattern matching every string that begins with `prefix` followed by `sep`
+/// (`<prefix><sep>*`), with `prefix`'s own `GLOB` metacharacters escaped — the general form of
+/// [`subtree_glob`], for prefixes that are not namespace paths (a `file://` uri's `#` fragments,
+/// a chunk uid's `:` index). Bind it to `col GLOB ?`; it matches case-exactly.
 ///
-/// The escape matters because real paths hold metacharacters: every `_sys` path does, and
-/// `LIKE` reads `_` as any one character, so unescaped `_sys/%` also matched `xsys/…`.
+/// `sep` is written literally, so it must not itself be `*`, `?` or `[`.
 #[must_use]
-pub fn subtree_like(path: &str) -> String {
-    prefix_like(path, '/')
-}
-
-/// The `LIKE` pattern matching every string that begins with `prefix` followed by `sep`
-/// (`<prefix><sep>%`), with `prefix`'s own `LIKE` metacharacters escaped — the general form of
-/// [`subtree_like`], for prefixes that are not namespace paths (a `file://` uri's `#` fragments,
-/// a chunk uid's `:` index). Bind it with [`like_escape_clause!`] after the `LIKE ?`.
-///
-/// `sep` is written literally, so it must not itself be `%`, `_` or `\`.
-#[must_use]
-pub fn prefix_like(prefix: &str, sep: char) -> String {
+pub fn prefix_glob(prefix: &str, sep: char) -> String {
     debug_assert!(
-        !matches!(sep, '%' | '_' | '\\'),
-        "separator {sep:?} is a LIKE metacharacter"
+        !matches!(sep, '*' | '?' | '['),
+        "separator {sep:?} is a GLOB metacharacter"
     );
-    let mut out = like_escape(prefix);
+    let mut out = glob_escape(prefix);
     out.push(sep);
-    out.push('%');
+    out.push('*');
     out
 }
 
-/// Escape `%`, `_`, and `\` so a value can be embedded literally inside a `LIKE … ESCAPE '\'`
-/// pattern. Namespace paths (`_sys`, `_sys/views`) and `file://` uris (filenames like
-/// `my_file.md`) routinely contain `_`, which `LIKE` otherwise treats as a single-character
-/// wildcard — silently matching sibling paths.
+/// Escape `*`, `?` and `[` so a value matches literally inside a `GLOB` pattern, by wrapping each
+/// in a one-character class (`[*]`, `[?]`, `[[]`). A `]` outside a class is already literal, and
+/// `GLOB` has no escape character, so nothing else needs it.
 ///
-/// Private on purpose: a caller holding only the escaped value still has to remember the `%`
-/// suffix and the `ESCAPE` clause. [`subtree_like`] and [`prefix_like`] mint the whole pattern.
-fn like_escape(s: &str) -> String {
+/// Private on purpose: [`subtree_glob`] and [`prefix_glob`] mint the whole pattern, so a caller
+/// cannot hold an escaped value and forget the `*` suffix.
+fn glob_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if matches!(c, '%' | '_' | '\\') {
-            out.push('\\');
+        if matches!(c, '*' | '?' | '[') {
+            out.push('[');
+            out.push(c);
+            out.push(']');
+        } else {
+            out.push(c);
         }
-        out.push(c);
     }
     out
 }
@@ -92,7 +81,7 @@ pub fn json_strings(values: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{like_escape, prefix_like, subtree_like};
+    use super::{glob_escape, prefix_glob, subtree_glob};
 
     /// Every list query takes more ids than `SQLite`'s 32,766-variable limit — the ids need not exist;
     /// a placeholder per id refused the statement before it looked.
@@ -140,11 +129,11 @@ mod tests {
     }
 
     #[test]
-    fn escapes_like_metacharacters() {
-        assert_eq!(like_escape("_sys"), r"\_sys");
-        assert_eq!(like_escape("a_b%c"), r"a\_b\%c");
-        assert_eq!(like_escape(r"back\slash"), r"back\\slash");
-        assert_eq!(like_escape("plain/path"), "plain/path");
+    fn escapes_glob_metacharacters() {
+        assert_eq!(glob_escape("_sys"), "_sys");
+        assert_eq!(glob_escape("a*b?c[d]"), "a[*]b[?]c[[]d]");
+        assert_eq!(glob_escape(r"back\slash%_"), r"back\slash%_");
+        assert_eq!(glob_escape("plain/path"), "plain/path");
     }
 
     /// Every string in `candidates` that `pattern` matches under `predicate` (`?1` is the
@@ -160,51 +149,85 @@ mod tests {
             .collect()
     }
 
-    /// A path holding both `LIKE` wildcards matches only its own subtree through the helper,
-    /// while the same pattern built without the escape also matches siblings the wildcards fit.
+    /// A path holding every `GLOB` and `LIKE` metacharacter matches only its own subtree.
     #[test]
     fn a_subtree_pattern_matches_only_its_own_subtree_when_the_path_holds_wildcards() {
-        let path = "_sys/a_b%c";
+        let path = "_sys/a*b?c[d]%_";
         let candidates = [
-            "_sys/a_b%c",          // the root itself: not a strict descendant
-            "_sys/a_b%c/x",        // own subtree
-            "_sys/a_b%c/y/z",      // own subtree, deeper
-            "xsys/a_b%c/x",        // `_` read as a wildcard
-            "_sys/aXb%c/x",        // `_` read as a wildcard
-            "_sys/a_bANYTHINGc/x", // `%` read as a wildcard
-            "_sys/a_b%cd/x",       // a sibling whose name only begins with the path
+            "_sys/a*b?c[d]%_",     // the root itself: not a strict descendant
+            "_sys/a*b?c[d]%_/x",   // own subtree
+            "_sys/a*b?c[d]%_/y/z", // own subtree, deeper
+            "xsys/a*b?c[d]%_/x",   // `_` read as a LIKE wildcard
+            "_sys/aXXb?c[d]%_/x",  // `*` read as a wildcard
+            "_sys/a*bXc[d]%_/x",   // `?` read as a wildcard
+            "_sys/a*b?cd%_/x",     // `[d]` read as a class
+            "_sys/aXXbYcd%_/x",    // all three read as wildcards
+            "_sys/a*b?c[d]%_Z/x",  // a sibling whose name only begins with the path
+            "_sys/a*b?c[d]%_/",    // the empty child is still under the separator
         ];
-        let predicate = concat!("?1 LIKE ?2 ", crate::like_escape_clause!());
         assert_eq!(
-            matching(predicate, &subtree_like(path), &candidates),
-            ["_sys/a_b%c/x", "_sys/a_b%c/y/z"]
+            matching("?1 GLOB ?2", &subtree_glob(path), &candidates),
+            [
+                "_sys/a*b?c[d]%_/x",
+                "_sys/a*b?c[d]%_/y/z",
+                "_sys/a*b?c[d]%_/"
+            ]
         );
-        let unescaped = matching(predicate, &format!("{path}/%"), &candidates);
-        for sibling in ["xsys/a_b%c/x", "_sys/aXb%c/x", "_sys/a_bANYTHINGc/x"] {
+        let unescaped = matching("?1 GLOB ?2", &format!("{path}/*"), &candidates);
+        for sibling in ["_sys/a*b?cd%_/x", "_sys/aXXbYcd%_/x"] {
             assert!(
                 unescaped.contains(&sibling.to_owned()),
                 "{sibling} in {unescaped:?}"
             );
         }
-        // The escaped pattern without its `ESCAPE` clause matches nothing at all.
-        assert!(matching("?1 LIKE ?2", &subtree_like(path), &candidates).is_empty());
+    }
+
+    /// The seam is case-exact, as every `=` it is paired with is: under `LIKE` (`SQLite`'s
+    /// default `case_sensitive_like` off) `Tasks.md`'s fragments matched `tasks.md`'s pattern.
+    #[test]
+    fn a_prefix_pattern_is_case_exact() {
+        let candidates = [
+            "file:///d/tasks.md#t1",
+            "file:///d/Tasks.md#t1",
+            "file:///d/TASKS.MD#t1",
+        ];
+        assert_eq!(
+            matching(
+                "?1 GLOB ?2",
+                &prefix_glob("file:///d/tasks.md", '#'),
+                &candidates
+            ),
+            ["file:///d/tasks.md#t1"]
+        );
+        assert_eq!(
+            matching(
+                "?1 GLOB ?2",
+                &subtree_glob("Notes"),
+                &["Notes/a", "notes/a", "NOTES/a"]
+            ),
+            ["Notes/a"]
+        );
+        // What the seam replaced: the same prefix under LIKE folds case.
+        assert_eq!(
+            matching("?1 LIKE ?2", "file:///d/tasks.md#%", &candidates).len(),
+            3
+        );
     }
 
     #[test]
     fn a_prefix_pattern_takes_its_separator_literally() {
-        let uri = "file:///d/my_file%.md";
+        let uri = "file:///d/my_file%*.md";
         let candidates = [
-            "file:///d/my_file%.md",
-            "file:///d/my_file%.md#t1",
-            "file:///d/myXfileYY.md#t1",
-            "file:///d/my_file%.md/t1",
+            "file:///d/my_file%*.md",
+            "file:///d/my_file%*.md#t1",
+            "file:///d/my_file%XX.md#t1",
+            "file:///d/my_file%*.md/t1",
         ];
-        let predicate = concat!("?1 LIKE ?2 ", crate::like_escape_clause!());
         assert_eq!(
-            matching(predicate, &prefix_like(uri, '#'), &candidates),
-            ["file:///d/my_file%.md#t1"]
+            matching("?1 GLOB ?2", &prefix_glob(uri, '#'), &candidates),
+            ["file:///d/my_file%*.md#t1"]
         );
-        assert_eq!(subtree_like("plain/path"), "plain/path/%");
-        assert_eq!(prefix_like("b3:abc", ':'), "b3:abc:%");
+        assert_eq!(subtree_glob("plain/path"), "plain/path/*");
+        assert_eq!(prefix_glob("b3:abc", ':'), "b3:abc:*");
     }
 }

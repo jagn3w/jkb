@@ -3958,3 +3958,63 @@ fn a_document_import_leaves_the_items_mirrors_alone() {
         "a document import must not unplace the item's mirror"
     );
 }
+
+/// A `+ns` mirror whose namespace differs from the internal `tasks/…` index only in case is a
+/// user's mirror, rendered into the file: the exclusion is case-exact, as `n.path != 'tasks'` is.
+#[test]
+fn a_mirror_to_a_case_variant_of_tasks_is_rendered() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, MIRRORED_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let setup = format!("{}#setup", uri_for(&file));
+    db.write_txn("cli", move |conn, meta| {
+        let id = item::id_for_uid(conn, &setup)?.expect("setup exists");
+        let mns = ns::ensure(conn, "Tasks/later")?;
+        jkb_core::placement::place(conn, meta, id, mns, jkb_types::PlacementRole::Reference, 0)
+    })
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+
+    let text = fs::read_to_string(&file).unwrap();
+    let setup_line = text
+        .lines()
+        .find(|l| l.ends_with("^setup"))
+        .unwrap_or_else(|| panic!("setup's line is gone: {text}"));
+    assert!(setup_line.contains("+Tasks/later"), "{text}");
+}
+
+/// Two tasks files whose names differ only in case (a case-sensitive filesystem) each keep their
+/// own tasks: gathering `tasks.md`'s bindings must not take `Tasks.md`'s, which the reconcile would
+/// then cancel as tasks the file no longer holds.
+#[test]
+fn tasks_files_differing_only_in_case_keep_their_own_tasks() {
+    let dir = real_tempdir();
+    let upper = dir.path().join("Tasks.md");
+    let lower = dir.path().join("tasks.md");
+    fs::write(&upper, "## A\n- [ ] Upper task ^up\n").unwrap();
+    if lower.exists() {
+        return; // a case-insensitive filesystem: the two names are one file
+    }
+    fs::write(&lower, "## A\n- [ ] Lower task ^low\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    for _ in 0..2 {
+        let report = sync(&db, "docs/plan").unwrap();
+        assert_eq!(report.count(Outcome::Failed), 0, "{:?}", report.results);
+    }
+    for (uid, path) in [("up", &upper), ("low", &lower)] {
+        let uri = format!("{}#{uid}", uri_for(path));
+        assert_eq!(status_of(&db, &uri).as_deref(), Some("open"), "{uri}");
+    }
+    assert!(fs::read_to_string(&upper)
+        .unwrap()
+        .contains("Upper task ^up"));
+    assert!(fs::read_to_string(&lower)
+        .unwrap()
+        .contains("Lower task ^low"));
+}
