@@ -51,12 +51,14 @@ mkrepo() {
 queue() {
     local r="$1"; shift
     local pre post rc out
-    pre="$(git -C "$r" rev-parse trunk)"
+    # THE BRANCH, NOT WHATEVER `trunk` RESOLVES TO: a bare name prefers a same-named tag, and the
+    # tag cases below plant exactly that.
+    pre="$(git -C "$r" rev-parse refs/heads/trunk)"
     : >"$r/.jkb-calls"
     out="$( cd "$r" && PATH="$work/bin:$PATH" JKB=jkb JKB_CALLS="$r/.jkb-calls" env "$@" \
         bash scripts/merge-queue.sh feat trunk "$r" 2>&1 )"
     rc=$?
-    post="$(git -C "$r" rev-parse trunk)"
+    post="$(git -C "$r" rev-parse refs/heads/trunk)"
     # `grep -c` PRINTS ITS ZERO AND THEN EXITS 1, so `|| echo 0` appends a second zero and every
     # field after it shifts. `|| true` keeps the count grep already printed.
     local calls detail
@@ -178,6 +180,69 @@ case_already_merged() {
     check "a branch already merged into the base stalls rather than closing or ejecting" "$r" 5 still 0
 }
 
+# --- a tag named like either branch -------------------------------------------------------
+# BARE NAMES RESOLVE A TAG FIRST. git's DWIM order tries `refs/tags/<name>` before
+# `refs/heads/<name>`, so while the queue read its two arguments bare, a tag named like the work
+# branch was what it grafted, and a tag named like the base was what it rebased onto. Each tag below
+# points at a DECOY commit carrying a file of its own, so the question is not only the exit code but
+# WHAT landed: the branch's work on the base branch, and no decoy anywhere in it.
+#
+# landed_tree <label> <repo> — the base branch holds the work and the base's own commit, no decoy.
+landed_tree() {
+    local label="$1" r="$2" want=""
+    git -C "$r" cat-file -e refs/heads/trunk:work 2>/dev/null || want="$want the branch's work is missing;"
+    git -C "$r" cat-file -e refs/heads/trunk:later 2>/dev/null || want="$want the base's own later commit is missing;"
+    ! git -C "$r" cat-file -e refs/heads/trunk:decoy 2>/dev/null || want="$want the tag's decoy commit landed;"
+    if [ -z "$want" ]; then
+        ok "$label: the base branch holds the branch's work and nothing from the tag"
+    else
+        fail "queue: $label tree" "after the queue ran, refs/heads/trunk is wrong:$want"
+    fi
+}
+
+# mktagged <name> — trunk is base→later, feat is base→work, and a decoy commit off base adds
+# `decoy`. The caller tags the decoy with the name it is testing.
+mktagged() {
+    local r; r="$(mkrepo "$1")"
+    git -C "$r" switch -qc decoy-src; echo d >"$r/decoy"; git -C "$r" add decoy
+    git -C "$r" commit -qm decoy
+    git -C "$r" switch -q trunk; git -C "$r" switch -qc feat
+    echo w >"$r/work"; git -C "$r" add work; git -C "$r" commit -qm work
+    git -C "$r" switch -q trunk; echo l >"$r/later"; git -C "$r" add later; git -C "$r" commit -qm later
+    printf '%s\n' "$r"
+}
+
+# THE WORK BRANCH'S TAG DECIDES THE ENTRY CHECKS, not the graft: `checkout --detach <name>` picks
+# the branch, but `rev-parse`, `merge-base --is-ancestor` and `diff` all read the tag. So the two
+# shapes that fail are the ones where the tag and the branch answer those checks differently.
+#
+# A stale tag at an ancestor of the base (a release tag, an earlier landing's marker): bare, the
+# queue saw "already an ancestor" and stalled a branch with real work in it.
+case_tag_like_branch() {
+    local r; r="$(mktagged tag-branch)"
+    git -C "$r" tag feat refs/heads/trunk~1; git -C "$r" branch -qD decoy-src
+    check "a stale tag named like the work branch does not stall real work" "$r" 0 moved 1
+    landed_tree "a tag named like the work branch" "$r"
+}
+
+# ...and the reverse, which is the phantom landing: the BRANCH is already an ancestor of the base
+# (nothing to land — exit 5, a person decides) while a diverged tag of the same name carries work.
+# Bare, the entry checks passed on the tag, the graft rebased the branch to a no-op, and the queue
+# printed `landed:` and called `jkb task landed` with nothing of the branch's in the base.
+case_tag_like_ancestor_branch() {
+    local r; r="$(mktagged tag-ancestor)"
+    git -C "$r" branch -qf feat refs/heads/trunk~1
+    git -C "$r" tag feat decoy-src; git -C "$r" branch -qD decoy-src
+    check "a diverged tag named like an already-merged branch does not close it" "$r" 5 still 0
+}
+
+case_tag_like_base() {     # bare, the queue rebased onto the tag and the fast-forward then failed
+    local r; r="$(mktagged tag-base)"
+    git -C "$r" tag trunk decoy-src; git -C "$r" branch -qD decoy-src
+    check "a tag named like the base is not what the branch is grafted onto" "$r" 0 moved 1
+    landed_tree "a tag named like the base" "$r"
+}
+
 echo "==> scripts/merge-queue.sh: what it exits, and whether the base moved"
 # THE STUB RECORDS. Asserting the exit code and the base ref leaves out the half of a phantom
 # landing that does the damage: `jkb task landed` is what closes every task in the group and
@@ -227,6 +292,7 @@ case_signalled() {   # killed mid-gate by any signal: never `landed`, and the ba
 }
 
 run_cases case_signalled case_land case_red_gate case_red_suite case_nothing_ahead case_empty_work \
-          case_conflict case_already_landed case_wedged case_already_merged
+          case_conflict case_already_landed case_wedged case_already_merged \
+          case_tag_like_branch case_tag_like_ancestor_branch case_tag_like_base
 
 finish
