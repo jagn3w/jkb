@@ -785,8 +785,13 @@ fn invert_entry(
                 .ok_or_else(|| {
                     TypeError::Validation(format!("cannot undo unknown table '{table}'"))
                 })?;
-            if entity == Entity::Namespaces {
-                refuse_occupied_namespace(conn, rowid()?)?;
+            // THE ONE NAMED SKIP IN THIS ARM: a namespace this transaction created that later
+            // work has since moved into is kept, and counts nothing — see `namespace_is_occupied`.
+            // The transaction is still marked undone as a whole, so this entry is never revisited:
+            // undoing the later work afterwards does not come back for the namespace (its own
+            // entries never logged it, since it already existed), and the namespace stays, empty.
+            if entity == Entity::Namespaces && namespace_is_occupied(conn, rowid()?)? {
+                return Ok(rows);
             }
             rows += conn
                 .prepare_cached(&format!("DELETE FROM {} WHERE rowid = ?1", entity.as_str()))?
@@ -796,49 +801,29 @@ fn invert_entry(
     Ok(rows)
 }
 
-/// Refuse to undo the creation of namespace `id` while something a *later* transaction made still
-/// lives in it: a child namespace, an item placement, or a mount.
+/// Whether namespace `id` holds something that is not the transaction being undone's to take
+/// back: a child namespace, an item placement, or a mount.
 ///
-/// Deleting the row would cascade the placements and the mount away (`ON DELETE CASCADE`) — work
-/// the user never asked to take back, gone with no entry of its own to restore it from. A child
-/// would fail the `parent_id` foreign key anyway, but with a message naming nothing. The same rule
-/// as `ns::remove`, which refuses a namespace that is not empty. Anything the transaction being
-/// undone put there itself was logged after the namespace and is inverted first (`undo` walks its
-/// entries newest first), so by the time this runs only other transactions' work can remain.
-fn refuse_occupied_namespace(conn: &Connection, id: i64) -> Result<()> {
-    let (path, children, placements, mounted): (String, i64, i64, bool) = match conn
+/// Deleting such a namespace would cascade the placements and the mount away (`ON DELETE
+/// CASCADE`) — work the user never asked to take back, with no entry of its own to restore it
+/// from — and a child would fail the `parent_id` foreign key. So the creation's inverse **keeps**
+/// an occupied namespace instead (see the `DeleteRow` arm). Anything the transaction being undone
+/// put there itself was logged after the namespace and has already been inverted (`undo` walks
+/// its entries newest first), so by the time this runs only other transactions' work can remain.
+///
+/// That is the everyday case, not a corner: `ns::ensure` logs only the namespaces it *creates*, so
+/// the first `task add` into a fresh namespace logs the namespace and every later one does not.
+/// Refusing here instead turned an explicit `jkb undo <that first transaction>` that used to work
+/// into a refusal; keeping the row leaves exactly the state that undo produced before namespaces
+/// were logged at all.
+fn namespace_is_occupied(conn: &Connection, id: i64) -> Result<bool> {
+    Ok(conn
         .prepare_cached(
-            "SELECT n.path,
-                    (SELECT count(*) FROM namespaces c WHERE c.parent_id = n.id),
-                    (SELECT count(*) FROM placements p WHERE p.namespace_id = n.id),
-                    EXISTS (SELECT 1 FROM mounts m WHERE m.namespace_id = n.id)
-               FROM namespaces n WHERE n.id = ?1",
+            "SELECT EXISTS (SELECT 1 FROM namespaces WHERE parent_id = ?1)
+                 OR EXISTS (SELECT 1 FROM placements WHERE namespace_id = ?1)
+                 OR EXISTS (SELECT 1 FROM mounts WHERE namespace_id = ?1)",
         )?
-        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-        .optional()?
-    {
-        Some(found) => found,
-        // Already gone: the absence the inverse promises holds (see the `DeleteRow` arm).
-        None => return Ok(()),
-    };
-    let held = [
-        (children, "child namespace(s)"),
-        (placements, "item placement(s)"),
-        (i64::from(mounted), "mount"),
-    ]
-    .iter()
-    .filter(|(n, _)| *n > 0)
-    .map(|(n, what)| format!("{n} {what}"))
-    .collect::<Vec<_>>();
-    if held.is_empty() {
-        return Ok(());
-    }
-    Err(TypeError::Validation(format!(
-        "namespace '{path}' was created by this transaction but now holds {} that later work put \
-         there; deleting it would take that work with it — undo or move it first",
-        held.join(", ")
-    ))
-    .into())
+        .query_row([id], |r| r.get(0))?)
 }
 
 /// Put an edge's previous weight back on the row `row` identifies.
@@ -1639,10 +1624,12 @@ fn snapshot_row_id(what: &str, row: &Value) -> Result<Option<i64>> {
 ///
 /// **The claim is about transactions that logged something, and only those.** A transaction that
 /// writes no changelog entry does not even take a transaction id (`write_txn` numbers from the
-/// changelog), so nothing here could see it; the guarantee rests on every mutation logging. The
-/// writers that do not are the derived-index ones — the ingest embed stage, `index_pending` and
-/// `jkb index --sweep` write vectors, which are rebuildable from the VFS and are nobody's change
-/// to take back — so reaching past them to the user's last change is the right answer. `ns::ensure`
+/// changelog), so nothing here could see it; the guarantee rests on every *content* mutation
+/// logging. The writers that still log nothing are bookkeeping: the derived-index ones (the ingest
+/// embed stage, `index_pending` and `jkb index --sweep` write vectors, rebuildable from the VFS),
+/// the sync engine's archive of a file's bytes into the blob store before it overwrites them, and
+/// the message queue, Claude-session registry and notification writers. None is a change the user
+/// would take back, so reaching past them to the user's last change is the right answer. `ns::ensure`
 /// was the content writer that did not: `jkb ns mk` logged nothing, and a bare `jkb undo` after it
 /// reverted the change before it. It now logs every namespace it creates.
 ///
@@ -4630,47 +4617,77 @@ mod tests {
         );
     }
 
-    /// Undoing a namespace's creation refuses while later work lives in it, rather than letting
-    /// `ON DELETE CASCADE` take that work away with it.
+    /// Undoing a namespace's creation **keeps** the namespace while later work lives in it, and
+    /// still undoes everything else — rather than refusing, or letting `ON DELETE CASCADE` take
+    /// that work away with it.
+    ///
+    /// The everyday shape: the first `task add` into a fresh namespace creates (and logs) it, the
+    /// second finds it and logs nothing. An explicit `jkb undo <the first>` worked before
+    /// namespaces were logged, and must keep working.
     #[test]
-    fn undoing_a_namespace_creation_refuses_while_later_work_lives_in_it() {
-        use crate::{ns, placement};
+    fn undoing_a_namespace_creation_keeps_it_while_later_work_lives_in_it() {
+        use crate::{item, ns, placement};
         use jkb_types::PlacementRole;
 
         let db = Db::open_in_memory().unwrap();
-        let (made, at) = db
-            .write_txn("t", |c, m| Ok((m.txn_id, ns::ensure(c, m, "x/y")?)))
+        let (first, at) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let at = ns::ensure(c, m, "notes/newproj")?;
+                placement::place(c, m, a, at, PlacementRole::Primary, 0)?;
+                Ok((m.txn_id, at))
+            })
             .unwrap();
-        let a = db.write_txn("t", |c, m| upsert(c, m, &note("a"))).unwrap();
-        db.write_txn("t", move |c, m| {
-            placement::place(c, m, a, at, PlacementRole::Reference, 0)
-        })
-        .unwrap();
+        let (second, b) = db
+            .write_txn("t", |c, m| {
+                let b = upsert(c, m, &note("b"))?;
+                let at = ns::ensure(c, m, "notes/newproj")?;
+                placement::place(c, m, b, at, PlacementRole::Primary, 0)?;
+                Ok((m.txn_id, b))
+            })
+            .unwrap();
 
-        let err = db
-            .write_txn("t", move |c, m| super::undo(c, m, made))
-            .expect_err("undoing the namespace's creation cascaded a later placement away")
-            .to_string();
-        assert!(
-            err.contains("Nothing was changed.") && err.contains("1 item placement(s)"),
-            "the refusal does not name what is in the way: {err}"
+        db.write_txn("t", move |c, m| super::undo(c, m, first))
+            .expect(
+                "undoing the first transaction was refused because later work used its namespace",
+            );
+        assert!(db.read(|c| item::id_for_uid(c, "a")).unwrap().is_none());
+        assert_eq!(
+            db.read(|c| ns::get(c, "notes/newproj")).unwrap(),
+            Some(at),
+            "the namespace the later work lives in was deleted"
         );
         assert_eq!(
-            db.read(move |c| crate::placement::items_directly_in(c, at))
+            db.read(move |c| placement::items_directly_in(c, at))
                 .unwrap(),
-            vec![a],
-            "the placement did not survive"
+            vec![b],
+            "the later placement did not survive, or the undone one did"
         );
 
-        // A child made by a later transaction is in the way too.
-        db.write_txn("t", |c, m| ns::ensure(c, m, "x/y/z")).unwrap();
-        db.write_txn("t", move |c, m| placement::unplace(c, m, a, at))
+        // The skipped entry is never revisited. Undoing the later work leaves the namespace (its
+        // own entries never logged it), and the first transaction is not undone a second time.
+        db.write_txn("t", move |c, m| super::undo(c, m, second))
             .unwrap();
+        assert_eq!(db.read(|c| ns::get(c, "notes/newproj")).unwrap(), Some(at));
         let err = db
-            .write_txn("t", move |c, m| super::undo(c, m, made))
-            .expect_err("undoing the namespace's creation orphaned a later child")
+            .write_txn("t", move |c, m| super::undo(c, m, first))
+            .expect_err("the first transaction was undone twice")
             .to_string();
-        assert!(err.contains("1 child namespace(s)"), "{err}");
+        assert!(err.contains("already"), "{err}");
+        assert_eq!(db.read(|c| ns::get(c, "notes/newproj")).unwrap(), Some(at));
+
+        // A child made by later work keeps its parent the same way.
+        let made = db
+            .write_txn("t", |c, m| {
+                ns::ensure(c, m, "x/y")?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        db.write_txn("t", |c, m| ns::ensure(c, m, "x/y/z")).unwrap();
+        db.write_txn("t", move |c, m| super::undo(c, m, made))
+            .expect("undoing a namespace's creation was refused because a later child lives in it");
+        assert!(db.read(|c| ns::get(c, "x/y/z")).unwrap().is_some());
+        assert!(db.read(|c| ns::get(c, "x/y")).unwrap().is_some());
     }
 
     /// Undoing `jkb ns mv` onto a new parent also removes the parent the move created.
