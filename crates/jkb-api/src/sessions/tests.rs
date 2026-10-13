@@ -250,7 +250,7 @@ fn a_take_refuses_a_place_the_task_s_line_cannot_carry_and_writes_nothing() {
     use jkb_types::{ConflictPolicy, SyncMode};
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let id = ns::ensure(c, "repos/in")?;
+        let id = ns::ensure(c, m, "repos/in")?;
         mount::create(
             c,
             m,
@@ -390,6 +390,53 @@ fn an_abandon_releases_only_the_judged_claim() {
     );
 }
 
+/// Claim `uid` for `owner` through `task.claim`, as a SCHEDULER pass would, and say it was acquired.
+fn claim_for(b: &LocalBackend, uid: &str, owner: &str) {
+    match call(b, json!({ "op": "task.claim", "uid": uid, "owner": owner })).unwrap() {
+        Response::Claimed { claimed } => assert!(claimed.acquired, "{claimed:?}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A task that was **unclaimed** when `jkb task abandon` looked, and claimed while it was removing the
+/// session, is left to its new holder: not reopened, its land target kept, the claim untouched.
+///
+/// The CLI states "nothing was held" as `observed: None`. Guarding the reopen only when a claim had
+/// been observed skipped the check for exactly this case, and the reopen then wrote `open` under a live
+/// claim — the claimed-but-open state the claim model forbids — and cleared the land target the new
+/// worker's `jkb task land` needs. The decision is taken in the op's transaction, against the claim as
+/// it is then.
+#[test]
+fn an_abandon_that_saw_no_claim_leaves_one_taken_meanwhile() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = add(&b, "claimed during the abandon +tasks/x");
+    assert!(start(&b, &uid, "host:1", None).unwrap());
+    // `doctor --fix` or `task release` freed it: in a session, in progress, held by nobody.
+    call(
+        &b,
+        json!({ "op": "task.release", "uid": uid, "owner": "host:1" }),
+    )
+    .unwrap();
+    let observed = facts(&b, &uid).claim;
+    assert_eq!(observed, None);
+
+    // ...and while the abandon runs its git subprocesses, the SCHEDULER claims it.
+    claim_for(&b, &uid, "host:7");
+
+    let a = abandon(&b, &uid, observed.as_deref());
+    assert_eq!(
+        (a.released, a.reopened, a.status.as_str()),
+        (false, false, "in_progress")
+    );
+    let f = facts(&b, &uid);
+    assert_eq!(f.claim.as_deref(), Some("host:7"), "the new claim stands");
+    assert_eq!(
+        f.land_target.as_deref(),
+        Some("batch"),
+        "and the land target its worker will land on"
+    );
+}
+
 /// The gate is read through the daemon and never written: there is no op that stores one.
 #[test]
 fn the_gate_is_read_only() {
@@ -401,7 +448,7 @@ fn the_gate_is_read_only() {
     };
     assert_eq!(gate("proj"), None);
     db.write_txn("t", |c, m| {
-        let id = jkb_core::ns::ensure(c, "repos/proj")?;
+        let id = jkb_core::ns::ensure(c, m, "repos/proj")?;
         jkb_core::ns::set_metadata(c, m, id, &json!({ "gate": "make test", "type": "repo" }))
     })
     .unwrap();
@@ -498,7 +545,7 @@ fn a_session_state_is_read_from_the_registry() {
 }
 
 /// **A claim is compared as stored.** An owner written in a spelling `AgentId` would render differently
-/// (`agent:a:b` renders `agent:a-b`) is reported verbatim by `task.facts`, so sending it back as
+/// (`host:007` renders `host:7`) is reported verbatim by `task.facts`, so sending it back as
 /// `displace` or `observed` matches it — a re-rendered owner never would, and the verb would loop on
 /// "run it again" for ever.
 #[test]
@@ -511,14 +558,14 @@ fn a_claim_in_a_non_canonical_spelling_is_compared_as_stored() {
         let uid = uid.clone();
         db.write_txn("t", move |c, m| {
             let id = jkb_core::task::resolve_ref(c, &uid)?.expect("task");
-            jkb_core::claim::claim(c, m, id, "agent:reviewer:G3")?;
+            jkb_core::claim::claim(c, m, id, "host:007")?;
             Ok(())
         })
         .unwrap();
     };
     plant(&db);
     let held = facts(&b, &uid).claim.unwrap();
-    assert_eq!(held, "agent:reviewer:G3");
+    assert_eq!(held, "host:007");
     assert!(start(&b, &uid, "host:1", Some(&held)).unwrap());
     assert_eq!(facts(&b, &uid).claim.as_deref(), Some("host:1"));
 
@@ -528,19 +575,19 @@ fn a_claim_in_a_non_canonical_spelling_is_compared_as_stored() {
     )
     .unwrap();
     plant(&db);
-    let a = abandon(&b, &uid, Some("agent:reviewer:G3"));
+    let a = abandon(&b, &uid, Some("host:007"));
     assert!(a.reopened, "the stored claim was released: {a:?}");
     assert_eq!(facts(&b, &uid).claim, None);
 }
 
-/// **A claim is taken only in the spelling it is stored in.** `agent:reviewer:G3` is stored
-/// `agent:reviewer-G3`, so a worker that took it under the first spelling could never release or
+/// **A claim is taken only in the spelling it is stored in.** `host:007` is stored
+/// `host:7`, so a worker that took it under the first spelling could never release or
 /// compare-and-set its own claim again. Each op that takes a claim refuses it, before writing.
 #[test]
 fn a_claim_is_taken_only_in_its_stored_spelling() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
     let uid = add(&b, "spelled +tasks/x");
-    let odd = "agent:reviewer:G3";
+    let odd = "host:007";
     let refused = |r: Result<Response, ApiError>| {
         let e = r.expect_err("a non-canonical owner is refused");
         assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
@@ -560,7 +607,55 @@ fn a_claim_is_taken_only_in_its_stored_spelling() {
                 "place": { "branch": "feat", "repo": "proj", "onto": "batch" } }),
     ));
     assert_eq!(facts(&b, &uid).claim, None, "nothing was taken");
-    assert!(start(&b, &uid, "agent:reviewer-G3", None).unwrap());
+    assert!(start(&b, &uid, "host:7", None).unwrap());
+}
+
+/// **An agent id with an inner colon is its own spelling.** `jkb task claim --owner agent:cloud:run-3`
+/// stores the string verbatim; when `AgentId::parse` rejoined an agent tail with `-`, the same runner
+/// re-asserting its claim was refused as non-canonical, and anything built from the parsed owner
+/// compared `agent:cloud-run-3` against the stored bytes and matched nothing.
+#[test]
+fn an_agent_owner_with_a_colon_keeps_its_claim() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let uid = add(&b, "colon agent +tasks/x");
+    let owner = "agent:cloud:run-3";
+    let u = uid.clone();
+    db.write_txn("t", move |c, m| {
+        let id = jkb_core::task::resolve_ref(c, &u)?.expect("task");
+        jkb_core::claim::claim(c, m, id, owner)?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        start(&b, &uid, owner, None).unwrap(),
+        "the holder re-asserts"
+    );
+    assert_eq!(facts(&b, &uid).claim.as_deref(), Some(owner));
+    call(
+        &b,
+        json!({ "op": "task.release", "uid": uid, "owner": owner }),
+    )
+    .unwrap();
+    assert_eq!(facts(&b, &uid).claim, None, "the release cleared it");
+}
+
+/// **A fresh claim by an agent id with an inner colon is stored as sent.** `jkb task start --owner
+/// agent:run:7` must write the row the caller named: when `AgentId::parse` rejoined the tail with
+/// `-`, the canonical-spelling check refused the owner outright, and a row written from the parsed
+/// owner would read `agent:run-7` — which the same owner's re-run then failed to recognize.
+#[test]
+fn a_fresh_start_by_an_agent_with_a_colon_stores_the_owner_as_sent() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = add(&b, "fresh colon agent +tasks/x");
+    let owner = "agent:run:7";
+    assert!(start(&b, &uid, owner, None).unwrap(), "the claim is taken");
+    assert_eq!(facts(&b, &uid).claim.as_deref(), Some(owner));
+    assert!(
+        start(&b, &uid, owner, None).unwrap(),
+        "the same owner's re-run recognizes its own claim"
+    );
+    assert_eq!(facts(&b, &uid).claim.as_deref(), Some(owner));
 }
 
 /// **A claim held in an older spelling is refused with the way out, not reported as a race.** Its holder,
@@ -574,31 +669,31 @@ fn a_claim_held_in_an_older_spelling_is_refused_with_the_way_out() {
     let u = uid.clone();
     db.write_txn("t", move |c, m| {
         let id = jkb_core::task::resolve_ref(c, &u)?.expect("task");
-        jkb_core::claim::claim(c, m, id, "agent:reviewer:G3")?;
+        jkb_core::claim::claim(c, m, id, "host:007")?;
         Ok(())
     })
     .unwrap();
     match call(
         &b,
-        json!({ "op": "task.claim", "uid": uid, "owner": "agent:reviewer-G3" }),
+        json!({ "op": "task.claim", "uid": uid, "owner": "host:7" }),
     )
     .unwrap()
     {
         Response::Claimed { claimed } => {
             assert!(!claimed.acquired);
             let why = claimed.refusal.unwrap();
-            assert!(why.contains("--owner 'agent:reviewer:G3'"), "{why}");
+            assert!(why.contains("--owner 'host:007'"), "{why}");
         }
         other => panic!("{other:?}"),
     }
     call(
         &b,
-        json!({ "op": "task.release", "uid": uid, "owner": "agent:reviewer:G3" }),
+        json!({ "op": "task.release", "uid": uid, "owner": "host:007" }),
     )
     .unwrap();
     match call(
         &b,
-        json!({ "op": "task.claim", "uid": uid, "owner": "agent:reviewer-G3" }),
+        json!({ "op": "task.claim", "uid": uid, "owner": "host:7" }),
     )
     .unwrap()
     {
@@ -653,6 +748,38 @@ fn a_land_finishes_the_task_unless_it_was_cancelled_meanwhile() {
     let l = land(&other, None).unwrap();
     assert!(!l.moved && l.refusal.is_some(), "{l:?}");
     assert_eq!(l.status, "cancelled");
+}
+
+/// A landing releases the task's claim **whoever holds it by then**: the claim goes with the terminal
+/// status, decided in one place — the lifecycle's plan for every terminal move — and not by a guard in
+/// the landing command.
+///
+/// The case: `jkb task land` removes the session's worktree before it records, so the session owner
+/// reads as gone, a `task reclaim` frees the claim and the next SCHEDULER pass claims the task for
+/// someone else — all before this op runs. The commits are already on the target, so the task is
+/// done; a terminal task holding a claim is a state the claim model forbids, and a worker left holding
+/// a landed task would only redo landed work. `settle_landing` once carried an owner-scoped clear meant
+/// to spare that claim; it never could, because the status write freed it anyway.
+#[test]
+fn a_land_releases_a_claim_taken_while_it_ran() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = add(&b, "reclaimed during the gate +tasks/x");
+    assert!(start(&b, &uid, "host:1", None).unwrap());
+    call(
+        &b,
+        json!({ "op": "task.release", "uid": uid, "owner": "host:1" }),
+    )
+    .unwrap();
+    claim_for(&b, &uid, "host:7");
+
+    let l = landing(call(
+        &b,
+        json!({ "op": "task.land", "uid": uid,
+                "landed": { "branch": "feat", "onto": "batch", "head": "abcd1234" } }),
+    ))
+    .unwrap();
+    assert_eq!((l.moved, l.status.as_str()), (true, "done"), "{l:?}");
+    assert_eq!(facts(&b, &uid).claim, None, "no claim outlives the landing");
 }
 
 /// `task.landed` records the queue's graft: it finishes a task in progress, records a landing a guard
@@ -854,4 +981,123 @@ fn the_staging_read_lists_the_repo_s_landing_tasks() {
     assert!(!targets(false).contains("old-batch"));
     assert!(targets(true).contains("old-batch"));
     assert!(targets(false).contains("batch"), "a live batch is listed");
+}
+
+fn why(b: &LocalBackend, uid: &str) -> Vec<crate::tasks::HistoryEntry> {
+    match call(b, json!({ "op": "task.why", "uid": uid })).unwrap() {
+        Response::History { entries, .. } => entries,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// One `task.start` is one entry in the task's history: the `start` row carries the branch and land
+/// target, so no `note` repeats them. A `note` is still the record when no transition row was written
+/// — a kept claim — since then nothing else carries where the work now is.
+#[test]
+fn a_start_is_one_entry_in_the_history() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = add(&b, "one action, one row +tasks/x");
+    assert!(start_on(&b, &uid, "host:1", None, "feat", "batch").unwrap());
+    let rows = why(&b, &uid);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(
+        (
+            row.event.as_str(),
+            row.from.as_deref(),
+            row.to.as_str(),
+            row.agent.as_deref(),
+            row.branch.as_deref(),
+            row.onto.as_deref(),
+        ),
+        (
+            "start",
+            Some("open"),
+            "in_progress",
+            Some("host:1"),
+            Some("feat"),
+            Some("batch")
+        ),
+        "{rows:?}"
+    );
+
+    // The same owner starting it again somewhere else: the declared `in_progress` self-loop, so
+    // again one `start` row carrying the new place, and no note beside it.
+    assert!(start_on(&b, &uid, "host:1", None, "feat2", "batch2").unwrap());
+    let rows = why(&b, &uid);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        (
+            rows[1].event.as_str(),
+            rows[1].agent.as_deref(),
+            rows[1].branch.as_deref(),
+            rows[1].onto.as_deref()
+        ),
+        ("start", Some("host:1"), Some("feat2"), Some("batch2")),
+        "{rows:?}"
+    );
+
+    // A kept claim produces no transition, so the note is its only record.
+    assert!(call(
+        &b,
+        json!({ "op": "task.start", "uid": uid, "keep": "host:1",
+                "place": { "branch": "feat3", "repo": "proj", "onto": "batch3" } }),
+    )
+    .map(taken)
+    .unwrap());
+    let rows = why(&b, &uid);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(
+        (rows[2].event.as_str(), rows[2].branch.as_deref()),
+        ("note", Some("feat3")),
+        "{rows:?}"
+    );
+}
+
+/// `task.facts`' `start_refusal` is the machine's refusal from the task's state and nothing else: for
+/// every status, `Some` exactly when the lifecycle has no `start` edge out of it, and `None` for a
+/// task somebody else holds — the guard's refusal depends on who asks, which only the write knows.
+#[test]
+fn the_start_refusal_is_the_machines_verdict_on_the_state() {
+    use jkb_core::lifecycle::{self, TaskEvent, TaskFacts};
+    use jkb_types::TaskStatus;
+
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    for status in [
+        TaskStatus::Open,
+        TaskStatus::InProgress,
+        TaskStatus::NeedsReview,
+        TaskStatus::Done,
+        TaskStatus::Cancelled,
+    ] {
+        let uid = add(&b, &format!("in {} +tasks/x", status.as_str()));
+        if status != TaskStatus::Open {
+            call(
+                &b,
+                json!({ "op": "task.set", "uid": uid, "status": status.as_str() }),
+            )
+            .unwrap();
+        }
+        let f = facts(&b, &uid);
+        assert_eq!(f.status, status.as_str());
+        let undefined = matches!(
+            lifecycle::apply(
+                &TaskFacts {
+                    status,
+                    ..TaskFacts::default()
+                },
+                TaskEvent::Start
+            ),
+            jkb_fsm::Outcome::Undefined { .. }
+        );
+        assert_eq!(f.start_refusal.is_some(), undefined, "{status:?}: {f:?}");
+    }
+
+    let held = add(&b, "held by another +tasks/x");
+    assert!(start(&b, &held, "host:1", None).unwrap());
+    assert_eq!(
+        facts(&b, &held).start_refusal,
+        None,
+        "another owner's claim is the guard's to judge at the write"
+    );
 }

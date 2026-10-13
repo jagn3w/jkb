@@ -2025,10 +2025,18 @@ refuse_shared_db() {
 }
 
 # jkb_sqlite <db> <sql> [sqlite3 options…] — `sqlite3 [options] <db> <sql>`, after refuse_shared_db.
+# Returns 3 when the database is refused, 127 (with the reason on stderr) when the database shell is
+# not installed, and otherwise the shell's own status. A caller must treat any non-zero as "could
+# not read", never as an empty answer: swarm-status once reported a missing shell as "file not yet
+# synced" with every task unbound — a missing tool presented as a fact about the data.
 jkb_sqlite() {
     local db="$1" sql="$2"
     shift 2
     if ! refuse_shared_db "$db"; then return 3; fi
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        printf 'cannot read %s: the SQLite shell (sqlite3) is not installed\n' "$db" >&2
+        return 127
+    fi
     sqlite3 "$@" "$db" "$sql"
 }
 

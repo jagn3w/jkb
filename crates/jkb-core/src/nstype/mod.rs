@@ -761,10 +761,10 @@ mod tests {
     fn a_namespace_resolves_its_type_by_inheritance_and_untyped_stays_untyped() {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
-            let root = ns::ensure(conn, "memory/jkb/bug")?;
+            let root = ns::ensure(conn, meta, "memory/jkb/bug")?;
             ns::set_type(conn, meta, root, "debugging")?;
-            ns::ensure(conn, "memory/jkb/bug/hypotheses")?;
-            ns::ensure(conn, "repos/jkb/docs")?;
+            ns::ensure(conn, meta, "memory/jkb/bug/hypotheses")?;
+            ns::ensure(conn, meta, "repos/jkb/docs")?;
             Ok(())
         })
         .unwrap();
@@ -788,11 +788,11 @@ mod tests {
     #[test]
     fn ensure_stamps_the_reserved_roots_and_the_subtree_inherits() {
         let db = Db::open_in_memory().unwrap();
-        db.write_txn("t", |conn, _meta| {
+        db.write_txn("t", |conn, meta| {
             for (path, _) in RESERVED_TYPES {
-                ns::ensure(conn, path)?;
+                ns::ensure(conn, meta, path)?;
             }
-            ns::ensure(conn, "tasks/jkb/.backlog")?;
+            ns::ensure(conn, meta, "tasks/jkb/.backlog")?;
             Ok(())
         })
         .unwrap();
@@ -815,7 +815,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let err = db
             .write_txn("t", |conn, meta| {
-                let ns_id = ns::ensure(conn, "tasks/jkb")?;
+                let ns_id = ns::ensure(conn, meta, "tasks/jkb")?;
                 let note = item::upsert(
                     conn,
                     meta,
@@ -841,7 +841,7 @@ mod tests {
 
         // …and it fires through `placement::place` itself, rolling the transaction back.
         let outcome = db.write_txn("t", |conn, meta| {
-            let ns_id = ns::ensure(conn, "_sys/views")?;
+            let ns_id = ns::ensure(conn, meta, "_sys/views")?;
             let note = item::upsert(
                 conn,
                 meta,
@@ -862,7 +862,7 @@ mod tests {
 
         // An untyped namespace still takes anything — every namespace that predates typing.
         db.write_txn("t", |conn, meta| {
-            let ns_id = ns::ensure(conn, "references/web")?;
+            let ns_id = ns::ensure(conn, meta, "references/web")?;
             let note = item::upsert(
                 conn,
                 meta,

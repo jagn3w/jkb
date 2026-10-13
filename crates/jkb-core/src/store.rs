@@ -276,6 +276,19 @@ impl Db {
         };
         let dest = dest.as_ref().to_path_buf();
 
+        // `VACUUM INTO` names its file as SQL TEXT, which is UTF-8, so a destination that is not
+        // valid UTF-8 cannot be expressed to it. Converting with `to_string_lossy` replaced each
+        // invalid byte with U+FFFD and wrote the backup to that DIFFERENT path while reporting
+        // success — the caller's file never appeared and a stranger one did. Refuse instead.
+        // The temp path below is built FROM this string, so it needs no conversion of its own.
+        let Some(dest_sql) = dest.to_str().map(str::to_owned) else {
+            return Err(jkb_types::Error::Validation(format!(
+                "backup destination {} is not valid UTF-8 — pick a UTF-8 path",
+                dest.display()
+            ))
+            .into());
+        };
+
         // A backup WRITES a database file, so it answers to the same rule as `db::open`: not on a
         // filesystem shared with another kernel, and never a `file:` URI (the bundled SQLite parses
         // `VACUUM INTO 'file:…'` as one). Without it, `jkb doctor --backup ~/.jkb/jkb.db` run in the
@@ -364,14 +377,12 @@ impl Db {
             // APPENDED rather than `with_extension`, which replaces an extension and would
             // mangle a dated destination like `backup.db.2026-08-09`.
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let mut tmp = dest.clone().into_os_string();
-            tmp.push(format!(
-                ".{}.{}.tmp",
+            let tmp_sql = format!(
+                "{dest_sql}.{}.{}.tmp",
                 std::process::id(),
                 SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let tmp = PathBuf::from(tmp);
-            let tmp_sql = tmp.to_string_lossy().into_owned();
+            );
+            let tmp = PathBuf::from(&tmp_sql);
             // Cleaned up on every failure path, the rename included.
             let result = conn
                 .execute("VACUUM INTO ?1", [&tmp_sql])
@@ -549,6 +560,26 @@ mod tests {
                 (name.starts_with("backup.db.") && is_temp).then_some(name)
             })
             .collect()
+    }
+
+    /// `VACUUM INTO` takes its filename as UTF-8 text, so a non-UTF-8 destination cannot be
+    /// expressed to it. The lossy conversion this replaces wrote the backup to a U+FFFD-mangled
+    /// path and returned `Ok`; the caller's file never appeared. Refused, and nothing written.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_destination_is_refused_and_nothing_is_written() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("jkb.db")).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        let dest = out.join(std::ffi::OsStr::from_bytes(b"backup-\xff.db"));
+        let err = db
+            .backup(&dest)
+            .expect_err("a non-UTF-8 destination must be refused");
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        let written: Vec<_> = std::fs::read_dir(&out).unwrap().collect();
+        assert!(written.is_empty(), "a refused backup wrote {written:?}");
     }
 
     #[test]

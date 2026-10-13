@@ -97,8 +97,10 @@ pub struct Entry {
     /// reopen the task and `jkb task work` recreates a session at the same path on the same
     /// branch — and a sweep keyed on those two would archive that live tree and force-delete its
     /// branch. A commit is not reused, so a tree that is not still sitting on the one the landing
-    /// recorded is not the tree this record is about. `None` only for a record written before this
-    /// field existed, which is held rather than acted on for the same reason.
+    /// recorded is not the tree this record is about. `None` means no identity was obtainable when
+    /// the record was written — the tree could not answer git for itself (see [`dispose`]'s deferred
+    /// arm, which records rather than refuses), or the record predates this field. Such a record
+    /// is held rather than acted on for the same reason.
     #[serde(default)]
     pub head: Option<String>,
     /// Where the tree was moved to, once it has been.
@@ -127,9 +129,10 @@ pub struct Report {
     /// Records dropped because there was nothing left to act on.
     pub cleared: Vec<String>,
     /// `(uid, why)` for a `delete_branch` plan that was NOT carried out because its premise had
-    /// stopped holding. Reported rather than silent: a plan the operator asked for and that jkb
-    /// declined to apply is exactly the thing they must be told about, and the alternative — a
-    /// silently surviving branch — reads as a jkb bug rather than as a deliberate refusal.
+    /// stopped holding, or because git would not say whether it still held. Reported rather than
+    /// silent: a plan the operator asked for and that jkb declined to apply is exactly the thing
+    /// they must be told about, and the alternative — a silently surviving branch — reads as a jkb
+    /// bug rather than as a deliberate refusal.
     pub kept_branches: Vec<(String, String)>,
     /// Pending records replaced by a later disposal of the same worktree. Their decision was
     /// superseded, so applying it would carry out an instruction the operator withdrew.
@@ -246,7 +249,7 @@ impl<'a> Stores<'a> {
 
     /// Confine records to `root` rather than this process's `~/repos`.
     #[cfg(test)]
-    const fn with_shared_root(mut self, root: &'a Path) -> Self {
+    pub(crate) const fn with_shared_root(mut self, root: &'a Path) -> Self {
         self.shared_root = Some(root);
         self
     }
@@ -851,7 +854,15 @@ impl Deferral {
 /// What became of a worktree this process tried to dispose of.
 pub enum Disposed {
     /// Moved into the repo's archive.
-    Archived(PathBuf),
+    Archived {
+        /// Where the tree went.
+        dest: PathBuf,
+        /// When the plan asked for the branch to go and it did not — it moved past the head
+        /// read from the tree, a worktree has it checked out, or git would not say — why, for
+        /// the caller to print. Returned rather than printed here so a caller can tell that
+        /// this disposal's verdict on the branch was reached, and must not be re-decided.
+        branch_note: Option<String>,
+    },
     /// Nothing moved — this process may not unlink the tree — and a record was left for the
     /// reaper. Carries the refusal, because "it did not work" without the reason is what makes an
     /// operator go looking in the wrong place.
@@ -871,8 +882,9 @@ pub enum Disposed {
 /// real work and is kept unless the operator says otherwise.
 ///
 /// # Errors
-/// Returns an error only if the worktree's HEAD cannot be read, which is the one thing this
-/// cannot proceed without: it is the identity the sweep later checks before acting on the path.
+/// Returns an error only if `git` cannot be executed at all. A worktree whose HEAD cannot be read
+/// is NOT an error: it is disposed of with no recorded identity (`Entry::head` is `None`), which
+/// the sweep then holds rather than acts on.
 pub fn dispose(
     stores: &Stores<'_>,
     repo_root: &Path,
@@ -923,12 +935,12 @@ pub fn dispose(
                 );
             }
             let _ = gitrepo::forget_worktree(repo_root, worktree);
-            if plan.delete_branch {
-                if let Err(e) = gitrepo::delete_branch(repo_root, branch, true) {
-                    eprintln!("note: could not delete {branch}: {e}");
-                }
-            }
-            Ok(Disposed::Archived(dest))
+            let branch_note = if plan.delete_branch {
+                delete_disposed_branch(repo_root, branch, entry.head.as_deref())
+            } else {
+                None
+            };
+            Ok(Disposed::Archived { dest, branch_note })
         }
         // A SESSION CANNOT ARCHIVE ITSELF, and that is the ordinary case rather than an error:
         // the refusal covers the session's own working directories, and every other process — the
@@ -973,6 +985,14 @@ pub fn dispose(
             }))
         }
     }
+}
+
+/// [`dispose`]'s own branch deletion, at the head it read from the worktree before archiving it —
+/// so a commit made on the branch after that read (the `stow` sits between the two) is kept with
+/// it rather than force-deleted. The line to print when the branch was not deleted, if any.
+fn delete_disposed_branch(repo_root: &Path, branch: &str, head: Option<&str>) -> Option<String> {
+    delete_branch_planned(repo_root, branch, head, branch_tip(repo_root, branch))
+        .note(repo_root, branch)
 }
 
 /// Whether this process may unlink `path` — asked of the kernel, not inferred.
@@ -1265,8 +1285,9 @@ pub struct Blocked {
 /// names — so adding a variant satisfied both (neither is tied to the enum) and skipped the audit
 /// entirely. Which is exactly what happened the round before this one, in the helper whose doc
 /// claimed the opposite. Here the sample is part of the declaration, so a variant cannot exist
-/// without one; the precedent is `jkb_core::changelog::Entity`, whose variants and `Entity::ALL`
-/// come out of one macro for the same reason.
+/// without one, and `every()` asserts each sample is the variant it sits beside, so a copy-pasted
+/// sample cannot stand in for a missing one; the precedent is `jkb_core::changelog::Entity`, whose
+/// variants and `Entity::ALL` come out of one macro for the same reason.
 macro_rules! remedies {
     (
         $(#[$emeta:meta])*
@@ -1286,8 +1307,22 @@ macro_rules! remedies {
         #[cfg(test)]
         impl $name {
             /// One of every variant, derived from the declaration — never a second list.
+            ///
+            /// Each sample is checked to BE the variant it is declared beside. Binding a sample
+            /// per variant makes a variant without one a compile error, but not a copy-pasted
+            /// sample of the wrong variant: that compiled and yielded two of one remedy and none
+            /// of the other, so every audit walking this list skipped the new variant silently.
             fn every() -> Vec<$name> {
-                vec![ $($sample),* ]
+                vec![ $({
+                    let sample: $name = $sample;
+                    assert!(
+                        matches!(sample, $name::$variant $({ $($field: _),* })?),
+                        "the sample declared beside `{}` is {:?}",
+                        stringify!($variant),
+                        sample,
+                    );
+                    sample
+                }),* ]
             }
         }
     };
@@ -2024,20 +2059,24 @@ fn sweep_archived(
         // Dropping the record here is destructive in the quiet way: it is the only thing that
         // names a multi-gigabyte archive, so a stat error that read as "removed by hand" left the
         // directory referenced by nothing and never deleted.
+        //
+        // The advice is a `Remedy`, rendered by `Remedy::advice` like the pending half's, so one
+        // action has one wording and the archived holds sit inside the same closed set.
         cause @ (presence::Presence::Unreadable | presence::Presence::AnchorInvisible) => {
-            let why = if cause == presence::Presence::Unreadable {
-                "this machine cannot read it — check the permissions on it and its parents, then \
-                 re-run"
+            let remedy = if cause == presence::Presence::Unreadable {
+                Remedy::FixPermissions {
+                    worktree: dir.to_path_buf(),
+                }
             } else {
-                "neither it nor the repo around it is visible from here; run this where that repo \
-                 is checked out"
+                Remedy::NoActionFromHere
             };
             report.held.push((
                 entry.uid.clone(),
                 format!(
                     "{} could not be read, so whether it is still there is unestablished — the \
-                     record is kept. {why}",
-                    dir.display()
+                     record is kept. {}",
+                    dir.display(),
+                    remedy.advice()
                 ),
             ));
             return;
@@ -2101,54 +2140,207 @@ fn drop_marker(stores: &Stores<'_>, marker: Key, dry_run: bool, report: &mut Rep
 ///
 /// The premise is that the branch's commits are already in the target, and `entry.head` is the
 /// evidence: it is where the branch was when the plan was made. If the branch has moved since,
-/// the commits past that point are in no target and this is the only copy, so a forced
-/// `git branch -D` destroys work. A deferred record makes that ordinary rather than exotic — the
-/// checkout is left in place for days and can be committed in, which is precisely the state the
-/// container produces on every landing.
+/// the commits past that point are in no target and this is the only copy, so a forced delete
+/// destroys work. A deferred record makes that ordinary rather than exotic — the checkout is left
+/// in place for days and can be committed in, which is precisely the state the container produces
+/// on every landing.
 ///
-/// **Checked here, in the callee, and not at the one verdict that provoked the finding.** The
-/// review found it on the `Wreck` path, where an unidentified tree reaches `Stow`; but
-/// `DropRecord` deletes branches too, and the next acting verdict would have to remember the rule
-/// as well. A rule every call site must remember is the defect (D40/D45).
-///
-/// **Its domain is the DEFERRED application of a plan**, and that is why two sibling sites
-/// legitimately do not call it: [`dispose`]'s own delete, and `jkb task abandon`'s when nothing
-/// was deferred. There the operator asks and jkb acts in one moment, so there is no window in
-/// which the branch can move between the decision and the act — the premise cannot have stopped
-/// holding, and re-checking it would only add a way to refuse what was just requested. What makes
-/// this function's check necessary is elapsed time, not the verb.
-///
-/// The comparison is positive-only: a `rev` that answers nothing is git failing OR the branch
-/// being gone already, and neither licenses a delete, so anything but a proven match keeps it.
-/// A branch already gone is silently fine — there is nothing to keep and nothing to report.
+/// **Checked in the callee, and not at the one verdict that provoked the finding.** The review
+/// found it on the `Wreck` path, where an unidentified tree reaches `Stow`; but `DropRecord`
+/// deletes branches too, and the next acting verdict would have to remember the rule as well. A
+/// rule every call site must remember is the defect (D40/D45) — which is also why the check and
+/// the delete live in [`delete_branch_planned`], the one function every branch deletion a
+/// disposal makes goes through: this sweep's, [`dispose`]'s own, and `jkb task abandon`'s when
+/// nothing was deferred. Those two once ran a plain `git branch -D` on the argument that the
+/// operator asks and jkb acts in one moment; but "one moment" still had a read and a delete in
+/// it, and in `dispose` a whole `stow` between them.
 fn delete_branch_if_any(entry: &Entry, report: &mut Report) {
     if !entry.plan.delete_branch || entry.branch.is_empty() {
         return;
     }
-    let tip = gitrepo::rev(&entry.repo_root, &entry.branch).ok().flatten();
-    match (&tip, &entry.head) {
-        (Some(now), Some(planned)) if now == planned => {
-            // A branch somebody checked out elsewhere is not an error worth stopping an
-            // unattended sweep for.
-            let _ = gitrepo::delete_branch(&entry.repo_root, &entry.branch, true);
-        }
-        // Gone already, or git will not name it: nothing to delete, nothing to warn about.
-        (None, _) => {}
-        (Some(now), planned) => report.kept_branches.push((
-            entry.uid.clone(),
-            format!(
-                "{} was kept: the disposal planned to delete it at {}, and it is now at {} — \
-                 whether anything since reached a target is not something this can establish, \
-                 and a forced `git branch -D` on the wrong side of that is the only copy's last \
-                 reader. Delete it yourself once you have looked.",
-                entry.branch,
-                planned
-                    .as_deref()
-                    .unwrap_or("a commit the record could not observe"),
-                now
-            ),
-        )),
+    let root = &entry.repo_root;
+    let branch = &entry.branch;
+    // A branch somebody checked out elsewhere is kept silently: not an error worth stopping an
+    // unattended sweep for.
+    if let BranchDeletion::Kept(why) = delete_branch_planned(
+        root,
+        branch,
+        entry.head.as_deref(),
+        branch_tip(root, branch),
+    ) {
+        report.kept_branches.push((entry.uid.clone(), why));
     }
+}
+
+/// What `refs/heads/<b>` was found to be — three answers, because git not answering is neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Tip {
+    /// Proven absent.
+    Absent,
+    /// Present, at this full object id.
+    At(String),
+    /// Git did not answer (dubious ownership, a corrupt ref store) — never read as absent.
+    Unanswered,
+}
+
+impl Tip {
+    /// The object id read, when one was.
+    pub(crate) fn oid(&self) -> Option<&str> {
+        match self {
+            Self::At(oid) => Some(oid),
+            Self::Absent | Self::Unanswered => None,
+        }
+    }
+}
+
+/// Where branch `branch` is, for a caller that goes on to ACT on the answer: `Ok(None)` when it is
+/// proven absent, its full object id when it is present, and an error when git did not answer.
+///
+/// [`branch_tip`] read as a value. It is the one read both `task land`'s authorization and `task
+/// review record` take, so neither spells its own: both used to ask `rev-parse <branch>`, which
+/// ranks a same-named tag above the branch, and which reads "git could not say" as "no branch" —
+/// so an unreadable ref store let a review be recorded against no commit at all.
+///
+/// # Errors
+/// Git did not answer about `refs/heads/<branch>` in `root`.
+pub(crate) fn branch_head(root: &Path, branch: &str) -> Result<Option<String>> {
+    match branch_tip(root, branch) {
+        Tip::Absent => Ok(None),
+        Tip::At(oid) => Ok(Some(oid)),
+        Tip::Unanswered => anyhow::bail!(
+            "git did not answer in {} about where branch {branch} is — refusing rather than \
+             reading that as no branch. `git -C {} for-each-ref refs/heads/{branch}` shows what \
+             git says.",
+            root.display(),
+            root.display(),
+        ),
+    }
+}
+
+/// Where branch `branch` is, asked of **the ref a delete removes**: `refs/heads/<b>` and never the
+/// bare name. `rev-parse <b>` is a DWIM lookup that ranks `refs/tags/<b>` above `refs/heads/<b>`
+/// (measured on git 2.51.1): a tag `<b>` left at the recorded head beside a branch that has moved
+/// on made the stale tag the evidence, and the moved branch — the only copy of what was committed
+/// since — was force-deleted.
+pub(crate) fn branch_tip(root: &Path, branch: &str) -> Tip {
+    match gitrepo::has_branch(root, branch) {
+        Ok(Fact::No) => Tip::Absent,
+        Ok(Fact::Yes) => match gitrepo::rev(root, &format!("refs/heads/{branch}")) {
+            Ok(Some(oid)) => Tip::At(oid),
+            Ok(None) | Err(_) => Tip::Unanswered,
+        },
+        Ok(Fact::Unknown) | Err(_) => Tip::Unanswered,
+    }
+}
+
+/// What became of a branch deletion asked of [`delete_branch_planned`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BranchDeletion {
+    /// Deleted, or proven gone already — which is what was wanted either way.
+    Done,
+    /// Kept because a worktree has it checked out. `update-ref` would have deleted it there
+    /// anyway (`git branch -D` refused), so the refusal is made here.
+    CheckedOut,
+    /// Kept, and why — for the operator, who asked for a deletion that was not carried out.
+    Kept(String),
+}
+
+impl BranchDeletion {
+    /// The line an interactive verb prints for a deletion that did not happen, or `None` when it
+    /// did. The sweep reports only [`Self::Kept`]; a verb the operator just ran says both.
+    pub(crate) fn note(&self, root: &Path, branch: &str) -> Option<String> {
+        match self {
+            Self::Done => None,
+            Self::CheckedOut => Some(format!(
+                "{branch} was not deleted: a worktree has it checked out — `git -C {} worktree \
+                 list` shows which; delete the branch once that checkout is gone.",
+                root.display(),
+            )),
+            Self::Kept(why) => Some(why.clone()),
+        }
+    }
+}
+
+/// THE ONE BRANCH DELETION a disposal makes: delete `branch` **only while it is still at
+/// `planned`** — git's compare-and-delete (`update-ref -d <ref> <old>`), so a commit landing
+/// between the read and the delete is kept, never lost with the branch.
+///
+/// `planned` is where the caller's decision saw the branch (a deferred record's head, the
+/// disposed worktree's head, or simply the tip `abandon` read); `now` is [`branch_tip`]'s answer
+/// read just before. **Four answers, not two.** Now at the planned commit deletes; present
+/// anywhere else is kept and reported; proven absent is silently fine — there is nothing to keep
+/// and nothing to say. The fourth, git not answering, used to read as absent, so whether the
+/// operator's `--delete-branch` was applied was decided by a question nobody answered. It is
+/// reported instead: nothing is deleted on it.
+pub(crate) fn delete_branch_planned(
+    root: &Path,
+    branch: &str,
+    planned: Option<&str>,
+    now: Tip,
+) -> BranchDeletion {
+    match (now, planned) {
+        (Tip::Absent, _) => BranchDeletion::Done,
+        (Tip::At(now), Some(planned)) if now == planned => delete_at_plan(root, branch, planned),
+        (Tip::At(now), planned) => BranchDeletion::Kept(moved(branch, planned, &now)),
+        (Tip::Unanswered, planned) => BranchDeletion::Kept(unanswered(root, branch, planned)),
+    }
+}
+
+/// The delete itself, at `planned`. The read was a `rev` and the delete once a `git branch -D` that
+/// takes no old value, so a commit landing in between was deleted with the branch.
+fn delete_at_plan(root: &Path, branch: &str, planned: &str) -> BranchDeletion {
+    // `update-ref` does not refuse a branch another worktree has checked out, as `git branch -D`
+    // did — so that refusal is asked for here. (`branch -D` also refused a branch mid-rebase or
+    // mid-bisect elsewhere, where HEAD is detached; at the planned head that loses no commit,
+    // since the rebase still holds them.)
+    match gitrepo::worktrees(root) {
+        Ok(Some(trees)) => {
+            if trees.iter().any(|w| w.branch.as_deref() == Some(branch)) {
+                return BranchDeletion::CheckedOut;
+            }
+        }
+        Ok(None) | Err(_) => return BranchDeletion::Kept(unanswered(root, branch, Some(planned))),
+    }
+    if let Ok(true) = gitrepo::delete_branch_at(root, branch, planned) {
+        return BranchDeletion::Done;
+    }
+    // Git refused, or could not be asked. Which, is read from git again — never from its message.
+    match branch_tip(root, branch) {
+        // Gone: somebody else deleted it, which is what the plan wanted.
+        Tip::Absent => BranchDeletion::Done,
+        Tip::At(now) if now != planned => BranchDeletion::Kept(moved(branch, Some(planned), &now)),
+        // Still at the planned head and not deleted: a held lock, or a git that would not run.
+        Tip::At(_) => BranchDeletion::Kept(format!(
+            "{branch} was not deleted: it is still at {planned}, where the disposal planned to \
+             delete it, but git refused to — `git -C {} branch -D {branch}` deletes it, and says \
+             why if it cannot.",
+            root.display(),
+        )),
+        Tip::Unanswered => BranchDeletion::Kept(unanswered(root, branch, Some(planned))),
+    }
+}
+
+/// The branch is not where the disposal planned to delete it, so it is kept and said so.
+fn moved(branch: &str, planned: Option<&str>, now: &str) -> String {
+    format!(
+        "{branch} was kept: the disposal planned to delete it at {}, and it is now at {now} — \
+         whether anything since reached a target is not something this can establish, and a \
+         forced `git branch -D` on the wrong side of that is the only copy's last reader. \
+         Delete it yourself once you have looked.",
+        planned.unwrap_or("a commit the record could not observe"),
+    )
+}
+
+/// Git did not answer, so the planned deletion could not be checked — reported, never skipped.
+fn unanswered(root: &Path, branch: &str, planned: Option<&str>) -> String {
+    format!(
+        "{branch} was not deleted: git did not answer in {} about whether it still exists, so \
+         the planned deletion could not be checked — `git -C {} branch --list {branch}` shows \
+         whether it is there; delete it yourself if it is still at {}.",
+        root.display(),
+        root.display(),
+        planned.unwrap_or("the commit the disposal recorded"),
+    )
 }
 
 /// `YYYYmmddTHHMMSSZ`, so an archive directory says when it was made without anything having to
@@ -2182,7 +2374,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A database at a test's path, and the stores over it: its rows, and the old file store beside it.
@@ -2268,7 +2460,7 @@ mod tests {
         );
     }
 
-    fn git(dir: &Path, args: &[&str]) -> String {
+    pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
         let out = fixture_git(dir, args).output().expect("git runs");
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_owned()
@@ -2277,7 +2469,7 @@ mod tests {
     /// A repo with one real session worktree, which is what the sweep now requires before it will
     /// act: the identity check asks git whether the path is a registered worktree and whether it
     /// is still on the commit the record names.
-    fn session(repo: &Path, name: &str) -> (PathBuf, String, String) {
+    pub(crate) fn session(repo: &Path, name: &str) -> (PathBuf, String, String) {
         std::fs::create_dir_all(repo).expect("mk");
         git(repo, &["init", "-q", "-b", "main"]);
         std::fs::write(repo.join("base.txt"), "base").expect("write");
@@ -2710,6 +2902,50 @@ mod tests {
              machine: {}",
             r.held[0].1
         );
+        assert!(
+            r.held[0].1.contains(
+                &Remedy::FixPermissions {
+                    worktree: dir.clone()
+                }
+                .advice()
+            ),
+            "worded by the remedy itself, so the action has one wording: {}",
+            r.held[0].1
+        );
+    }
+
+    /// An archive whose repo is not visible from here is held with `NoActionFromHere`'s own
+    /// wording — the archived half renders its advice through `Remedy`, like the pending half,
+    /// rather than keeping a second hand-written copy the audits over `Remedy` never see.
+    ///
+    /// Called directly: `reap` holds a record whose repo root is invisible before it dispatches,
+    /// so this arm is defence in depth there, and its wording is what is under test.
+    #[test]
+    fn an_archive_nobody_here_can_see_is_held_in_the_remedys_own_words() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
+        let repo = t.path().join("not-here");
+        let dir = repo.join(".jkb/archive/sess-19700101T000000Z");
+        let e = Entry {
+            archive: Some(dir.clone()),
+            archived_at: Some(0),
+            ..entry(&repo.join(".jkb/work/sess"), &repo)
+        };
+        assert_eq!(
+            presence::present_under(&dir, &repo),
+            presence::Presence::AnchorInvisible,
+            "the premise"
+        );
+        let mut r = Report::default();
+        sweep_archived(&s, &dir, &e, Key(0), RETAIN_DAYS, 0, false, &mut r);
+        assert_eq!(r.held.len(), 1, "kept, never dropped: {r:?}");
+        assert!(
+            r.held[0].1.contains(&Remedy::NoActionFromHere.advice()),
+            "{}",
+            r.held[0].1
+        );
     }
 
     /// A `delete_branch` plan is applied only while the branch is still where the plan was made
@@ -2791,6 +3027,419 @@ mod tests {
         }
     }
 
+    // A declaration whose second sample was copy-pasted from the first: it compiles, and before
+    // `every()` checked each sample it yielded two `First` and no `Second`.
+    remedies! {
+    #[allow(dead_code)]
+    Mislabelled {
+        First = Mislabelled::First,
+        Second { n: u8 } = Mislabelled::First,
+    }
+    }
+
+    /// A sample that is not the variant it is declared beside is refused, not silently counted.
+    #[test]
+    #[should_panic(expected = "the sample declared beside `Second`")]
+    fn a_copy_pasted_remedy_sample_is_refused() {
+        let _ = Mislabelled::every();
+    }
+
+    /// One fixture for the deferred branch-deletion guard: a session whose branch has moved one
+    /// commit past `head`, with the record planning to delete it at `head`.
+    fn moved_branch(t: &Path) -> (PathBuf, Entry, String) {
+        let repo = t.join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        fs::write(wt.join("late.txt"), "after the plan").expect("write");
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "late work"]);
+        let e = Entry {
+            plan: Plan {
+                delete_branch: true,
+                accept_dirty: false,
+            },
+            ..session_entry(&repo, &wt, &branch, &head)
+        };
+        (repo, e, head)
+    }
+
+    /// The guard reads the ref the delete removes. A TAG named like the branch, left at the
+    /// recorded head, outranks `refs/heads/<b>` in `rev-parse`'s DWIM order — so asked by bare
+    /// name, the stale tag was the evidence, matched the plan, and the moved branch (the only copy
+    /// of `late work`) was force-deleted.
+    #[test]
+    fn a_tag_named_like_the_branch_cannot_vouch_for_deleting_it() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, head) = moved_branch(t.path());
+        git(&repo, &["tag", &e.branch, &head]);
+        assert_eq!(
+            git(&repo, &["rev-parse", &e.branch]),
+            head,
+            "the premise: the bare name resolves to the tag, not the moved branch"
+        );
+
+        let mut r = Report::default();
+        delete_branch_if_any(&e, &mut r);
+
+        assert!(
+            !git(&repo, &["branch", "--list", &e.branch]).is_empty(),
+            "the moved branch must survive"
+        );
+        assert_eq!(
+            r.kept_branches.len(),
+            1,
+            "and the refusal is reported: {r:?}"
+        );
+    }
+
+    /// A planned deletion whose branch is already gone locally, beside refs that a by-name lookup
+    /// would still resolve: the record's `delete_branch` with no local branch left.
+    fn gone_branch(t: &Path) -> (PathBuf, Entry, String) {
+        let (repo, e, head) = moved_branch(t);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &e.worktree.to_string_lossy(),
+            ],
+        );
+        git(
+            &repo,
+            &["update-ref", "-d", &format!("refs/heads/{}", e.branch)],
+        );
+        (repo, e, head)
+    }
+
+    /// With NO local branch, a tag named like it is not the branch: the tip reads as proven absent,
+    /// nothing is deleted, nothing is reported, and the tag is untouched. Read by bare name, the
+    /// tag matched the plan and the sweep tried to delete — and reported a branch it had not read.
+    #[test]
+    fn a_tag_named_like_a_gone_branch_reads_as_absent_and_is_left_alone() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, head) = gone_branch(t.path());
+        git(&repo, &["tag", &e.branch, &head]);
+        assert_eq!(
+            git(&repo, &["rev-parse", &e.branch]),
+            head,
+            "the premise: the bare name still resolves, to the tag"
+        );
+
+        assert_eq!(branch_tip(&repo, &e.branch), Tip::Absent);
+        let mut r = Report::default();
+        delete_branch_if_any(&e, &mut r);
+
+        assert!(
+            r.kept_branches.is_empty(),
+            "an absent branch is what was wanted: {r:?}"
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/tags/{}", e.branch)]),
+            head,
+            "the tag is not touched"
+        );
+    }
+
+    /// With no local branch, `origin/<b>` is not the branch either: the remote-tracking copy is
+    /// not what a deletion removes, so it cannot make the local branch read as present.
+    #[test]
+    fn a_remote_tracking_copy_of_a_gone_branch_reads_as_absent_and_is_left_alone() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, head) = gone_branch(t.path());
+        let remote = format!("refs/remotes/origin/{}", e.branch);
+        git(&repo, &["update-ref", &remote, &head]);
+
+        assert_eq!(branch_tip(&repo, &e.branch), Tip::Absent);
+        let mut r = Report::default();
+        delete_branch_if_any(&e, &mut r);
+
+        assert!(
+            r.kept_branches.is_empty(),
+            "an absent branch is what was wanted: {r:?}"
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", &remote]),
+            head,
+            "the remote-tracking ref is not touched"
+        );
+    }
+
+    /// Git not answering is neither present nor absent. A repo whose `.git` names a git dir that
+    /// does not exist fails every question; the planned deletion is reported as not carried out,
+    /// never folded into "already gone" and dropped with the record.
+    #[test]
+    fn a_branch_git_cannot_answer_for_is_reported_not_read_as_gone() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, mut e, head) = moved_branch(t.path());
+        let broken = t.path().join("broken");
+        fs::create_dir_all(&broken).expect("mk");
+        fs::write(
+            broken.join(".git"),
+            format!("gitdir: {}\n", t.path().join("no-such-gitdir").display()),
+        )
+        .expect("write");
+        e.repo_root.clone_from(&broken);
+
+        assert_eq!(branch_tip(&broken, &e.branch), Tip::Unanswered);
+        let mut r = Report::default();
+        delete_branch_if_any(&e, &mut r);
+
+        assert_eq!(r.kept_branches.len(), 1, "reported: {r:?}");
+        assert!(
+            r.kept_branches[0].1.contains("did not answer"),
+            "as unanswered: {r:?}"
+        );
+        assert!(
+            r.kept_branches[0].1.contains(&head),
+            "naming the planned head: {r:?}"
+        );
+        // The real repository's branch was never in question, and is still there.
+        assert!(!git(&repo, &["branch", "--list", &e.branch]).is_empty());
+    }
+
+    /// The delete is conditional on the tip that was read. A commit landing between the read and
+    /// the delete — simulated by moving the branch, then deleting at the head read before it moved
+    /// — is kept with its branch, and the refusal reported. `git branch -D` deleted it.
+    #[test]
+    fn a_branch_that_moves_after_it_was_read_is_kept() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, head) = moved_branch(t.path());
+        // The tree is out of the way by the time the sweep deletes, as in the sweep itself.
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &e.worktree.to_string_lossy(),
+            ],
+        );
+        let now = git(&repo, &["rev-parse", &format!("refs/heads/{}", e.branch)]);
+        assert_ne!(
+            now, head,
+            "the premise: the branch moved after `head` was read"
+        );
+
+        // The read, taken before the branch moved: it and the plan agree, so the delete is tried.
+        let out = delete_branch_planned(&repo, &e.branch, Some(&head), Tip::At(head.clone()));
+
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/heads/{}", e.branch)]),
+            now,
+            "the branch survives, with the commit that landed in the window"
+        );
+        let BranchDeletion::Kept(why) = out else {
+            panic!("and the refusal is reported: {out:?}")
+        };
+        assert!(why.contains(&now), "naming where it is: {why}");
+    }
+
+    /// `update-ref` deletes a branch another worktree has checked out, which `git branch -D`
+    /// refused; that refusal is the sweep's to make now, and it keeps such a branch silently.
+    #[test]
+    fn a_branch_checked_out_elsewhere_is_not_deleted() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        let e = Entry {
+            plan: Plan {
+                delete_branch: true,
+                accept_dirty: false,
+            },
+            ..session_entry(&repo, &wt, &branch, &head)
+        };
+
+        let mut r = Report::default();
+        delete_branch_if_any(&e, &mut r);
+
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/heads/{branch}")]),
+            head,
+            "the checked-out branch is kept"
+        );
+        assert!(r.kept_branches.is_empty(), "silently, as before: {r:?}");
+    }
+
+    /// `dispose` deletes the branch at the head it read from the worktree, not wherever the branch
+    /// happens to be by then. Here the branch has moved past that head — the worktree was left
+    /// detached one commit behind it, so the read and the branch disagree exactly as they do when a
+    /// commit lands on the branch between the read and the delete. `git branch -D` deleted it,
+    /// and with it the only copy of `late work`.
+    #[test]
+    fn dispose_keeps_a_branch_that_moved_past_the_head_it_read() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        fs::write(wt.join("late.txt"), "after the read").expect("write");
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "late work"]);
+        let moved = git(&wt, &["rev-parse", "HEAD"]);
+        git(&wt, &["checkout", "-q", "--detach", &head]);
+
+        let out = dispose(
+            &s,
+            &repo,
+            &wt,
+            &branch,
+            "task:t",
+            Plan {
+                delete_branch: true,
+                accept_dirty: false,
+            },
+        )
+        .expect("disposed");
+        let Disposed::Archived { branch_note, .. } = out else {
+            panic!("the premise: archived")
+        };
+
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/heads/{branch}")]),
+            moved,
+            "the branch survives, with the commit past the head that was read"
+        );
+        // Kept, and said so — naming where it is.
+        let note = branch_note.expect("reported");
+        assert!(note.contains(&moved) && note.contains(&branch), "{note}");
+    }
+
+    /// `dispose`'s delete no longer refuses a branch another worktree has checked out by itself
+    /// (`update-ref` would delete it there), so that refusal is the seam's — and reported, as the
+    /// `git branch -D` error it replaces was.
+    #[test]
+    fn dispose_does_not_delete_a_branch_checked_out_elsewhere() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let db = t.path().join("jkb.db");
+        let kb = TestKb::at(&db);
+        let s = kb.stores();
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        // The session leaves the branch, and another checkout takes it — at the same commit, so
+        // only the worktree check stands between it and the delete.
+        git(&wt, &["checkout", "-q", "--detach"]);
+        let other = t.path().join("other");
+        git(
+            &repo,
+            &["worktree", "add", "-q", &other.to_string_lossy(), &branch],
+        );
+
+        let out = dispose(
+            &s,
+            &repo,
+            &wt,
+            &branch,
+            "task:t",
+            Plan {
+                delete_branch: true,
+                accept_dirty: false,
+            },
+        )
+        .expect("disposed");
+        let Disposed::Archived { branch_note, .. } = out else {
+            panic!("the premise: archived")
+        };
+
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/heads/{branch}")]),
+            head,
+            "the checked-out branch is kept"
+        );
+        assert_eq!(
+            git(&other, &["rev-parse", "HEAD"]),
+            head,
+            "and the checkout holding it still has its commit"
+        );
+        let note = branch_note.expect("reported");
+        assert!(note.contains("checked out"), "{note}");
+    }
+
+    /// Git not answering is not "the branch is gone". Before, it read as absent: the plan was
+    /// silently not applied and the record dropped, so whether `--delete-branch` happened was
+    /// decided by a question nobody answered.
+    #[test]
+    fn a_branch_git_will_not_speak_for_is_reported_not_skipped() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, _head) = moved_branch(t.path());
+        // A repo git refuses outright: an unparseable config makes every command exit non-zero.
+        let config = repo.join(".git/config");
+        let good = fs::read(&config).expect("read config");
+        fs::write(&config, "[core\n").expect("break config");
+        assert!(
+            !fixture_git(&repo, &["rev-parse", "HEAD"])
+                .output()
+                .expect("git runs")
+                .status
+                .success(),
+            "the premise: git cannot answer in this repo"
+        );
+
+        let mut r = Report::default();
+        delete_branch_if_any(&e, &mut r);
+        fs::write(&config, good).expect("restore config");
+
+        assert!(
+            !git(&repo, &["branch", "--list", &e.branch]).is_empty(),
+            "nothing is deleted on an unanswered question"
+        );
+        assert_eq!(r.kept_branches.len(), 1, "but it is reported: {r:?}");
+        assert!(r.kept_branches[0].1.contains(&e.branch), "{r:?}");
+    }
+
+    /// `branch_head` reads the branch, not a same-named tag pointing elsewhere — the read `task
+    /// land` authorizes with and `task review record` records.
+    #[test]
+    fn branch_head_reads_the_branch_beside_a_same_named_tag() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, head) = moved_branch(t.path());
+        git(&repo, &["tag", &e.branch, &head]);
+        let tip = git(&repo, &["rev-parse", &format!("refs/heads/{}", e.branch)]);
+        assert_ne!(tip, head, "the premise: the branch moved past the tag");
+        assert_eq!(
+            git(&repo, &["rev-parse", &e.branch]),
+            head,
+            "the premise: the bare name resolves to the tag"
+        );
+
+        assert_eq!(branch_head(&repo, &e.branch).expect("answered"), Some(tip));
+    }
+
+    /// A tag alone is not a branch: absent, not the tag's commit.
+    #[test]
+    fn branch_head_reads_a_tag_with_no_branch_as_absent() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, _e, head) = moved_branch(t.path());
+        git(&repo, &["tag", "task/tag-only", &head]);
+        assert_eq!(
+            git(&repo, &["rev-parse", "task/tag-only"]),
+            head,
+            "the premise: the bare name resolves"
+        );
+
+        assert_eq!(branch_head(&repo, "task/tag-only").expect("answered"), None);
+    }
+
+    /// Git not answering is an error, never `None` — `None` is what lets a review be recorded
+    /// against no commit and a landing be authorized for an "unknown" head.
+    #[test]
+    fn branch_head_refuses_when_git_does_not_answer() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, _head) = moved_branch(t.path());
+        let config = repo.join(".git/config");
+        let good = fs::read(&config).expect("read config");
+        fs::write(&config, "[core\n").expect("break config");
+        let read = branch_head(&repo, &e.branch);
+        fs::write(&config, good).expect("restore config");
+
+        let err = format!(
+            "{:#}",
+            read.expect_err("an unanswered read must not be a value")
+        );
+        assert!(err.contains("git did not answer"), "{err}");
+        assert!(err.contains(&e.branch), "{err}");
+    }
+
     /// A session that CAN be archived is archived, even when its HEAD cannot be read.
     ///
     /// The HEAD requirement was a precondition of the whole function, checked before `stow` was
@@ -2828,7 +3477,7 @@ mod tests {
             },
         )
         .expect("an archivable session is archived, not refused");
-        let Disposed::Archived(dest) = out else {
+        let Disposed::Archived { dest, .. } = out else {
             panic!("stow can succeed here, so it must have")
         };
         assert!(dest.exists(), "the tree really moved");

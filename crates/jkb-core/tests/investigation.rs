@@ -885,7 +885,7 @@ fn the_seam_dispatches_per_namespace_and_untyped_namespaces_are_unaffected() {
             &[],
         )?;
         // An ordinary namespace with an ordinary task-shaped item.
-        ns::ensure(conn, "repos/jkb/docs")?;
+        ns::ensure(conn, meta, "repos/jkb/docs")?;
         Ok(())
     })
     .unwrap();
@@ -1513,8 +1513,8 @@ fn list_distinguishes_an_empty_memory_root_from_a_failure() {
     assert!(db.read(inv::list).unwrap().is_empty());
 
     // An untyped `memory/` subtree is still empty of *investigations*.
-    db.write_txn("test", |conn, _m| {
-        ns::ensure(conn, "memory/scratch")?;
+    db.write_txn("test", |conn, meta| {
+        ns::ensure(conn, meta, "memory/scratch")?;
         Ok(())
     })
     .unwrap();

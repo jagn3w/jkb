@@ -138,7 +138,8 @@ pub struct Query {
     pub claimed: Option<bool>,
     /// `blocks:<uid>` — items that block the item with this uid.
     pub blocks: Option<String>,
-    /// A bare/quoted term for FTS `match`.
+    /// The bare/quoted words for FTS `match`, as typed: [`Query::evaluate`] quotes each word
+    /// as an FTS5 string ([`jkb_types::fts5_match_expr`]), so a word is never FTS5 syntax.
     pub fts: Option<String>,
     /// `~"…"` — a vector-similarity ranking term (applied by `jkb-search`, not here).
     pub vector: Option<String>,
@@ -152,12 +153,21 @@ pub struct Query {
 /// for tasks (a task's `resolution` is always NULL, so the frontier clauses collapse onto
 /// the ready ones). Putting this rule in only one of them would break that the moment a
 /// task had a subtask.
-const SUBTASK_CLAUSE: &str = "
+const SUBTASK_CLAUSE: &str = concat!(
+    "
                  AND NOT EXISTS (
                      SELECT 1 FROM containment ct JOIN items c ON c.id = ct.child_item_id
                      WHERE ct.parent_item_id = i.id
-                       AND c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
-                 )";
+                       AND ",
+    jkb_types::sql_not_terminal!("c.status"),
+    "
+                 )"
+);
+
+/// The NULL-safe *"`i` is not terminal"* and *"dependency `d` is not terminal"* predicates,
+/// named once so the `format!` strings below can interpolate them.
+const I_NOT_TERMINAL: &str = jkb_types::sql_not_terminal!("i.status");
+const D_NOT_TERMINAL: &str = jkb_types::sql_not_terminal!("d.status");
 
 /// The most `tag:`/`-tag:` terms one query evaluates ([`Query::evaluate`]).
 pub const MAX_TAG_TERMS: usize = 64;
@@ -189,7 +199,7 @@ impl Query {
         if let Some(term) = &self.fts {
             clauses
                 .push("i.id IN (SELECT rowid FROM fts_items WHERE fts_items MATCH ?)".to_owned());
-            params.push(Value::Text(term.clone()));
+            params.push(Value::Text(jkb_types::fts5_match_expr(term)));
         }
 
         let mut sql = "SELECT i.id FROM items i".to_owned();
@@ -332,11 +342,11 @@ impl Query {
             // exist to split.
             clauses.push(format!(
                 "i.claimant_id IS NULL
-                 AND i.status IS NOT 'done' AND i.status IS NOT 'cancelled'
+                 AND {I_NOT_TERMINAL}
                  AND NOT EXISTS (
                      SELECT 1 FROM edges e JOIN items d ON e.dst_item_id = d.id
                      WHERE e.src_item_id = i.id AND e.type = 'depends_on'
-                       AND d.status IS NOT 'done' AND d.status IS NOT 'cancelled'
+                       AND {D_NOT_TERMINAL}
                  ){SUBTASK_CLAUSE}"
             ));
         }
@@ -356,12 +366,12 @@ impl Query {
             // can ask for the whole frontier including in-flight work; the `is:frontier`
             // DSL term and the strategy descriptors add `claimed = Some(false)`.
             clauses.push(format!(
-                "i.status IS NOT 'done' AND i.status IS NOT 'cancelled'
+                "{I_NOT_TERMINAL}
                  AND {UNRESOLVED_SELF}
                  AND NOT EXISTS (
                      SELECT 1 FROM edges e JOIN items d ON e.dst_item_id = d.id
                      WHERE e.src_item_id = i.id AND e.type = 'depends_on'
-                       AND d.status IS NOT 'done' AND d.status IS NOT 'cancelled'
+                       AND {D_NOT_TERMINAL}
                        AND (d.resolution IS NULL OR d.resolution = 'unresolved')
                  ){SUBTASK_CLAUSE}"
             ));

@@ -25,6 +25,7 @@ enum Parcel {
 
 impl State for Parcel {
     const ALL: &'static [Self] = &[Self::Ordered, Self::Shipped, Self::Delivered, Self::Lost];
+    const NOUN: &'static str = "a parcel";
 
     fn name(self) -> &'static str {
         match self {
@@ -347,7 +348,7 @@ fn an_undefined_pair_still_explains_itself() {
     let out = m.apply(&at(Parcel::Delivered, &Facts::default()), Move::Ship);
     assert_eq!(
         out.refusal().as_deref(),
-        Some("`ship` is not something that can happen to a task that is `delivered`.")
+        Some("`ship` is not something that can happen to a parcel that is `delivered`.")
     );
     assert!(!out.moved());
     assert_eq!(out.state(), Parcel::Delivered);
@@ -474,7 +475,10 @@ fn a_stated_destination_is_reported_as_none() {
     const STATED: &[Transition<Parcel, Move, Facts, Fx>] = &[Transition {
         from: Parcel::Ordered,
         event: Move::WriteOff,
-        to: Dest::Stated(|_| Some(Parcel::Lost)),
+        to: Dest::Stated {
+            pick: |_| Some(Parcel::Lost),
+            among: &[Parcel::Lost],
+        },
         guard: None,
         plan: None,
     }];
@@ -558,6 +562,165 @@ fn a_state_that_cannot_finish_is_a_defect() {
     assert!(defects.contains(&Defect::UnusedEvent {
         event: Move::WriteOff
     }));
+}
+
+/// `ordered -> shipped -> delivered`, plus an override from `ordered` that can name only
+/// `delivered`. Nothing can put a parcel in `lost`.
+const STATED_NARROW: &[Transition<Parcel, Move, Facts, Fx>] = &[
+    Transition {
+        from: Parcel::Ordered,
+        event: Move::Ship,
+        to: Dest::To(Parcel::Shipped),
+        guard: None,
+        plan: None,
+    },
+    Transition {
+        from: Parcel::Shipped,
+        event: Move::Deliver,
+        to: Dest::To(Parcel::Delivered),
+        guard: None,
+        plan: None,
+    },
+    Transition {
+        from: Parcel::Ordered,
+        event: Move::WriteOff,
+        to: Dest::Stated {
+            pick: |_| Some(Parcel::Delivered),
+            among: &[Parcel::Delivered],
+        },
+        guard: None,
+        plan: None,
+    },
+];
+
+/// A stated row reaches what it can name and nothing else. Counting any stated row as reaching
+/// every state switched the reachability check off for the whole machine.
+#[test]
+fn a_stated_row_reaches_only_what_it_can_name() {
+    let defects = with(STATED_NARROW).check();
+    assert!(
+        defects.contains(&Defect::UnreachableState {
+            state: Parcel::Lost
+        }),
+        "{:?}",
+        render(&defects)
+    );
+    let unreachable: Vec<_> = defects
+        .iter()
+        .filter(|d| matches!(d, Defect::UnreachableState { .. }))
+        .collect();
+    assert_eq!(unreachable.len(), 1, "{:?}", render(&defects));
+}
+
+/// `lost` can name anything, but nothing reaches `lost`: a stated row reaches its targets only
+/// once its own `from` is reached.
+const STATED_FROM_NOWHERE: &[Transition<Parcel, Move, Facts, Fx>] = &[
+    Transition {
+        from: Parcel::Ordered,
+        event: Move::Ship,
+        to: Dest::To(Parcel::Shipped),
+        guard: None,
+        plan: None,
+    },
+    Transition {
+        from: Parcel::Shipped,
+        event: Move::Deliver,
+        to: Dest::To(Parcel::Delivered),
+        guard: None,
+        plan: None,
+    },
+    Transition {
+        from: Parcel::Lost,
+        event: Move::WriteOff,
+        to: Dest::Stated {
+            pick: |_| Some(Parcel::Lost),
+            among: Parcel::ALL,
+        },
+        guard: None,
+        plan: None,
+    },
+];
+
+#[test]
+fn a_stated_row_from_an_unreachable_state_reaches_nothing() {
+    let defects = with(STATED_FROM_NOWHERE).check();
+    assert!(
+        defects.contains(&Defect::UnreachableState {
+            state: Parcel::Lost
+        }),
+        "{:?}",
+        render(&defects)
+    );
+}
+
+/// The other half, which must not regress: a state only a person ever sets is reachable through
+/// the row that sets it (the investigation machine's `abandoned`).
+#[test]
+fn a_state_only_a_stated_row_names_is_reachable() {
+    const ONLY_BY_HAND: &[Transition<Parcel, Move, Facts, Fx>] = &[
+        Transition {
+            from: Parcel::Ordered,
+            event: Move::Ship,
+            to: Dest::To(Parcel::Shipped),
+            guard: None,
+            plan: None,
+        },
+        Transition {
+            from: Parcel::Shipped,
+            event: Move::Deliver,
+            to: Dest::To(Parcel::Delivered),
+            guard: None,
+            plan: None,
+        },
+        Transition {
+            from: Parcel::Shipped,
+            event: Move::WriteOff,
+            to: Dest::Stated {
+                pick: |_| Some(Parcel::Lost),
+                among: &[Parcel::Lost],
+            },
+            guard: None,
+            plan: None,
+        },
+    ];
+    let defects = with(ONLY_BY_HAND).check();
+    assert!(
+        !defects
+            .iter()
+            .any(|d| matches!(d, Defect::UnreachableState { .. })),
+        "{:?}",
+        render(&defects)
+    );
+}
+
+/// `among` is enforced, so it cannot claim less than the row really does: a pick outside it is
+/// refused rather than moved, and is not offered to a reconcile either.
+#[test]
+fn a_stated_pick_outside_its_declaration_is_refused() {
+    const LIES: &[Transition<Parcel, Move, Facts, Fx>] = &[Transition {
+        from: Parcel::Ordered,
+        event: Move::WriteOff,
+        to: Dest::Stated {
+            pick: |_| Some(Parcel::Lost),
+            among: &[Parcel::Delivered],
+        },
+        guard: None,
+        plan: Some(|_| vec![Fx::DropCourier]),
+    }];
+
+    let m = with(STATED_NARROW);
+    let out = m.apply(&at(Parcel::Ordered, &Facts::default()), Move::WriteOff);
+    assert!(out.moved(), "{out:?}");
+    assert_eq!(out.state(), Parcel::Delivered);
+
+    let out = with(LIES).apply(&at(Parcel::Ordered, &Facts::default()), Move::WriteOff);
+    assert!(!out.moved(), "{out:?}");
+    assert_eq!(out.state(), Parcel::Ordered);
+    assert!(out.effects().is_empty());
+    assert_eq!(
+        out.refusal().as_deref(),
+        Some("`write_off` cannot lead to `lost`.")
+    );
 }
 
 const UNGUARDED_RECONCILIATION: &[Transition<Parcel, Move, Facts, Fx>] = &[
@@ -795,6 +958,7 @@ fn a_machine_with_no_terminal_state_says_so() {
     }
     impl State for Spin {
         const ALL: &'static [Self] = &[Self::A, Self::B];
+        const NOUN: &'static str = "a spinner";
         fn name(self) -> &'static str {
             match self {
                 Self::A => "a",

@@ -46,7 +46,9 @@ use crate::{containment, edge, item, ns, placement, Error, Result};
 use crdt::{Crdt, Piece, PieceKind, Pieces};
 pub use discuss::{discussion, Discussion, Touched, MAX_DISCUSS_UNITS};
 pub use export::{DesignMeta, Exported, Source};
-pub use plan::{PlanTask, PlanView, Plans, StepView, TaskPlace, PLAN_KIND};
+pub use plan::{
+    Ancestry, Named, PlanTask, PlanView, Plans, StepPlace, StepView, TaskPlace, PLAN_KIND,
+};
 pub use prompts::{Launch, PromptRecord, RecordPrompt, Recorded, PROMPT_KIND};
 pub use tree::Split;
 use yrs::Text as _;
@@ -472,7 +474,7 @@ pub fn create(
             mime: None,
         },
     )?;
-    let home = ns::ensure(conn, &path)?;
+    let home = ns::ensure(conn, meta, &path)?;
     placement::place(conn, meta, id, home, PlacementRole::Primary, 0)?;
     ensure_topic(conn, meta, &uid)?;
     let mut seq = 0;

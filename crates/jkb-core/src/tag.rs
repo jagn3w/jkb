@@ -68,7 +68,7 @@ pub fn apply(
     // an insert made `jkb undo` remove a tag application the transaction had not created.
     let existing: Option<i64> = conn
         .prepare_cached(
-            "SELECT rowid FROM tag_applications WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
+            "SELECT id FROM tag_applications WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
         )?
         .query_row(params![item.get(), facet, value], |row| row.get(0))
         .optional()?;
@@ -76,7 +76,7 @@ pub fn apply(
         .prepare_cached(
             "INSERT INTO tag_applications (item_id, facet, value) VALUES (?1, ?2, ?3)
              ON CONFLICT(item_id, facet, value) DO UPDATE SET value = value
-             RETURNING rowid",
+             RETURNING id",
         )?
         .query_row(params![item.get(), facet, value], |row| row.get(0))?;
     let after = json!({ "item_id": item.get(), "facet": facet, "value": value });
@@ -106,28 +106,32 @@ pub fn remove(
     facet: &str,
     value: &str,
 ) -> Result<()> {
-    // Read `props` before the delete: `undo` puts the application back from exactly the columns
-    // recorded here, and one restored without them is a different application.
-    let props: Option<String> = conn
+    // Read the row before the delete: `undo` puts the application back from exactly the columns
+    // recorded here, and one restored without its `props` is a different application — or, without
+    // its `id` (V029), the same application under an id no older entry names.
+    let row: Option<(i64, String)> = conn
         .prepare_cached(
-            "SELECT props FROM tag_applications WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
+            "SELECT id, props FROM tag_applications
+              WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
         )?
-        .query_row(params![item.get(), facet, value], |r| r.get(0))
+        .query_row(params![item.get(), facet, value], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .optional()?;
     let removed = conn
         .prepare_cached(
             "DELETE FROM tag_applications WHERE item_id = ?1 AND facet = ?2 AND value = ?3",
         )?
         .execute(params![item.get(), facet, value])?;
-    if let (1.., Some(props)) = (removed, props) {
+    if let (1.., Some((id, props))) = (removed, row) {
         changelog::append(
             conn,
             meta,
             Op::Delete,
             Entity::TagApplications,
-            &item.get().to_string(),
+            &id.to_string(),
             Some(&json!({
-                "item_id": item.get(), "facet": facet, "value": value, "props": props,
+                "id": id, "item_id": item.get(), "facet": facet, "value": value, "props": props,
             })),
             None,
         )?;
@@ -280,7 +284,7 @@ pub fn rename_facet(conn: &Connection, meta: &WriteMeta, old: &str, new: &str) -
         let sql = if table == "tag_defs" {
             "SELECT rowid FROM tag_defs WHERE facet = ?1"
         } else {
-            "SELECT rowid FROM tag_applications WHERE facet = ?1"
+            "SELECT id FROM tag_applications WHERE facet = ?1"
         };
         let mut stmt = conn.prepare_cached(sql)?;
         let rows = stmt.query_map(params![old], |r| r.get::<_, i64>(0))?;

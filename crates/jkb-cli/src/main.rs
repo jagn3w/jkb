@@ -9,6 +9,7 @@
 mod agent_cli;
 mod archive;
 mod atomic;
+mod closed_stdout;
 mod commands;
 mod design_cli;
 mod design_export;
@@ -385,8 +386,10 @@ enum Command {
         #[command(subcommand)]
         cmd: BlobCmd,
     },
-    /// A synced file's history: every version the KB has bytes for, newest first.
-    /// Pair with `jkb blob cat <hash>` to read or diff any of them.
+    /// A synced file's history: each version of it that sync settled, newest first. Pair with
+    /// `jkb blob cat <hash>` to read or diff any of them. Bytes sync archived before
+    /// overwriting the file are in the blob store but not linked to it, so they are not listed
+    /// here: find them with `jkb blob ls --contains`.
     History {
         /// The file path (or its `file://` uri).
         path: String,
@@ -1506,7 +1509,8 @@ enum TaskTagCmd {
 
 #[derive(Subcommand)]
 enum ServiceCmd {
-    /// Print the service unit for this platform (a dry run of `install`).
+    /// Print the service units for this platform (a dry run of `install`), each under a comment
+    /// naming the file `install` writes it to.
     Print,
     /// Write the service unit and print the command to activate it.
     Install,
@@ -1597,7 +1601,11 @@ impl From<PolicyArg> for ConflictPolicy {
 }
 
 fn main() {
+    closed_stdout::install();
     if let Err(err) = run(Cli::parse()) {
+        if closed_stdout::is_stdout_closed(&err) {
+            std::process::exit(closed_stdout::EXIT_STATUS);
+        }
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }
@@ -2011,7 +2019,9 @@ STAGING BRANCHES (where a batch lands before trunk — the swarm's integration b
                               cannot prove is reported with the reason. No verb takes a sha.
 
 RECOVERY (the archive nothing else exposes)
-  jkb history <path>          every synced version of a file, newest first.
+  jkb history <path>          each version of a file that sync settled, newest first. Not
+                              the bytes it archived before overwriting the file: those are
+                              stored with no link to it, so find them with `blob ls --contains`.
   jkb blob ls --contains "…"  find the version still carrying a line you remember.
   jkb blob cat <hash>         write those bytes to stdout (pipe to a file or `diff`).
       File sync stores the bytes of every version it settles and blobs are never deleted,
@@ -2068,9 +2078,9 @@ fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
         }
         NsCmd::Mk { paths } => {
             let to_make = paths.clone();
-            db.write_txn("cli", move |conn, _meta| {
+            db.write_txn("cli", move |conn, meta| {
                 for p in &to_make {
-                    ns::ensure(conn, p)?;
+                    ns::ensure(conn, meta, p)?;
                 }
                 Ok(())
             })?;
@@ -2173,7 +2183,7 @@ fn cmd_ns_type(
     let ty = nstype::resolve(&type_name)?;
     let (p, t) = (path.clone(), type_name.clone());
     db.write_txn("cli", move |conn, meta| {
-        let id = ns::ensure(conn, &p)?;
+        let id = ns::ensure(conn, meta, &p)?;
         ns::set_type(conn, meta, id, &t)
     })?;
     if json {
@@ -2411,7 +2421,7 @@ fn cmd_mount_create(db: &Db, ns_path: &str, dir: &Path, edit: MountEdit) -> Resu
     let updating = existing.is_some();
     let (ser, inc, exc) = (serializer.clone(), include.clone(), exclude.clone());
     db.write_txn("cli", move |conn, meta| {
-        let ns_id = ns::ensure(conn, &ns_path)?;
+        let ns_id = ns::ensure(conn, meta, &ns_path)?;
         mount::create(
             conn,
             meta,
@@ -2538,6 +2548,11 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     }
     for path in report.quarantined() {
         println!("  needs attention (parse failed): {}", path.display());
+    }
+    // A warning changed nothing that needs undoing, but the file says something the sync did not
+    // record — a `needs:^id` naming no task — so it is said on every sync until the file is fixed.
+    for (path, warning) in report.warnings() {
+        println!("  warning {}: {warning}", path.display());
     }
     // A refusal wrote nothing, so it must be visible or the file silently stops syncing.
     for (path, reason) in report.refused() {
@@ -2979,27 +2994,8 @@ fn land_preflight(
             .filter(|_| dirty.is_yes() && reason.contains("uncommitted changes"))
             .map(|s| (s, gitrepo::deletions_only(&s.worktree, &ctx.root)))
         {
-            Some((s, Ok(d))) => match d.caveat() {
-                None => String::new(),
-                // The remedy is the land path's own, which is why `caveat` does not carry one: it
-                // belongs only to the arm where putting the files back is the answer.
-                Some(c) => {
-                    // By characters, not by bytes. `c[..1]` panics on any caveat whose first
-                    // character is multi-byte, and the wordings live in `Deletions::caveat` where
-                    // nothing warns a future editor that a caller is slicing them.
-                    let mut ch = c.chars();
-                    let capped = ch.next().map_or_else(String::new, |f| {
-                        f.to_uppercase().collect::<String>() + ch.as_str()
-                    });
-                    match d {
-                        gitrepo::Deletions::Only(_) => format!(
-                            " {capped}. `git -C {} restore .` puts them all back.",
-                            s.worktree.display()
-                        ),
-                        _ => format!(" {capped}."),
-                    }
-                }
-            },
+            // The sentence is `Deletions::refusal_suffix`'s, shared with `jkb task abandon`.
+            Some((s, Ok(d))) => d.refusal_suffix(&s.worktree),
             _ => String::new(),
         };
         anyhow::bail!("{uid} cannot land. {reason}{hint}");
@@ -3077,7 +3073,7 @@ pub(crate) fn cmd_task_land(
     // `.jkb/archive` in a repo where `task work` has never run. The lock itself is a database lease
     // now, and leaves nothing on disk.
     session::ensure_excluded(&ctx.root)?;
-    let _lock = session_cli::LandLease::acquire(kb, &ctx.key)?;
+    let _lock = session_cli::LandLease::acquire(kb, &ctx.key, session_cli::LockFor::Land)?;
 
     let Preflight {
         sess,
@@ -3179,7 +3175,10 @@ pub(crate) fn cmd_task_land(
 /// landed in git, not in jkb.
 ///
 /// Returns the branch's head — read here, so the head this asks about is the head that lands, and
-/// `"unknown"` when the branch has none, which is what the waiver string carries.
+/// `"unknown"` when the branch has none, which is what the waiver string carries. Read as
+/// `refs/heads/<branch>` through [`archive::branch_head`], never the bare name, which git resolves
+/// to a same-named TAG first — so the head authorized and recorded was not the head that lands —
+/// and a git that does not answer refuses the landing rather than reading as "no head".
 fn refuse_unless_may_land(
     kb: &session_cli::Kb<'_>,
     root: &Path,
@@ -3187,7 +3186,7 @@ fn refuse_unless_may_land(
     branch: &str,
     onto: &str,
 ) -> Result<String> {
-    let head = gitrepo::rev(root, branch)?;
+    let head = archive::branch_head(root, branch)?;
     kb.land_check(
         uid,
         &jkb_api::sessions::Landed {
@@ -3326,12 +3325,12 @@ fn settle_landing(
     //
     // The status is re-read **inside** the transaction: `land_preflight` checked it before a
     // multi-minute gate, and nothing serializes a `jkb task set --status cancelled` against a
-    // land (the land lease only excludes a second land). Writing `Done` over a cancellation made
+    // land (the land lease only excludes a second land, or an abandon). Writing `Done` over a cancellation made
     // this the one transition the guard exists to prevent. Same reasoning as `review::record`.
     // Whether the status was left as somebody else set it during the gate. Reported, not
-    // returned as an error: the session HAS been disposed of by this point, so bailing left
-    // the claim held on a worktree that no longer exists — freed only by `doctor --fix` — and
-    // said nothing about what had just been removed.
+    // returned as an error: the session's disposal has already RUN by this point (archived, or
+    // deferred to the reaper), so bailing left the claim held on a worktree that may no longer
+    // exist — freed only by `doctor --fix` — and said nothing about what had just been done to it.
     // THE PLAN IS APPLIED LAST, after every fallible git step above has succeeded. That is the
     // rule that makes a git failure survivable: a landing whose session could not be disposed of
     // leaves the task where it was, and the verb is simply re-runnable. The incident this
@@ -3340,7 +3339,7 @@ fn settle_landing(
     //
     // The status is re-read **inside** the transaction: `land_preflight` checked it before a
     // multi-minute gate, and nothing serializes a `jkb task set --status cancelled` against a
-    // land (the land lease only excludes a second land). The machine has no `land` from `cancelled`,
+    // land (the land lease only excludes a second land, or an abandon). The machine has no `land` from `cancelled`,
     // so a cancellation that arrived during the gate is not overwritten — and it says so rather
     // than being silently skipped.
     //
@@ -3361,9 +3360,8 @@ fn settle_landing(
     let kept_status = outcome.refusal.map(|why| (outcome.status, why));
     if let Some((status, why)) = &kept_status {
         eprintln!(
-            "note: {} was left `{status}` — {why} Its commits are on {}, and its session has been \
-             disposed of.",
-            landed.uid, landed.onto
+            "{}",
+            kept_status_note(landed.uid, landed.onto, status, why, &disposal)
         );
     }
 
@@ -3400,6 +3398,22 @@ fn settle_landing(
         json,
     );
     Ok(())
+}
+
+/// The note for a landing whose `land` transition was refused (the task was cancelled during the
+/// gate), saying what became of the session on the arm that actually ran. It once said "its
+/// session has been disposed of" on every arm, which the deferred arm — a session landing itself,
+/// whose tree is still where it was — contradicts.
+fn kept_status_note(uid: &str, onto: &str, status: &str, why: &str, disposal: &Disposal) -> String {
+    let session = match disposal {
+        Disposal::AlreadyGone => "its session was already gone",
+        Disposal::Archived(_) => "its session has been archived",
+        Disposal::Deferred(_) => {
+            "its session could not be archived from in here and is still where it was"
+        }
+        Disposal::Kept => "its session was kept, as asked",
+    };
+    format!("note: {uid} was left `{status}` — {why} Its commits are on {onto}, and {session}.")
 }
 
 /// Say what happened, never what was intended. Two claims here were once simply false:
@@ -3640,8 +3654,8 @@ fn git_audit_pass(db_path: &Path, last: &mut String, json: bool) {
     if now == *last {
         return;
     }
-    for (dir, why) in &findings {
-        let line = format!("git-audit: {}: {why}", dir.display());
+    for f in &findings {
+        let line = format!("git-audit: {}: {}", f.dir.display(), f.why);
         if json {
             eprintln!("{line}");
         } else {
@@ -4155,7 +4169,12 @@ fn dispose_session(
                 accept_dirty: false,
             },
         )? {
-            archive::Disposed::Archived(dest) => disposal = Disposal::Archived(dest),
+            archive::Disposed::Archived { dest, branch_note } => {
+                if let Some(note) = branch_note {
+                    eprintln!("note: {note}");
+                }
+                disposal = Disposal::Archived(dest);
+            }
             archive::Disposed::Deferred(d) => disposal = Disposal::Deferred(d),
         }
     }
@@ -4206,53 +4225,55 @@ impl Disposal {
 /// landed onto a different branch than the last, and keep failing until the directory was
 /// deleted by hand.
 fn land_dir_for(ctx: &repo::RepoCtx, onto: &str) -> Result<PathBuf> {
-    if let Some(dir) = gitrepo::worktree_for_branch(&ctx.root, onto)? {
-        return Ok(dir);
-    }
+    gitrepo::valid_ref(onto)?;
+    // A DELIBERATE collapse of a listing git did not answer, and the safe direction here: every
+    // arm it can select either borrows nothing or refuses. "No checkout of `onto`" means the land
+    // cuts its own, which git refuses outright if the branch really is checked out somewhere; "no
+    // registered `.jkb/base`" sends an existing one to the bail below. The land preflight
+    // (`staging::target_dirty_reason`) has already refused a silent listing, under the lock.
+    let worktrees = gitrepo::worktrees(&ctx.root)?.unwrap_or_default();
+    // Spelled as jkb spells it rather than as the listing does, as it always was: the gate's
+    // placement maps this path, and a listing may spell the same directory another way.
     let base = session::base_worktree(&ctx.root);
-    // Whether git knows a worktree there — NOT whether it has a branch. A **detached**
-    // `.jkb/base` has no branch, so the branch test sent it to the "exists but git does not
-    // know it" bail below and refused every landing, while `staging::land_dir_in` matched the
-    // same directory by path and reported the task landable. `switch_to` attaches it either
-    // way, so a detached base is an ordinary reusable cache.
-    // Collapsing to "not registered" is the safe direction: the arm it selects only refuses,
-    // with git's own message, rather than reusing a checkout on an unverified premise.
-    let base_registered = gitrepo::worktrees(&ctx.root)?
-        .unwrap_or_default()
-        .iter()
-        .any(|w| session::same_path(&w.path, &base));
-    if base_registered {
-        // It exists and holds some other branch (or none) — if it held `onto`, the lookup
-        // above would have found it. Reuse it: it is a cache, and switching keeps its
-        // build artifacts.
-        //
-        // This is not a second copy of the land gate's dirty rule (that one lives in
-        // `staging::target_dirty_reason` and is asked once, under the lock). It guards the
-        // mutation on the *next* line: `git switch` across branches carries uncommitted changes
-        // over, or refuses outright with a message about neither jkb nor the task. Hence its own
-        // remedy, which is about this scratch checkout rather than about landing.
-        anyhow::ensure!(
-            gitrepo::is_dirty(&base, &ctx.root)?.is_no(),
-            "{} could not be established as clean — it is jkb's own scratch checkout, so commit \
-             or discard any changes, or remove it with `git worktree remove --force` and let \
-             jkb recreate it",
-            base.display()
-        );
-        gitrepo::switch_to(&base, onto)?;
-        return Ok(base);
+    match staging::land_dir_in(&worktrees, &ctx.root, onto) {
+        Some(staging::LandDir::Checkout(dir)) => Ok(dir),
+        Some(staging::LandDir::Base(_)) => {
+            // It exists and holds some other branch (or none) — if it held `onto`, the lookup
+            // would have answered `Checkout`. Reuse it: it is a cache, and switching keeps its
+            // build artifacts.
+            //
+            // This is not a second copy of the land gate's dirty rule (that one lives in
+            // `staging::target_dirty_reason` and is asked once, under the lock). It guards the
+            // mutation on the *next* line: `git switch` across branches carries uncommitted
+            // changes over, or refuses outright with a message about neither jkb nor the task.
+            // Hence its own remedy, which is about this scratch checkout rather than about
+            // landing.
+            anyhow::ensure!(
+                gitrepo::is_dirty(&base, &ctx.root)?.is_no(),
+                "{} could not be established as clean — it is jkb's own scratch checkout, so \
+                 commit or discard any changes, or remove it with `git worktree remove --force` \
+                 and let jkb recreate it",
+                base.display()
+            );
+            gitrepo::switch_to(&base, onto)?;
+            Ok(base)
+        }
+        None => {
+            anyhow::ensure!(
+                !base.exists(),
+                "{} exists but git does not know it as a worktree — look at it, then move it \
+                 out of the way (not `git worktree prune`, which drops every checkout this side \
+                 cannot see)",
+                base.display()
+            );
+            if let Some(parent) = base.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            gitrepo::worktree_add(&ctx.root, &base, onto, onto)?;
+            Ok(base)
+        }
     }
-    anyhow::ensure!(
-        !base.exists(),
-        "{} exists but git does not know it as a worktree — look at it, then move it \
-         out of the way (not `git worktree prune`, which drops every checkout this side cannot see)",
-        base.display()
-    );
-    if let Some(parent) = base.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    gitrepo::worktree_add(&ctx.root, &base, onto, onto)?;
-    Ok(base)
 }
 
 /// The last `n` lines of `text` — enough of a failed gate to act on, without replaying the
@@ -4320,12 +4341,6 @@ fn branch_fate(asked_to_delete: bool, present: Fact, reaper_will_act: bool) -> B
     }
 }
 
-/// The `doctor` line for this repo's task sessions. Best-effort: `doctor` is often run
-/// outside a git repo entirely, and that is not a fault to report.
-///
-/// Every session is listed, not just some subset flagged as neglected — nothing here can tell
-/// a session you are working in from one you walked away from (design D36.6), and a report
-/// that guesses would tell you to abandon the work you are doing.
 /// Worktrees a landing disposed of, or could not (design D49).
 ///
 /// Reported by `doctor` because both halves are otherwise invisible: a deferred removal is a
@@ -4473,6 +4488,13 @@ fn fix_worktree_removals(stores: &archive::Stores<'_>) {
     }
 }
 
+/// The `doctor` lines for this repo's task sessions: each one, with the task it carries and how
+/// to resume, land or drop it. Best-effort: `doctor` is often run outside a git repo entirely,
+/// and that is not a fault to report.
+///
+/// Every session is listed, not just some subset flagged as neglected — nothing here can tell
+/// a session you are working in from one you walked away from (design D36.6), and a report
+/// that guesses would tell you to abandon the work you are doing.
 fn report_sessions(kb: &session_cli::Kb<'_>) {
     let Ok(ctx) = repo::repo_ctx() else { return };
     let Ok(sessions) = session::discover(&ctx.root) else {
@@ -4501,6 +4523,61 @@ fn report_sessions(kb: &session_cli::Kb<'_>) {
                 "  {} — no task records {}; `jkb task work <uid>` resumes it, `jkb task abandon \
                  <uid>` drops it, for the task that opened it",
                 s.name, s.branch
+            ),
+        }
+    }
+}
+
+/// The `doctor` lines for directories under this repo's `.jkb/work` that git does not list as
+/// worktrees — directories nothing is tracking.
+///
+/// NOT the deferred-removal report: a removal record names a tree something will finish, and is
+/// reported there. These have no record at all, so a directory a record names is left to that
+/// report rather than counted twice.
+///
+/// REPORTED, NOT DELETED (D34.4). A directory git does not list may be a worktree whose
+/// registration was lost while it still holds the only copy of real work. Only a provable stub —
+/// empty, or an empty `.claude` and nothing else, what a hand-run `git worktree remove` leaves
+/// from inside a sandboxed session — is removed, and only under `--fix`; a stub that refuses (the
+/// session's own answers `EPERM`) is left and said so, never turned into a failure.
+fn report_untracked_sessions(kb: &session_cli::Kb<'_>, fix: bool) {
+    let Ok(ctx) = repo::repo_ctx() else { return };
+    let Some(mut found) = session::untracked(&ctx.root) else {
+        return;
+    };
+    if let Ok(store) = archive::entries(&archive::Stores::new(*kb, None)) {
+        let recorded: Vec<&Path> = store
+            .records
+            .iter()
+            .map(|(_, r)| r.worktree.as_path())
+            .chain(store.rejected.iter().map(|r| r.entry.worktree.as_path()))
+            .collect();
+        found.retain(|u| !recorded.iter().any(|w| session::same_path(w, &u.path)));
+    }
+    if found.is_empty() {
+        return;
+    }
+    println!(
+        "untracked session directories: {} under .jkb/work that git does not list as a worktree",
+        found.len()
+    );
+    for u in &found {
+        let path = u.path.display();
+        match (u.stub, fix) {
+            (true, true) => match session::remove_stub(&u.path) {
+                Ok(()) => println!("  {path} — removed (an empty stub)"),
+                Err(e) => println!(
+                    "  {path} — an empty stub, left: {e} (a session cannot remove its own \
+                     directory; any other process can)"
+                ),
+            },
+            (true, false) => println!(
+                "  {path} — an empty stub (nothing in it but an empty .claude); `jkb doctor --fix` \
+                 removes it"
+            ),
+            (false, _) => println!(
+                "  {path} — holds files: it may be a worktree whose registration was lost; look \
+                 before removing it — jkb will not"
             ),
         }
     }
@@ -4580,11 +4657,13 @@ fn cmd_index(db: &Db, sweep: bool) -> Result<()> {
     // clean without running the whole of `doctor`. Deliberately its own flag rather than
     // something `index` always does: embedding needs a live embedder and this must not.
     if sweep {
-        let removed = sweep_stale(db)?;
-        if removed.is_empty() {
+        // Destructured exhaustively: a new derived index is a compile error here, not a
+        // sweep this message silently under-reports.
+        let jkb_index::StaleRows { vectors } = sweep_stale(db)?;
+        if vectors == 0 {
             println!("index: no stale rows");
         } else {
-            println!("index: removed {} stale vector row(s)", removed.vectors);
+            println!("index: removed {vectors} stale vector row(s)");
         }
         return Ok(());
     }
@@ -4751,6 +4830,41 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The refused-land note says what became of the session on the arm that ran. On the deferred
+    /// arm — a session landing itself — the tree is still where it was, and the note used to say
+    /// it "has been disposed of".
+    #[test]
+    fn a_refused_land_note_says_what_became_of_the_session() {
+        use super::{kept_status_note, Disposal};
+        use crate::archive::{Deferral, Verdict};
+        let deferred = Disposal::Deferred(Deferral {
+            why: "permission denied".to_owned(),
+            verdict: Verdict::Stow,
+            unrecorded: None,
+        });
+        let note = kept_status_note("task:t", "main", "cancelled", "Cancelled.", &deferred);
+        assert!(
+            note.contains("is still where it was"),
+            "deferred arm must say the session is still in place: {note}"
+        );
+        assert!(!note.contains("disposed of"), "{note}");
+        assert!(note
+            .starts_with("note: task:t was left `cancelled` — Cancelled. Its commits are on main"));
+
+        let archived = kept_status_note(
+            "task:t",
+            "main",
+            "cancelled",
+            "Cancelled.",
+            &Disposal::Archived(std::path::PathBuf::from("/a")),
+        );
+        assert!(archived.contains("has been archived"), "{archived}");
+        let gone = kept_status_note("task:t", "main", "cancelled", "x", &Disposal::AlreadyGone);
+        assert!(gone.contains("already gone"), "{gone}");
+        let kept = kept_status_note("task:t", "main", "cancelled", "x", &Disposal::Kept);
+        assert!(kept.contains("was kept"), "{kept}");
+    }
 
     /// THE REPORTING RULE, driven for every outcome. Nothing executed it before: the seam stopped
     /// one level lower, at `sweep_with`, so the loop's own discipline — say what CHANGED — was

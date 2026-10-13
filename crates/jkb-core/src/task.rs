@@ -195,10 +195,10 @@ pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<Ite
         })),
     )?;
 
-    let home = ns::ensure(conn, &task.home)?;
+    let home = ns::ensure(conn, meta, &task.home)?;
     placement::place(conn, meta, item_id, home, PlacementRole::Primary, 0)?;
     for mirror in &task.mirrors {
-        let ns_id = ns::ensure(conn, mirror)?;
+        let ns_id = ns::ensure(conn, meta, mirror)?;
         placement::place(conn, meta, item_id, ns_id, PlacementRole::Reference, 0)?;
     }
 
@@ -270,7 +270,7 @@ pub fn ensure_task_mirror(
         ))
         .into());
     }
-    let ns_id = ns::ensure(conn, &mirror)?;
+    let ns_id = ns::ensure(conn, meta, &mirror)?;
     let exists = conn
         .prepare_cached(
             "SELECT 1 FROM placements WHERE item_id = ?1 AND namespace_id = ?2 LIMIT 1",
@@ -338,25 +338,60 @@ pub fn set_primary_home(
     Ok(())
 }
 
-/// Ensure every task whose Primary home is outside `tasks/` has a `tasks/…` mirror. Backs
-/// the sync-time reconcile (file-backed tasks under `repos/<repo>/…`) and the one-shot
-/// `jkb task mirror`. Idempotent; returns the number of mirrors added.
+/// Ensure every task whose Primary home is outside `tasks/` has a `tasks/…` mirror: the global
+/// repair behind `jkb task mirror`. Idempotent; returns the number of mirrors added.
+///
+/// Sync does not call this: a file's import derives only its own tasks' mirrors
+/// ([`ensure_mirrors_for`]).
 ///
 /// # Errors
 /// Returns an error if a query or placement fails.
 pub fn ensure_all_mirrors(conn: &Connection, meta: &WriteMeta) -> Result<usize> {
-    let tasks: Vec<(ItemId, String)> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT i.id, n.path FROM items i
-             JOIN placements p ON p.item_id = i.id AND p.role = 'primary'
-             JOIN namespaces n ON n.id = p.namespace_id
-             WHERE i.kind = 'task'",
-        )?;
-        let rows = stmt.query_map([], |r| {
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.id, n.path FROM items i
+         JOIN placements p ON p.item_id = i.id AND p.role = 'primary'
+         JOIN namespaces n ON n.id = p.namespace_id
+         WHERE i.kind = 'task'",
+    )?;
+    let tasks = stmt
+        .query_map([], |r| {
             Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    mirror_each(conn, meta, tasks)
+}
+
+/// [`ensure_all_mirrors`] for the tasks among `items` only; other kinds are ignored. Backs the
+/// sync-time reconcile, which passes the items bound to the file it just imported.
+///
+/// Scoped because the reconcile runs once per importing file inside that file's transaction: the
+/// global scan cost a pass over every task in the database per file, and made the file's import
+/// fail — and roll back — on any task anywhere whose mirror cannot be derived (a home at the
+/// namespace limits), however unrelated to the file.
+///
+/// # Errors
+/// Returns an error if a query or placement fails.
+pub fn ensure_mirrors_for(conn: &Connection, meta: &WriteMeta, items: &[ItemId]) -> Result<usize> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.id, n.path FROM items i
+         JOIN placements p ON p.item_id = i.id AND p.role = 'primary'
+         JOIN namespaces n ON n.id = p.namespace_id
+         WHERE i.kind = 'task' AND i.id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let tasks = stmt
+        .query_map(
+            [crate::sql::json_ids(items.iter().map(|id| id.get()))],
+            |r| Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    mirror_each(conn, meta, tasks)
+}
+
+/// [`ensure_task_mirror`] over `(task, home)` pairs, counting the mirrors added.
+fn mirror_each(conn: &Connection, meta: &WriteMeta, tasks: Vec<(ItemId, String)>) -> Result<usize> {
     let mut added = 0;
     for (item, home) in tasks {
         if ensure_task_mirror(conn, meta, item, &home)? {
@@ -378,8 +413,9 @@ pub fn ensure_all_mirrors(conn: &Connection, meta: &WriteMeta) -> Result<usize> 
 /// follow-up task, not handled here).
 ///
 /// A parent bound to a synced `file://` line takes only a child bound to that same file: the file
-/// declares exactly its lines' children, so the next sync would unlink the edge to any other task
-/// and leave its containment row behind.
+/// declares exactly its lines' children, and a child whose line is elsewhere is one it cannot show
+/// (the sync owns only the edges between two of the file's own tasks, so it would keep the edge
+/// and render the parent without it).
 ///
 /// An execution plan or a design span is never a task's parent (design D53.6): a plan's work is
 /// under its steps, and a plan's listing and its *archived* both walk only from the steps, so a task
@@ -413,8 +449,7 @@ pub fn add_subtask(
             if file_of(child)?.as_deref() != Some(file.as_str()) {
                 return Err(Error::Types(TypeError::Validation(format!(
                     "`{}` is a line of {file}, which declares exactly its children: add the task \
-                     under it in the file (a parent edge to a task not in the file is removed by \
-                     the next sync)",
+                     under it in the file (the file cannot show a child whose line is not in it)",
                     p.uid
                 ))));
             }
@@ -424,7 +459,35 @@ pub fn add_subtask(
     // inside the parent. Both here so they cannot drift — this is the only supported way to
     // make a subtask.
     edge::link(conn, meta, parent, child, EdgeType::ParentOf, None)?;
-    crate::containment::contain(conn, meta, child, parent, 0)
+    set_container(conn, meta, child, parent, 0)
+}
+
+/// Make `parent` the container of `child`, at `position` among its siblings, and drop the
+/// `parent_of` edge from the container it leaves, if it had another.
+///
+/// A task has one container, and its `parent_of` edge stands beside that row, so replacing the
+/// row alone left the old parent's edge behind: `jkb related` and the edge listings showed two
+/// parents while the frontier and `ls`, which read containment, showed one. Every replacement of
+/// a task's container goes through here so the two move together; both writes are journalled,
+/// so `jkb undo` puts the old row and its edge back. The caller links `parent`'s own edge (as
+/// [`add_subtask`] does, or the tasks file import before reconciling containment).
+///
+/// # Errors
+/// A validation error from [`crate::containment::contain`] (`child` is `parent` or contains it);
+/// otherwise a database error.
+pub fn set_container(
+    conn: &Connection,
+    meta: &WriteMeta,
+    child: ItemId,
+    parent: ItemId,
+    position: i64,
+) -> Result<()> {
+    if let Some(old) = crate::containment::parent(conn, child)? {
+        if old != parent {
+            edge::unlink(conn, meta, old, child, EdgeType::ParentOf)?;
+        }
+    }
+    crate::containment::contain(conn, meta, child, parent, position)
 }
 
 /// What [`move_under`] did.
@@ -573,11 +636,12 @@ pub fn subtasks_each(
 /// Returns an error if the query fails.
 pub fn subtasks_all_terminal(conn: &Connection, parent: ItemId) -> Result<bool> {
     let open: i64 = conn
-        .prepare_cached(
+        .prepare_cached(concat!(
             "SELECT count(*) FROM containment c JOIN items i ON i.id = c.child_item_id
               WHERE c.parent_item_id = ?1
-                AND i.status IS NOT 'done' AND i.status IS NOT 'cancelled'",
-        )?
+                AND ",
+            jkb_types::sql_not_terminal!("i.status"),
+        ))?
         .query_row([parent.get()], |r| r.get(0))?;
     Ok(open == 0)
 }
@@ -724,12 +788,14 @@ pub fn observe(conn: &Connection, task: ItemId) -> Result<crate::lifecycle::Task
 /// held.
 fn has_open_subtasks(conn: &Connection, task: ItemId) -> Result<bool> {
     Ok(conn
-        .prepare_cached(
+        .prepare_cached(concat!(
             "SELECT 1 FROM containment ct JOIN items c ON c.id = ct.child_item_id
               WHERE ct.parent_item_id = ?1
-                AND c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
+                AND ",
+            jkb_types::sql_not_terminal!("c.status"),
+            "
               LIMIT 1",
-        )?
+        ))?
         .query_row([task.get()], |_| Ok(()))
         .optional()?
         .is_some())
@@ -853,12 +919,14 @@ pub fn set_due(conn: &Connection, meta: &WriteMeta, task: ItemId, due: Option<&s
 /// Returns an error if the query fails.
 pub fn is_blocked(conn: &Connection, task: ItemId) -> Result<bool> {
     let hit: Option<i64> = conn
-        .prepare_cached(
+        .prepare_cached(concat!(
             "SELECT 1 FROM edges e JOIN items d ON e.dst_item_id = d.id
              WHERE e.src_item_id = ?1 AND e.type = 'depends_on'
-               AND d.status IS NOT 'done' AND d.status IS NOT 'cancelled'
+               AND ",
+            jkb_types::sql_not_terminal!("d.status"),
+            "
              LIMIT 1",
-        )?
+        ))?
         .query_row([task.get()], |row| row.get(0))
         .optional()?;
     Ok(hit.is_some())
@@ -1058,6 +1126,40 @@ fn bad(token: &str, expected: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// The SQL spellings of the terminal set, evaluated by `SQLite` itself, agree with
+    /// `TaskStatus::is_terminal` for every status — and `sql_not_terminal!` passes a NULL
+    /// status (a non-task item), which the readiness and blocker anti-joins rely on.
+    #[test]
+    fn sql_terminal_fragments_agree_with_is_terminal_in_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let not_terminal = |s: Option<&str>| -> bool {
+            conn.query_row(
+                concat!(
+                    "SELECT ",
+                    jkb_types::sql_not_terminal!("x"),
+                    " FROM (SELECT ?1 AS x)"
+                ),
+                [s],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let in_list = |s: &str| -> bool {
+            conn.query_row(
+                concat!("SELECT ?1 IN ", jkb_types::sql_terminal_list!()),
+                [s],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        for status in jkb_types::TaskStatus::ALL {
+            let s = status.as_str();
+            assert_eq!(in_list(s), status.is_terminal(), "{s}");
+            assert_eq!(not_terminal(Some(s)), !status.is_terminal(), "{s}");
+        }
+        assert!(not_terminal(None));
+    }
+
     /// `ready_ids` is the frontier `ready` lists, in `ready`'s order, cut by its limit — over mixed
     /// priorities, due dates and nulls, where the tie-breaks are. And `ready`'s own load takes more
     /// ids than `SQLite` has variables.
@@ -1271,7 +1373,7 @@ mod tests {
 
         // Re-home to a different repo subtree; the stale `tasks/jkb/a` mirror must go.
         db.write_txn("t", move |conn, meta| {
-            let dst = ns::ensure(conn, "repos/jkb/b")?;
+            let dst = ns::ensure(conn, meta, "repos/jkb/b")?;
             set_primary_home(conn, meta, id, dst, 0)
         })
         .unwrap();

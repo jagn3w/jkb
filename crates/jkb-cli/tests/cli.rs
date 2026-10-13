@@ -337,6 +337,652 @@ fn task_edit_appends_a_body_to_a_file_backed_task_but_refuses_a_blank_line() {
         .stdout(predicate::str::contains("appended"));
 }
 
+/// A `needs:^id` word in a file-backed task's text is refused: in the file the id may exist, and the
+/// line would read back as a dependency the knowledge base does not have — a disagreement no later
+/// sync would report. A `needs:` the file itself names but cannot resolve is parked on the task, not
+/// kept in its text, so the task is held to its line like any other: a write the line cannot carry is
+/// refused, and every other write lands with the reference kept on the line.
+#[test]
+fn a_needs_word_in_a_file_backed_tasks_text_is_refused_and_a_parked_one_holds_its_line() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = dir.path().canonicalize().unwrap().join("proj");
+    std::fs::create_dir_all(&repo).unwrap();
+    let file = repo.join("tasks.md");
+    let text = "## Backend\n- [ ] Set up CI ^setup\n- [ ] Fix flaky test needs:^ghost ^fix\n\
+                - [ ] Ship button ^ship\n";
+    std::fs::write(&file, text).unwrap();
+    jkb(&db)
+        .args([
+            "mount",
+            "create",
+            "work",
+            repo.to_str().unwrap(),
+            "--serializer",
+            "tasks",
+        ])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["sync", "work"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("needs:^ghost"));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+    let uid = |id: &str| format!("file://{}#{id}", file.display());
+    let shown = |id: &str| {
+        let out = jkb(&db)
+            .args(["--json", "task", "show", &uid(id)])
+            .output()
+            .unwrap();
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    let fix = shown("fix");
+    assert_eq!(fix["content"], "Fix flaky test", "{fix}");
+    assert_eq!(
+        fix["unresolved_needs"],
+        serde_json::json!(["ghost"]),
+        "{fix}"
+    );
+    jkb(&db)
+        .args(["task", "show", &uid("fix")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("needs:     ^ghost"));
+
+    // The edit that would leave the file and the knowledge base disagreeing is refused.
+    jkb(&db)
+        .args(["task", "edit", &uid("ship"), "Ship button needs:^setup"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("`needs:^id` dependency"))
+        .stderr(predicate::str::contains("jkb task depend"));
+    assert_eq!(shown("ship")["content"], "Ship button");
+
+    // A value the line cannot carry is refused on the task with a parked reference, as on any other.
+    for id in ["fix", "ship"] {
+        jkb(&db)
+            .args(["task", "tag", "add", &uid(id), "area=a b"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("would not come back"));
+        jkb(&db)
+            .args(["task", "set", &uid(id), "--due", "next week"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("would not come back"));
+    }
+    jkb(&db).args(["sync", "work"]).assert().success();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+
+    // Every write the line can carry lands, and the reference stays on the line.
+    jkb(&db)
+        .args(["task", "edit", &uid("fix"), "--append", "seen in CI"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args([
+            "task",
+            "set",
+            &uid("fix"),
+            "--status",
+            "in_progress",
+            "--priority",
+            "1",
+        ])
+        .assert()
+        .success();
+    assert_eq!(shown("fix")["content"], "Fix flaky test\nseen in CI");
+    jkb(&db).args(["sync", "work"]).assert().success();
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        on_disk.contains("- [~] Fix flaky test !p1 needs:^ghost ^fix\n  seen in CI\n"),
+        "{on_disk}"
+    );
+    assert_eq!(
+        shown("fix")["unresolved_needs"],
+        serde_json::json!(["ghost"])
+    );
+}
+
+/// Two `tasks` mounts, `work` over `proj/tasks.md` (whose `^fix` and `^ship` name tasks it does
+/// not define) and `oth` over `other/tasks.md` (which defines `^ghost`), both synced once. Returns
+/// the database and the two files.
+fn two_tasks_files(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let db = db_path(dir);
+    let root = dir.path().canonicalize().unwrap();
+    let (proj, other) = (root.join("proj"), root.join("other"));
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let (pfile, ofile) = (proj.join("tasks.md"), other.join("tasks.md"));
+    std::fs::write(
+        &pfile,
+        "## Backend\n- [ ] Fix flaky test needs:^ghost needs:^phantom ^fix\n\
+         - [ ] Ship button needs:^later ^ship\n",
+    )
+    .unwrap();
+    std::fs::write(&ofile, "## X\n- [ ] Ghost ^ghost\n").unwrap();
+    for (name, path) in [("work", &proj), ("oth", &other)] {
+        jkb(&db)
+            .args(["mount", "create", name, path.to_str().unwrap()])
+            .args(["--serializer", "tasks"])
+            .assert()
+            .success();
+        jkb(&db).args(["sync", name]).assert().success();
+    }
+    (db, pfile, ofile)
+}
+
+/// `jkb --json task show <uid>`.
+fn task_json(db: &Path, uid: &str) -> serde_json::Value {
+    let out = jkb(db)
+        .args(["--json", "task", "show", uid])
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// What `jkb task next` offers, across every namespace.
+fn ready_tasks(db: &Path) -> String {
+    let out = jkb(db).args(["--global", "task", "next"]).output().unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// A parked `needs:^id` becomes the dependency it names as soon as its task is moved into a
+/// tasks.md that defines the id, without the line being edited. It used to stay parked until the
+/// next disk edit, so the file read `needs:^ghost` beside `- [ ] Ghost ^ghost` while the store had
+/// no edge, `task next` offered the task as ready and the sync said the file was up to date.
+#[test]
+fn a_parked_needs_resolves_when_its_task_moves_into_a_file_that_defines_the_id() {
+    let dir = TempDir::new().unwrap();
+    let (db, pfile, ofile) = two_tasks_files(&dir);
+    let fix = format!("file://{}#fix", pfile.display());
+    assert!(ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
+
+    // The first sync of the file that defines `^ghost` records the dependency, keeps `^phantom`
+    // parked, and leaves the line as the file reads it.
+    jkb(&db)
+        .args(["task", "place", &fix, "oth/tasks.md/x", "--home"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "bind", &fix, "--sync"])
+        .arg(format!("file://{}#fix", ofile.display()))
+        .assert()
+        .success();
+    jkb(&db).args(["sync", "oth"]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(&ofile).unwrap(),
+        "## X\n- [ ] Ghost ^ghost\n- [ ] Fix flaky test needs:^ghost needs:^phantom ^fix\n"
+    );
+    let moved = task_json(&db, &fix);
+    assert_eq!(
+        moved["unresolved_needs"],
+        serde_json::json!(["phantom"]),
+        "{moved}"
+    );
+    assert!(!ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
+    jkb(&db)
+        .args(["sync", "oth"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 up-to-date"));
+
+    // The heal is undone with the sync that recorded it, and the next sync records it again.
+    jkb(&db).arg("undo").assert().success();
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!(["ghost", "phantom"])
+    );
+    assert!(ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
+    sync_ok(&db, "oth");
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!(["phantom"])
+    );
+    assert!(!ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
+
+    // The file and the knowledge base agree from either side: the dependency survives the line
+    // being re-read from disk.
+    std::fs::write(
+        &ofile,
+        "## X\n- [ ] Ghost ^ghost\n- [ ] Fix flaky test !p2 needs:^ghost needs:^phantom ^fix\n",
+    )
+    .unwrap();
+    jkb(&db).args(["sync", "oth"]).assert().success();
+    assert!(!ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
+}
+
+/// The other direction: the task a parked `needs:^id` names is bound into the file holding it.
+#[test]
+fn a_parked_needs_resolves_when_the_named_task_is_bound_into_its_file() {
+    let dir = TempDir::new().unwrap();
+    let (db, pfile, _) = two_tasks_files(&dir);
+    let ship = format!("file://{}#ship", pfile.display());
+    let later = jkb(&db)
+        .args([
+            "--json",
+            "task",
+            "add",
+            "Do it later +work/tasks.md/backend",
+        ])
+        .output()
+        .unwrap();
+    let later: serde_json::Value = serde_json::from_slice(&later.stdout).unwrap();
+    let later = later["uid"].as_str().expect("a uid").to_owned();
+    jkb(&db)
+        .args(["task", "bind", &later, "--sync"])
+        .arg(format!("file://{}#later", pfile.display()))
+        .assert()
+        .success();
+    jkb(&db).args(["sync", "work"]).assert().success();
+    let healed = task_json(&db, &ship);
+    assert_eq!(
+        healed["unresolved_needs"],
+        serde_json::json!([]),
+        "{healed}"
+    );
+    assert!(!ready_tasks(&db).contains("#ship"), "{}", ready_tasks(&db));
+}
+
+/// A task rebound `--managed` keeps a parked need, the only record of what its line said it
+/// needed, and `task show` says it is parked outside any tasks.md rather than naming one.
+#[test]
+fn a_task_rebound_managed_keeps_its_parked_needs_and_says_where_they_stand() {
+    let dir = TempDir::new().unwrap();
+    let (db, pfile, _) = two_tasks_files(&dir);
+    let fix = format!("file://{}#fix", pfile.display());
+    jkb(&db)
+        .args(["task", "show", &fix])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("named in its tasks.md"));
+    jkb(&db)
+        .args(["task", "bind", &fix, "--managed"])
+        .assert()
+        .success();
+    let managed = task_json(&db, &fix);
+    assert_eq!(
+        managed["unresolved_needs"],
+        serde_json::json!(["ghost", "phantom"]),
+        "{managed}"
+    );
+    assert_eq!(managed["needs_outside_tasks_file"], true, "{managed}");
+    jkb(&db)
+        .args(["task", "show", &fix])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("this task is in no tasks.md"))
+        .stdout(predicate::str::contains("named in its tasks.md").not());
+}
+
+/// `jkb sync <mount>`, asserting no file failed; returns whether it exited zero, and its output.
+fn sync_run(db: &Path, mount: &str) -> (bool, String) {
+    let out = jkb(db).args(["sync", mount]).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains(" 0 failed"), "{text}");
+    (out.status.success(), text)
+}
+
+/// [`sync_run`], asserting it exited zero.
+fn sync_ok(db: &Path, mount: &str) -> String {
+    let (ok, text) = sync_run(db, mount);
+    assert!(ok, "{text}");
+    text
+}
+
+/// A parked need whose dependency would close a cycle stays parked, with a warning, and the file
+/// keeps syncing. Here `^ghost`'s parked `needs:^fix` and `^fix`'s parked `needs:^ghost` both come
+/// to name tasks of one file when `^fix` moves in: resolving both is a cycle. Resolving them
+/// regardless made `edge::link` refuse inside the reconcile, so the file failed on every pass, its
+/// journal never flagged, and no edit to the file could clear it, because the need was in the store.
+#[test]
+fn a_parked_needs_that_would_close_a_cycle_stays_parked_and_the_file_still_syncs() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let root = dir.path().canonicalize().unwrap();
+    let (proj, other) = (root.join("proj"), root.join("other"));
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let (pfile, ofile) = (proj.join("tasks.md"), other.join("tasks.md"));
+    std::fs::write(
+        &pfile,
+        "## Backend\n- [ ] Fix flaky test needs:^ghost ^fix\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &ofile,
+        "## X\n- [ ] Ghost needs:^fix ^ghost\n- [ ] Other ^oth1\n",
+    )
+    .unwrap();
+    for (name, path) in [("work", &proj), ("oth", &other)] {
+        jkb(&db)
+            .args(["mount", "create", name, path.to_str().unwrap()])
+            .args(["--serializer", "tasks"])
+            .assert()
+            .success();
+        sync_ok(&db, name);
+    }
+    let fix = format!("file://{}#fix", pfile.display());
+    let ghost = format!("file://{}#ghost", ofile.display());
+    jkb(&db)
+        .args(["task", "place", &fix, "oth/tasks.md/x", "--home"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "bind", &fix, "--sync"])
+        .arg(format!("file://{}#fix", ofile.display()))
+        .assert()
+        .success();
+
+    // One need resolves (the first by local id); the one that would close the cycle stays parked
+    // and is named.
+    let first = sync_ok(&db, "oth");
+    assert!(
+        first.contains("`^ghost`: `needs:^fix` would close a dependency cycle"),
+        "{first}"
+    );
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        task_json(&db, &ghost)["unresolved_needs"],
+        serde_json::json!(["fix"])
+    );
+    let text = std::fs::read_to_string(&ofile).unwrap();
+    assert!(
+        text.contains("- [ ] Fix flaky test needs:^ghost ^fix"),
+        "{text}"
+    );
+
+    // The file now holds both `needs:` words, which its parser reads as an in-file dependency cycle
+    // once both ids are in it, and an in-file cycle quarantines (`docs/file-sync.md`): flagged, never
+    // failed, so the file is not overwritten and its last good tasks are kept, with or without an
+    // edit elsewhere in it.
+    for edit in [None, Some(("Other ^oth1", "Other edited ^oth1"))] {
+        if let Some((from, to)) = edit {
+            std::fs::write(&ofile, text.replace(from, to)).unwrap();
+        }
+        let (ok, out) = sync_run(&db, "oth");
+        assert!(!ok && out.contains("1 quarantined"), "{out}");
+        assert!(out.contains("needs attention"), "{out}");
+    }
+
+    // Breaking the cycle on disk imports, and the need the disk dropped is not brought back.
+    let broken = std::fs::read_to_string(&ofile)
+        .unwrap()
+        .replace("Ghost needs:^fix ^ghost", "Ghost ^ghost");
+    std::fs::write(&ofile, &broken).unwrap();
+    let healed = sync_ok(&db, "oth");
+    assert!(healed.contains("1 imported"), "{healed}");
+    assert!(!healed.contains("cycle"), "{healed}");
+    sync_ok(&db, "oth");
+    assert_eq!(std::fs::read_to_string(&ofile).unwrap(), broken);
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!([])
+    );
+    let ready = ready_tasks(&db);
+    assert!(
+        ready.contains("#ghost") && !ready.contains("#fix"),
+        "{ready}"
+    );
+    let other = jkb(&db)
+        .args(["task", "show"])
+        .arg(format!("file://{}#oth1", ofile.display()))
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&other.stdout).contains("Other edited"),
+        "the unrelated edit came in with the fix"
+    );
+}
+
+/// A parked need whose dependency would close a cycle through edges outside its file stays parked:
+/// `^ghost` waits on a task in no file, which waits on `^fix`.
+#[test]
+fn a_parked_needs_closing_a_cycle_through_another_file_stays_parked() {
+    let dir = TempDir::new().unwrap();
+    let (db, pfile, ofile) = two_tasks_files(&dir);
+    let fix = format!("file://{}#fix", pfile.display());
+    let ghost = format!("file://{}#ghost", ofile.display());
+    let out = jkb(&db)
+        .args(["--json", "task", "add", "Between"])
+        .output()
+        .unwrap();
+    let between: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let between = between["uid"].as_str().expect("a uid").to_owned();
+    for (task, dep) in [(&ghost, &between), (&between, &fix)] {
+        jkb(&db)
+            .args(["task", "depend", task, dep])
+            .assert()
+            .success();
+    }
+    jkb(&db)
+        .args(["task", "place", &fix, "oth/tasks.md/x", "--home"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "bind", &fix, "--sync"])
+        .arg(format!("file://{}#fix", ofile.display()))
+        .assert()
+        .success();
+    let first = sync_ok(&db, "oth");
+    assert!(
+        first.contains("`^fix`: `needs:^ghost` would close a dependency cycle"),
+        "{first}"
+    );
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!(["ghost", "phantom"])
+    );
+    let again = sync_ok(&db, "oth");
+    assert!(again.contains("1 up-to-date"), "{again}");
+
+    // An edit elsewhere in the file imports without failing. The import reads `needs:^ghost` off
+    // the line as a dependency between two of the file's tasks, and recording it would close the
+    // cycle through `^ghost`'s dependency on `Between`, which the import does not own and keeps:
+    // so the need stays parked, with the same warning, rather than failing the file.
+    let text = std::fs::read_to_string(&ofile).unwrap();
+    std::fs::write(&ofile, text.replace("- [ ] Ghost", "- [ ] Ghost town")).unwrap();
+    let edited = sync_ok(&db, "oth");
+    assert!(edited.contains("1 imported"), "{edited}");
+    assert!(
+        edited.contains("`^fix`: `needs:^ghost` would close a dependency cycle"),
+        "{edited}"
+    );
+    assert_eq!(
+        task_json(&db, &fix)["unresolved_needs"],
+        serde_json::json!(["ghost", "phantom"])
+    );
+    let ready = ready_tasks(&db);
+    assert!(
+        ready.contains("#fix") && !ready.contains("#ghost"),
+        "`^ghost` still waits on `Between`: {ready}"
+    );
+    let settled = sync_ok(&db, "oth");
+    assert!(settled.contains("1 up-to-date"), "{settled}");
+}
+
+/// A disk edit that adds a `needs:^id` closing a cycle through a dependency the file does not own
+/// is warned about on the very import that parks it, though the pass started with no cycle to warn
+/// about.
+#[test]
+fn a_disk_need_closing_a_cycle_is_warned_about_on_its_own_import() {
+    let dir = TempDir::new().unwrap();
+    let (db, _pfile, ofile) = two_tasks_files(&dir);
+    std::fs::write(&ofile, "## X\n- [ ] Ghost ^ghost\n- [ ] Fix ^fx\n").unwrap();
+    sync_ok(&db, "oth");
+    let (ghost, fx) = (
+        format!("file://{}#ghost", ofile.display()),
+        format!("file://{}#fx", ofile.display()),
+    );
+    let between = add_task(&db, "Between");
+    for (task, dep) in [(&ghost, &between), (&between, &fx)] {
+        jkb(&db)
+            .args(["task", "depend", task, dep])
+            .assert()
+            .success();
+    }
+    let quiet = sync_ok(&db, "oth");
+    assert!(!quiet.contains("cycle"), "{quiet}");
+
+    std::fs::write(
+        &ofile,
+        "## X\n- [ ] Ghost ^ghost\n- [ ] Fix needs:^ghost ^fx\n",
+    )
+    .unwrap();
+    let edited = sync_ok(&db, "oth");
+    assert!(edited.contains("1 imported"), "{edited}");
+    assert!(
+        edited.contains("`^fx`: `needs:^ghost` would close a dependency cycle"),
+        "{edited}"
+    );
+    assert_eq!(
+        task_json(&db, &fx)["unresolved_needs"],
+        serde_json::json!(["ghost"])
+    );
+}
+
+/// A dependency recorded with `jkb task depend` from a filed task to a task outside its file is
+/// not one the file can express, so importing the file keeps it. The import used to reset each
+/// filed task's dependencies to the in-file ones, dropping it on any unrelated edit to the file and
+/// putting the task back on the frontier.
+#[test]
+fn an_import_keeps_a_filed_tasks_dependency_on_a_task_outside_its_file() {
+    let dir = TempDir::new().unwrap();
+    let (db, _pfile, ofile) = two_tasks_files(&dir);
+    let ghost = format!("file://{}#ghost", ofile.display());
+    let between = add_task(&db, "Between");
+    assert!(ready_tasks(&db).contains("#ghost"), "{}", ready_tasks(&db));
+    jkb(&db)
+        .args(["task", "depend", &ghost, &between])
+        .assert()
+        .success();
+    assert!(!ready_tasks(&db).contains("#ghost"), "{}", ready_tasks(&db));
+
+    let text = std::fs::read_to_string(&ofile).unwrap();
+    std::fs::write(&ofile, text.replace("- [ ] Ghost", "- [ ] Ghost town")).unwrap();
+    let edited = sync_ok(&db, "oth");
+    assert!(edited.contains("1 imported"), "{edited}");
+    assert!(
+        !ready_tasks(&db).contains("#ghost"),
+        "the dependency survived the import: {}",
+        ready_tasks(&db)
+    );
+}
+
+/// The uids of the items with a `parent_of` edge into `uid`, from `jkb related`.
+fn parent_edges_into(db: &Path, uid: &str) -> Vec<String> {
+    let out = jkb(db)
+        .args([
+            "--json",
+            "related",
+            uid,
+            "--direction",
+            "in",
+            "--edge",
+            "parent_of",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut uids: Vec<String> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["uid"].as_str().map(str::to_owned))
+        .collect();
+    uids.sort();
+    uids
+}
+
+/// A filed task given a container outside its file (`jkb task add --sync --under`) and then
+/// indented under another of the file's tasks moves to the file's parent, and the outside parent's
+/// `parent_of` edge goes with its containment row: the import used to replace only the row, so the
+/// edge named a second parent the frontier and `ls` no longer agreed with. `jkb undo` of the import
+/// brings both back, and the next sync finds the file up to date.
+#[test]
+fn a_file_parent_replaces_an_outside_container_with_its_edge() {
+    let dir = TempDir::new().unwrap();
+    let (db, _pfile, ofile) = two_tasks_files(&dir);
+    let outside = add_task(&db, "Outside");
+    let out = jkb(&db)
+        .args(["--json", "task", "add", "Kid", "+oth/tasks.md/x", "--sync"])
+        .args(["--under", &outside])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let kid = v["uid"].as_str().unwrap().to_owned();
+    sync_ok(&db, "oth");
+    let ghost = task_json(&db, &format!("file://{}#ghost", ofile.display()))["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let subtasks = |parent: &str| -> Vec<String> {
+        let out = jkb(&db)
+            .args(["--json", "task", "subtasks", parent])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["ref"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let outside_held = || {
+        assert_eq!(subtasks(&outside), [kid.as_str()]);
+        assert!(subtasks(&ghost).is_empty());
+        assert_eq!(parent_edges_into(&db, &kid), [outside.as_str()]);
+    };
+    outside_held();
+
+    let text = std::fs::read_to_string(&ofile).unwrap();
+    assert!(text.contains("\n- [ ] Kid "), "{text}");
+    std::fs::write(&ofile, text.replace("\n- [ ] Kid ", "\n  - [ ] Kid ")).unwrap();
+    let file_held = || {
+        assert_eq!(subtasks(&ghost), [kid.as_str()]);
+        assert!(subtasks(&outside).is_empty());
+        assert_eq!(
+            parent_edges_into(&db, &kid),
+            [ghost.as_str()],
+            "the outside parent's edge left with its row"
+        );
+    };
+    let edited = sync_ok(&db, "oth");
+    assert!(edited.contains("1 imported"), "{edited}");
+    file_held();
+    let settled = sync_ok(&db, "oth");
+    assert!(settled.contains("1 up-to-date"), "{settled}");
+
+    // The settled pass wrote nothing, so the import is the last change, and undoing it puts the
+    // outside container back with its edge.
+    jkb(&db).arg("undo").assert().success();
+    outside_held();
+}
+
 #[test]
 fn ns_ls_shows_created_namespaces() {
     let dir = TempDir::new().unwrap();
@@ -433,6 +1079,28 @@ fn task_set_status_priority_due_roundtrips_and_is_undoable() {
 
     // The last mutation (set due) is undoable like any other write.
     jkb(&db).args(["undo"]).assert().success();
+}
+
+/// `jkb undo` after `jkb task set --status` puts the status back. It used to reach past the
+/// status change, which it could not invert, and revert the task's creation instead — deleting
+/// the task and reporting success.
+#[test]
+fn undo_after_a_status_change_restores_the_status_rather_than_deleting_the_task() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let uid = add_task(&db, "a task whose status is undone");
+
+    jkb(&db)
+        .args(["task", "set", &uid, "--status", "in_progress"])
+        .assert()
+        .success();
+    jkb(&db).args(["undo"]).assert().success();
+
+    assert_eq!(
+        task_status(&db, &uid),
+        "open",
+        "undo did not restore the status (task_status also fails if the task was deleted)"
+    );
 }
 
 #[test]
@@ -5221,6 +5889,106 @@ fn a_plan_is_built_and_played_through_the_cli() {
         .stdout(predicate::str::contains(&plan_uid));
 }
 
+/// `jkb task show` names the plan step, plan and design a task sits under — and the root when the
+/// plan's design is nested — in both outputs; a subtask reports its parent's; a task under no
+/// design shows none of it, without an error.
+#[test]
+fn task_show_names_the_step_plan_and_design_a_task_sits_under() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = jkb(&db).arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let uid_of = |v: serde_json::Value| v["uid"].as_str().unwrap().to_owned();
+    let root = uid_of(json(&["design", "create", "Factory", "--repo", "jkb"]));
+    let child = uid_of(json(&["design", "create", "Storage", "--repo", "jkb"]));
+    jkb(&db)
+        .args(["design", "mv", &child, "--under", &root])
+        .assert()
+        .success();
+    let plan = json(&[
+        "design", "plan", "create", &child, "First", "cut", "--step", "scaffold", "--step",
+        "database",
+    ]);
+    let plan_uid = plan["uid"].as_str().unwrap().to_owned();
+    let step = plan["steps"][1]["uid"].as_str().unwrap().to_owned();
+    let task = uid_of(json(&[
+        "task",
+        "add",
+        "Build",
+        "the",
+        "schema",
+        "--under",
+        &step,
+        "--managed",
+    ]));
+    let sub = uid_of(json(&[
+        "task",
+        "add",
+        "Write",
+        "a",
+        "migration",
+        "--under",
+        &task,
+        "--managed",
+    ]));
+
+    for t in [&task, &sub] {
+        let shown = json(&["task", "show", t]);
+        let place = &shown["place"];
+        assert_eq!(place["step"]["uid"], step.as_str(), "{shown}");
+        assert_eq!(place["step"]["title"], "database");
+        assert_eq!(place["step"]["number"], 2);
+        assert_eq!(place["plan"]["uid"], plan_uid.as_str());
+        assert_eq!(place["plan"]["title"], "First cut");
+        assert_eq!(place["design"]["uid"], child.as_str());
+        assert_eq!(place["design"]["title"], "Storage");
+        assert_eq!(place["root"]["uid"], root.as_str());
+        assert_eq!(place["root"]["title"], "Factory");
+        // Additive: the fields consumers already read are still there.
+        assert_eq!(shown["uid"], t.as_str());
+        jkb(&db)
+            .args(["task", "show", t])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "plan:      First cut · step 2. database ({step})"
+            )))
+            .stdout(predicate::str::contains(format!(
+                "design:    Storage ({child}), under Factory ({root})"
+            )));
+    }
+
+    let loose = uid_of(json(&["task", "add", "Loose", "end", "--managed"]));
+    assert!(json(&["task", "show", &loose])["place"].is_null());
+    jkb(&db)
+        .args(["task", "show", &loose])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("plan:").not())
+        .stdout(predicate::str::contains("design:").not());
+
+    // Remote mode: the same answer crosses the daemon's wire, from the op and not a client read.
+    let token = dir.path().join("daemon/token");
+    let (_serve, url) = Daemon::start(&db, &token);
+    let out = assert_cmd::Command::from_std(jkb_bare())
+        .env("HOME", dir.path())
+        .env("JKB_REMOTE", &url)
+        .env("JKB_REMOTE_TOKEN_FILE", &token)
+        .env_remove("JKB_DB")
+        .args(["--json", "task", "show", &sub])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let remote: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(remote["place"]["step"]["uid"], step.as_str(), "{remote}");
+    assert_eq!(remote["place"]["root"]["uid"], root.as_str(), "{remote}");
+}
+
 /// Design prompts (D53.6) through the CLI: the *New prompt* text, a launch recording its session
 /// from the directory it runs in, and the listing with the command that resumes it.
 #[test]
@@ -5722,4 +6490,58 @@ fn ls_of_a_path_that_names_nothing_fails_rather_than_listing_empty() {
         .assert()
         .success()
         .stdout(predicate::str::contains("(empty)"));
+}
+
+/// Run `cmd` with its stdout a pipe whose reader has already gone, as `jkb … | sed 1q` leaves it.
+fn output_into_a_closed_pipe(mut cmd: Command) -> std::process::Output {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    cmd.stdout(writer)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+/// What a shell reports for a process `SIGPIPE` killed, which is what `cat` gives in the same spot.
+const CLOSED_PIPE_STATUS: i32 = 141;
+
+#[test]
+fn printing_into_a_closed_pipe_ends_quietly() {
+    // `println!` panics on a closed stdout ("failed printing to stdout: Broken pipe") unless
+    // something catches it: status 101 and a panic report on stderr.
+    let mut cmd = jkb_bare();
+    cmd.args(["notify", "topic"]);
+    let out = output_into_a_closed_pipe(cmd);
+    assert_eq!(out.status.code(), Some(CLOSED_PIPE_STATUS), "{out:?}");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn writing_bytes_into_a_closed_pipe_ends_quietly() {
+    // `blob cat` writes with `write_all`, whose error comes back up through `run` rather than as
+    // a panic — the other path a closed stdout can take.
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let bytes = b"a blob to print\n".repeat(64);
+    let hash = jkb_core::blob::hash_bytes(&bytes);
+    {
+        let store = jkb_core::Db::open(&db).unwrap();
+        let (h, b) = (hash.clone(), bytes.clone());
+        store
+            .write_txn("t", move |c, _| jkb_core::blob::store(c, &h, &b, None))
+            .unwrap();
+    }
+    let mut cmd = jkb(&db);
+    cmd.args(["blob", "cat", &hash]);
+    let out = output_into_a_closed_pipe(cmd);
+    assert_eq!(out.status.code(), Some(CLOSED_PIPE_STATUS), "{out:?}");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

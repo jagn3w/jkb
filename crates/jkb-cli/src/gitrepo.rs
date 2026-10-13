@@ -91,6 +91,11 @@ const SAFE_SUBCOMMANDS: &[&str] = &[
     "merge",
     "rebase",
     "reset",
+    // Ref plumbing only: it reads and writes `refs/`, never an index or a work tree. Measured on
+    // git 2.51.1 by `jkb_s_git_does_not_run_a_submodule_s_config` — and by hand without jkb's
+    // settings at all, where a bare superproject `git status` ran the planted filter and a bare
+    // `git update-ref -d` did not.
+    "update-ref",
 ];
 
 /// Where the subcommand is in `args`: past any leading `-c <key>=<value>` pairs, the one global
@@ -276,6 +281,28 @@ pub(crate) fn audit_repo_config(dir: &Path) -> Result<()> {
     check_repo_config(dir)
 }
 
+/// [`check_repo_config`]'s refusal when git cannot read a repository's config at all — a config it
+/// cannot parse, or a `.git` file naming a git directory that is gone. Nothing in it was judged, so
+/// it is not a finding of a planted key, and the reap scan words it apart ([`crate::git_audit`]).
+#[derive(Debug)]
+pub(crate) struct ConfigUnreadable {
+    dir: PathBuf,
+    git_says: String,
+}
+
+impl std::fmt::Display for ConfigUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "git could not read the config for {}: {}",
+            self.dir.display(),
+            self.git_says
+        )
+    }
+}
+
+impl std::error::Error for ConfigUnreadable {}
+
 /// [`audit_repo_config`]'s check — also what the reap service's scan asks of every repository
 /// (`git_audit`), so the two cannot come to disagree.
 ///
@@ -290,12 +317,13 @@ pub(crate) fn check_repo_config(dir: &Path) -> Result<()> {
     .with_context(|| format!("reading {}'s git config", dir.display()))?;
     // Outside any repository `config --list` still lists the operator's own scopes and succeeds; a
     // failure is a config git cannot parse, which is no more trustworthy than a planted one.
-    anyhow::ensure!(
-        out.status.success(),
-        "git could not read the config for {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
+    if !out.status.success() {
+        return Err(ConfigUnreadable {
+            dir: dir.to_path_buf(),
+            git_says: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        }
+        .into());
+    }
     let layout = check_layout(dir)?;
     let git_dir = layout.as_ref().map(|(git_dir, _)| git_dir.clone());
     let repo = layout.and_then(|(_, common)| common.parent().map(Path::to_path_buf));
@@ -1258,6 +1286,18 @@ fn git(dir: &Path, args: &[&str]) -> Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()))
 }
 
+/// Whether the repository containing `dir` has a remote called `name` (one with a URL).
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn has_remote(dir: &Path, name: &str) -> Result<bool> {
+    valid_ref(name)?;
+    Ok(
+        git(dir, &["config", "--get", &format!("remote.{name}.url")])?
+            .is_some_and(|url| !url.is_empty()),
+    )
+}
+
 /// The repository root containing `dir`, or `None` if it is not inside a work tree.
 ///
 /// # Errors
@@ -1465,25 +1505,6 @@ pub fn worktrees(dir: &Path) -> Result<Option<Vec<Worktree>>> {
     Ok(Some(out))
 }
 
-/// The worktree in which `branch` is currently checked out, if any. `git` refuses to check
-/// one branch out twice, so this is what decides whether a land can borrow an existing
-/// checkout or must make its own.
-///
-/// # Errors
-/// Returns an error if `git` cannot be executed.
-pub fn worktree_for_branch(dir: &Path, branch: &str) -> Result<Option<PathBuf>> {
-    valid_ref(branch)?;
-    // A DELIBERATE collapse, and the safe direction here: this decides whether a land may borrow
-    // an existing checkout, and "no" means it cuts its own — which git then refuses outright if
-    // the branch really is checked out somewhere. A wrong `None` costs a refusal with git's own
-    // message; it cannot make a land graft into a checkout it does not own.
-    Ok(worktrees(dir)?
-        .unwrap_or_default()
-        .into_iter()
-        .find(|w| w.branch.as_deref() == Some(branch))
-        .map(|w| w.path))
-}
-
 /// Drop git's registration of the worktree at `path`, whose directory is gone.
 ///
 /// **This path only — never `git worktree prune`.** Prune drops every registration whose directory
@@ -1511,8 +1532,12 @@ pub fn forget_worktree(dir: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Add a worktree at `path` checked out to `branch`, creating that branch from `start` when
-/// it does not exist yet.
+/// Add a worktree at `path` checked out to `branch`. A local `branch` is used as it is; when
+/// there is none, it is created from an existing remote-tracking `origin/<branch>` if there is
+/// one — **in preference to `start`** — and from `start` only when neither exists. This is
+/// [`ensure_branch`]'s rule (adopt the remote, because a session branch may already carry pushed
+/// work), not [`create_branch`]'s: a caller that needs the branch to begin exactly at `start`
+/// must not use this.
 ///
 /// # Errors
 /// Returns an error if `git` cannot be executed or refuses to create the worktree.
@@ -1692,27 +1717,78 @@ pub fn branch_name(dir: &Path, name: &str) -> Result<BranchName> {
 /// created.
 ///
 /// # Errors
-/// Returns an error if `git` cannot be executed or refuses to create the branch.
+/// Returns an error if `git` cannot be executed or refuses to create the branch — naming the race
+/// when the branch was proven absent and then appeared while this was creating it.
 pub fn create_branch(dir: &Path, branch: &str, start: &str) -> Result<bool> {
+    create_branch_between(dir, branch, start, || {})
+}
+
+/// [`create_branch`], running `between` after the existence check and before `git branch` — the
+/// window a concurrent creator lands in, held open by the test that pins the race's wording.
+fn create_branch_between(
+    dir: &Path,
+    branch: &str,
+    start: &str,
+    between: impl FnOnce(),
+) -> Result<bool> {
     valid_ref(branch)?;
     valid_ref(start)?;
     // Proven present, or attempt it: `git branch` refuses an existing branch on its own, so an
     // unestablished answer costs a clear git error rather than a silent wrong turn.
-    if has_branch(dir, branch)?.is_yes() {
+    let before = has_branch(dir, branch)?;
+    if before.is_yes() {
         return Ok(false);
     }
-    git_must(dir, &["branch", branch, start])?;
-    Ok(true)
+    between();
+    let args = ["branch", branch, start];
+    let (ok, text) = git_run(dir, &args)?;
+    if ok {
+        return Ok(true);
+    }
+    // A RACE, said as one. Two `jkb task work` on one task both see no branch and both run `git
+    // branch`; the loser used to print git's `cannot lock ref … reference already exists`. Decided
+    // by asking git again, never by parsing its English, and only when the first answer was a
+    // proven `No`: after an `Unknown` the branch may have been there all along, which is no race.
+    // Still a refusal rather than `Ok(false)`: the caller is mid-way through a command another
+    // process is also running, and what it would build on the other's branch is the other's call.
+    anyhow::ensure!(
+        !(before.is_no() && has_branch(dir, branch)?.is_yes()),
+        "branch `{branch}` was created by another process while this one was creating it — most \
+         likely a concurrent `jkb task work` on the same task. Nothing was changed here; let the \
+         other command finish, then run this one again."
+    );
+    anyhow::bail!("git {}: {text}", args.join(" "))
 }
 
-/// Delete branch `branch`, discarding unmerged commits when `force`.
+/// Delete branch `branch` **only if it still points at `expected`** — git's own compare-and-delete
+/// (`update-ref -d <ref> <old>`), so a commit that lands on the branch after the caller read it is
+/// never discarded with it. `git branch -D` takes no old value: a caller that read the tip,
+/// compared it, then deleted, lost whatever arrived in between — which is why there is no
+/// `delete_branch` beside this one any more, and why a disposal deletes only through
+/// `archive::delete_branch_planned`.
+///
+/// `Ok(true)` when git deleted it, `Ok(false)` when git refused — the ref moved, is gone, or is
+/// locked. Which of those is the caller's to establish by asking again, never by parsing git's
+/// English.
+///
+/// **Not `git branch -D`'s checks.** `update-ref` is plumbing: it deletes a branch another
+/// worktree has checked out (measured on git 2.51.1: that worktree then reads `No commits yet`),
+/// which `branch -D` refuses. A caller that may meet one must ask [`worktrees`] first.
 ///
 /// # Errors
-/// Returns an error if `git` cannot be executed or refuses to delete the branch.
-pub fn delete_branch(dir: &Path, branch: &str, force: bool) -> Result<()> {
+/// Returns an error if `branch` or `expected` cannot be passed to git (`expected` must be a full
+/// object id: anything else would be resolved as a revision), or `git` cannot be executed.
+pub fn delete_branch_at(dir: &Path, branch: &str, expected: &str) -> Result<bool> {
     valid_ref(branch)?;
-    git_must(dir, &["branch", if force { "-D" } else { "-d" }, branch])?;
-    Ok(())
+    anyhow::ensure!(
+        matches!(expected.len(), 40 | 64) && expected.bytes().all(|b| b.is_ascii_hexdigit()),
+        "`{expected}` is not a full object id, so it cannot say which commit `{branch}` must be \
+         at to be deleted"
+    );
+    let full = format!("refs/heads/{branch}");
+    // `--no-deref`: delete the ref itself, as `branch -D` does, never a symbolic ref's target.
+    let (ok, _) = git_run(dir, &["update-ref", "--no-deref", "-d", &full, expected])?;
+    Ok(ok)
 }
 
 /// Whether the working tree at `dir` has uncommitted changes (staged, unstaged, or
@@ -1952,9 +2028,10 @@ impl Deletions {
     /// commit what may be a part-way removal. Three-valued `Deletions` exists so those two cannot
     /// read the same; a renderer per caller is how they came to.
     ///
-    /// Deliberately carries no remedy and no path: the two callers offer different ones (`land`
-    /// suggests `git restore .` inline, the sweep has a [`crate::archive::Remedy`] of its own),
-    /// and folding a remedy in here would have one of them print it twice.
+    /// Deliberately carries no remedy and no path: its readers offer different ones (`land` and
+    /// `abandon` suggest `git restore .` inline, through [`Deletions::refusal_suffix`]; the sweep
+    /// has a [`crate::archive::Remedy`] of its own), and folding a remedy in here would have one
+    /// of them print it twice.
     #[must_use]
     pub fn caveat(self) -> Option<String> {
         match self {
@@ -1968,6 +2045,38 @@ impl Deletions {
                  is unestablished"
                     .to_owned(),
             ),
+        }
+    }
+
+    /// [`Deletions::caveat`] as the sentence a command line appends to its own *"it has
+    /// uncommitted changes"* refusal for the session checkout at `worktree` — with a leading
+    /// space, or empty where there is nothing to add — and, for a part-way removal, the
+    /// `git restore .` that puts it back.
+    ///
+    /// **One rendering for the two refusals that print it inline**, `jkb task land` and `jkb task
+    /// abandon`. Abandon is the verb the sweep's own [`crate::archive::Remedy::CommitOrForce`]
+    /// sends the operator to, and it went on saying "commit them" with no caveat over exactly the
+    /// part-way removal the caveat exists for, because the wording lived inside `land_preflight`.
+    /// The sweep keeps its structured [`crate::archive::Remedy`] instead of this sentence.
+    #[must_use]
+    pub fn refusal_suffix(self, worktree: &Path) -> String {
+        let Some(c) = self.caveat() else {
+            return String::new();
+        };
+        // By characters, not by bytes. `c[..1]` panics on any caveat whose first character is
+        // multi-byte, and nothing in `caveat` warns a future editor that a caller slices it.
+        let mut ch = c.chars();
+        let capped = ch.next().map_or_else(String::new, |f| {
+            f.to_uppercase().collect::<String>() + ch.as_str()
+        });
+        // The remedy belongs only to the arm where putting the files back is the answer, which is
+        // why `caveat` does not carry one.
+        match self {
+            Self::Only(_) => format!(
+                " {capped}. `git -C {} restore .` puts them all back.",
+                worktree.display()
+            ),
+            Self::NotOnly | Self::Unknown => format!(" {capped}."),
         }
     }
 }
@@ -2055,13 +2164,24 @@ pub enum Graft {
 /// does not *move* it: `branch` still points at its pre-rebase commits when this returns.
 ///
 /// # Errors
-/// Returns an error if `git` cannot be executed, or if the working tree cannot be put on
-/// `onto` to begin with.
+/// Returns an error if `git` cannot be executed, if the working tree cannot be put on `onto`
+/// to begin with, or if `branch` cannot be checked out (detached) in it — carrying git's own
+/// message, since that is a fault of the working tree and never a [`Graft::Conflict`].
 pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     valid_ref(branch)?;
     valid_ref(onto)?;
     git_must(dir, &["switch", onto])?;
     let pre = rev(dir, "HEAD")?.context("target branch has no commits to graft onto")?;
+    // BOTH NAMES FULLY QUALIFIED for every question asked with them below. `branch` and `onto` are
+    // branches, and a bare name is a DWIM lookup that ranks `refs/tags/<name>` above
+    // `refs/heads/<name>` (measured on git 2.51.1). A tag named like the work branch was what the
+    // count below measured — a tag at `onto` refused two real commits as "nothing to land", a tag
+    // ahead of it waved an empty branch through — and a tag named like `onto` was what the branch
+    // was rebased onto, commits `onto` never had. (`checkout --detach <name>` happens to prefer the
+    // branch, also measured, but is qualified too rather than relied on.) `switch` above takes
+    // only branches, so it is the one place the bare name is exact.
+    let branch_ref = format!("refs/heads/{branch}");
+    let onto_ref = format!("refs/heads/{onto}");
 
     // NOTHING TO GRAFT IS NOT A LANDING. A branch sitting at `onto`'s tip rebases to a no-op and
     // `merge --ff-only` then answers "Already up to date." with exit 0 — so this returned
@@ -2086,7 +2206,7 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
     // unattended, which is where the harm was, and the same fix here needs a `Graft` variant and
     // a `do_land` arm deciding whether a task with no content should be marked done at all. Filed
     // rather than guessed at.
-    if ahead_count(dir, onto, branch)? == 0 {
+    if ahead_count(dir, &onto_ref, &branch_ref)? == 0 {
         anyhow::bail!(
             "{branch} has no commits ahead of {onto} — there is nothing to land. If its work is \
              already in {onto} under someone else's commit, close it with `jkb task landed \
@@ -2094,11 +2214,28 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
         );
     }
 
-    if !git_run(dir, &["checkout", "--detach", branch])?.0 {
-        git_must(dir, &["switch", onto])?;
-        return Ok((Graft::Conflict, pre));
+    // A CHECKOUT THAT FAILS IS NOT A CONFLICT. Nothing has been rebased yet, so whatever stopped
+    // the detach — an untracked file the checkout would overwrite, a held `index.lock`, a
+    // permissions error — is a property of the working tree at `dir`, and `Graft::Conflict` would
+    // send the user to resolve a conflict in a branch that has none. It used to, with git's own
+    // text discarded. The error carries that text instead, the same split `scripts/merge-queue.sh`
+    // makes between a setup failure and a content conflict.
+    let (detached, why) = git_run(dir, &["checkout", "--detach", &branch_ref])?;
+    if !detached {
+        // Put the tree back on `onto` if the failure moved it; a refused checkout normally has
+        // not, so this is a no-op whose own failure must not hide the cause above.
+        let back = match git_run(dir, &["switch", onto]) {
+            Ok((true, _)) => String::new(),
+            Ok((false, text)) => format!("\n\nand switching back to {onto} also failed: {text}"),
+            Err(e) => format!("\n\nand switching back to {onto} also failed: {e:#}"),
+        };
+        anyhow::bail!(
+            "could not check out {branch} in {} to rebase it — nothing changed, and this is not a \
+             conflict in {branch}. git said: {why}{back}",
+            dir.display()
+        );
     }
-    if !git_run(dir, &["rebase", onto])?.0 {
+    if !git_run(dir, &["rebase", &onto_ref])?.0 {
         let _ = git_run(dir, &["rebase", "--abort"])?;
         git_must(dir, &["switch", onto])?;
         return Ok((Graft::Conflict, pre));
@@ -2842,6 +2979,36 @@ mod tests {
         );
     }
 
+    /// Losing the race to create a branch is reported as that race, not as git's `cannot lock ref`:
+    /// two concurrent `jkb task work` on one task both find no batch branch and both cut one. The
+    /// other creator is put in the window between the existence check and `git branch`, which is
+    /// where the loser of a real race is.
+    #[test]
+    fn losing_the_race_to_create_a_branch_names_the_race() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path();
+        fixture(dir);
+        let err = super::create_branch_between(dir, "batch", "main", || {
+            let out = fixture_git(dir, &["branch", "batch", "main"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        })
+        .expect_err("the branch appeared under it, so this creation lost");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("created by another process while this one was creating it"),
+            "{msg}"
+        );
+        assert!(!msg.contains("cannot lock ref"), "{msg}");
+
+        // The other outcomes are unchanged: present beforehand is no creation and no error, and a
+        // refusal with no branch appearing still carries git's own text.
+        assert!(!super::create_branch(dir, "batch", "main").unwrap());
+        let err = super::create_branch(dir, "fresh", "no-such-start").unwrap_err();
+        assert!(!format!("{err:#}").contains("another process"), "{err:#}");
+    }
+
     /// Unregistering one worktree — removed, or already gone — leaves a registration whose directory
     /// this side cannot see: the other side of the host/container bind's session.
     #[test]
@@ -3036,6 +3203,92 @@ mod tests {
         assert_eq!(name("v1.0"), NotABranch, "a tag was accepted as a branch");
         assert_eq!(name("HEAD"), NotABranch);
         assert_eq!(name("no-such-thing"), Unknown);
+    }
+
+    /// **A checkout that fails is an error carrying git's text, never a `Graft::Conflict`.** An
+    /// untracked file in the land tree that `unmerged`'s checkout would overwrite stops the
+    /// detach before any rebase runs; this used to come back as `Conflict`, which `jkb task land`
+    /// renders as "does not rebase cleanly — fix the conflict" for a branch that has none.
+    #[test]
+    fn a_checkout_that_fails_is_not_reported_as_a_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fixture(dir);
+        std::fs::write(dir.join("unmerged.txt"), "in the way").unwrap();
+
+        let err = super::graft(dir, "unmerged", "main")
+            .map(|(outcome, _)| outcome)
+            .expect_err("a refused checkout is not an outcome of the graft");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a conflict") && msg.contains("would be overwritten"),
+            "the refusal names itself and carries git's own reason: {msg}"
+        );
+        assert_eq!(
+            current_branch(dir).unwrap().as_deref(),
+            Some("main"),
+            "the land tree is left on the target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("unmerged.txt")).unwrap(),
+            "in the way",
+            "the file in the way is untouched"
+        );
+    }
+
+    /// The graft counts the BRANCH's commits, not a same-named tag's. A tag `unmerged` left at
+    /// `main`'s tip outranks `refs/heads/unmerged` in `rev-list`'s lookup, so the branch's two
+    /// commits counted as none and the landing was refused as having nothing to land.
+    #[test]
+    fn a_tag_named_like_the_branch_does_not_stand_in_for_it_in_a_graft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fixture(dir);
+        let git_ok = |args: &[&str]| assert!(fixture_git(dir, args).status().unwrap().success());
+        // The rebase commits, and the graft's own git sees no global identity.
+        git_ok(&["config", "user.name", "t"]);
+        git_ok(&["config", "user.email", "t@example.com"]);
+        git_ok(&["tag", "unmerged", "main"]);
+
+        let (outcome, _) = super::graft(dir, "unmerged", "main").expect("grafted");
+        assert!(
+            matches!(outcome, super::Graft::Landed { .. }),
+            "{outcome:?}"
+        );
+        assert!(
+            dir.join("unmerged.txt").exists(),
+            "the branch's work is on main"
+        );
+    }
+
+    /// The graft rebases onto the TARGET BRANCH, not a same-named tag elsewhere. A tag `main` at
+    /// `squash`'s tip outranks `refs/heads/main`, so the branch was rebased onto commits `main`
+    /// never had, and the fast-forward then refused.
+    #[test]
+    fn a_tag_named_like_the_target_does_not_stand_in_for_it_in_a_graft() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        fixture(dir);
+        let git_ok = |args: &[&str]| assert!(fixture_git(dir, args).status().unwrap().success());
+        // The rebase commits, and the graft's own git sees no global identity.
+        git_ok(&["config", "user.name", "t"]);
+        git_ok(&["config", "user.email", "t@example.com"]);
+        git_ok(&["tag", "main", "squash"]);
+
+        let (outcome, _) = super::graft(dir, "unmerged", "main").expect("grafted");
+        assert!(
+            matches!(outcome, super::Graft::Landed { .. }),
+            "{outcome:?}"
+        );
+        let log = fixture_git(dir, &["log", "--format=%s", "refs/heads/main"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(log.contains("unmerged c2"), "{log}");
+        assert!(
+            !log.contains("squash c1"),
+            "the tag's line was not landed: {log}"
+        );
     }
 
     #[test]
@@ -4014,8 +4267,45 @@ mod tests {
         let _ = super::git_run(&sup, &["checkout", "--detach", "other"]);
         let _ = super::git_run(&sup, &["switch", "other"]);
         assert!(!marker.exists(), "checkout or switch entered the submodule");
+        // The compare-and-delete the disposal sweep tidies a branch with is ref plumbing alone.
+        run(&sup, &["branch", "tidied"]);
+        let tip = super::rev(&sup, "refs/heads/tidied").unwrap().unwrap();
+        std::fs::write(sup.join("sub/f"), "eeee\n").unwrap();
+        assert!(super::delete_branch_at(&sup, "tidied", &tip).unwrap());
+        assert!(!marker.exists(), "update-ref entered the submodule");
         let e = super::git_run(&sup, &["stash"]).unwrap_err().to_string();
         assert!(e.contains("does not run `git stash`"), "{e}");
+    }
+
+    /// The delete is conditional on the tip the caller read: a branch that moved since is kept,
+    /// with the commit that moved it, and one still at that tip is deleted.
+    #[test]
+    fn delete_branch_at_keeps_a_branch_that_moved_since_it_was_read() {
+        let t = tempfile::tempdir().unwrap();
+        fixture(t.path());
+        let read = super::rev(t.path(), "refs/heads/unmerged")
+            .unwrap()
+            .unwrap();
+        let moved = super::rev(t.path(), "refs/heads/mergecommit")
+            .unwrap()
+            .unwrap();
+        assert_ne!(read, moved, "the premise: two different commits");
+        let ok = fixture_git(t.path(), &["update-ref", "refs/heads/unmerged", &moved])
+            .output()
+            .unwrap();
+        assert!(ok.status.success(), "{ok:?}");
+
+        assert!(!super::delete_branch_at(t.path(), "unmerged", &read).unwrap());
+        assert_eq!(
+            super::rev(t.path(), "refs/heads/unmerged").unwrap(),
+            Some(moved.clone()),
+            "the moved branch survives, where it moved to"
+        );
+        assert!(super::delete_branch_at(t.path(), "unmerged", &moved).unwrap());
+        assert!(super::has_branch(t.path(), "unmerged").unwrap().is_no());
+        // Never resolved as a revision: `HEAD` would match whatever the branch is at.
+        let e = super::delete_branch_at(t.path(), "deep/er", "HEAD").unwrap_err();
+        assert!(e.to_string().contains("not a full object id"), "{e}");
     }
 
     /// A submodule checked out inside a session worktree has a git directory of its own, under the

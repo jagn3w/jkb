@@ -154,12 +154,18 @@ mod tests {
         )
         .unwrap();
 
-        // A valid task status inserts.
-        conn.execute(
-            "INSERT INTO items (uid, kind, status) VALUES ('t1', 'task', 'in_progress')",
-            [],
-        )
-        .unwrap();
+        // Every status the enum has inserts. Walking the generated list rather than naming a
+        // case is what makes a new `TaskStatus` variant fail HERE, naming itself, when the
+        // migrations' hand-written CHECK set was not widened to match — instead of passing
+        // every test and failing at runtime on a bare CHECK violation.
+        for status in jkb_types::TaskStatus::ALL {
+            let status = status.as_str();
+            conn.execute(
+                "INSERT INTO items (uid, kind, status) VALUES (?1, 'task', ?2)",
+                rusqlite::params![format!("t-{status}"), status],
+            )
+            .unwrap_or_else(|e| panic!("status {status:?} must pass the items CHECK: {e}"));
+        }
 
         // An out-of-set status is rejected by the DB (the CHECK), not just the Rust layer.
         assert!(
@@ -352,7 +358,7 @@ mod reviews_migration_tests {
             )
             .unwrap();
         }
-        embedded::migrations::runner().run(&mut conn).unwrap();
+        super::run(&mut conn).unwrap();
 
         let rows: Vec<(i64, String, Option<String>, String)> = conn
             .prepare("SELECT item_id, kind, ns, sha FROM reviews ORDER BY id")
@@ -517,7 +523,7 @@ mod design_exports_migration_tests {
             )
             .unwrap();
         }
-        embedded::migrations::runner().run(&mut conn).unwrap();
+        super::run(&mut conn).unwrap();
 
         let targets: Vec<(i64, String)> = conn
             .prepare("SELECT design_id, path FROM design_doc_targets ORDER BY design_id")
@@ -575,10 +581,426 @@ mod design_exports_migration_tests {
             [],
         )
         .unwrap();
-        embedded::migrations::runner().run(&mut conn).unwrap();
+        super::run(&mut conn).unwrap();
         let watermark: i64 = conn
             .query_row("SELECT from_txn FROM undo_watermark", [], |r| r.get(0))
             .unwrap();
         assert_eq!(watermark, 0);
+    }
+}
+
+#[cfg(test)]
+mod edges_namespaces_autoincrement_tests {
+    use super::embedded;
+    use refinery::Target;
+    use rusqlite::types::Value;
+    use rusqlite::{params, Connection};
+
+    /// Every row of `table`, every column, in id order.
+    fn rows(conn: &Connection, table: &str) -> Vec<Vec<Value>> {
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let width = stmt.column_count();
+        stmt.query_map([], |r| (0..width).map(|i| r.get::<_, Value>(i)).collect())
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Every placement, by the columns V027 saw. Not `rows`: the harness below runs every later
+    /// migration too, and V029 gives `placements` an `id` column (its old rowid) that V027 did not
+    /// see, so `SELECT *` would differ for a reason that is not V027's.
+    fn placement_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT item_id, namespace_id, role, position, metadata FROM placements
+                  ORDER BY rowid",
+            )
+            .unwrap();
+        stmt.query_map([], |r| (0..5).map(|i| r.get::<_, Value>(i)).collect())
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// The indexes on `table`, as `(name, sql)` — `sql` is NULL for a constraint's own index.
+    fn indexes(conn: &Connection, table: &str) -> Vec<(String, Option<String>)> {
+        conn.prepare(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1
+              ORDER BY name",
+        )
+        .unwrap()
+        .query_map([table], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// The foreign keys every table declares, as `(table, from, to-table, to, on_delete)`.
+    fn foreign_keys(conn: &Connection) -> Vec<(String, String, String, String, String)> {
+        conn.prepare(
+            "SELECT m.name, f.\"from\", f.\"table\", f.\"to\", f.on_delete
+               FROM sqlite_master m, pragma_foreign_key_list(m.name) f
+              WHERE m.type = 'table' ORDER BY 1, 2",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// V027 rebuilds `edges` and `namespaces` as AUTOINCREMENT without changing anything a reader
+    /// can see — rows, ids, indexes, foreign keys, cascades — and sets each table's high-water
+    /// mark above every id the database has ever issued, including ids deleted off the top of the
+    /// range that a pending `undo` would write back.
+    ///
+    /// Migrated in two steps, like the V011 test, so the ids exist and are already deleted when
+    /// V027 runs: populating afterwards would let the explicit-id inserts set the sequence
+    /// themselves and hide a missing high-water mark.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one migration scenario, seeded and read back top to bottom
+    fn v027_makes_edge_and_namespace_ids_unreusable_and_changes_nothing_else() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(26))
+            .run(&mut conn)
+            .unwrap();
+
+        for i in 1..=4 {
+            conn.execute(
+                "INSERT INTO items (id, uid, kind) VALUES (?1, ?2, 'note')",
+                params![i, format!("u{i}")],
+            )
+            .unwrap();
+        }
+        // Namespaces 20 and 21 (a child), a mount and a placement referencing them, and 23 —
+        // the top of the range — removed by `ns rm`, which logged the whole row.
+        conn.execute_batch(
+            "INSERT INTO namespaces (id, path, parent_id, kind, metadata)
+                  VALUES (20, 'a', NULL, 'mount', '{\"k\":1}');
+             INSERT INTO namespaces (id, path, parent_id, kind) VALUES (21, 'a/b', 20, 'logical');
+             INSERT INTO mounts (namespace_id, backing_uri, sync_mode)
+                  VALUES (20, 'file:///tmp/a', 'bidirectional');
+             INSERT INTO placements (item_id, namespace_id, role) VALUES (1, 21, 'primary');
+             INSERT INTO namespaces (id, path, parent_id, kind) VALUES (23, 'a/gone', 20, 'logical');
+             DELETE FROM namespaces WHERE id = 23;
+             INSERT INTO changelog (txn_id, op, entity_type, entity_id, before)
+                  VALUES (1, 'delete', 'namespaces', '23', '{\"id\":23,\"path\":\"a/gone\"}');",
+        )
+        .unwrap();
+        // Edges 1-3 survive; 5 was unlinked (logged with its row, `entity_id` is `src->dst`);
+        // 7 left by cascade with an item, so only its insert remembers it.
+        conn.execute_batch(
+            "INSERT INTO edges (id, src_item_id, dst_item_id, type) VALUES (1, 1, 2, 'references');
+             INSERT INTO edges (id, src_item_id, dst_item_id, type, props, weight)
+                  VALUES (2, 2, 3, 'supports', '{\"p\":true}', 0.5);
+             INSERT INTO edges (id, src_item_id, dst_item_id, type) VALUES (3, 3, 4, 'depends_on');
+             INSERT INTO changelog (txn_id, op, entity_type, entity_id, before)
+                  VALUES (2, 'delete', 'edges', '4->1', '{\"id\":5,\"src_item_id\":4}');
+             INSERT INTO changelog (txn_id, op, entity_type, entity_id, after)
+                  VALUES (3, 'insert', 'edges', '7', '{}');",
+        )
+        .unwrap();
+
+        let before = (
+            rows(&conn, "edges"),
+            rows(&conn, "namespaces"),
+            rows(&conn, "mounts"),
+            placement_rows(&conn),
+            indexes(&conn, "edges"),
+            indexes(&conn, "namespaces"),
+            foreign_keys(&conn),
+        );
+
+        // The harness, so its `foreign_key_check` runs over the rebuild.
+        super::run(&mut conn).expect("V027 applied, with no dangling foreign key");
+
+        let after = (
+            rows(&conn, "edges"),
+            rows(&conn, "namespaces"),
+            rows(&conn, "mounts"),
+            placement_rows(&conn),
+            indexes(&conn, "edges"),
+            indexes(&conn, "namespaces"),
+            foreign_keys(&conn),
+        );
+        assert_eq!(
+            after, before,
+            "the rebuild changed a row, an id, an index or a foreign key"
+        );
+
+        for table in ["edges", "namespaces"] {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                sql.contains("AUTOINCREMENT"),
+                "{table} is not AUTOINCREMENT: {sql}"
+            );
+            let seq_rows: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_sequence WHERE name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(seq_rows, 1, "{table} has {seq_rows} sequence rows, not one");
+        }
+
+        // The harm: a new row must not land on an id that was issued and freed.
+        conn.execute(
+            "INSERT INTO namespaces (path, kind) VALUES ('fresh', 'logical')",
+            [],
+        )
+        .unwrap();
+        let fresh_ns: i64 = conn
+            .query_row("SELECT id FROM namespaces WHERE path = 'fresh'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            fresh_ns > 23,
+            "namespace id {fresh_ns} was reissued, so undoing `ns rm a/gone` would collide"
+        );
+        conn.execute(
+            "INSERT INTO edges (src_item_id, dst_item_id, type) VALUES (4, 1, 'references')",
+            [],
+        )
+        .unwrap();
+        let fresh_edge: i64 = conn
+            .query_row("SELECT id FROM edges WHERE src_item_id = 4", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            fresh_edge > 7,
+            "edge id {fresh_edge} was reissued, so undoing an unlink would collide"
+        );
+
+        // The constraints still hold on the rebuilt tables: the harness turned enforcement back
+        // on, so the cascades fire and a dangling parent is refused.
+        conn.execute("DELETE FROM items WHERE id = 2", []).unwrap();
+        let edges_left: Vec<i64> = conn
+            .prepare("SELECT id FROM edges ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            edges_left,
+            vec![3, fresh_edge],
+            "edges did not cascade with item 2"
+        );
+        conn.execute("DELETE FROM placements WHERE namespace_id = 21", [])
+            .unwrap();
+        conn.execute("DELETE FROM namespaces WHERE id = 21", [])
+            .unwrap();
+        conn.execute("DELETE FROM namespaces WHERE id = 20", [])
+            .unwrap();
+        let mounts_left: i64 = conn
+            .query_row("SELECT count(*) FROM mounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            mounts_left, 0,
+            "the mount did not cascade with its namespace"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO namespaces (path, parent_id, kind) VALUES ('orphan', 999, 'logical')",
+                [],
+            )
+            .is_err(),
+            "the parent_id foreign key is no longer enforced"
+        );
+        let unique_kept = conn.execute(
+            "INSERT INTO edges (src_item_id, dst_item_id, type) VALUES (3, 4, 'depends_on')",
+            [],
+        );
+        assert!(
+            unique_kept.is_err(),
+            "the (src, dst, type) uniqueness was lost"
+        );
+    }
+
+    /// V028 drops `idx_task_transitions_branch`, which nothing read: the table's one read
+    /// (`transition::history`) goes by item, through `idx_task_transitions_item`.
+    #[test]
+    fn v028_drops_the_unread_branch_index_and_history_still_reads_by_item() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        super::run(&mut conn).unwrap();
+
+        let names: Vec<String> = indexes(&conn, "task_transitions")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["idx_task_transitions_item".to_owned()],
+            "task_transitions should keep only the index its history read uses"
+        );
+
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, txn_id, at, event, from_status, to_status, agent_id,
+                        branch, onto, ref_commit, pr_number, evidence
+                   FROM task_transitions WHERE item_id = ?1 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([1], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("USING INDEX idx_task_transitions_item")),
+            "the history read no longer uses its index: {plan:?}"
+        );
+    }
+
+    /// V029 gives `placements` and `tag_applications` an AUTOINCREMENT `id` equal to each row's old
+    /// rowid — so every changelog entry already keyed by one still names the same row — keeps the
+    /// natural key unique and the cascades firing, and sets each high-water mark above every rowid
+    /// the changelog names for the table, including ones deleted off the top of the range.
+    ///
+    /// Seeded at V028 so the rowids exist and are already deleted when V029 runs.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one migration scenario, seeded and read back top to bottom
+    fn v029_makes_placement_and_tag_ids_unreusable_and_keeps_their_rowids() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // V027 rebuilds tables other rows reference, so the partial run needs the harness's
+        // `foreign_keys = OFF` as well; the full run below is the harness itself.
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(28))
+            .run(&mut conn)
+            .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO items (id, uid, kind) VALUES (1, 'u1', 'note'), (2, 'u2', 'note');
+             INSERT INTO namespaces (id, path, kind) VALUES (30, 'p', 'logical'), (31, 'q', 'logical');
+             INSERT INTO placements (rowid, item_id, namespace_id, role, position, metadata)
+                  VALUES (4, 1, 30, 'primary', 2, '{\"m\":1}'), (6, 2, 31, 'reference', 0, '{}');
+             INSERT INTO tag_applications (rowid, item_id, facet, value, props)
+                  VALUES (3, 1, 'size', 'small', '{\"p\":1}');
+             -- Placement 9 and tag application 8 were inserted, then deleted off the top: only
+             -- the changelog remembers them.
+             INSERT INTO changelog (txn_id, op, entity_type, entity_id, after)
+                  VALUES (1, 'insert', 'placements', '9', '{}'),
+                         (1, 'update', 'tag_applications', '8', '{}');",
+        )
+        .unwrap();
+        let placements = rows(&conn, "placements");
+        let tags = rows(&conn, "tag_applications");
+
+        super::run(&mut conn).expect("V029 applied, with no dangling foreign key");
+
+        // Each row's id is its old rowid, followed by the columns it had.
+        let with_id = |old: Vec<Vec<Value>>, ids: &[i64]| -> Vec<Vec<Value>> {
+            old.into_iter()
+                .zip(ids)
+                .map(|(row, id)| std::iter::once(Value::Integer(*id)).chain(row).collect())
+                .collect()
+        };
+        assert_eq!(
+            rows(&conn, "placements"),
+            with_id(placements, &[4, 6]),
+            "a placement's id is not its old rowid, or a column changed"
+        );
+        assert_eq!(
+            rows(&conn, "tag_applications"),
+            with_id(tags, &[3]),
+            "a tag application's id is not its old rowid, or a column changed"
+        );
+
+        for (table, issued) in [("placements", 9), ("tag_applications", 8)] {
+            let sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                sql.contains("AUTOINCREMENT"),
+                "{table} is not AUTOINCREMENT: {sql}"
+            );
+            let seq: i64 = conn
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                seq >= issued,
+                "{table}'s high-water mark {seq} is below the id {issued} the changelog names"
+            );
+        }
+        let names = |table: &str| -> Vec<String> {
+            indexes(&conn, table).into_iter().map(|(n, _)| n).collect()
+        };
+        assert!(names("placements").contains(&"idx_placements_ns".to_owned()));
+        assert!(names("placements").contains(&"idx_placements_item".to_owned()));
+        assert!(names("tag_applications").contains(&"idx_tag_applications_facet".to_owned()));
+        assert!(names("tag_applications").contains(&"idx_tag_applications_item".to_owned()));
+
+        // A new row is not handed an id the changelog still names.
+        let fresh: i64 = conn
+            .query_row(
+                "INSERT INTO placements (item_id, namespace_id, role) VALUES (2, 30, 'primary')
+                 RETURNING id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fresh > 9, "placement id {fresh} was reissued");
+        let fresh: i64 = conn
+            .query_row(
+                "INSERT INTO tag_applications (item_id, facet, value) VALUES (2, 'size', 'big')
+                 RETURNING id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fresh > 8, "tag application id {fresh} was reissued");
+
+        // The natural keys stay unique, and the upserts that name them still resolve.
+        assert!(conn
+            .execute(
+                "INSERT INTO placements (item_id, namespace_id, role) VALUES (1, 30, 'primary')",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO tag_applications (item_id, facet, value) VALUES (1, 'size', 'small')
+             ON CONFLICT(item_id, facet, value) DO UPDATE SET value = value",
+            [],
+        )
+        .unwrap();
+
+        // …and the cascades still fire: enforcement is back on after the harness.
+        conn.execute("DELETE FROM items WHERE id = 1", []).unwrap();
+        let left: i64 = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM placements WHERE item_id = 1)
+                      + (SELECT count(*) FROM tag_applications WHERE item_id = 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "placements or tags did not cascade with their item"
+        );
     }
 }

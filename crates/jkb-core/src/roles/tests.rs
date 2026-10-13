@@ -7,7 +7,8 @@ use super::{
     token_hash, Bound, Minter, Role, CONTAINER_AGENT, GRANTABLE,
 };
 use crate::task::{create, NewTask};
-use crate::Db;
+use crate::{Db, Error};
+use jkb_types::Error as TypeError;
 
 fn tasks(db: &Db) -> (ItemId, ItemId) {
     db.write_txn("test", |c, m| {
@@ -175,6 +176,29 @@ fn the_agent_type_map_is_explicit_and_unmapped_types_hold_nothing() {
         None
     );
     assert_eq!(db.read(agent_type_map).unwrap().len(), 1);
+}
+
+#[test]
+fn no_agent_type_maps_to_operator() {
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("test", |c, m| {
+        map_agent_type(c, m, "evil", Some(Role::Implementer))
+    })
+    .unwrap();
+    let e = db
+        .write_txn("test", |c, m| {
+            map_agent_type(c, m, "evil", Some(Role::Operator))
+        })
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::Types(TypeError::Validation(ref m)) if m.contains("operator")),
+        "{e:?}"
+    );
+    assert_eq!(
+        db.read(agent_type_map).unwrap(),
+        vec![("evil".to_owned(), Role::Implementer)],
+        "the refused mapping neither lands nor replaces the existing one"
+    );
 }
 
 #[test]

@@ -85,8 +85,17 @@ case3() {
 # --- 4. core.hooksPath is read from the repo we asked about, not from the cwd ------------
 # The must-fix this file grew for: setup.sh asked a bare `git config`, which answers for
 # whatever repository the caller happens to be standing in.
+#
+# EACH OVERRIDE CASE OWNS ITS REPOSITORY. Cases 1 and 2 compare against `git rev-parse --git-path`,
+# which honours `core.hooksPath`, while `git_hooks_dir` deliberately never does — so their oracle is
+# only valid while `$main` sets no override. Cases 4 and 5 used to set the key on the shared `$main`
+# and unset it on their own last line, in this file's return-early-on-failure style: any early
+# return left the key behind, and every case reading `$main` after it went red over a
+# `git_hooks_dir` regression that never happened. A throwaway repo per case has nothing to restore.
+# `case_main_untouched`, run last, fails if any case writes the key into the shared fixture again.
 case4() {
-    local other="$work/other" got
+    local main="$work/c4-main" other="$work/c4-other" got
+    git_q init -q "$main" >/dev/null 2>&1
     git_q init -q "$other" >/dev/null 2>&1
     git_q -C "$other" config core.hooksPath "$work/others-hooks"
 
@@ -107,14 +116,14 @@ case4() {
     else
         fail "override: missed" "expected $work/our-hooks, got '$got'"
     fi
-    git_q -C "$main" config --unset core.hooksPath
 }
 
 # --- 5. a relative core.hooksPath resolves the way git resolves it -----------------------
 # githooks(5): git chdirs to the top of the working tree before running a hook, so a relative
 # value is relative to THAT — not to wherever the installer was invoked from.
 case5() {
-    local got expected sub
+    local main="$work/c5-main" got expected sub
+    git_q init -q "$main" >/dev/null 2>&1
     git_q -C "$main" config core.hooksPath .githooks
     mkdir -p "$main/.githooks" "$main/deep/nested"
 
@@ -133,7 +142,24 @@ case5() {
     else
         fail "relative: cwd" "from a subdirectory it resolved to $(abs_dir "$sub")"
     fi
-    git_q -C "$main" config --unset core.hooksPath
+}
+
+# --- the shared fixture is left as cases 1 and 2 need it ---------------------------------
+# Run LAST, so it sees what every other case left behind. `$main` and `$wt` are the only
+# repositories shared between cases, and an override on either silently invalidates the oracle
+# comparison in cases 1 and 2 (see case 4's header) for whichever of them runs afterwards.
+case_main_untouched() {
+    local r v leaked=""
+    for r in "$main" "$wt"; do
+        if v="$(git -C "$r" config --get core.hooksPath 2>/dev/null)"; then
+            leaked="$leaked $r=$v"
+        fi
+    done
+    if [ -z "$leaked" ]; then
+        ok "the shared fixture carries no core.hooksPath after every case has run"
+    else
+        fail "fixture: leaked override" "a case left core.hooksPath set on the shared repo:$leaked"
+    fi
 }
 
 # --- 6. a hooks path inside the working tree is excluded locally -------------------------
@@ -2729,6 +2755,6 @@ case_kit_linked() {
     fi
 }
 
-run_cases case_kit_main case_kit_linked case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m case10n
+run_cases case_kit_main case_kit_linked case1 case2 case3 case4 case5 case6 case6b case6c case6d case6p case6n case6g case6m case6k case6h case6j case6i case6e case6f case7 case8 case9 case10 case10b case10c case10d case10e case10f case10g case10h case10i case10j case10k case10l case10m case10n case_main_untouched
 
 finish

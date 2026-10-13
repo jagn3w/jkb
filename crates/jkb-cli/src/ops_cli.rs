@@ -335,10 +335,28 @@ impl<'a> Ops<'a> {
             _ => None,
         };
         if let Some(notice) = notice {
-            eprintln!("{notice}");
-            self.notices.borrow_mut().push(notice);
+            self.notice(notice);
+        }
+        // Said here, for every `kb.search` this client sends, rather than by each command that
+        // takes a search apart: the liveness filter hides the orphan rows from the hits, so this
+        // count is the only sign left that the table needs a sweep.
+        if let Response::SearchHits { orphan_vectors, .. } = &response {
+            if orphan_vectors.needs_sweep() {
+                self.notice(format!(
+                    "jkb: {} of the {} nearest vector rows this search read belong to deleted \
+                     items — run `jkb index --sweep` to remove them",
+                    orphan_vectors.dropped, orphan_vectors.scanned
+                ));
+            }
         }
         Ok(response)
+    }
+
+    /// Tell the user something about an answer, on stderr whatever the output mode, so `--json`'s
+    /// stdout stays exactly the answer.
+    fn notice(&self, notice: String) {
+        eprintln!("{notice}");
+        self.notices.borrow_mut().push(notice);
     }
 
     /// `jkb ingest`: read and parse the source here — in the dev container, the container's file or a
@@ -573,8 +591,9 @@ impl<'a> Ops<'a> {
         }
         for hit in &hits {
             let Some(item) = &hit.row else {
-                // A hit whose item is gone should be unreachable now that `knn_live` filters them,
-                // so say so rather than skipping silently (design D42.4).
+                // A hit whose item is gone should be unreachable now that the KNN filters dead
+                // rows (and `call` reports how many it dropped), so say so rather than skipping
+                // silently (design D42.4): the item went between the search and resolving it.
                 eprintln!(
                     "warning: search hit {} has no item row; run `jkb index --sweep`",
                     hit.item
@@ -1031,7 +1050,41 @@ fn task_json(task: &TaskDetail) -> serde_json::Value {
         "subtasks": task.subtasks.iter()
             .map(|t| serde_json::json!({ "uid": t.uid, "title": t.title, "status": t.status }))
             .collect::<Vec<_>>(),
+        // Additive: the step, plan and design it sits under (null under none), so an implementer
+        // finds the design that governs it.
+        "place": task.place,
+        // Additive: the `needs:^id`s its tasks.md line declares that name no task in the file yet.
+        "unresolved_needs": task.unresolved_needs,
+        // Additive: those needs are kept from a tasks.md the task is no longer written into.
+        "needs_outside_tasks_file": task.needs_outside_tasks_file,
     })
+}
+
+/// `task show`'s `plan:` and `design:` lines: where the task sits, or nothing under no design.
+fn place_lines(place: Option<&jkb_api::kb::TaskPlacement>) -> Vec<String> {
+    let Some(p) = place else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    if let (Some(step), Some(plan)) = (&p.step, &p.plan) {
+        lines.push(format!(
+            "plan:      {} · step {}. {} ({})",
+            first_line(&plan.title),
+            step.number,
+            first_line(&step.title),
+            step.uid
+        ));
+    }
+    let mut design = format!(
+        "design:    {} ({})",
+        first_line(&p.design.title),
+        p.design.uid
+    );
+    if let Some(root) = &p.root {
+        let _ = write!(design, ", under {} ({})", first_line(&root.title), root.uid);
+    }
+    lines.push(design);
+    lines
 }
 
 fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
@@ -1062,8 +1115,30 @@ fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
             .collect();
         println!("tags:      {}", pairs.join(", "));
     }
+    if !task.unresolved_needs.is_empty() {
+        let ids: Vec<String> = task
+            .unresolved_needs
+            .iter()
+            .map(|id| format!("^{id}"))
+            .collect();
+        if task.needs_outside_tasks_file {
+            println!(
+                "needs:     {} (parked: this task is in no tasks.md; each becomes a dependency once \
+                 it is bound into a tasks.md that defines that id)",
+                ids.join(", ")
+            );
+        } else {
+            println!(
+                "needs:     {} (named in its tasks.md, but no task there has that id yet)",
+                ids.join(", ")
+            );
+        }
+    }
     if let Some(line) = review_line(&task.review) {
         println!("review:    {line}");
+    }
+    for line in place_lines(task.place.as_ref()) {
+        println!("{line}");
     }
     if !task.transitions.is_empty() {
         println!("recent transitions (`jkb task why` for all):");
@@ -1203,6 +1278,7 @@ mod tests {
                 Request::KbSearch { .. } => Response::SearchHits {
                     hits: Vec::new(),
                     truncated: true,
+                    orphan_vectors: jkb_api::kb::OrphanVectors::default(),
                 },
                 Request::TaskShow { .. } => Response::Task {
                     task: Box::new(TaskDetail {
@@ -1220,6 +1296,9 @@ mod tests {
                         },
                         transitions: Vec::new(),
                         subtasks: Vec::new(),
+                        place: None,
+                        unresolved_needs: Vec::new(),
+                        needs_outside_tasks_file: false,
                     }),
                     truncated: true,
                 },
@@ -1316,6 +1395,78 @@ mod tests {
                     node_cap,
                     "{args:?}: {notices:?}"
                 );
+            }
+        }
+    }
+
+    /// Answers `kb.search` with no hits and the orphan count it was built with.
+    struct Orphaned(jkb_api::kb::OrphanVectors);
+
+    impl Backend for Orphaned {
+        fn call(&self, request: Request) -> Result<Response, ApiError> {
+            Ok(match request {
+                Request::KbAmbient { .. } => Response::Ambient { namespace: None },
+                Request::KbSearch { .. } => Response::SearchHits {
+                    hits: Vec::new(),
+                    truncated: false,
+                    orphan_vectors: self.0,
+                },
+                other => {
+                    return Err(ApiError::bad_request(format!(
+                        "not scripted: {}",
+                        other.op()
+                    )))
+                }
+            })
+        }
+    }
+
+    /// `jkb search` points the user at `jkb index --sweep`, with the count, when a large share of
+    /// the rows its scan read were orphans — in either output mode, on stderr so `--json`'s
+    /// stdout is unchanged — and says nothing on a clean or barely-dirty table.
+    #[test]
+    fn search_hints_at_a_sweep_when_the_scan_was_mostly_orphans() {
+        use jkb_api::kb::OrphanVectors;
+        let cases = [
+            (OrphanVectors::default(), false),
+            (
+                OrphanVectors {
+                    dropped: 0,
+                    scanned: 40,
+                },
+                false,
+            ),
+            (
+                OrphanVectors {
+                    dropped: 3,
+                    scanned: 40,
+                },
+                false,
+            ),
+            (
+                OrphanVectors {
+                    dropped: 2010,
+                    scanned: 2048,
+                },
+                true,
+            ),
+        ];
+        for (orphans, hinted) in cases {
+            for json in [false, true] {
+                let cli = Cli::try_parse_from(["jkb", "search", "x", "--route", "fts"]).unwrap();
+                let backend = Orphaned(orphans);
+                let reads = Ops::new(&backend, false, json, false);
+                reads
+                    .run(cli.command)
+                    .unwrap_or_else(|e| panic!("{orphans:?}: {e:#}"));
+                let notices = reads.notices.borrow();
+                if hinted {
+                    assert_eq!(notices.len(), 1, "{orphans:?} json={json}: {notices:?}");
+                    assert!(notices[0].contains("jkb index --sweep"), "{notices:?}");
+                    assert!(notices[0].contains("2010 of the 2048"), "{notices:?}");
+                } else {
+                    assert!(notices.is_empty(), "{orphans:?} json={json}: {notices:?}");
+                }
             }
         }
     }

@@ -127,6 +127,26 @@ BRANCH="${1:?usage: merge-queue.sh <branch> <base> <worktree>}"
 BASE="${2:?missing <base>}"
 WT="${3:?missing <worktree>}"
 
+# BOTH NAMES ARE LOCAL BRANCHES, AND EVERY READ SAYS SO. A bare name is resolved by git's DWIM
+# order, which tries `refs/tags/<name>` BEFORE `refs/heads/<name>`: measured on git 2.51.1, with a
+# branch and a tag both named `trunk`, `git rev-parse --verify trunk` answers the TAG's commit (with
+# an "ambiguous" warning this script discards), and `merge-base`, `diff`, `rebase` and `ls-tree`
+# resolve the same way (`checkout --detach` alone prefers the branch). So a tag named like the work
+# branch answered the entry checks in the branch's place — a stale tag at an old base commit
+# stalled real work as "already an ancestor", and a diverged tag on a merged branch let it through
+# to a no-op graft reported as `landed:` — and a tag named like the base was what the branch was
+# rebased onto and the suite floor read from, while `git switch`, which takes only branches, put
+# the real base back. The Rust twin `gitrepo::graft` qualifies the same two names the same way.
+#
+# Neither argument can legitimately be anything but a local branch: the one caller (the swarm
+# coordinator's template in `workflow/agents.json`) passes its group branch and its local
+# integration branch, and `git switch "$BASE"` below already refuses a tag, a remote-tracking ref
+# or a bare commit. So these are the only spellings any READ uses. `git switch` keeps the bare name
+# (measured: it rejects `refs/heads/<name>` with "a branch is expected", and never picks a tag),
+# and so do the messages and `jkb task landed`, which key on the branch NAME.
+BRANCH_REF="refs/heads/$BRANCH"
+BASE_REF="refs/heads/$BASE"
+
 # The one reading of the codes above. Set after the arguments are read, so a usage error prints no
 # outcome line — which the coordinator treats as a stall, the same as an unknown code.
 queue_outcome() {
@@ -157,7 +177,7 @@ trap 'rc=$?
 if [ -z "$SIGNAL" ] && [ "$DECIDED" = "$rc" ]; then
   echo "merge-queue: $(queue_outcome "$rc") (exit $rc)"
 elif [ -n "$SIGNAL" ]; then
-  echo "merge-queue: stall: killed by $SIGNAL, after the step it was running finished — check \`git -C $WT status\` and \`git log -1 $BASE\` before anything else: $BASE may already have advanced (owing \`jkb task landed\`), or this worktree may be detached at a commit the gate never passed; never fast-forward onto that"
+  echo "merge-queue: stall: killed by $SIGNAL, after the step it was running finished — check \`git -C $WT status\` and \`git log -1 $BASE_REF\` before anything else: $BASE may already have advanced (owing \`jkb task landed\`), or this worktree may be detached at a commit the gate never passed; never fast-forward onto that"
 else
   echo "merge-queue: stall: ended without an outcome"
 fi' EXIT
@@ -175,7 +195,7 @@ fi' EXIT
 
 cd "$WT" 2>/dev/null || { echo "error: cannot cd to worktree $WT"; finish 3; }
 git switch "$BASE" >/dev/null 2>&1 || { echo "error: cannot switch to base $BASE"; finish 3; }
-git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || { echo "error: no such branch $BRANCH"; finish 3; }
+git rev-parse --verify --quiet "$BRANCH_REF^{commit}" >/dev/null 2>&1 || { echo "error: no such branch $BRANCH"; finish 3; }
 # AND IT MUST HAVE SOMETHING TO GRAFT. A branch sitting at the base tip rebases to a no-op, and
 # `merge --ff-only` then answers "Already up to date." with exit 0 — so the queue printed `landed:`
 # and called `jkb task landed`, which drives every task recording that branch to done with
@@ -205,7 +225,7 @@ git rev-parse --verify "$BRANCH" >/dev/null 2>&1 || { echo "error: no such branc
 # a worktree the queue cannot use needs a person, while an implementer who reported ready without
 # committing needs to go back and implement. Since the consumer now stalls deterministically on 3,
 # leaving it there would have stopped the retryable case from ever retrying.
-_merge_base="$(git merge-base "$BASE" "$BRANCH" 2>/dev/null)" || _merge_base=""
+_merge_base="$(git merge-base "$BASE_REF" "$BRANCH_REF" 2>/dev/null)" || _merge_base=""
 if [ -z "$_merge_base" ]; then
   echo "error: $BRANCH and $BASE have no common ancestor"
   finish 3
@@ -224,7 +244,7 @@ fi
 # "Implement it, commit, and resubmit" — which sends an implementer whose work IS in the base
 # round a retry loop with nothing to fix, until the group resets to `open` with its tasks never
 # closed. Stalling says the true thing: somebody has to look.
-if git merge-base --is-ancestor "$BRANCH" "$BASE" 2>/dev/null; then
+if git merge-base --is-ancestor "$BRANCH_REF" "$BASE_REF" 2>/dev/null; then
   echo "stall: $BRANCH is already an ancestor of $BASE — either an earlier entry landed its work and it was rebased since, or it was never committed to. The graph cannot tell those apart; close it with \`jkb task landed\` if the work is in, or send it back if it is not."
   finish 5
 fi
@@ -239,7 +259,7 @@ fi
 # implement, and exit 3 now stalls for a human. The `rev-list --count` check that used to sit
 # here is gone rather than kept as a belt — it was unreachable, because a branch with no commits
 # ahead is an ancestor and is answered above.
-if git diff --quiet "$_merge_base" "$BRANCH"; then
+if git diff --quiet "$_merge_base" "$BRANCH_REF"; then
   echo "eject: $BRANCH diverged from $BASE but changes nothing against it — no work to land, however many commits it carries. Implement it, commit, and resubmit."
   finish 1
 fi
@@ -257,12 +277,12 @@ PRE=$(git rev-parse HEAD)   # the base tip before this graft: what the gated res
 # claim the branch ref, so it is allowed even when the branch is live elsewhere; we rebase
 # that detached HEAD, then fast-forward the base to the grafted result (linear, no merge
 # commit). Empty commits drop exactly as a normal rebase would.
-if ! git checkout --detach "$BRANCH" >/tmp/merge-queue.log 2>&1; then
+if ! git checkout --detach "$BRANCH_REF" >/tmp/merge-queue.log 2>&1; then
   git switch "$BASE" >/dev/null 2>&1
   echo "eject: cannot detach at $BRANCH (see /tmp/merge-queue.log)"
   finish 1
 fi
-if ! git rebase "$BASE" >/tmp/merge-queue.log 2>&1; then
+if ! git rebase "$BASE_REF" >/tmp/merge-queue.log 2>&1; then
   git rebase --abort >/dev/null 2>&1 || true
   git switch "$BASE" >/dev/null 2>&1
   echo "eject: rebase conflict onto $BASE"
@@ -295,7 +315,7 @@ GRAFT=$(git rev-parse HEAD)   # the rebased commits (detached HEAD)
 start=$(date +%s)
 if ! { ./scripts/build.sh >/tmp/merge-queue-build.log 2>&1 \
        && ./scripts/test.sh >/tmp/merge-queue-test.log 2>&1 \
-       && _shell_suites_pass "$(_suite_floor "$BASE")" >/tmp/merge-queue-shell.log 2>&1; }; then
+       && _shell_suites_pass "$(_suite_floor "$BASE_REF")" >/tmp/merge-queue-shell.log 2>&1; }; then
   # THE RECOVERY SWITCH IS CHECKED TOO, and this line used to end `|| true`. Step 2's own comment
   # names "its status was discarded" as one of the two ways the old shape went wrong, and then
   # discarded one. A refusal here is not exotic: the gate has just run for minutes in this tree —

@@ -84,6 +84,7 @@ impl NotifState {
 
 impl State for NotifState {
     const ALL: &'static [Self] = &[Self::Absent, Self::AwaitingTool, Self::AwaitingUser];
+    const NOUN: &'static str = "a notification";
 
     fn name(self) -> &'static str {
         self.as_str()
@@ -213,6 +214,11 @@ impl Stateful<NotifState> for NotifCtx {
     }
 }
 
+/// The two states a `Needed` can land in — what [`needed_dest`] may name, declared beside it so
+/// the reachability check can follow the row, and enforced by the machine so the two cannot
+/// disagree.
+const POSTED: &[NotifState] = &[NotifState::AwaitingTool, NotifState::AwaitingUser];
+
 /// Where a `Needed` lands, stated by the context rather than by the table.
 ///
 /// Two destinations share one `(state, event)` pair — tool named or not — and two rows would be
@@ -269,21 +275,30 @@ const ROWS: &[Transition<NotifState, NotifEvent, NotifCtx, NotifEffect>] = &[
     Transition {
         from: NotifState::Absent,
         event: NotifEvent::Needed,
-        to: Dest::Stated(needed_dest),
+        to: Dest::Stated {
+            pick: needed_dest,
+            among: POSTED,
+        },
         guard: None,
         plan: Some(needed_plan),
     },
     Transition {
         from: NotifState::AwaitingTool,
         event: NotifEvent::Needed,
-        to: Dest::Stated(needed_dest),
+        to: Dest::Stated {
+            pick: needed_dest,
+            among: POSTED,
+        },
         guard: None,
         plan: Some(needed_plan),
     },
     Transition {
         from: NotifState::AwaitingUser,
         event: NotifEvent::Needed,
-        to: Dest::Stated(needed_dest),
+        to: Dest::Stated {
+            pick: needed_dest,
+            among: POSTED,
+        },
         guard: None,
         plan: Some(needed_plan),
     },

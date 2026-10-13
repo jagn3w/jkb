@@ -108,7 +108,7 @@ fn end_to_end_full_flow() {
     // --- mount + import ---
     let repo_dir = repo.path().to_string_lossy().into_owned();
     db.write_txn("t", move |conn, meta| {
-        let ns_id = ns::ensure(conn, "docs/repo")?;
+        let ns_id = ns::ensure(conn, meta, "docs/repo")?;
         mount::create(
             conn,
             meta,
@@ -223,7 +223,7 @@ fn end_to_end_full_flow() {
     let searcher = Searcher::new(embedder());
     for route in [Route::Fts, Route::Vector, Route::Hybrid] {
         let query = search_query(route);
-        let hits = searcher.search(&db, &query, route, 10).unwrap();
+        let hits = searcher.search(&db, &query, route, 10).unwrap().hits;
         assert!(
             !hits.is_empty(),
             "route {} returned no hits",
@@ -281,7 +281,7 @@ fn ingest_and_sync_are_idempotent_and_audited() {
 
     let repo_dir = repo.path().to_string_lossy().into_owned();
     db.write_txn("t", move |conn, meta| {
-        let ns_id = ns::ensure(conn, "docs/repo")?;
+        let ns_id = ns::ensure(conn, meta, "docs/repo")?;
         mount::create(
             conn,
             meta,

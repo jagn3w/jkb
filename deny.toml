@@ -3,6 +3,13 @@
 
 [advisories]
 version = 2
+# Fail on a yanked crate in Cargo.lock. Config version 2 defaults this to "warn", and
+# `./scripts/check.sh` does not fail on warnings, so the default let two yanked crates
+# (chacha20 0.10.1, der 0.8.0) sit in the lockfile through every green gate. A yanked
+# version can vanish from the registry index, which turns a clean build into an
+# unreproducible one; the fix is nearly always a `cargo update -p <crate>` to its
+# non-yanked successor, so failing loudly costs little.
+yanked = "deny"
 # Fail on any security advisory for a dependency. Add specific IDs to `ignore`
 # only with a written justification.
 ignore = [

@@ -48,6 +48,9 @@ fn a_task_closes_on_a_merge_its_client_established() {
     assert_eq!((before.pr, before.branch.as_deref()), (None, Some("feat")));
     assert!(before.writable);
     assert!(!before.live_landing);
+    // The location facet is read beside the history's branch, which a session started through the
+    // op records in both places.
+    assert_eq!(before.branch_facet.as_deref(), Some("feat"));
 
     call(
         &b,
@@ -260,4 +263,88 @@ fn the_landing_that_speaks_is_the_newest_one_still_standing() {
         call(&b, json!({ "op": "task.set", "uid": uid, "status": s })).unwrap();
     }
     assert_eq!(landed(&b, &uid), None);
+}
+
+/// A *no pull request* answer is read back with the branch and remote tip it was asked at, the
+/// latest one standing; it is not a landing, and a tip that is not an object name is refused.
+#[test]
+fn a_recorded_none_is_read_back_with_what_it_was_asked_at() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = match call(
+        &b,
+        json!({ "op": "task.add", "text": "w", "managed": true }),
+    )
+    .unwrap()
+    {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    call(
+        &b,
+        json!({ "op": "task.start", "uid": uid, "take": { "owner": "box:1" },
+                "place": { "branch": "feat", "repo": "proj" } }),
+    )
+    .unwrap();
+    assert_eq!(facts(&b, &uid).pr_absent, None, "never asked");
+    call(
+        &b,
+        json!({ "op": "task.pr_absent", "uid": uid, "branch": "feat" }),
+    )
+    .unwrap();
+    let head = "0123456789abcdef0123456789abcdef01234567";
+    call(
+        &b,
+        json!({ "op": "task.pr_absent", "uid": uid, "branch": "feat", "remote_head": head }),
+    )
+    .unwrap();
+    let after = facts(&b, &uid);
+    assert_eq!(
+        after.pr_absent,
+        Some(super::PrAbsent {
+            branch: "feat".to_owned(),
+            remote_head: Some(head.to_owned()),
+        }),
+        "the latest answer stands"
+    );
+    assert_eq!(
+        (after.pr, after.branch.as_deref(), after.live_landing),
+        (None, Some("feat"), false),
+        "an answer of none is not a landing and moves no branch"
+    );
+    assert_eq!(status(&b, &uid), "in_progress");
+    // About another branch than the one the task is on: refused, and the task's branch stays.
+    let e = call(
+        &b,
+        json!({ "op": "task.pr_absent", "uid": uid, "branch": "elsewhere", "remote_head": head }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Stale, "{e:?}");
+    let still = facts(&b, &uid);
+    assert_eq!(still.branch.as_deref(), Some("feat"));
+    assert_eq!(still.pr_absent, after.pr_absent);
+    // Re-worked on another branch: an answer about the old one is refused, and the one recorded
+    // does not speak for the new branch (the client compares the branch).
+    call(
+        &b,
+        json!({ "op": "task.locate", "uid": uid, "owner": "box:1",
+                "place": { "branch": "next", "repo": "proj" } }),
+    )
+    .unwrap();
+    let e = call(
+        &b,
+        json!({ "op": "task.pr_absent", "uid": uid, "branch": "feat" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Stale, "{e:?}");
+    let moved = facts(&b, &uid);
+    assert_eq!(moved.branch.as_deref(), Some("next"));
+    assert_eq!(moved.pr_absent.map(|a| a.branch).as_deref(), Some("feat"));
+    for bad in ["", "not-hex", &"a".repeat(65)] {
+        let e = call(
+            &b,
+            json!({ "op": "task.pr_absent", "uid": uid, "branch": "next", "remote_head": bad }),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{bad:?}");
+    }
 }

@@ -6,7 +6,7 @@
 //! statement, as `task.landed` is — and is held to the task-write rules.
 
 use jkb_core::lifecycle::{self, TaskEvent};
-use jkb_core::{item, task, transition, WriteMeta};
+use jkb_core::{item, location, tag, task, transition, WriteMeta};
 use jkb_fsm::Fact;
 use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,12 @@ pub struct PrFacts {
     pub pr: Option<i64>,
     /// The branch it most recently recorded.
     pub branch: Option<String>,
+    /// Its `branch=` location facet, which a session started before the transition log existed
+    /// carries with nothing in the history naming it. Read only to tell *this task records no
+    /// branch* apart from *it records one but no session says where it lands* when `branch` is
+    /// `None` — the two have different remedies. Defaulted, so an older daemon reads as no facet.
+    #[serde(default)]
+    pub branch_facet: Option<String>,
     /// A landing jkb recorded still speaks for the work in flight.
     pub live_landing: bool,
     /// A recorded landing was superseded: `(onto, the event that retired it, when)`.
@@ -34,6 +40,21 @@ pub struct PrFacts {
     /// Whether this client may write the task — `false` for one filed outside `jkb serve`'s file
     /// roots, which `close-merged` holds rather than failing the whole run on.
     pub writable: bool,
+    /// The latest recorded *no pull request* answer ([`record_absent`]), which the client judges
+    /// against the branch's remote-tracking tip now. Defaulted, so an older daemon reads as never
+    /// asked — and the client asks.
+    #[serde(default)]
+    pub pr_absent: Option<PrAbsent>,
+}
+
+/// A recorded *no pull request is headed by this branch*, and what it was asked at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrAbsent {
+    /// The branch asked about.
+    pub branch: String,
+    /// Its remote-tracking tip when asked; `None` when it had none.
+    #[serde(default)]
+    pub remote_head: Option<String>,
 }
 
 /// `task.pr_facts`.
@@ -57,6 +78,9 @@ pub fn facts(
         uid,
         pr: landing.pr_number(),
         branch: transition::latest_with_branch(conn, id)?.and_then(|r| r.labels.branch),
+        branch_facet: tag::applications(conn, id)?
+            .into_iter()
+            .find_map(|(facet, value)| (facet == location::FACET_BRANCH).then_some(value)),
         live_landing: landing.live().is_some(),
         superseded: landing.superseded().map(|(landed, resumed)| {
             (
@@ -67,6 +91,12 @@ pub fn facts(
         }),
         resumed_at: landing.resumed_at().map(str::to_owned),
         writable,
+        pr_absent: landing.pr_absent().and_then(|row| {
+            Some(PrAbsent {
+                branch: row.labels.branch.clone()?,
+                remote_head: row.labels.ref_commit.clone(),
+            })
+        }),
     })
 }
 
@@ -140,6 +170,52 @@ pub fn record(
         ..transition::Labels::default()
     };
     transition::note(conn, meta, id, &facts, &labels)?;
+    Ok(())
+}
+
+/// `task.pr_absent`: note that no pull request is headed by `branch`, asked when its remote-tracking
+/// tip was `remote_head` (`None`: it had none) — so `close-merged` does not ask `gh` again until that
+/// tip moves (`jkb_core::transition::no_pull_request`).
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for a malformed branch or tip, [`ErrorCode::Stale`] when `branch` is not
+/// the task's latest recorded branch, [`ErrorCode::NotFound`], [`ErrorCode::Forbidden`] under
+/// `roots`, or a failed write.
+pub fn record_absent(
+    conn: &Connection,
+    meta: &WriteMeta,
+    reference: &str,
+    branch: &str,
+    remote_head: Option<&str>,
+    roots: Option<&FileRoots>,
+) -> Result<(), ApiError> {
+    check_name("branch", branch)?;
+    if let Some(head) = remote_head {
+        // An object name: what `git rev-parse` prints, sha-1 or sha-256.
+        if head.is_empty() || head.len() > 64 || !head.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ApiError::with_code(
+                ErrorCode::Invalid,
+                "a remote head is a commit's object name",
+            ));
+        }
+    }
+    let id = writable(conn, reference, roots)?;
+    // Only about the branch the task is on now, read in this transaction: an answer about a branch
+    // the task has since left — `close-merged` asked, and the task was re-worked meanwhile — would
+    // otherwise stand in for a question nobody asked about the new one.
+    let current = transition::latest_with_branch(conn, id)?.and_then(|r| r.labels.branch);
+    if current.as_deref() != Some(branch) {
+        return Err(ApiError::with_code(
+            ErrorCode::Stale,
+            format!(
+                "`{branch}` is not the branch this task's history records it on ({}); the answer \
+                 is not recorded",
+                current.as_deref().unwrap_or("none")
+            ),
+        ));
+    }
+    let facts = task::observe(conn, id)?;
+    transition::no_pull_request(conn, meta, id, &facts, branch, remote_head)?;
     Ok(())
 }
 

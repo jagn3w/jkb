@@ -63,9 +63,10 @@ pub struct TaskState {
     pub claim: Option<String>,
     /// Where its work lands, from its transition history.
     pub land_target: Option<String>,
-    /// Why the lifecycle refuses to start a **finished** task — what `task work` refuses with. `None`
-    /// for a task that is not finished: whether an unfinished one can be started depends on who asks,
-    /// which only the write decides.
+    /// Why the lifecycle refuses to start this task **from its state** — the machine has no `start`
+    /// edge out of it — which is what `task work` refuses with before it touches git. `None` when the
+    /// state has one: whether its guard lets the task start depends on who asks, which only the write
+    /// decides.
     pub start_refusal: Option<String>,
     /// Whether its status is terminal (`done`, `cancelled`).
     pub terminal: bool,
@@ -141,12 +142,20 @@ pub fn facts(
                 },
             )
             .map(Box::new),
-        start_refusal: if terminal {
-            lifecycle::apply(&observed, TaskEvent::Start).refusal()
-        } else {
-            None
-        },
+        start_refusal: state_refusal(&observed, TaskEvent::Start),
     })
+}
+
+/// The machine's refusal of `event` that holds **whoever asks**: an event with no edge out of the
+/// task's state. A guard's refusal is not one — the start guard asks who holds the claim against who
+/// is asking, and these facts name nobody — so it is left to the write. Asked of the machine's own
+/// verdict rather than a list of statuses beside it, so the two cannot disagree about which refusals
+/// a caller may act on before it does anything.
+fn state_refusal(observed: &lifecycle::TaskFacts, event: TaskEvent) -> Option<String> {
+    match lifecycle::apply(observed, event) {
+        undefined @ jkb_fsm::Outcome::Undefined { .. } => undefined.refusal(),
+        _ => None,
+    }
 }
 
 /// One of a repo's tasks, as `task.by_branch` indexes it.
@@ -245,10 +254,21 @@ pub struct Take {
     pub displace: Option<String>,
 }
 
+/// What [`swap`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Swapped {
+    /// The claim changed hands since the caller read it, and nothing was written.
+    Lost,
+    /// The task moved, and the `start` row in its history carries the labels.
+    Recorded,
+    /// The owner already had it started: the machine's start was idempotent, so no row was written.
+    Unmoved,
+}
+
 /// Move the claim on `id` to `take.owner`, atomically against `take.displace`, through the lifecycle's
-/// `start` — so starting a task is in its history, with who started it and where. `false` means the
-/// claim changed hands since the caller read it, and nothing was written: a claim that is not
-/// `displace` (or, with no `displace`, any claim but `take.owner`'s own) was never judged by the
+/// `start` — so starting a task is in its history, with who started it and where. [`Swapped::Lost`]
+/// means the claim changed hands since the caller read it, and nothing was written: a claim that is
+/// not `displace` (or, with no `displace`, any claim but `take.owner`'s own) was never judged by the
 /// caller.
 ///
 /// Clearing first is what lets a resumed session re-take its own claim under a new pid: the claim's
@@ -260,13 +280,13 @@ fn swap(
     id: jkb_types::ItemId,
     take: &Take,
     labels: &transition::Labels,
-) -> Result<bool, ApiError> {
+) -> Result<Swapped, ApiError> {
     let judged = match &take.displace {
         Some(prev) => claim::clear_if(conn, meta, id, prev)?,
         None => claim::holder(conn, id)?.is_none_or(|c| c == take.owner),
     };
     if !judged {
-        return Ok(false);
+        return Ok(Swapped::Lost);
     }
     let facts = lifecycle::TaskFacts {
         actor: Some(AgentId::parse(&take.owner)),
@@ -276,9 +296,10 @@ fn swap(
     match outcome.refusal() {
         // As the core error, so the wording is the one `jkb task start` always printed.
         Some(why) => Err(jkb_core::Error::from(jkb_types::Error::Validation(why)).into()),
+        None if outcome.moved() => Ok(Swapped::Recorded),
         // An already-started task claimed by the same owner is idempotent: asking twice is not an
-        // error (D48/S1.6).
-        None => Ok(true),
+        // error (D48/S1.6), and nothing happened again, so the history has no row for it.
+        None => Ok(Swapped::Unmoved),
     }
 }
 
@@ -299,9 +320,14 @@ pub struct StartAsk {
     pub place: Place,
 }
 
-/// `task.start`: take the claim (unless kept), record where the work is, and note it in the task's
+/// `task.start`: take the claim (unless kept), record where the work is, and put it in the task's
 /// history — one transaction, as `jkb task start` always was. Returns `false`, having written nothing,
 /// when the claim changed hands since the caller read it.
+///
+/// **One row per action.** When the start moved the task, its `start` row already carries the branch
+/// and land target, so nothing more is written; a `note` after it repeated the same labels with no
+/// agent and `from == to`, and `jkb task why` showed one start as two entries. The `note` is written
+/// only when no transition row was: a kept claim, or a re-start the machine found idempotent.
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`]/[`ErrorCode::Forbidden`] for the task, [`ErrorCode::Invalid`] for a
@@ -315,11 +341,13 @@ pub fn start(
     ask.place.check()?;
     let id = writable(conn, &ask.uid, roots)?;
     let labels = ask.place.labels();
-    match (&ask.take, &ask.keep) {
+    let recorded = match (&ask.take, &ask.keep) {
         (Some(take), None) => {
             check_new_owner(&take.owner)?;
-            if !swap(conn, meta, id, take, &labels)? {
-                return Ok(false);
+            match swap(conn, meta, id, take, &labels)? {
+                Swapped::Lost => return Ok(false),
+                Swapped::Recorded => true,
+                Swapped::Unmoved => false,
             }
         }
         (None, Some(kept)) => {
@@ -327,6 +355,7 @@ pub fn start(
             if claim::holder(conn, id)?.as_deref() != Some(kept.as_str()) {
                 return Ok(false);
             }
+            false
         }
         _ => {
             return Err(ApiError::with_code(
@@ -334,12 +363,14 @@ pub fn start(
                 "a start takes a claim or keeps one: exactly one of `take` and `keep`",
             ))
         }
-    }
+    };
     // Through the one location-facet writer, as `task.take` does. The branch and its land target are
     // also labels on a transition, so there is no second store to keep in step.
     locate_id(conn, meta, id, &ask.place)?;
-    let facts = task::observe(conn, id)?;
-    transition::note(conn, meta, id, &facts, &labels)?;
+    if !recorded {
+        let facts = task::observe(conn, id)?;
+        transition::note(conn, meta, id, &facts, &labels)?;
+    }
     Ok(true)
 }
 
@@ -389,7 +420,7 @@ pub fn take(
     }
     let id = writable(conn, &ask.uid, roots)?;
     trial_locate(conn, meta, id, &ask.uid, &ask.place)?;
-    swap(conn, meta, id, &ask.take, &transition::Labels::default())
+    Ok(swap(conn, meta, id, &ask.take, &transition::Labels::default())? != Swapped::Lost)
 }
 
 /// Write the place, check the task's `tasks.md` line would still read back, and undo the write —
@@ -716,11 +747,8 @@ pub fn landed(
     };
     let labels = landed.labels();
     let outcome = transition::perform(conn, meta, id, &facts, TaskEvent::ObservedLanded, &labels)?;
-    let refusal = outcome.refusal();
-    if refusal.is_some() && matches!(outcome, jkb_fsm::Outcome::Refused { .. }) {
-        transition::observed(conn, meta, id, &facts, TaskEvent::ObservedLanded, &labels)?;
-    }
-    landing(conn, id, refusal)
+    transition::observed(conn, meta, id, &facts, &outcome, &labels)?;
+    landing(conn, id, outcome.refusal())
 }
 
 /// One open must-fix finding.

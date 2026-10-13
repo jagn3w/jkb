@@ -55,15 +55,63 @@ fn manager() -> Result<Manager> {
 /// One installable unit: its label, where it goes, and what goes in it.
 type Unit = (&'static str, PathBuf, String);
 
-/// Print the service units for this platform to stdout (a dry run of `install`).
+/// Print the service units for this platform to stdout (a dry run of `install`), each under a
+/// comment naming the path `install` writes it to.
 ///
 /// # Errors
 /// Returns an error if the current executable or working directory can't be resolved.
 pub fn print(db: &Path) -> Result<()> {
-    for (_, _, unit) in units_for_platform(db)? {
-        print!("{unit}");
-    }
+    print!("{}", render_print(manager()?, &units_for_platform(db)?));
     Ok(())
+}
+
+/// Every unit, separated by a blank line, each carrying a comment that names its install path in
+/// that unit type's own comment syntax — so each section can be copied into its file verbatim.
+/// Concatenated bare, two plists were two XML documents in one stream (which `plutil` and launchd
+/// reject) and nothing said which file either belonged in.
+///
+/// A systemd unit takes a leading `#` line. A plist cannot: the XML declaration must be the
+/// document's first bytes, so the `<!-- … -->` comment goes on the line after it, in the prolog,
+/// where XML allows one. `--` may not appear inside an XML comment, so a run of hyphens in a path
+/// is spelled with spaces between them there ([`xml_comment_safe`]).
+fn render_print(manager: Manager, units: &[Unit]) -> String {
+    let mut sections = Vec::with_capacity(units.len());
+    for (_, path, unit) in units {
+        let path = path.display().to_string();
+        let mut section = match manager {
+            Manager::Systemd => format!("# {path}\n{unit}"),
+            Manager::Launchd => {
+                let comment = format!("<!-- {} -->\n", xml_comment_safe(&path));
+                match unit.split_once('\n') {
+                    Some((decl, rest)) if decl.starts_with("<?xml") => {
+                        format!("{decl}\n{comment}{rest}")
+                    }
+                    _ => format!("{comment}{unit}"),
+                }
+            }
+        };
+        if !section.ends_with('\n') {
+            section.push('\n');
+        }
+        sections.push(section);
+    }
+    sections.join("\n")
+}
+
+/// `text` with no `--` in it, which an XML comment may not contain: every hyphen in a run is
+/// followed by a space. One left-to-right `replace("--", "- -")` was not enough — it skips past
+/// each match, so `---` became `- --`.
+fn xml_comment_safe(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_hyphen = false;
+    for c in text.chars() {
+        if c == '-' && prev_hyphen {
+            out.push(' ');
+        }
+        prev_hyphen = c == '-';
+        out.push(c);
+    }
+    out
 }
 
 /// Write the service units to their platform locations and print the activation commands.
@@ -313,8 +361,7 @@ fn launchd_plist(exe: &Path, db: &Path) -> String {
 
 /// A systemd **user** unit running the all-mounts watcher, restarted on failure.
 fn systemd_unit(exe: &Path, db: &Path) -> String {
-    let exe = exe.to_string_lossy();
-    let db = db.to_string_lossy();
+    let command = systemd_command(exe, db);
     format!(
         "[Unit]\n\
          Description=jkb knowledge base file-sync watcher\n\
@@ -322,7 +369,7 @@ fn systemd_unit(exe: &Path, db: &Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={exe} --db {db} sync --watch\n\
+         ExecStart={command} sync --watch\n\
          Restart=on-failure\n\
          \n\
          [Install]\n\
@@ -425,8 +472,7 @@ fn systemd_reap_unit(exe: &Path, db: &Path, container: Option<&str>) -> String {
             crate::transcripts::CONTAINER_NAME_VAR
         )
     });
-    let exe = exe.to_string_lossy();
-    let db = db.to_string_lossy();
+    let command = systemd_command(exe, db);
     format!(
         "[Unit]\n\
          Description=jkb session worktree archiver\n\
@@ -434,7 +480,7 @@ fn systemd_reap_unit(exe: &Path, db: &Path, container: Option<&str>) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={exe} --db {db} task reap --watch\n\
+         ExecStart={command} task reap --watch\n\
          {container_env}Restart=on-failure\n\
          \n\
          [Install]\n\
@@ -478,8 +524,7 @@ fn launchd_serve_plist(exe: &Path, db: &Path) -> String {
 
 /// A systemd **user** unit running `jkb serve`, restarted on failure.
 fn systemd_serve_unit(exe: &Path, db: &Path) -> String {
-    let exe = exe.to_string_lossy();
-    let db = db.to_string_lossy();
+    let command = systemd_command(exe, db);
     format!(
         "[Unit]\n\
          Description=jkb knowledge base daemon (serves the dev container)\n\
@@ -487,12 +532,68 @@ fn systemd_serve_unit(exe: &Path, db: &Path) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={exe} --db {db} serve\n\
+         ExecStart={command} serve\n\
          Restart=on-failure\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n"
     )
+}
+
+/// The start of a systemd `ExecStart=` value: `jkb --db <db>`, each path one quoted word.
+///
+/// Every unit builds its command line here, so the one rule that differs between the program word
+/// and its arguments (see [`Word`]) cannot be forgotten by a unit that spells its own.
+fn systemd_command(exe: &Path, db: &Path) -> String {
+    format!(
+        "{} --db {}",
+        systemd_quote(&exe.to_string_lossy(), Word::Program),
+        systemd_quote(&db.to_string_lossy(), Word::Argument)
+    )
+}
+
+/// Which word of an `ExecStart=` line [`systemd_quote`] is spelling.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Word {
+    /// The executable. systemd never environment-expands it ("the first argument (i.e. the
+    /// program to execute) may not be a variable", systemd.service(5)): it is looked up from the
+    /// unescaped path as is, so a `$` in it is literal and must NOT be doubled — `$$` there names
+    /// a file that does not exist, and the service fails with 203/EXEC.
+    Program,
+    /// Any later argument, which systemd does expand `$VAR`/`${VAR}` in at exec time.
+    Argument,
+}
+
+/// One word of a systemd `ExecStart=` line, spelled so systemd runs (for [`Word::Program`]) or
+/// passes (for [`Word::Argument`]) exactly `s`.
+///
+/// `ExecStart=` is not a shell line, but it is not literal either: systemd splits it into words at
+/// whitespace, unquotes and C-unescapes each word, expands `%` specifiers in it, and at exec time
+/// expands `$VAR`/`${VAR}` in the arguments (systemd.service(5), "Command lines"; systemd.syntax(7),
+/// "Quoting"). So a bare path is right only until it holds a space (two arguments: the wrong
+/// executable, or `--db` pointing at a truncated path) or a `%` (`%h`, `%u` … silently substituted,
+/// or a unit that fails to load on an unknown specifier). The word is therefore always
+/// double-quoted, with `\` and `"` backslash-escaped, `%` doubled to the specifier escape `%%`,
+/// control characters (a newline would end the line) written as `\xNN`, which the C-unescape step
+/// turns back into the byte, and — in an argument only — `$` doubled to the literal-dollar `$$`.
+fn systemd_quote(s: &str, word: Word) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '%' => out.push_str("%%"),
+            '$' if word == Word::Argument => out.push_str("$$"),
+            c if c.is_ascii_control() => {
+                let _ = write!(out, "\\x{:02x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Minimal XML escaping for text that goes inside plist `<string>` elements.
@@ -508,10 +609,101 @@ fn xml_escape(s: &str) -> String {
 mod tests {
     use super::{
         install_units, launchd_log, launchd_plist, launchd_reap_plist, launchd_serve_plist,
-        systemd_reap_unit, systemd_serve_unit, systemd_unit, xml_escape, Manager, LABEL,
-        REAP_LABEL, SERVE_LABEL,
+        render_print, systemd_quote, systemd_reap_unit, systemd_serve_unit, systemd_unit,
+        xml_escape, Manager, Word, LABEL, REAP_LABEL, SERVE_LABEL,
     };
     use std::path::Path;
+
+    /// `service print` is a dry run of `install`: each unit is announced by a comment naming its
+    /// install path, in a syntax its file accepts, so every section copies into its file verbatim.
+    #[test]
+    fn print_names_each_systemd_unit_by_its_install_path() {
+        let exe = Path::new("/usr/local/bin/jkb");
+        let db = Path::new("/home/u/.jkb/jkb.db");
+        let dir = Path::new("/home/u/.config/systemd/user");
+        let units = vec![
+            (
+                LABEL,
+                dir.join(format!("{LABEL}.service")),
+                systemd_unit(exe, db),
+            ),
+            (
+                REAP_LABEL,
+                dir.join(format!("{REAP_LABEL}.service")),
+                systemd_reap_unit(exe, db, None),
+            ),
+        ];
+        let out = render_print(Manager::Systemd, &units);
+        let want = format!(
+            "# /home/u/.config/systemd/user/{LABEL}.service\n{}\n\
+             # /home/u/.config/systemd/user/{REAP_LABEL}.service\n{}",
+            units[0].2, units[1].2
+        );
+        assert_eq!(out, want);
+        // Each section is a whole unit: the header line is a systemd comment, and the next
+        // section begins only after the previous unit's last line.
+        for (_, path, unit) in &units {
+            let header = format!("# {}\n", path.display());
+            let at = out.find(&header).expect("every unit has a header");
+            assert!(out[at + header.len()..].starts_with(unit.as_str()));
+        }
+    }
+
+    #[test]
+    fn print_names_each_plist_by_its_install_path_after_the_xml_declaration() {
+        let exe = Path::new("/usr/local/bin/jkb");
+        let db = Path::new("/Users/u/.jkb/jkb.db");
+        let dir = Path::new("/Users/u/Library/LaunchAgents");
+        let units = vec![
+            (
+                LABEL,
+                dir.join(format!("{LABEL}.plist")),
+                launchd_plist(exe, db),
+            ),
+            (
+                SERVE_LABEL,
+                Path::new("/Users/a--b").join(format!("{SERVE_LABEL}.plist")),
+                launchd_serve_plist(exe, db),
+            ),
+            (
+                REAP_LABEL,
+                Path::new("/Users/a---b").join(format!("{REAP_LABEL}.plist")),
+                launchd_reap_plist(exe, db, None),
+            ),
+            (
+                LABEL,
+                Path::new("/Users/a----b-").join(format!("{LABEL}.plist")),
+                launchd_plist(exe, db),
+            ),
+        ];
+        let out = render_print(Manager::Launchd, &units);
+        // The XML declaration must be a document's first bytes, so every section starts with it
+        // and names its path on the very next line.
+        let docs: Vec<&str> = out.split("<?xml ").filter(|d| !d.is_empty()).collect();
+        assert_eq!(docs.len(), 4, "{out}");
+        assert!(out.starts_with("<?xml "));
+        let comments = [
+            format!("<!-- /Users/u/Library/LaunchAgents/{LABEL}.plist -->"),
+            format!("<!-- /Users/a- -b/{SERVE_LABEL}.plist -->"),
+            format!("<!-- /Users/a- - -b/{REAP_LABEL}.plist -->"),
+            format!("<!-- /Users/a- - - -b-/{LABEL}.plist -->"),
+        ];
+        for ((doc, comment), (_, _, unit)) in docs.iter().zip(&comments).zip(&units) {
+            let mut lines = doc.lines();
+            lines.next();
+            let line = lines.next().expect("a comment line after the declaration");
+            assert_eq!(line, comment.as_str());
+            // The comment's body, as printed, holds no `--`: XML forbids it inside a comment.
+            let body = line
+                .strip_prefix("<!--")
+                .and_then(|l| l.strip_suffix("-->"))
+                .expect("an XML comment");
+            assert!(!body.contains("--"), "{line}");
+            // Taking the comment line back out leaves exactly the unit `install` writes.
+            let restored = format!("<?xml {}", doc.replacen(&format!("{comment}\n"), "", 1));
+            assert_eq!(restored.trim_end(), unit.trim_end());
+        }
+    }
 
     #[test]
     fn launchd_plist_runs_the_watcher() {
@@ -558,7 +750,9 @@ mod tests {
     #[test]
     fn systemd_unit_runs_the_watcher() {
         let unit = systemd_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
-        assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db sync --watch"));
+        assert!(
+            unit.contains("ExecStart=\"/usr/bin/jkb\" --db \"/home/u/.jkb/jkb.db\" sync --watch")
+        );
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
     }
@@ -611,8 +805,51 @@ mod tests {
         assert!(plist.contains("<key>KeepAlive</key>"));
         assert!(plist.contains("serve.log"));
         let unit = systemd_serve_unit(Path::new("/usr/bin/jkb"), Path::new("/home/u/.jkb/jkb.db"));
-        assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db serve"));
+        assert!(unit.contains("ExecStart=\"/usr/bin/jkb\" --db \"/home/u/.jkb/jkb.db\" serve"));
         assert!(unit.contains("Restart=on-failure"));
+    }
+
+    /// A path with a space or a `%` must reach the process as ONE argument, spelled as written.
+    /// Unquoted, `/home/a b/jkb` ran `/home/a` with `b/jkb` as its first argument, and `%h` in a
+    /// database path was replaced by the home directory before `jkb` ever saw it.
+    #[test]
+    fn systemd_exec_start_quotes_and_escapes_the_exe_and_db() {
+        assert_eq!(
+            systemd_quote(r#"/a b/100%h$HOME"q"\n"#, Word::Argument),
+            r#""/a b/100%%h$$HOME\"q\"\\n""#
+        );
+        assert_eq!(
+            systemd_quote(r#"/a b/100%h$HOME"q"\n"#, Word::Program),
+            r#""/a b/100%%h$HOME\"q\"\\n""#
+        );
+        assert_eq!(systemd_quote("a\nb\tc", Word::Argument), r#""a\x0ab\x09c""#);
+
+        let exe = Path::new("/opt/my apps/jkb");
+        let db = Path::new("/home/u/100% sure/jkb.db");
+        let want = r#"ExecStart="/opt/my apps/jkb" --db "/home/u/100%% sure/jkb.db""#;
+        for (unit, tail) in [
+            (systemd_unit(exe, db), " sync --watch\n"),
+            (systemd_serve_unit(exe, db), " serve\n"),
+            (systemd_reap_unit(exe, db, None), " task reap --watch\n"),
+        ] {
+            assert!(unit.contains(&format!("{want}{tail}")), "{unit}");
+        }
+    }
+
+    /// systemd looks the program up from its path without expanding `$`, so doubling it there
+    /// names a missing file (203/EXEC); in the `--db` argument it IS expanded, so it must double.
+    #[test]
+    fn systemd_exec_start_doubles_dollar_in_the_db_argument_but_never_in_the_program() {
+        let exe = Path::new("/opt/$x/jkb");
+        let db = Path::new("/home/u/$y/jkb.db");
+        let want = r#"ExecStart="/opt/$x/jkb" --db "/home/u/$$y/jkb.db""#;
+        for (unit, tail) in [
+            (systemd_unit(exe, db), " sync --watch\n"),
+            (systemd_serve_unit(exe, db), " serve\n"),
+            (systemd_reap_unit(exe, db, None), " task reap --watch\n"),
+        ] {
+            assert!(unit.contains(&format!("{want}{tail}")), "{unit}");
+        }
     }
 
     #[test]
@@ -631,7 +868,8 @@ mod tests {
             named.contains("Environment=JKB_CONTAINER_NAME=jkb-alt"),
             "the reaper must sweep the container the operator actually named: {named}"
         );
-        assert!(unit.contains("ExecStart=/usr/bin/jkb --db /home/u/.jkb/jkb.db task reap --watch"));
+        assert!(unit
+            .contains("ExecStart=\"/usr/bin/jkb\" --db \"/home/u/.jkb/jkb.db\" task reap --watch"));
         assert!(unit.contains("Restart=on-failure"));
         // NO `Environment=PATH=` HERE, deliberately, and the launchd side is not the same case.
         // systemd's `Environment=` REPLACES the inherited value rather than extending it, and its

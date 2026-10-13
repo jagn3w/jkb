@@ -68,11 +68,8 @@ fn open_db() -> Db {
 
 fn pipeline() -> Pipeline {
     // Small windows so ordinary test text yields several chunks.
-    Pipeline::new(FakeEmbedder::arc()).with_chunking(ChunkConfig {
-        max_chars: 40,
-        overlap_chars: 10,
-        min_chars: 10,
-    })
+    Pipeline::new(FakeEmbedder::arc())
+        .with_chunking(ChunkConfig::new(40, 10, 10).expect("valid chunk config"))
 }
 
 fn doc(text: &str) -> ParsedDocument {
@@ -128,7 +125,7 @@ fn vector_route_ranks_by_similarity_with_distances() {
         vector: Some("safety and performance".to_owned()),
         ..Query::default()
     };
-    let hits = searcher().search(&db, &q, Route::Vector, 5).unwrap();
+    let hits = searcher().search(&db, &q, Route::Vector, 5).unwrap().hits;
 
     assert!(!hits.is_empty(), "vector route finds embedded items");
     assert!(hits.iter().all(|h| h.route == Route::Vector));
@@ -160,7 +157,7 @@ fn fts_route_excludes_items_lacking_the_term() {
         fts: Some("photosynthesis".to_owned()),
         ..Query::default()
     };
-    let hits = searcher().search(&db, &q, Route::Fts, 10).unwrap();
+    let hits = searcher().search(&db, &q, Route::Fts, 10).unwrap().hits;
 
     assert!(!hits.is_empty(), "keyword route returns matches");
     assert!(hits.iter().all(|h| h.route == Route::Fts));
@@ -189,7 +186,7 @@ fn scoped_vector_returns_only_in_scope_items() {
         scope: Scope::Subtree("books".to_owned()),
         ..Query::default()
     };
-    let hits = searcher().search(&db, &q, Route::Vector, 10).unwrap();
+    let hits = searcher().search(&db, &q, Route::Vector, 10).unwrap().hits;
 
     assert!(!hits.is_empty(), "scoped vector search returns results");
     for hit in &hits {
@@ -227,8 +224,8 @@ fn selective_large_scope_returns_results_via_overfetch() {
     let vector = VectorIndexer::new(FakeEmbedder::arc());
     db.write_txn_with::<(), jkb_search::Error, _>("seed", move |conn, meta| {
         vector.ensure_ready(conn)?;
-        let out_ns = ns::ensure(conn, "out")?;
-        let in_ns = ns::ensure(conn, "in")?;
+        let out_ns = ns::ensure(conn, meta, "out")?;
+        let in_ns = ns::ensure(conn, meta, "in")?;
         // 60 out-of-scope decoys sitting exactly on the query (distance ~0): far more
         // than the initial over-fetch batch, so growth is forced.
         for i in 0..60 {
@@ -271,7 +268,7 @@ fn selective_large_scope_returns_results_via_overfetch() {
         scope: Scope::Subtree("in".to_owned()),
         ..Query::default()
     };
-    let hits = searcher().search(&db, &q, Route::Vector, 5).unwrap();
+    let hits = searcher().search(&db, &q, Route::Vector, 5).unwrap().hits;
 
     assert_eq!(
         hits.len(),
@@ -303,9 +300,9 @@ fn hybrid_fuses_vector_and_fts_orderings() {
         ..Query::default()
     };
 
-    let vector = searcher().search(&db, &q, Route::Vector, 10).unwrap();
-    let fts = searcher().search(&db, &q, Route::Fts, 10).unwrap();
-    let hybrid = searcher().search(&db, &q, Route::Hybrid, 10).unwrap();
+    let vector = searcher().search(&db, &q, Route::Vector, 10).unwrap().hits;
+    let fts = searcher().search(&db, &q, Route::Fts, 10).unwrap().hits;
+    let hybrid = searcher().search(&db, &q, Route::Hybrid, 10).unwrap().hits;
 
     assert!(!hybrid.is_empty(), "hybrid returns fused results");
     assert!(hybrid.iter().all(|h| h.route == Route::Hybrid));
@@ -400,4 +397,68 @@ fn context_expansion_of_a_non_chunk_returns_the_item_itself() {
     assert!(ctx[0].is_hit);
     assert_eq!(ctx[0].item, id);
     assert_eq!(ctx[0].content, "a standalone note");
+}
+
+/// Plant `n` orphan vector rows — ids no item has, as a database that predates the vector GC
+/// trigger carries — each exactly the embedding of `text`, so they rank ahead of every live row.
+fn plant_orphans(db: &Db, text: &str, n: i64) {
+    let bytes: Vec<u8> = embed16(text).iter().flat_map(|f| f.to_le_bytes()).collect();
+    db.write_txn("test", move |conn, _meta| {
+        let mut insert =
+            conn.prepare_cached("INSERT INTO vec_items_16(item_id, embedding) VALUES (?1, ?2)")?;
+        for orphan in 900_000..900_000 + n {
+            insert.execute(rusqlite::params![orphan, bytes])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// A search reports the orphan vector rows its liveness filter dropped, on every route that runs
+/// a KNN, so the caller can point the user at `jkb index --sweep` — and reports none on a clean
+/// table, so the hint never fires there.
+#[test]
+fn search_reports_the_orphan_vectors_it_filtered_out() {
+    let db = open_db();
+    ingest(
+        &db,
+        "The Rust programming language emphasizes memory safety and performance \
+         in systems software without a garbage collector.",
+        "docs",
+    );
+    let q = Query {
+        vector: Some("safety and performance".to_owned()),
+        ..Query::default()
+    };
+
+    for route in [Route::Vector, Route::Hybrid] {
+        let clean = searcher().search(&db, &q, route, 5).unwrap();
+        assert!(!clean.hits.is_empty(), "{route:?}");
+        assert_eq!(clean.orphans.dropped, 0, "clean table, {route:?}");
+        assert!(clean.orphans.scanned > 0, "the KNN ran, {route:?}");
+    }
+
+    plant_orphans(&db, "safety and performance", 40);
+    for route in [Route::Vector, Route::Hybrid] {
+        let dirty = searcher().search(&db, &q, route, 5).unwrap();
+        assert!(!dirty.hits.is_empty(), "live hits still found, {route:?}");
+        assert!(
+            dirty.hits.iter().all(|h| h.item.get() < 900_000),
+            "no orphan reaches the hits, {route:?}"
+        );
+        assert_eq!(
+            dirty.orphans.dropped, 40,
+            "every orphan ranks first, so the last page held all of them, {route:?}: {:?}",
+            dirty.orphans
+        );
+        assert!(dirty.orphans.scanned > dirty.orphans.dropped);
+    }
+
+    // FTS never touches the vector table.
+    let q = Query {
+        fts: Some("safety".to_owned()),
+        ..Query::default()
+    };
+    let fts = searcher().search(&db, &q, Route::Fts, 5).unwrap();
+    assert_eq!(fts.orphans, jkb_search::OrphanVectors::default());
 }

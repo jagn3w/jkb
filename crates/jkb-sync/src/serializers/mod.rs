@@ -103,6 +103,12 @@ pub struct SyncItem {
     pub mirrors: Vec<String>,
     /// The `local_id` of this item's parent (indentation → `parent_of`); `None` if top.
     pub parent: Option<String>,
+    /// The `^id`s this task's `needs:` modifiers name that no item in the file defines, in file
+    /// order: a dependency the file declares but cannot yet record. Never an edge and never words
+    /// of the content; rendered back as `needs:^id` so the line survives, and stored on the item
+    /// (`jkb_core::item::UNRESOLVED_NEEDS`). The parse resolves one into a `depends_on` edge as
+    /// soon as the file defines its id.
+    pub unresolved_needs: Vec<String>,
 }
 
 impl SyncItem {
@@ -121,6 +127,7 @@ impl SyncItem {
             tags: Vec::new(),
             mirrors: Vec::new(),
             parent: None,
+            unresolved_needs: Vec::new(),
         }
     }
 }
@@ -132,7 +139,7 @@ pub struct SyncEdge {
     pub src: String,
     /// Destination item `local_id`.
     pub dst: String,
-    /// The edge type (`parent_of`, `depends_on`).
+    /// The edge type. Which item owns it in a three-way merge is `engine::edge_owner`.
     pub edge_type: EdgeType,
 }
 
@@ -149,6 +156,18 @@ pub trait SyncSerializer: Send + Sync {
     /// Returns a validation error if the bytes cannot be parsed for this format.
     fn parse(&self, bytes: &[u8]) -> Result<SyncDoc>;
 
+    /// [`parse`](Self::parse), plus one warning for each thing in the bytes the parse accepted
+    /// without taking it at face value — for `tasks`, a `needs:^id` naming no task in the file,
+    /// parked on its task ([`SyncItem::unresolved_needs`]) instead of becoming an edge. The engine reports these on the file's
+    /// [`FileResult`](crate::FileResult) every time it reads the file, so a reference that
+    /// records nothing is never silent. The default has nothing to warn about.
+    ///
+    /// # Errors
+    /// As [`parse`](Self::parse).
+    fn parse_with_warnings(&self, bytes: &[u8]) -> Result<(SyncDoc, Vec<String>)> {
+        Ok((self.parse(bytes)?, Vec::new()))
+    }
+
     /// Render a [`SyncDoc`] back into file bytes. Must be idempotent:
     /// `render(parse(render(doc)))` equals `render(doc)`.
     ///
@@ -161,6 +180,15 @@ pub trait SyncSerializer: Send + Sync {
     /// hard error (design D25). Multi-item formats opt in; `document` does not, so its
     /// only failure (non-UTF-8) stays a hard, rolled-back error.
     fn quarantine_on_parse_error(&self) -> bool {
+        false
+    }
+
+    /// Whether this format writes an item's `+ns` mirrors (its reference placements outside
+    /// the file) into the file and reads them back. Only such a format can *remove* a mirror
+    /// by omitting it: for one that never carries mirrors, an item parsed with none says
+    /// nothing about the item's placements, and the import must leave them alone. `document`
+    /// carries none; `tasks` opts in.
+    fn carries_mirrors(&self) -> bool {
         false
     }
 }

@@ -229,8 +229,8 @@ pub(crate) fn check_owner(owner: &str) -> Result<(), ApiError> {
 }
 
 /// An owner a claim is about to be **taken** as: [`check_owner`], and in the spelling the lifecycle
-/// stores (`AgentId`'s). A claim is stored canonically, so an owner sent in another spelling (`agent:a:b`
-/// is stored `agent:a-b`) would never match its own claim again — every later compare-and-set, and its
+/// stores (`AgentId`'s). A claim is stored canonically, so an owner sent in another spelling (`host:007`
+/// is stored `host:7`) would never match its own claim again — every later compare-and-set, and its
 /// own release, would miss. An owner that names an *existing* claim is only [`check_owner`]ed: it is
 /// compared with what is stored, which a claim written outside the lifecycle may spell any way.
 pub(crate) fn check_new_owner(owner: &str) -> Result<(), ApiError> {
@@ -774,7 +774,7 @@ pub fn place(
     if let Some(scope) = scope {
         crate::rbac::check_destination(conn, scope, namespace)?;
     }
-    let ns_id = ns::ensure(conn, namespace)?;
+    let ns_id = ns::ensure(conn, meta, namespace)?;
     if home {
         task::set_primary_home(conn, meta, id, ns_id, 0)?;
     } else {

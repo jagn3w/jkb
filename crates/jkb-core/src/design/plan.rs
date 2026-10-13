@@ -337,22 +337,22 @@ impl StepTasks {
 /// A database error.
 pub(crate) fn step_tasks(conn: &Connection, step: ItemId) -> Result<StepTasks> {
     Ok(conn
-        .prepare_cached(
+        .prepare_cached(concat!(
             "WITH RECURSIVE under(id) AS (
                  SELECT child_item_id FROM containment WHERE parent_item_id = ?1
                  UNION
                  SELECT c.child_item_id FROM containment c JOIN under u ON c.parent_item_id = u.id
              )
              SELECT COUNT(*), COALESCE(SUM(i.status IS ?2), 0),
-                    COALESCE(SUM(i.status IN (?2, ?3)), 0)
+                    COALESCE(SUM(i.status IN ",
+            jkb_types::sql_terminal_list!(),
+            "), 0)
                FROM under u JOIN items i ON i.id = u.id WHERE i.kind = 'task'",
-        )?
+        ))?
         .query_row(
-            params![
-                step.get(),
-                TaskStatus::Done.as_str(),
-                TaskStatus::Cancelled.as_str()
-            ],
+            // `done` is its own count (a step is IMPLEMENTED only by landed work); the
+            // terminal count comes from the shared terminal-set fragment above.
+            params![step.get(), TaskStatus::Done.as_str()],
             |r| {
                 Ok(StepTasks {
                     count: r.get(0)?,
@@ -451,13 +451,55 @@ pub struct TaskPlace {
     pub spans: Vec<SpanView>,
 }
 
-/// The design (and plan step) task `task` is contained under, walking its containers up; `None`
-/// for a task under no design.
-///
-/// # Errors
-/// A database error.
-pub fn place_of(conn: &Connection, task: ItemId) -> Result<Option<TaskPlace>> {
-    let mut step: Option<(ItemId, String, String)> = None;
+/// An item a task sits under: its uid and its text (a design's or plan's title, a step's words).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Named {
+    /// Its uid.
+    pub uid: String,
+    /// Its content, as stored.
+    pub text: String,
+}
+
+/// The plan step a task sits under, with where it falls in its plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepPlace {
+    /// The step.
+    pub step: Named,
+    /// Its place among its plan's steps, from 1.
+    pub number: usize,
+    /// The plan it is a step of.
+    pub plan: Named,
+}
+
+/// What a task sits under, for `jkb task show`: the step and plan when it is under one, the design,
+/// and the root of the design's tree when that design is nested under another. Read by
+/// [`ancestry_of`] without loading the design's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ancestry {
+    /// The plan step, when the task (or a task it is a subtask of) is under one.
+    pub step: Option<StepPlace>,
+    /// The design whose plan (or whose one-off) the task is.
+    pub design: Named,
+    /// The top of `design`'s tree ([`super::tree::root_of`]); `None` when `design` is the top.
+    pub root: Option<Named>,
+}
+
+/// The first step and the design above `task`, found by walking its containers up: the one walk
+/// [`place_of`] and [`ancestry_of`] share.
+struct Climb {
+    step: Option<(ItemId, Named)>,
+    design: (ItemId, Named),
+}
+
+fn named(meta: item::ItemMeta) -> Named {
+    Named {
+        uid: meta.uid,
+        text: meta.content.unwrap_or_default(),
+    }
+}
+
+fn climb(conn: &Connection, task: ItemId) -> Result<Option<Climb>> {
+    let mut step: Option<(ItemId, Named)> = None;
     let mut at = task;
     // Bounded like `tasks_under`: a tree ends, a corrupted table should not spin.
     for _ in 0..128 {
@@ -468,41 +510,93 @@ pub fn place_of(conn: &Connection, task: ItemId) -> Result<Option<TaskPlace>> {
             return Ok(None);
         };
         match meta.kind.as_str() {
-            STEP_KIND if step.is_none() => {
-                step = Some((parent, meta.uid, meta.content.unwrap_or_default()));
-            }
+            STEP_KIND if step.is_none() => step = Some((parent, named(meta))),
             KIND => {
-                let design = (meta.uid.clone(), meta.content.unwrap_or_default());
-                let plan = match &step {
-                    Some((step_id, _, _)) => match containment::parent(conn, *step_id)? {
-                        Some(p) => item::get(conn, p)?
-                            .filter(|m| m.kind == PLAN_KIND)
-                            .map(|m| (m.uid, m.content.unwrap_or_default())),
-                        None => None,
-                    },
-                    None => None,
-                };
-                let spans = match &step {
-                    Some((_, step_uid, _)) => {
-                        let design_item = parent;
-                        let (doc, _) = super::load(conn, design_item)?;
-                        span_views(conn, design_item, &doc)?
-                            .into_iter()
-                            .filter(|s| s.steps.contains(step_uid))
-                            .collect()
-                    }
-                    None => Vec::new(),
-                };
-                return Ok(Some(TaskPlace {
-                    design,
-                    plan,
-                    step: step.map(|(_, uid, text)| (uid, text)),
-                    spans,
-                }));
+                return Ok(Some(Climb {
+                    step,
+                    design: (parent, named(meta)),
+                }))
             }
             _ => {}
         }
         at = parent;
     }
     Ok(None)
+}
+
+/// The plan `step` is a step of, and its number in that plan from 1; `None` for a step no plan
+/// contains.
+fn plan_of_step(conn: &Connection, step: ItemId) -> Result<Option<(Named, usize)>> {
+    let Some(plan) = containment::parent(conn, step)? else {
+        return Ok(None);
+    };
+    let Some(meta) = item::get(conn, plan)?.filter(|m| m.kind == PLAN_KIND) else {
+        return Ok(None);
+    };
+    let number = step_items(conn, plan)?
+        .iter()
+        .position(|(id, _, _)| *id == step)
+        .map_or(0, |i| i + 1);
+    Ok(Some((named(meta), number)))
+}
+
+/// What task `task` sits under — its plan step, that step's plan, the design, and the design's
+/// root — walking its containers up, so a subtask reports its parent's step. `None` for a task
+/// under no design.
+///
+/// # Errors
+/// A database error.
+pub fn ancestry_of(conn: &Connection, task: ItemId) -> Result<Option<Ancestry>> {
+    let Some(Climb { step, design }) = climb(conn, task)? else {
+        return Ok(None);
+    };
+    let step = match step {
+        Some((id, step)) => {
+            plan_of_step(conn, id)?.map(|(plan, number)| StepPlace { step, number, plan })
+        }
+        None => None,
+    };
+    let root_id = super::tree::root_of(conn, design.0)?;
+    let root = if root_id == design.0 {
+        None
+    } else {
+        item::get(conn, root_id)?.map(named)
+    };
+    Ok(Some(Ancestry {
+        step,
+        design: design.1,
+        root,
+    }))
+}
+
+/// The design (and plan step) task `task` is contained under, walking its containers up; `None`
+/// for a task under no design.
+///
+/// # Errors
+/// A database error.
+pub fn place_of(conn: &Connection, task: ItemId) -> Result<Option<TaskPlace>> {
+    let Some(Climb { step, design }) = climb(conn, task)? else {
+        return Ok(None);
+    };
+    let (design_item, design) = design;
+    let Some((step_id, step)) = step else {
+        return Ok(Some(TaskPlace {
+            design: (design.uid, design.text),
+            plan: None,
+            step: None,
+            spans: Vec::new(),
+        }));
+    };
+    let plan = plan_of_step(conn, step_id)?.map(|(p, _)| (p.uid, p.text));
+    let (doc, _) = super::load(conn, design_item)?;
+    let spans = span_views(conn, design_item, &doc)?
+        .into_iter()
+        .filter(|s| s.steps.contains(&step.uid))
+        .collect();
+    Ok(Some(TaskPlace {
+        design: (design.uid, design.text),
+        plan,
+        step: Some((step.uid, step.text)),
+        spans,
+    }))
 }

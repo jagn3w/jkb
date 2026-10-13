@@ -264,7 +264,8 @@ impl Request {
             | Self::IngestText(_)
             | Self::InvWrite(_)
             | Self::TaskLocate { .. }
-            | Self::TaskPrRecord { .. } => OpPermission::TaskWrite,
+            | Self::TaskPrRecord { .. }
+            | Self::TaskPrAbsent { .. } => OpPermission::TaskWrite,
             Self::TaskClaim { .. }
             | Self::TaskRelease { .. }
             | Self::TaskStart(_)
@@ -351,6 +352,7 @@ impl Request {
             | Self::TaskRanOnHost { uid, .. }
             | Self::ItemRm { uid, .. }
             | Self::TaskPrRecord { uid, .. }
+            | Self::TaskPrAbsent { uid, .. }
             | Self::TaskCloseMerged { uid, .. }
             | Self::WorkflowFire { uid, .. }
             | Self::WorkflowObserve { uid }
@@ -854,7 +856,8 @@ pub fn resolve(
                     None => None,
                 };
                 // A mapped role never exceeds the credential that minted the ticket: the operator's
-                // map cannot make a container subagent an operator.
+                // map cannot make a container subagent an operator. `roles::map_agent_type` refuses
+                // such a mapping; this filter covers a row written before it did.
                 let role = role.filter(|r| *r != Role::Operator);
                 Principal {
                     roles: role.into_iter().collect(),
@@ -1284,9 +1287,7 @@ pub fn map(
     role: Option<&str>,
 ) -> Result<(), ApiError> {
     let role = role.map(Role::parse).transpose().map_err(ApiError::from)?;
-    if role == Some(Role::Operator) {
-        return Err(invalid("no agent type may be mapped to operator"));
-    }
+    // `roles::map_agent_type` refuses `operator` itself, as a validation error (`Invalid`).
     Ok(roles::map_agent_type(conn, meta, agent_type, role)?)
 }
 

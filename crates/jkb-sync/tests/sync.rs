@@ -41,7 +41,7 @@ fn mount_dir(
     let include = include.map(str::to_owned);
     let exclude = exclude.map(str::to_owned);
     db.write_txn("t", move |conn, meta| {
-        let ns_id = ns::ensure(conn, &ns_path)?;
+        let ns_id = ns::ensure(conn, meta, &ns_path)?;
         jkb_core::mount::create(
             conn,
             meta,
@@ -363,6 +363,94 @@ fn sync_paths_drops_paths_outside_scope() {
     assert!(content_for(&db, &uri_for(&keep)).is_some());
 }
 
+/// A watch event can name a directory whose name the globs accept (`notes.md/`). The full
+/// sync's `discover` keeps only files, so `sync_paths` must too: reconciling the directory
+/// would try to read it as a file.
+#[test]
+fn sync_paths_ignores_directories_the_globs_accept() {
+    let dir = real_tempdir();
+    let folder = dir.path().join("notes.md");
+    fs::create_dir(&folder).unwrap();
+    let file = dir.path().join("a.md");
+    fs::write(&file, "a").unwrap();
+    let gone = dir.path().join("gone.md");
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/repo",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/repo").unwrap().results.len(), 1);
+
+    let report = sync_paths(&db, "docs/repo", &[folder.clone(), file, gone.clone()]).unwrap();
+    let paths: Vec<_> = report.results.iter().map(|r| r.path.clone()).collect();
+    assert!(
+        !paths.contains(&folder),
+        "a directory is not reconciled: {paths:?}"
+    );
+    // A path that no longer exists still reaches the reconcile (a deletion is an event too).
+    assert!(paths.contains(&gone), "{paths:?}");
+    assert_eq!(report.count(Outcome::Failed), 0, "{:?}", report.results);
+}
+
+/// A directory row journalled before `sync_paths` skipped directories (a `mkdir` under a watched
+/// mount, refused as `Is a directory`) is cleared by the next full sync, since no reconcile will
+/// ever revisit it.
+#[test]
+fn a_full_sync_settles_a_flag_journalled_for_a_directory() {
+    let dir = real_tempdir();
+    let folder = dir.path().join("notes.md");
+    fs::create_dir(&folder).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/repo",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    let uri = uri_for(&folder);
+    let seeded = uri.clone();
+    db.write_txn("sync", move |conn, meta| {
+        jkb_core::sync_state::upsert(
+            conn,
+            meta,
+            &jkb_core::sync_state::SyncStateWrite {
+                uri: &seeded,
+                serializer: "document",
+                status: "needs_attention",
+                last_synced_hash: None,
+                base_blob_hash: None,
+                parse_error: Some("could not archive: Is a directory (os error 21)"),
+                quarantine_blob_hash: None,
+                document: None,
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(journal(&db, &uri).unwrap().0, "needs_attention");
+
+    sync(&db, "docs/repo").unwrap();
+    assert_eq!(
+        journal(&db, &uri).unwrap().0,
+        "ok",
+        "the directory's flag is settled"
+    );
+    assert!(db
+        .read(jkb_core::sync_state::needs_attention)
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn watch_runs_an_initial_reconcile_then_stops() {
     let dir = real_tempdir();
@@ -389,6 +477,79 @@ fn watch_runs_an_initial_reconcile_then_stops() {
     assert_eq!(
         content_for(&db, &uri_for(&file)).as_deref(),
         Some("watch me")
+    );
+}
+
+/// A pass that fails outright — not one bad file, but `sync` itself returning `Err`, here for an
+/// unknown serializer — is reported and owed a retry; it does not end the watcher. It used to
+/// propagate with `?`, which exited that mount's thread for good while `watch_all` sat joining the
+/// others, so the service looked healthy and the mount never synced again.
+///
+/// `stop` is preset, so `watch` runs exactly its initial pass and then returns: the result is the
+/// loop's own verdict on that pass, with no timing involved.
+#[test]
+fn watch_survives_a_pass_that_fails_outright() {
+    let dir = real_tempdir();
+    fs::write(dir.path().join("a.md"), "x").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/broken",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "spec",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert!(
+        sync(&db, "docs/broken").is_err(),
+        "precondition: this mount's pass must fail outright, or the test proves nothing"
+    );
+
+    let stop = Arc::new(AtomicBool::new(true));
+    jkb_sync::watch(&db, "docs/broken", Duration::from_millis(20), &stop)
+        .expect("a failed reconcile pass must not end the watcher");
+}
+
+/// `watch_all`'s own result does not carry one watcher's failure, and a healthy mount beside a
+/// mount whose every pass fails outright still gets its initial reconcile.
+///
+/// This does **not** guard against a watcher thread dying on a failed pass: with `stop` preset,
+/// `Watchers::shutdown` only reports a watcher's `Err`, so this passes even when `watch` propagates
+/// the pass error again. That defect is pinned by `watch_survives_a_pass_that_fails_outright`
+/// (the loop survives) and the `Watchers` unit tests in `watch.rs`, e.g.
+/// `a_watcher_that_exited_is_re_armed_after_a_backoff` (an exited watcher is reported and re-armed).
+#[test]
+fn watch_all_keeps_syncing_beside_a_mount_whose_pass_fails() {
+    let db = Db::open_in_memory().unwrap();
+    let broken = real_tempdir();
+    let good = real_tempdir();
+    fs::write(broken.path().join("a.md"), "x").unwrap();
+    fs::write(good.path().join("b.md"), "beta").unwrap();
+    for (path, dir, serializer) in [
+        ("docs/broken", broken.path(), "spec"),
+        ("docs/good", good.path(), "document"),
+    ] {
+        mount_dir(
+            &db,
+            path,
+            dir,
+            SyncMode::Bidirectional,
+            serializer,
+            Some("**/*.md"),
+            None,
+            ConflictPolicy::Manual,
+        );
+    }
+    assert!(sync(&db, "docs/broken").is_err(), "precondition");
+
+    let stop = Arc::new(AtomicBool::new(true));
+    jkb_sync::watch_all(&db, Duration::from_millis(20), &stop)
+        .expect("one mount's failed pass must not fail the others");
+    assert_eq!(
+        content_for(&db, &uri_for(&good.path().join("b.md"))).as_deref(),
+        Some("beta")
     );
 }
 
@@ -426,6 +587,64 @@ fn watch_all_reconciles_every_mount_then_stops() {
         content_for(&db, &uri_for(&repo_b.path().join("b.md"))).as_deref(),
         Some("beta")
     );
+}
+
+/// `watch_all` watches a mount created after it started. It read the mount list once, so a mount
+/// created while the service ran was never watched until the service restarted.
+#[test]
+fn watch_all_watches_a_mount_created_after_it_started() {
+    let db = Db::open_in_memory().unwrap();
+    let early = real_tempdir();
+    let late = real_tempdir();
+    let early_file = early.path().join("early.md");
+    let late_file = late.path().join("late.md");
+    fs::write(&early_file, "early").unwrap();
+    fs::write(&late_file, "late").unwrap();
+    let mount = |ns: &str, dir: &Path| {
+        mount_dir(
+            &db,
+            ns,
+            dir,
+            SyncMode::Bidirectional,
+            "document",
+            Some("**/*.md"),
+            None,
+            ConflictPolicy::Manual,
+        );
+    };
+    mount("docs/early", early.path());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let db = db.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || jkb_sync::watch_all(&db, Duration::from_millis(20), &stop))
+    };
+    let wait_for = |file: &Path, what: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while content_for(&db, &uri_for(file)).is_none() {
+            assert!(
+                !watcher.is_finished() && std::time::Instant::now() < deadline,
+                "{what}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // The early mount's initial reconcile proves `watch_all` has read the mount list, so the
+    // next mount is created strictly after it.
+    wait_for(
+        &early_file,
+        "the mount present at startup was never watched",
+    );
+
+    mount("docs/late", late.path());
+    wait_for(
+        &late_file,
+        "the mount created after `watch_all` started was never watched",
+    );
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    watcher.join().unwrap().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +943,161 @@ fn malformed_file_is_quarantined_then_recovers() {
     let report = sync(&db, "docs/plan").unwrap();
     assert!(report.count(Outcome::Imported) + report.count(Outcome::Merged) >= 1);
     assert_eq!(journal(&db, &uri).unwrap().0, "ok");
+}
+
+#[test]
+fn a_needs_naming_a_deleted_task_drops_one_edge_not_the_file() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    assert!(is_blocked(&db, &format!("{uri}#fix")));
+
+    // Delete `setup`'s line, leaving `fix`'s `needs:^setup` naming nothing, and in the same edit
+    // reopen `ship` and add a task that depends on `fix`. Every one of those must land.
+    let edited = "<!-- notes -->\n## Backend\n- [ ] Fix flaky test !p1 needs:^setup ^fix\n\
+                  ## Frontend\n- [ ] Ship button ^ship\n- [ ] Release needs:^fix ^release\n";
+    fs::write(&file, edited).unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(report.count(Outcome::Quarantined), 0);
+    assert_eq!(report.count(Outcome::Imported), 1, "{:?}", report.results);
+    assert_eq!(journal(&db, &uri).unwrap().0, "ok");
+    assert_eq!(
+        status_of(&db, &format!("{uri}#ship")).as_deref(),
+        Some("open")
+    );
+    assert!(is_blocked(&db, &format!("{uri}#release")));
+    // Only the dangling edge went: `fix` no longer waits on the removed task…
+    assert!(!is_blocked(&db, &format!("{uri}#fix")));
+    assert_eq!(
+        status_of(&db, &format!("{uri}#setup")).as_deref(),
+        Some("cancelled")
+    );
+    // …and that is said, not swallowed.
+    let warnings = report.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].0, file.as_path());
+    assert!(warnings[0].1.contains("needs:^setup"), "{}", warnings[0].1);
+
+    // The token stays in the file, on its line exactly as written, while the task's text stays
+    // clean and the reference is parked on the item; the file settles, and the warning is
+    // repeated on every sync until the file stops saying it.
+    let text = fs::read_to_string(&file).unwrap();
+    assert_eq!(text, edited);
+    assert_eq!(
+        content_for(&db, &format!("{uri}#fix")).as_deref(),
+        Some("Fix flaky test")
+    );
+    assert_eq!(unresolved_needs(&db, &format!("{uri}#fix")), ["setup"]);
+    let again = sync(&db, "docs/plan").unwrap();
+    assert_eq!(again.count(Outcome::UpToDate), 1);
+    assert_eq!(again.warnings().len(), 1);
+    assert_eq!(fs::read_to_string(&file).unwrap(), text);
+
+    // Re-adding the target's line brings the dependency back.
+    fs::write(
+        &file,
+        text.replace("## Frontend", "- [ ] Set up CI ^setup\n## Frontend"),
+    )
+    .unwrap();
+    let back = sync(&db, "docs/plan").unwrap();
+    assert!(back.warnings().is_empty());
+    assert!(is_blocked(&db, &format!("{uri}#fix")));
+    assert!(unresolved_needs(&db, &format!("{uri}#fix")).is_empty());
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        text.replace("## Frontend", "- [ ] Set up CI ^setup\n## Frontend")
+    );
+}
+
+/// The parked `needs:` of the bound task `uid`.
+fn unresolved_needs(db: &Db, uid: &str) -> Vec<String> {
+    let uid = uid.to_owned();
+    db.read(move |conn| {
+        let id = item::id_for_uid(conn, &uid)?.expect("task");
+        item::unresolved_needs(conn, id)
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_parked_needs_edited_on_disk_is_seen_by_a_three_way_merge() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, "## A\n- [ ] a needs:^ghost ^a\n- [ ] b ^b\n").unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(unresolved_needs(&db, &format!("{uri}#a")), ["ghost"]);
+
+    // Disk changes only `a`'s parked reference while the KB changes `b`: the merge must take the
+    // disk's `a`, so its signature has to see the parked reference change.
+    kb_set_status(&db, &format!("{uri}#b"), "in_progress");
+    fs::write(&file, "## A\n- [ ] a needs:^phantom ^a\n- [ ] b ^b\n").unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(report.count(Outcome::Merged), 1, "{:?}", report.results);
+    assert_eq!(unresolved_needs(&db, &format!("{uri}#a")), ["phantom"]);
+    assert_eq!(
+        status_of(&db, &format!("{uri}#b")).as_deref(),
+        Some("in_progress")
+    );
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.contains("- [ ] a needs:^phantom ^a"), "{text}");
+}
+
+#[test]
+fn ambiguous_mixed_indentation_quarantines_with_the_line_named() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    // A tab-indented line under a four-space-indented task: child or sibling depends on the tab
+    // width. Neither reading is imported; the file is quarantined and left as written.
+    let ambiguous = "<!-- notes -->\n## Backend\n- [ ] Set up CI ^setup\n    - [ ] Fix flaky test !p1 needs:^setup ^fix\n\
+                     \t- [ ] Ship button ^ship\n";
+    fs::write(&file, ambiguous).unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(report.count(Outcome::Quarantined), 1);
+    assert_eq!(journal(&db, &uri).unwrap().0, "needs_attention");
+    assert!(!has_parent_edge(
+        &db,
+        &format!("{uri}#fix"),
+        &format!("{uri}#ship")
+    ));
+    assert_eq!(fs::read_to_string(&file).unwrap(), ambiguous);
+    let reason = db
+        .read({
+            let uri = uri.clone();
+            move |conn| jkb_core::sync_state::get(conn, &uri)
+        })
+        .unwrap()
+        .and_then(|j| j.parse_error)
+        .unwrap();
+    assert!(reason.contains("line 5:"), "{reason}");
+
+    // Indenting it the way its parent is indented clears the quarantine with the tree it shows.
+    fs::write(
+        &file,
+        ambiguous.replace("\t- [ ] Ship", "        - [ ] Ship"),
+    )
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(journal(&db, &uri).unwrap().0, "ok");
+    assert!(has_parent_edge(
+        &db,
+        &format!("{uri}#fix"),
+        &format!("{uri}#ship")
+    ));
 }
 
 /// Whether a `parent_of` edge runs from `parent_uri` to `child_uri`.
@@ -1073,7 +1447,7 @@ fn document_order_survives_kb_side_changes_and_merges() {
         let u = format!("{uri}#first");
         move |conn, meta| {
             let id = binding::item_for_uri(conn, &u)?.expect("bound");
-            let beta = ns::ensure(conn, "docs/plan/tasks-md/beta")?;
+            let beta = ns::ensure(conn, meta, "docs/plan/tasks-md/beta")?;
             jkb_core::placement::set_primary(conn, meta, id, beta, 99)
         }
     })
@@ -1636,6 +2010,53 @@ fn kb_wins_over_a_structurally_changed_disk_keeps_the_items() {
     );
 }
 
+/// `kb_wins` on an import-only mount cannot write the file, so the conflict resolves nothing:
+/// it must report the export's `Skipped`, not a `ResolvedFromKb` claiming the disk's edits
+/// were overwritten when the file was never touched.
+#[test]
+fn kb_wins_on_an_import_only_mount_reports_skipped_not_a_resolution() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, "## Plan\n\n- [ ] shared !p1\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/plan",
+        dir.path(),
+        SyncMode::Import,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::KbWins,
+    );
+    sync(&db, "docs/plan").unwrap();
+    let settled = fs::read_to_string(&tasks).unwrap();
+
+    // Both sides edit the same task: the disk reprioritizes it, the KB closes it.
+    let disk_edit = settled.replace("!p1", "!p3");
+    assert_ne!(disk_edit, settled);
+    fs::write(&tasks, &disk_edit).unwrap();
+    db.write_txn("t", |conn, _m| {
+        conn.execute(
+            "UPDATE items SET status = 'done' WHERE content LIKE '%shared%'",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(report.count(Outcome::Skipped), 1, "{:?}", report.results);
+    assert_eq!(report.count(Outcome::ResolvedFromKb), 0);
+    assert!(report.resolved().is_empty(), "nothing was resolved");
+    assert_eq!(
+        fs::read_to_string(&tasks).unwrap(),
+        disk_edit,
+        "an import-only mount never writes the file"
+    );
+}
+
 /// Following the refusal's own advice must not destroy the data the refusal protected.
 ///
 /// The refusal says "edit the file". That edit makes both sides differ, which routes the file
@@ -1894,7 +2315,7 @@ fn an_export_only_mount_overwrites_a_file_it_has_never_imported() {
     // A KB item bound to that path, created without ever importing the file.
     let bound_uri = uri.clone();
     db.write_txn("t", move |conn, meta| {
-        let ns_id = ns::ensure(conn, "docs/out")?;
+        let ns_id = ns::ensure(conn, meta, "docs/out")?;
         let id = item::upsert(
             conn,
             meta,
@@ -2030,13 +2451,11 @@ fn undoing_a_sync_then_re_syncing_does_not_strip_the_file() {
     assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::Created), 1);
     assert_eq!(task_count(&db), 3, "setup: the tasks should have imported");
 
-    // Undo the sync the way a user reaching for `jkb undo` would: the trailing mirror
-    // transaction, then the reconcile itself. Not more — a third would start unwinding the mount
-    // and the test would be measuring something else.
-    for _ in 0..2 {
-        db.write_txn("cli", jkb_core::undo::undo_last)
-            .expect("undo should succeed");
-    }
+    // Undo the sync the way a user reaching for `jkb undo` would: once, which takes the
+    // reconcile and the `tasks/**` mirrors it derived in the same transaction. Not more — a second
+    // would start unwinding the mount and the test would be measuring something else.
+    db.write_txn("cli", jkb_core::undo::undo_last)
+        .expect("undo should succeed");
 
     // Whatever the undo did to the KB, the next reconcile must not damage the file.
     let report = sync(&db, "docs/plan").unwrap();
@@ -2155,12 +2574,10 @@ fn matrix_case(mode: SyncMode, stage: Stage) -> (jkb_sync::SyncReport, String, S
         .unwrap();
     }
     if matches!(stage, Stage::PostUndo) {
-        // The trailing mirror transaction, then the reconcile itself — exactly what a user
-        // reaching for `jkb undo` after a sync unwinds.
-        for _ in 0..2 {
-            db.write_txn("cli", jkb_core::undo::undo_last)
-                .expect("undo should succeed");
-        }
+        // The reconcile, with the mirrors it derived in the same transaction — exactly what a
+        // user reaching for `jkb undo` after a sync unwinds.
+        db.write_txn("cli", jkb_core::undo::undo_last)
+            .expect("undo should succeed");
         assert_eq!(
             task_count(&db),
             0,
@@ -2814,6 +3231,75 @@ fn a_dotless_document_named_with_a_hash_syncs_as_itself() {
     assert!(!dir.path().join("issue").exists(), "no stray file `issue`");
 }
 
+/// A file whose name holds a `#` beside the file named up to it — `a#b.md` beside `a.md`, and the
+/// dotless `a#b` beside `a` — are four documents: each pass visits only the real files, each file
+/// gathers only its own binding, and an edit to one is exported to that file alone. Read by
+/// spelling, `file:///d/a#b` was the file `a` with the fragment `b`: `a`'s reconcile gathered
+/// `a#b`'s item, and a phantom `a` was exported with its hash stamped on `a#b`'s binding.
+#[test]
+fn files_named_with_a_hash_beside_their_prefix_stay_apart() {
+    let dir = real_tempdir();
+    let names = ["a.md", "a#b.md", "a", "a#b"];
+    for name in names {
+        fs::write(dir.path().join(name), format!("body of {name}")).unwrap();
+    }
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/notes",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::Created), 4);
+    let report = sync(&db, "docs/notes").unwrap();
+    assert_eq!(report.count(Outcome::UpToDate), 4, "{report:?}");
+    assert_eq!(report.results.len(), 4, "only the real files: {report:?}");
+
+    for name in names {
+        let path = dir.path().join(name);
+        let uris = {
+            let uri = uri_for(&path);
+            db.read(move |conn| binding::synced_uris_for_file(conn, &uri))
+                .unwrap()
+        };
+        assert_eq!(
+            uris,
+            [uri_for(&path)],
+            "{name} gathers only its own binding"
+        );
+        assert_eq!(
+            content_for(&db, &uri_for(&path)).as_deref(),
+            Some(format!("body of {name}").as_str())
+        );
+    }
+
+    kb_edit(&db, &uri_for(&dir.path().join("a#b")), "edited in kb");
+    let report = sync(&db, "docs/notes").unwrap();
+    assert_eq!(report.count(Outcome::Exported), 1, "{report:?}");
+    assert_eq!(report.count(Outcome::UpToDate), 3, "{report:?}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a#b")).unwrap(),
+        "edited in kb"
+    );
+    for name in ["a.md", "a#b.md", "a"] {
+        assert_eq!(
+            fs::read_to_string(dir.path().join(name)).unwrap(),
+            format!("body of {name}")
+        );
+    }
+    let mut on_disk: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    on_disk.sort();
+    assert_eq!(on_disk, ["a", "a#b", "a#b.md", "a.md"], "no phantom file");
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::UpToDate), 4);
+}
+
 /// An unbound file flagged on its first sync, whose directory is then replaced by a link, is out of
 /// scope for the sweep as it is for discovery — kept in scope, its flag could never clear.
 #[cfg(unix)]
@@ -3081,8 +3567,8 @@ fn a_refused_file_is_re_judged_after_its_database_remedy() {
     assert_eq!(journal(&db, &uri_for(&tasks)).unwrap().0, "needs_attention");
     // Another write elsewhere, with nothing changed for this file: judged on the same render, it is not
     // reconciled — and so not re-archived, re-refused and re-logged — again.
-    db.write_txn("cli", |conn, _| {
-        jkb_core::ns::ensure(conn, "elsewhere")?;
+    db.write_txn("cli", |conn, meta| {
+        jkb_core::ns::ensure(conn, meta, "elsewhere")?;
         Ok(())
     })
     .unwrap();
@@ -3289,5 +3775,772 @@ fn a_disk_reindent_that_swaps_parent_and_child_is_applied() {
             !has_parent_edge(&db, child.2, parent.2),
             "round {round}: the old edge is gone"
         );
+        // The containment row follows the edge: the frontier, `jkb tree` and `jkb ls` read it.
+        assert_eq!(
+            container_of(&db, child.2),
+            Some(item_of(&db, parent.2)),
+            "round {round}: the child is contained by its new parent"
+        );
+        assert_eq!(
+            container_of(&db, parent.2),
+            None,
+            "round {round}: the old container is gone"
+        );
     }
+}
+
+/// The item bound to `uri`.
+fn item_of(db: &Db, uri: &str) -> jkb_types::ItemId {
+    let uri = uri.to_owned();
+    db.read(move |conn| binding::item_for_uri(conn, &uri))
+        .unwrap()
+        .expect("a bound item")
+}
+
+/// The item containing the item bound to `uri`, from its containment row.
+fn container_of(db: &Db, uri: &str) -> Option<jkb_types::ItemId> {
+    let id = item_of(db, uri);
+    db.read(move |conn| jkb_core::containment::parent(conn, id))
+        .unwrap()
+}
+
+/// The uids `jkb task next` would offer, across every namespace.
+fn ready_uids(db: &Db) -> Vec<String> {
+    db.read(|conn| task::ready(conn, jkb_core::query::Query::default()))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.uid)
+        .collect()
+}
+
+/// A subtask written by indentation holds its parent off the frontier until it is done, like one
+/// made with `jkb task add --under`: the frontier reads the containment row, and the import used to
+/// write only the `parent_of` edge.
+#[test]
+fn a_file_subtask_holds_its_parent_off_the_frontier_until_done() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n  - [ ] Test it ^test\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let (ship, write, test) = (
+        format!("{uri}#ship"),
+        format!("{uri}#write"),
+        format!("{uri}#test"),
+    );
+    let ready = ready_uids(&db);
+    assert!(!ready.contains(&ship), "{ready:?}");
+    assert!(ready.contains(&write) && ready.contains(&test), "{ready:?}");
+    // Positioned in file order among the parent's children.
+    let ship_id = item_of(&db, &ship);
+    let children = db
+        .read(move |conn| jkb_core::containment::children(conn, ship_id))
+        .unwrap();
+    assert_eq!(children, [item_of(&db, &write), item_of(&db, &test)]);
+
+    // One child done is not enough; both are.
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [x] Write it ^write\n  - [ ] Test it ^test\n",
+    )
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert!(!ready_uids(&db).contains(&ship));
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [x] Write it ^write\n  - [x] Test it ^test\n",
+    )
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert!(ready_uids(&db).contains(&ship), "{:?}", ready_uids(&db));
+}
+
+/// Out-denting a subtask drops its containment row with its edge, and `jkb undo` of that import
+/// puts both back: the row is journalled like the edge.
+#[test]
+fn an_outdent_drops_the_container_and_undo_restores_it() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let (ship, write) = (format!("{uri}#ship"), format!("{uri}#write"));
+    assert_eq!(container_of(&db, &write), Some(item_of(&db, &ship)));
+
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n- [ ] Write it ^write\n",
+    )
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert!(!has_parent_edge(&db, &ship, &write));
+    assert_eq!(container_of(&db, &write), None);
+    assert!(ready_uids(&db).contains(&ship));
+
+    db.write_txn("t", jkb_core::undo::undo_last).unwrap();
+    assert!(has_parent_edge(&db, &ship, &write));
+    assert_eq!(container_of(&db, &write), Some(item_of(&db, &ship)));
+    assert!(!ready_uids(&db).contains(&ship));
+}
+
+/// A subtask whose line is deleted is cancelled and leaves its parent's containment with the
+/// `parent_of` edge the import drops, so its parent no longer lists it.
+#[test]
+fn a_deleted_subtask_line_leaves_its_parent() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let (ship, write) = (format!("{uri}#ship"), format!("{uri}#write"));
+    let write_id = item_of(&db, &write);
+
+    fs::write(&file, "## Work\n- [ ] Ship it ^ship\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(kb_status(&db, &write).as_deref(), Some("cancelled"));
+    assert_eq!(
+        db.read(move |conn| jkb_core::containment::parent(conn, write_id))
+            .unwrap(),
+        None
+    );
+    assert!(ready_uids(&db).contains(&ship));
+}
+
+/// A parent whose line is deleted is cancelled, and its open subtask must not stay contained by it:
+/// every listing hides a cancelled item, so the child would be reachable nowhere. The `parent_of`
+/// edge goes with the row, and `jkb undo` of the import brings both back.
+#[test]
+fn a_deleted_parent_line_releases_its_open_subtask() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let (ship, write) = (format!("{uri}#ship"), format!("{uri}#write"));
+    let (ship_id, write_id) = (item_of(&db, &ship), item_of(&db, &write));
+    let section = db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT namespace_id FROM placements WHERE item_id = ?1 AND role = 'primary'",
+                [write_id.get()],
+                |r| r.get::<_, i64>(0),
+            )?)
+        })
+        .map(jkb_types::NamespaceId::new)
+        .unwrap();
+    let listed = || {
+        db.read(move |conn| jkb_core::placement::items_directly_in(conn, section))
+            .unwrap()
+    };
+    let parent_edge = || {
+        db.read(move |conn| {
+            jkb_core::edge::edges_from(conn, ship_id, jkb_types::EdgeType::ParentOf)
+        })
+        .unwrap()
+        .contains(&write_id)
+    };
+    assert!(!listed().contains(&write_id));
+
+    fs::write(&file, "## Work\n- [ ] Write it ^write\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(kb_status(&db, &ship).as_deref(), Some("cancelled"));
+    assert_eq!(container_of(&db, &write), None);
+    assert!(listed().contains(&write_id), "{:?}", listed());
+    assert!(
+        !parent_edge(),
+        "the cancelled parent's edge went with the row"
+    );
+    let again = sync(&db, "docs/plan").unwrap();
+    assert_eq!(again.count(Outcome::UpToDate), 1, "{:?}", again.results);
+
+    db.write_txn("t", jkb_core::undo::undo_last).unwrap();
+    assert!(parent_edge());
+    assert_eq!(container_of(&db, &write), Some(ship_id));
+}
+
+/// A task whose line is deleted keeps its dependencies (D25): reopened, it still waits on the task
+/// it needed, rather than landing on the frontier ahead of it.
+#[test]
+fn a_deleted_dependents_line_keeps_its_dependency() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n- [ ] Write it needs:^ship ^write\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let (ship, write) = (format!("{uri}#ship"), format!("{uri}#write"));
+    let write_id = item_of(&db, &write);
+
+    fs::write(&file, "## Work\n- [ ] Ship it ^ship\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(kb_status(&db, &write).as_deref(), Some("cancelled"));
+    db.write_txn("t", move |conn, meta| {
+        task::set_status(conn, meta, write_id, jkb_types::TaskStatus::Open)
+    })
+    .unwrap();
+    let ready = ready_uids(&db);
+    assert!(ready.contains(&ship), "{ready:?}");
+    assert!(!ready.contains(&write), "still waits on ^ship: {ready:?}");
+}
+
+/// An import that changes nothing about a task's parent journals no containment write, so a sync
+/// of an unrelated edit does not grow the changelog by a row per subtask.
+#[test]
+fn an_unrelated_edit_rewrites_no_containment_row() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n",
+    )
+    .unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let containment_entries = || -> i64 {
+        db.read(|conn| {
+            Ok(conn.query_row(
+                "SELECT count(*) FROM changelog WHERE entity_type = 'containment'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+    };
+    let before = containment_entries();
+    assert_eq!(before, 1);
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it now ^ship\n  - [ ] Write it ^write\n",
+    )
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(containment_entries(), before);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The `tasks/**` mirror derivation.
+// ---------------------------------------------------------------------------------------------
+
+/// Make every `tasks/…` mirror placement fail, as a contended or broken database would, until
+/// [`allow_mirrors`] lifts it. A trigger rather than a contrived namespace: the failure has to be
+/// transient, or there is no retry to observe.
+fn refuse_mirrors(db: &Db) {
+    db.write_txn("t", |conn, _meta| {
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_mirrors BEFORE INSERT ON placements
+             WHEN (SELECT path FROM namespaces WHERE id = NEW.namespace_id) LIKE 'tasks/%'
+             BEGIN SELECT RAISE(ABORT, 'mirror placement refused by the test'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn allow_mirrors(db: &Db) {
+    db.write_txn("t", |conn, _meta| {
+        conn.execute_batch("DROP TRIGGER refuse_mirrors")?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Tasks that have a `tasks/…` placement, of those the KB holds.
+fn mirrored_task_count(db: &Db) -> i64 {
+    db.read(|conn| {
+        Ok(conn.query_row(
+            "SELECT count(DISTINCT p.item_id) FROM placements p
+             JOIN items i ON i.id = p.item_id
+             JOIN namespaces n ON n.id = p.namespace_id
+             WHERE i.kind = 'task' AND n.path LIKE 'tasks/%'",
+            [],
+            |r| r.get(0),
+        )?)
+    })
+    .unwrap()
+}
+
+/// A failed mirror derivation is one file's result, not the pass's.
+///
+/// It used to be a trailing transaction after every file had committed, propagated with `?`, so
+/// its failure threw away the whole report — every other file's refusal, conflict and policy
+/// resolution — which is what the watcher and `jkb sync` exist to say.
+#[test]
+fn a_failed_mirror_derivation_is_a_file_result_not_a_lost_report() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, TASKS_MD).unwrap();
+    let readme = dir.path().join("notes.md");
+    fs::write(&readme, "## Notes\n\n- [ ] Write the notes ^notes\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    refuse_mirrors(&db);
+
+    let report = match sync(&db, "docs/plan") {
+        Ok(report) => report,
+        Err(e) => panic!("a failed mirror derivation discarded the whole report: {e}"),
+    };
+    let failed: Vec<_> = report.failed().into_iter().map(|(p, _)| p).collect();
+    assert_eq!(
+        failed.len(),
+        2,
+        "each importing file should report its own failure: {:?}",
+        report.results
+    );
+    // The import and its mirrors are one transaction, so the failure left nothing half-done: no
+    // unmirrored task, and a journal that says so rather than `ok`.
+    assert_eq!(
+        task_count(&db),
+        0,
+        "the import must roll back with its mirrors"
+    );
+    assert_eq!(
+        journal(&db, &uri_for(&tasks)).map(|(status, _)| status),
+        Some("needs_attention".to_owned()),
+        "the failure must be visible to `jkb doctor`"
+    );
+}
+
+/// The retry after a failed mirror derivation derives it.
+///
+/// With the derivation after the per-file commits, its failure left the imported tasks unmirrored
+/// while their files read as settled, so the retry found every file up to date, never ran the
+/// derivation, and `jkb task next` — scoped to `tasks/**` — never saw the work.
+#[test]
+fn the_retry_after_a_failed_mirror_derivation_mirrors_the_import() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, TASKS_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    refuse_mirrors(&db);
+    // Whatever the failed pass returns, the next one must finish the work.
+    let _ = sync(&db, "docs/plan");
+    allow_mirrors(&db);
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "the retry failed: {:?}",
+        report.failed()
+    );
+    assert_eq!(task_count(&db), 3, "the retry should hold the file's tasks");
+    assert_eq!(
+        mirrored_task_count(&db),
+        3,
+        "every imported task needs its `tasks/…` mirror after the retry"
+    );
+}
+
+/// A file's import derives only its OWN tasks' mirrors, so an unrelated task whose mirror cannot
+/// be derived does not block it — and `jkb task mirror` still repairs every task.
+///
+/// The import ran the global `ensure_all_mirrors`, a scan of every task in the database once per
+/// importing file, inside that file's transaction: one task anywhere whose mirror placement failed
+/// rolled back every import, on every pass, until someone found it.
+#[test]
+fn an_import_mirrors_only_its_own_tasks() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, TASKS_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    // A task bound to no file, homed outside `tasks/`, whose mirror is missing and cannot be placed.
+    db.write_txn("t", |conn, meta| {
+        let mut new = task::NewTask::new("task:stray", "A task no file declares");
+        new.home = "elsewhere/stray".to_owned();
+        task::create(conn, meta, &new)?;
+        conn.execute_batch(
+            "DELETE FROM placements WHERE namespace_id =
+                 (SELECT id FROM namespaces WHERE path = 'tasks/elsewhere/stray');
+             CREATE TRIGGER refuse_stray_mirror BEFORE INSERT ON placements
+             WHEN (SELECT path FROM namespaces WHERE id = NEW.namespace_id) = 'tasks/elsewhere/stray'
+             BEGIN SELECT RAISE(ABORT, 'the stray task cannot be mirrored'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        mirrored_task_count(&db),
+        0,
+        "the stray task starts unmirrored"
+    );
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "an unrelated task blocked the import: {:?}",
+        report.failed()
+    );
+    assert_eq!(
+        mirrored_task_count(&db),
+        3,
+        "the file's own tasks are mirrored, and only they"
+    );
+
+    // The global repair still covers every task.
+    let added = db
+        .write_txn("t", |conn, meta| {
+            conn.execute_batch("DROP TRIGGER refuse_stray_mirror")?;
+            task::ensure_all_mirrors(conn, meta)
+        })
+        .unwrap();
+    assert_eq!(
+        added, 1,
+        "`jkb task mirror` must still reach the stray task"
+    );
+    assert_eq!(mirrored_task_count(&db), 4);
+}
+
+// ---------------------------------------------------------------------------------------------
+// `+ns` mirrors a file stops declaring.
+// ---------------------------------------------------------------------------------------------
+
+/// Every namespace path the item with `uid` is placed in as a reference (a mirror), sorted.
+fn reference_paths(db: &Db, uid: &str) -> Vec<String> {
+    let uid = uid.to_owned();
+    db.read(move |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT n.path FROM placements p
+             JOIN items i ON i.id = p.item_id
+             JOIN namespaces n ON n.id = p.namespace_id
+             WHERE i.uid = ?1 AND p.role = 'reference' ORDER BY n.path",
+        )?;
+        let rows = stmt.query_map([uid], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+    .unwrap()
+}
+
+const MIRRORED_MD: &str = "\
+## Backend
+- [ ] Set up CI +repos/app +repos/web ^setup
+- [ ] Fix flaky test ^fix
+";
+
+/// Deleting a `+ns` mirror from a line removes the placement, rather than the next render
+/// writing it straight back over the edit.
+#[test]
+fn a_mirror_deleted_from_the_file_stays_deleted() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, MIRRORED_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let setup = format!("{}#setup", uri_for(&file));
+    let before = reference_paths(&db, &setup);
+    assert!(
+        before.contains(&"repos/app".to_owned()) && before.contains(&"repos/web".to_owned()),
+        "both declared mirrors are placed: {before:?}"
+    );
+    assert!(
+        before.iter().any(|p| p.starts_with("tasks/")),
+        "the derived `tasks/…` mirror exists: {before:?}"
+    );
+
+    let edited = MIRRORED_MD.replace(" +repos/web", "");
+    fs::write(&file, &edited).unwrap();
+    sync(&db, "docs/plan").unwrap();
+
+    let after = reference_paths(&db, &setup);
+    assert!(
+        !after.contains(&"repos/web".to_owned()),
+        "the mirror the file dropped must be unplaced: {after:?}"
+    );
+    assert!(after.contains(&"repos/app".to_owned()), "{after:?}");
+    assert!(
+        after.iter().any(|p| p.starts_with("tasks/")),
+        "the derived `tasks/…` mirror is not the file's to remove: {after:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        edited,
+        "the edit survives"
+    );
+
+    // And it stays settled: the next pass neither re-adds the mirror nor rewrites the file.
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(fs::read_to_string(&file).unwrap(), edited);
+    assert!(!reference_paths(&db, &setup).contains(&"repos/web".to_owned()));
+}
+
+/// The three-way `Merged` arm applies the same rule: a mirror the disk dropped is removed while
+/// a disjoint KB edit to another task is merged in.
+#[test]
+fn a_mirror_deleted_from_the_file_stays_deleted_through_a_merge() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, MIRRORED_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let setup = format!("{}#setup", uri_for(&file));
+    let fix = format!("{}#fix", uri_for(&file));
+
+    // KB side: complete the other task. Disk side: drop one mirror from `setup`.
+    db.write_txn("cli", move |conn, meta| {
+        let id = jkb_core::item::id_for_uid(conn, &fix)?.expect("fix exists");
+        task::set_status(conn, meta, id, jkb_types::TaskStatus::Done)
+    })
+    .unwrap();
+    fs::write(&file, MIRRORED_MD.replace(" +repos/web", "")).unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report
+            .results
+            .iter()
+            .any(|r| matches!(r.outcome, Outcome::Merged)),
+        "expected a three-way merge: {:?}",
+        report.results
+    );
+    let after = reference_paths(&db, &setup);
+    assert!(!after.contains(&"repos/web".to_owned()), "{after:?}");
+    assert!(after.contains(&"repos/app".to_owned()), "{after:?}");
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(!text.contains("+repos/web"), "{text}");
+    assert!(text.contains("- [x] Fix flaky test"), "{text}");
+}
+
+/// The converse of the test above: a mirror ADDED in the KB survives a three-way merge with a
+/// disk edit to a different task. The merge takes `setup` from the KB side only because its
+/// `Sig` differs from base there — the mirror is the only difference — and `apply_doc` must then
+/// see the KB's mirror in the merged doc as declared rather than remove it as dropped.
+#[test]
+fn a_mirror_added_in_the_kb_survives_a_merge_with_a_disk_edit() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, MIRRORED_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let setup = format!("{}#setup", uri_for(&file));
+    let fix = format!("{}#fix", uri_for(&file));
+    assert!(!reference_paths(&db, &setup).contains(&"repos/extra".to_owned()));
+
+    // KB side: add a `+ns` mirror to `setup` as a real placement write. Disk side: retitle `fix`.
+    let placed = setup.clone();
+    db.write_txn("cli", move |conn, meta| {
+        let id = item::id_for_uid(conn, &placed)?.expect("setup exists");
+        let mns = ns::ensure(conn, meta, "repos/extra")?;
+        jkb_core::placement::place(conn, meta, id, mns, jkb_types::PlacementRole::Reference, 0)
+    })
+    .unwrap();
+    fs::write(
+        &file,
+        MIRRORED_MD.replace("Fix flaky test ^fix", "Fix the flaky test ^fix"),
+    )
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Merged),
+        1,
+        "expected a three-way merge: {:?}",
+        report.results
+    );
+
+    // The KB's mirror survived in the KB…
+    let after = reference_paths(&db, &setup);
+    assert!(
+        after.contains(&"repos/extra".to_owned()),
+        "the KB-added mirror must survive the merge: {after:?}"
+    );
+    assert!(after.contains(&"repos/app".to_owned()), "{after:?}");
+    assert!(after.contains(&"repos/web".to_owned()), "{after:?}");
+    // …and the file now shows it on `setup`'s line, beside the disk's edit to `fix`.
+    let text = fs::read_to_string(&file).unwrap();
+    let setup_line = text
+        .lines()
+        .find(|l| l.ends_with("^setup"))
+        .unwrap_or_else(|| panic!("setup's line is gone: {text}"));
+    assert!(setup_line.contains("+repos/extra"), "{text}");
+    assert!(text.contains("- [ ] Fix the flaky test ^fix"), "{text}");
+    // The disk's edit to `fix` is in the KB.
+    assert_eq!(
+        content_for(&db, &fix).as_deref(),
+        Some("Fix the flaky test")
+    );
+
+    // And it settles: the next pass is a no-op that keeps the mirror.
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
+    assert!(reference_paths(&db, &setup).contains(&"repos/extra".to_owned()));
+}
+
+/// A format that never writes mirrors cannot remove one by omission: a `document` file's item
+/// keeps a placement made in the KB across an import of a disk edit.
+#[test]
+fn a_document_import_leaves_the_items_mirrors_alone() {
+    let dir = real_tempdir();
+    let file = dir.path().join("README.md");
+    fs::write(&file, "hello").unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/repo",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    sync(&db, "docs/repo").unwrap();
+    let placed_uri = uri.clone();
+    db.write_txn("cli", move |conn, meta| {
+        let id = binding::item_for_uri(conn, &placed_uri)?.expect("bound");
+        let mns = ns::ensure(conn, meta, "references/readmes")?;
+        jkb_core::placement::place(conn, meta, id, mns, jkb_types::PlacementRole::Reference, 0)
+    })
+    .unwrap();
+
+    fs::write(&file, "hello, edited").unwrap();
+    sync(&db, "docs/repo").unwrap();
+    assert_eq!(content_for(&db, &uri).as_deref(), Some("hello, edited"));
+    let still = db
+        .read(move |conn| {
+            let id = binding::item_for_uri(conn, &uri)?.expect("bound");
+            Ok(conn.query_row(
+                "SELECT count(*) FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+                 WHERE p.item_id = ?1 AND p.role = 'reference' AND n.path = 'references/readmes'",
+                [id.get()],
+                |r| r.get::<_, i64>(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(
+        still, 1,
+        "a document import must not unplace the item's mirror"
+    );
+}
+
+/// The converse of the sweep above: a **bound** file replaced by a directory keeps its flag. The KB
+/// still holds the file's item, so the refusal is reported rather than settled away.
+#[test]
+fn a_bound_file_replaced_by_a_directory_stays_flagged() {
+    let dir = real_tempdir();
+    let file = dir.path().join("notes.md");
+    fs::write(&file, "a note").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/repo",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/repo").unwrap().count(Outcome::Created), 1);
+    fs::remove_file(&file).unwrap();
+    fs::create_dir(&file).unwrap();
+    for pass in 0..2 {
+        let report = sync(&db, "docs/repo").unwrap();
+        assert_eq!(report.count(Outcome::Failed), 1, "pass {pass}: {report:?}");
+        assert_eq!(
+            journal(&db, &uri_for(&file)).unwrap().0,
+            "needs_attention",
+            "pass {pass}"
+        );
+    }
+    assert_eq!(content_for(&db, &uri_for(&file)).as_deref(), Some("a note"));
+}
+
+/// A `+ns` mirror whose namespace differs from the internal `tasks/…` index only in case is a
+/// user's mirror, rendered into the file: the exclusion is case-exact, as `n.path != 'tasks'` is.
+#[test]
+fn a_mirror_to_a_case_variant_of_tasks_is_rendered() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, MIRRORED_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let setup = format!("{}#setup", uri_for(&file));
+    db.write_txn("cli", move |conn, meta| {
+        let id = item::id_for_uid(conn, &setup)?.expect("setup exists");
+        let mns = ns::ensure(conn, meta, "Tasks/later")?;
+        jkb_core::placement::place(conn, meta, id, mns, jkb_types::PlacementRole::Reference, 0)
+    })
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+
+    let text = fs::read_to_string(&file).unwrap();
+    let setup_line = text
+        .lines()
+        .find(|l| l.ends_with("^setup"))
+        .unwrap_or_else(|| panic!("setup's line is gone: {text}"));
+    assert!(setup_line.contains("+Tasks/later"), "{text}");
+}
+
+/// Two tasks files whose names differ only in case (a case-sensitive filesystem) each keep their
+/// own tasks: gathering `tasks.md`'s bindings must not take `Tasks.md`'s, which the reconcile would
+/// then cancel as tasks the file no longer holds.
+#[test]
+fn tasks_files_differing_only_in_case_keep_their_own_tasks() {
+    let dir = real_tempdir();
+    let upper = dir.path().join("Tasks.md");
+    let lower = dir.path().join("tasks.md");
+    fs::write(&upper, "## A\n- [ ] Upper task ^up\n").unwrap();
+    if lower.exists() {
+        return; // a case-insensitive filesystem: the two names are one file
+    }
+    fs::write(&lower, "## A\n- [ ] Lower task ^low\n").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    for _ in 0..2 {
+        let report = sync(&db, "docs/plan").unwrap();
+        assert_eq!(report.count(Outcome::Failed), 0, "{:?}", report.results);
+    }
+    for (uid, path) in [("up", &upper), ("low", &lower)] {
+        let uri = format!("{}#{uid}", uri_for(path));
+        assert_eq!(status_of(&db, &uri).as_deref(), Some("open"), "{uri}");
+    }
+    assert!(fs::read_to_string(&upper)
+        .unwrap()
+        .contains("Upper task ^up"));
+    assert!(fs::read_to_string(&lower)
+        .unwrap()
+        .contains("Lower task ^low"));
 }

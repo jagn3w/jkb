@@ -24,6 +24,13 @@ enum Direction {
     Backward,
 }
 
+/// Whether an adjacency walk follows [`Dest::Stated`] rows. See [`Machine::adjacency`].
+#[derive(Clone, Copy)]
+enum Stated {
+    Counted,
+    Excluded,
+}
+
 /// Something wrong with a machine, or with the advice it gives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Defect<S, E> {
@@ -266,13 +273,12 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
         // state. Both are plain graph walks over the table; guards are ignored, which is the
         // right reading — a guard makes a path conditional, while a missing edge makes it
         // impossible, and only the second is a defect of the machine itself.
-        let forward = self.adjacency(Direction::Forward);
-        let backward = self.adjacency(Direction::Backward);
+        let forward = self.adjacency(Direction::Forward, Stated::Counted);
+        let backward = self.adjacency(Direction::Backward, Stated::Excluded);
 
         let reachable = reach(&forward, std::iter::once(self.initial));
-        let by_override = self.stated_reaches_everything();
         for &state in S::ALL {
-            if !by_override && !reachable.contains(&state.name()) {
+            if !reachable.contains(&state.name()) {
                 defects.push(Defect::UnreachableState { state });
             }
         }
@@ -292,35 +298,40 @@ impl<S: State, E: Event, C: Stateful<S> + 'static, X: 'static> Machine<S, E, C, 
         defects
     }
 
-    /// The table as a name-keyed adjacency map, in whichever direction `edge` picks out.
-    /// A [`Dest::Stated`] row contributes no edge: it is an escape hatch, not a way the
-    /// lifecycle gets anywhere, and counting it would make [`Defect::Wedged`] vacuous for every
-    /// machine that has an operator override (see [`Dest`]).
+    /// The table as a name-keyed adjacency map, in whichever direction `direction` picks out.
     ///
-    /// **Reachability is the exception, and asks the opposite question.** *Can the object be
-    /// here* is answered yes by an override, whatever the lifecycle does; *can the lifecycle get
-    /// it out of here* is not. Collapsing the two reported the investigation machine's
-    /// `abandoned` — which only a person ever sets — as unreachable dead code, when it is a
-    /// state units are in every day.
-    fn adjacency(&self, direction: Direction) -> HashMap<&'static str, Vec<&'static str>> {
+    /// Whether a [`Dest::Stated`] row contributes is the caller's choice, because the two walks
+    /// ask opposite questions. *Can the lifecycle get it out of here* ([`Defect::Wedged`]) must
+    /// not count one: it is an escape hatch, not a way the lifecycle gets anywhere, and counting
+    /// it would make the check vacuous for every machine that has an operator override (see
+    /// [`Dest`]). *Can the object be here* ([`Defect::UnreachableState`]) must: excluding them
+    /// reported the investigation machine's `abandoned`, which only a person ever sets, as dead
+    /// code when it is a state units are in every day.
+    ///
+    /// Counted, a stated row is an edge from its `from` to each state in its `among` and to
+    /// nothing else, so it reaches what it can name only once its own `from` is reached. Before
+    /// that, one stated row anywhere in the table made every state reachable.
+    fn adjacency(
+        &self,
+        direction: Direction,
+        stated: Stated,
+    ) -> HashMap<&'static str, Vec<&'static str>> {
         let mut map: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
         for t in self.transitions {
-            let Dest::To(to) = t.to else { continue };
-            let (a, b) = match direction {
-                Direction::Forward => (t.from, to),
-                Direction::Backward => (to, t.from),
+            let tos: &[S] = match (&t.to, stated) {
+                (Dest::To(to), _) => std::slice::from_ref(to),
+                (Dest::Stated { among, .. }, Stated::Counted) => among,
+                (Dest::Stated { .. }, Stated::Excluded) => &[],
             };
-            map.entry(a.name()).or_default().push(b.name());
+            for to in tos {
+                let (a, b) = match direction {
+                    Direction::Forward => (t.from, *to),
+                    Direction::Backward => (*to, t.from),
+                };
+                map.entry(a.name()).or_default().push(b.name());
+            }
         }
         map
-    }
-
-    /// Every state an operator could name outright — the destinations a [`Dest::Stated`] row can
-    /// resolve to, which is *any* state, since the caller chooses.
-    fn stated_reaches_everything(&self) -> bool {
-        self.transitions
-            .iter()
-            .any(|t| matches!(t.to, Dest::Stated(_)))
     }
 
     /// Walk every `(state, event)` pair against each observed context, and report the defects

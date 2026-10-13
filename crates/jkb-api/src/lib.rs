@@ -1213,6 +1213,17 @@ pub enum Request {
         /// The pull request's number.
         number: i64,
     },
+    /// Record that no pull request is headed by a task's branch ([`prs::record_absent`]).
+    #[serde(rename = "task.pr_absent")]
+    TaskPrAbsent {
+        /// A task uid or bare slug.
+        uid: String,
+        /// The branch asked about.
+        branch: String,
+        /// Its remote-tracking tip when asked; absent when it had none.
+        #[serde(default)]
+        remote_head: Option<String>,
+    },
     /// Close a task whose work merged ([`prs::close_merged`]).
     #[serde(rename = "task.close_merged")]
     TaskCloseMerged {
@@ -1716,6 +1727,7 @@ impl Request {
         "task.pr_facts",
         "task.open_in_repo",
         "task.pr_record",
+        "task.pr_absent",
         "task.close_merged",
         "ns.list",
         "ns.mv",
@@ -1866,6 +1878,7 @@ impl Request {
             Self::TaskPrFacts { .. } => "task.pr_facts",
             Self::TaskOpenInRepo { .. } => "task.open_in_repo",
             Self::TaskPrRecord { .. } => "task.pr_record",
+            Self::TaskPrAbsent { .. } => "task.pr_absent",
             Self::TaskCloseMerged { .. } => "task.close_merged",
         }
     }
@@ -2006,6 +2019,7 @@ impl Request {
             | Self::ItemRm { .. }
             | Self::InvWrite(_)
             | Self::TaskPrRecord { .. }
+            | Self::TaskPrAbsent { .. }
             | Self::TaskCloseMerged { .. }
             | Self::NsMv { .. }
             | Self::DesignCreate { .. }
@@ -2211,6 +2225,10 @@ pub enum Response {
         /// Cut short at the read's budget ([`kb::Budget`]).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
+        /// Orphan vector rows the scan dropped rather than return; absent (and so zero, from a
+        /// server that predates it) when none were.
+        #[serde(default, skip_serializing_if = "kb::OrphanVectors::is_clean")]
+        orphan_vectors: kb::OrphanVectors,
     },
     /// A write that answers with nothing but its success (`task.set`, `edit`, `tag`, `depend`,
     /// `undepend`, `place`, `bind`).
@@ -3644,7 +3662,10 @@ impl LocalBackend {
                 limit,
                 context,
             } => {
-                let hits = kb::search(
+                let kb::Searched {
+                    hits,
+                    orphan_vectors,
+                } = kb::search(
                     db,
                     self.embedder.as_ref(),
                     &kb::SearchAsk {
@@ -3659,6 +3680,7 @@ impl LocalBackend {
                 Response::SearchHits {
                     hits,
                     truncated: budget.exhausted(),
+                    orphan_vectors,
                 }
             }
             Request::TaskReady {
@@ -4478,6 +4500,17 @@ impl LocalBackend {
                 let roots = self.file_roots.clone();
                 task_write(db, actor, uid, move |c, m, uid| {
                     prs::record(c, m, uid, number, roots.as_ref())
+                })?;
+                Response::Applied {}
+            }
+            Request::TaskPrAbsent {
+                uid,
+                branch,
+                remote_head,
+            } => {
+                let roots = self.file_roots.clone();
+                task_write(db, actor, uid, move |c, m, uid| {
+                    prs::record_absent(c, m, uid, &branch, remote_head.as_deref(), roots.as_ref())
                 })?;
                 Response::Applied {}
             }

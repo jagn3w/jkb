@@ -134,8 +134,11 @@ mod tests {
         // V024 design documents as CRDT updates (design_updates, design_snapshots),
         // V025 the operator's workflow agent templates (workflow_agents),
         // V026 a design's doc target and sources out of its metadata (design_doc_targets,
-        // design_sources).
-        assert_eq!(user_version, 26);
+        // design_sources),
+        // V027 edges.id and namespaces.id AUTOINCREMENT (a freed id is never reissued),
+        // V028 drops the unread task_transitions branch index; V029 gives placements and tag
+        // applications unreusable ids.
+        assert_eq!(user_version, 29);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -299,7 +302,9 @@ mod tests {
         let user_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(user_version, 26);
+        // V028 drops the unread task_transitions branch index; V029 gives placements and tag
+        // applications unreusable ids.
+        assert_eq!(user_version, 29);
         assert_eq!(
             crate::supported_schema_version(),
             user_version,

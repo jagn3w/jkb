@@ -8,7 +8,7 @@ use serde_json::json;
 use jkb_types::{Error as TypeError, ItemId, Resolution};
 
 use crate::changelog::{Entity, Op};
-use crate::sql::like_escape;
+use crate::sql::subtree_glob;
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
 
@@ -165,10 +165,10 @@ pub fn grep_each(
     if let Some(s) = scope {
         sql.push_str(
             " AND EXISTS (SELECT 1 FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-                          WHERE p.item_id = i.id AND (n.path = ? OR n.path LIKE ? ESCAPE '\\'))",
+                          WHERE p.item_id = i.id AND (n.path = ? OR n.path GLOB ?))",
         );
         params.push(Value::Text(s.to_owned()));
-        params.push(Value::Text(format!("{}/%", like_escape(s))));
+        params.push(Value::Text(subtree_glob(s)));
     }
     sql.push_str(" ORDER BY i.uid");
 
@@ -567,7 +567,7 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
 
     let placements = {
         let mut stmt = conn.prepare_cached(
-            "SELECT namespace_id, role, position, metadata FROM placements WHERE item_id = ?1",
+            "SELECT namespace_id, role, position, metadata, id FROM placements WHERE item_id = ?1",
         )?;
         let rows = stmt.query_map([id], |r| {
             Ok(json!({
@@ -575,26 +575,32 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
                 "role": r.get::<_, String>(1)?,
                 "position": r.get::<_, i64>(2)?,
                 "metadata": r.get::<_, String>(3)?,
+                // Restored as-is (`undo::restore_children`), so the changelog rows keyed by it —
+                // `placement::place`'s insert among them — still address this placement after
+                // an undo. V029 made it unreusable, so no other row can hold it by then.
+                "id": r.get::<_, i64>(4)?,
             }))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let tags = {
         let mut stmt = conn.prepare_cached(
-            "SELECT facet, value, props FROM tag_applications WHERE item_id = ?1",
+            "SELECT facet, value, props, id FROM tag_applications WHERE item_id = ?1",
         )?;
         let rows = stmt.query_map([id], |r| {
             Ok(json!({
                 "facet": r.get::<_, String>(0)?,
                 "value": r.get::<_, String>(1)?,
                 "props": r.get::<_, String>(2)?,
+                // Restored as-is, for the same reason as a placement's.
+                "id": r.get::<_, i64>(3)?,
             }))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let edges = {
         let mut stmt = conn.prepare_cached(
-            "SELECT src_item_id, dst_item_id, type, props, weight, created_at FROM edges
+            "SELECT src_item_id, dst_item_id, type, props, weight, created_at, id FROM edges
              WHERE src_item_id = ?1 OR dst_item_id = ?1",
         )?;
         let rows = stmt.query_map([id], |r| {
@@ -605,6 +611,12 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
                 "props": r.get::<_, String>(3)?,
                 "weight": r.get::<_, Option<f64>>(4)?,
                 "created_at": r.get::<_, String>(5)?,
+                // Restored as-is when no row holds it, which since V027 made `edges.id`
+                // AUTOINCREMENT is always: an undo then puts the edge back where
+                // `edge::link_weighted`'s changelog rows (keyed by it) can still find it. If
+                // another edge holds it — only history from before V027 can cause that — the
+                // edge is restored under a fresh id (`undo::restore_edge`).
+                "id": r.get::<_, i64>(6)?,
             }))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -1010,9 +1022,96 @@ pub fn set_content(
     Ok(())
 }
 
+/// The `metadata` key holding a file-backed task's **unresolved needs**: the `^id`s its line's
+/// `needs:` modifiers name that no task in its file defines, in file order. Kept so the file's
+/// text survives a round trip without the reference becoming either an edge to nothing or
+/// words of the title; the `tasks` serializer turns one into a `depends_on` edge as soon as the
+/// file defines its id.
+pub const UNRESOLVED_NEEDS: &str = "unresolved_needs";
+
+/// The item's [`UNRESOLVED_NEEDS`], in order; empty when it has none.
+///
+/// # Errors
+/// [`jkb_types::Error::NotFound`] for an unknown item, unreadable `metadata`, or a failed read.
+pub fn unresolved_needs(conn: &Connection, item: ItemId) -> Result<Vec<String>> {
+    let md = metadata_of(conn, item)?;
+    Ok(md
+        .get(UNRESOLVED_NEEDS)
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Set the item's [`UNRESOLVED_NEEDS`] (removing the key when `needs` is empty), leaving every
+/// other `metadata` key as it was. Writes nothing when the value is unchanged; a write is logged so
+/// `jkb undo` restores the previous `metadata`.
+///
+/// # Errors
+/// [`jkb_types::Error::NotFound`] for an unknown item, unreadable `metadata`, or a failed write.
+pub fn set_unresolved_needs(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    needs: &[String],
+) -> Result<()> {
+    if unresolved_needs(conn, item)? == needs {
+        return Ok(());
+    }
+    let before = metadata_of(conn, item)?;
+    let mut after = before.clone();
+    if let Some(map) = after.as_object_mut() {
+        if needs.is_empty() {
+            map.remove(UNRESOLVED_NEEDS);
+        } else {
+            map.insert(UNRESOLVED_NEEDS.to_owned(), json!(needs));
+        }
+    }
+    let (before, after) = (before.to_string(), after.to_string());
+    conn.prepare_cached(
+        "UPDATE items SET metadata = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+          WHERE id = ?1",
+    )?
+    .execute(params![item.get(), after])?;
+    changelog::append(
+        conn,
+        meta,
+        Op::Update,
+        Entity::Items,
+        &item.get().to_string(),
+        Some(&json!({ "metadata": before })),
+        Some(&json!({ "metadata": after })),
+    )?;
+    Ok(())
+}
+
+/// The item's `metadata` object.
+fn metadata_of(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
+    let raw: String = conn
+        .prepare_cached("SELECT metadata FROM items WHERE id = ?1")?
+        .query_row([item.get()], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        Error::Types(TypeError::Validation(format!(
+            "item {item} has unreadable metadata: {e}"
+        )))
+    })?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(Error::Types(TypeError::Validation(format!(
+            "item {item} has metadata that is not an object"
+        ))))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{grep, remove, upsert, NewItem};
+    use super::{grep, remove, set_unresolved_needs, unresolved_needs, upsert, NewItem};
     use crate::{ns, placement, Db};
     use jkb_types::PlacementRole;
     use proptest::prelude::*;
@@ -1061,8 +1160,8 @@ mod tests {
     fn grep_is_literal_case_sensitive_and_scoped() {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
-            let a = ns::ensure(conn, "proj/a")?;
-            let b = ns::ensure(conn, "proj/b")?;
+            let a = ns::ensure(conn, meta, "proj/a")?;
+            let b = ns::ensure(conn, meta, "proj/b")?;
             for (uid, body, at) in [
                 ("n:1", "buy a 6-inch Pipe", a),
                 ("n:2", "review the pipe", a),
@@ -1119,7 +1218,7 @@ mod tests {
                 ("n:accent", "the RÉSUMÉ is ready", "_sys/z"),
                 ("n:bleed", "résumé elsewhere", "xsys/z"),
             ] {
-                let at = ns::ensure(conn, ns_path)?;
+                let at = ns::ensure(conn, meta, ns_path)?;
                 let item = upsert(
                     conn,
                     meta,
@@ -1151,6 +1250,39 @@ mod tests {
             hits.iter().map(|h| h.uid.as_str()).collect::<Vec<_>>(),
             ["n:accent"],
             "the `_sys` scope must not match the sibling `xsys`"
+        );
+    }
+
+    /// A grep scope is case-exact, as namespace identity is (`Notes` and `notes` are two
+    /// namespaces): under a `LIKE` subtree, scope `notes` also took `Notes/…`.
+    #[test]
+    fn grep_scope_does_not_fold_case() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            for (uid, ns_path) in [("n:lower", "notes/a"), ("n:upper", "Notes/a")] {
+                let at = ns::ensure(conn, meta, ns_path)?;
+                let item = upsert(
+                    conn,
+                    meta,
+                    &NewItem {
+                        uid: uid.to_owned(),
+                        kind: "note".to_owned(),
+                        content: Some("needle".to_owned()),
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                placement::place(conn, meta, item, at, PlacementRole::Primary, 0)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let hits = db
+            .read(|conn| grep(conn, "needle", Some("notes"), false))
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.uid.as_str()).collect::<Vec<_>>(),
+            ["n:lower"]
         );
     }
 
@@ -1255,5 +1387,73 @@ mod tests {
                 .unwrap();
             prop_assert_eq!(n, 1);
         }
+    }
+
+    /// Unresolved needs live under one `metadata` key: set and read back in order, cleared by an
+    /// empty list without touching any other key, and restored by `jkb undo`.
+    #[test]
+    fn unresolved_needs_round_trip_keep_other_metadata_and_undo() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |c, m| {
+                let id = upsert(
+                    c,
+                    m,
+                    &NewItem {
+                        uid: "task:n".into(),
+                        kind: "task".into(),
+                        content: Some("n".into()),
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                c.execute(
+                    "UPDATE items SET metadata = '{\"keep\":1}' WHERE id = ?1",
+                    [id.get()],
+                )?;
+                Ok(id)
+            })
+            .unwrap();
+        let needs = vec!["b".to_owned(), "a".to_owned()];
+        db.write_txn("t", {
+            let needs = needs.clone();
+            move |c, m| set_unresolved_needs(c, m, id, &needs)
+        })
+        .unwrap();
+        assert_eq!(db.read(move |c| unresolved_needs(c, id)).unwrap(), needs);
+        db.write_txn("t", move |c, m| set_unresolved_needs(c, m, id, &[]))
+            .unwrap();
+        let md: String = db
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT metadata FROM items WHERE id = ?1",
+                    [id.get()],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(md, r#"{"keep":1}"#);
+        db.write_txn("t", |c, m| crate::undo::undo_last(c, m).map(|_| ()))
+            .unwrap();
+        assert_eq!(db.read(move |c| unresolved_needs(c, id)).unwrap(), needs);
+    }
+
+    /// An item with no readable first line is named by its uid, never by a blank: a listing row,
+    /// a staging row and a refusal all label items through `title_from`, and an empty title renders
+    /// as a blank row in every host.
+    #[test]
+    fn a_title_with_no_readable_line_falls_back_to_the_uid() {
+        for content in [None, Some(""), Some("  \n\t\n   ")] {
+            assert_eq!(
+                super::title_from("doc:x", content),
+                "doc:x",
+                "content {content:?} has no title of its own"
+            );
+        }
+        assert_eq!(
+            super::title_from("doc:x", Some("\n  Real title  \nbody")),
+            "Real title",
+            "the first non-blank line, trimmed"
+        );
     }
 }

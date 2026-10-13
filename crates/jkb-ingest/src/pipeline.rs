@@ -106,7 +106,8 @@ impl Pipeline {
     fn strategy(&self) -> String {
         format!(
             "char:{}:{}",
-            self.chunking.max_chars, self.chunking.overlap_chars
+            self.chunking.max_chars(),
+            self.chunking.overlap_chars()
         )
     }
 
@@ -308,7 +309,7 @@ impl Pipeline {
                     })
                 }
                 None => {
-                    let ns_id = ns::ensure(conn, &namespace)?;
+                    let ns_id = ns::ensure(conn, meta, &namespace)?;
                     let document = item::upsert(
                         conn,
                         meta,
@@ -542,7 +543,8 @@ impl Pipeline {
         Ok(report)
     }
 
-    /// Write a batch of vectors in one transaction, returning how many landed.
+    /// Write a batch of vectors in one transaction, returning how many landed. An item deleted
+    /// since it was read for embedding gets no vector (`upsert_vector` checks) and is not counted.
     ///
     /// Committing per batch rather than once at the end is what makes a long backfill
     /// resumable: interrupting it keeps everything already written, and re-running picks up
@@ -551,16 +553,17 @@ impl Pipeline {
         if embeddings.is_empty() {
             return Ok(0);
         }
-        let count = embeddings.len();
         let vector = VectorIndexer::new(self.embedder.clone());
-        db.write_txn_with::<(), Error, _>("index-pending", move |conn, _meta| {
+        db.write_txn_with::<usize, Error, _>("index-pending", move |conn, _meta| {
             vector.ensure_ready(conn)?;
+            let mut landed = 0;
             for (id, embedding) in &embeddings {
-                vector.upsert_vector(conn, *id, embedding)?;
+                if vector.upsert_vector(conn, *id, embedding)? {
+                    landed += 1;
+                }
             }
-            Ok(())
-        })?;
-        Ok(count)
+            Ok(landed)
+        })
     }
 
     /// Give each document a vector **averaged from its chunks** rather than embedded from
@@ -625,16 +628,14 @@ fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
 fn pending_rows_sql(conn: &Connection, table: &str) -> rusqlite::Result<String> {
     Ok(if table_exists(conn, table)? {
         format!(
-            // The join is belt-and-braces, and provably cannot change this result set: an
-            // orphan's `item_id` matches no live item, so `NOT IN` already excludes it, and
-            // under id *reuse* the row names a live item so the join succeeds and the item still
-            // reads as indexed. Only the high-water mark (`V011`) prevents reuse. It is kept
-            // because it states the intent — "indexed" means a vector for an item that exists —
-            // where a bare `NOT IN` leaves that to the reader.
+            // "Indexed" means a vector for an item that exists. The bare subquery already says
+            // exactly that: every candidate `id` is drawn from `items`, so an orphan vector row
+            // (one whose item is gone) can never match it. Joining the vec table back to `items`
+            // to make the point explicit changed nothing but the plan, on the query behind both
+            // `jkb index` and `jkb doctor`'s un-embedded count over the whole store.
             "SELECT id, content, kind FROM items
              WHERE content IS NOT NULL
-               AND id NOT IN (SELECT v.item_id FROM {table} v
-                              JOIN items i ON i.id = v.item_id)"
+               AND id NOT IN (SELECT item_id FROM {table})"
         )
     } else {
         "SELECT id, content, kind FROM items WHERE content IS NOT NULL".to_owned()
@@ -741,13 +742,25 @@ fn document_id(conn: &Connection, hash: &str) -> Result<ItemId> {
     Ok(ItemId::new(id))
 }
 
+/// The `GLOB` pattern matching every chunk uid of `hash` (`b3:<hash>:<idx>`); bind it to
+/// `uid GLOB ?`.
+///
+/// `hash` is blake3 hex today (`blob::hash_bytes` or [`text_address`]), which holds no `GLOB`
+/// metacharacter, so the escape is a no-op for every value ingest produces. It is escaped anyway,
+/// through the same [`jkb_core::sql::prefix_glob`] every other prefix match uses, so that safety
+/// is a property of this one function rather than of what each caller happens to pass, and these
+/// sites read like their siblings instead of like the unescaped patterns that were bugs.
+fn chunk_uid_glob(hash: &str) -> String {
+    jkb_core::sql::prefix_glob(&format!("b3:{hash}"), ':')
+}
+
 /// Items left over from a previous ingestion of `hash` — its chunks, and the document if it
 /// is somehow still there — so a re-capture can start from nothing.
 fn surviving_fragments(conn: &Connection, hash: &str) -> Result<Vec<ItemId>> {
     let mut stmt =
-        conn.prepare_cached("SELECT id FROM items WHERE uid = ?1 OR uid LIKE ?2 ORDER BY id DESC")?;
+        conn.prepare_cached("SELECT id FROM items WHERE uid = ?1 OR uid GLOB ?2 ORDER BY id DESC")?;
     let rows = stmt.query_map(
-        rusqlite::params![format!("b3:{hash}"), format!("b3:{hash}:%")],
+        rusqlite::params![format!("b3:{hash}"), chunk_uid_glob(hash)],
         |r| r.get::<_, i64>(0),
     )?;
     Ok(rows
@@ -760,8 +773,8 @@ fn surviving_fragments(conn: &Connection, hash: &str) -> Result<Vec<ItemId>> {
 /// The number of chunk items for `hash` (uid `b3:<hash>:<idx>`).
 fn count_chunks(conn: &Connection, hash: &str) -> Result<usize> {
     let n: i64 = conn
-        .prepare_cached("SELECT count(*) FROM items WHERE uid LIKE ?1")?
-        .query_row([format!("b3:{hash}:%")], |r| r.get(0))?;
+        .prepare_cached("SELECT count(*) FROM items WHERE uid GLOB ?1")?
+        .query_row([chunk_uid_glob(hash)], |r| r.get(0))?;
     Ok(usize::try_from(n).unwrap_or(0))
 }
 
@@ -774,13 +787,61 @@ fn load_items(conn: &Connection, hash: &str) -> Result<(ItemId, Vec<(ItemId, Str
     let mut items = vec![(document, doc_content)];
 
     let mut stmt = conn.prepare_cached(
-        "SELECT id, content FROM items WHERE uid LIKE ?1 AND content IS NOT NULL ORDER BY id",
+        "SELECT id, content FROM items WHERE uid GLOB ?1 AND content IS NOT NULL ORDER BY id",
     )?;
     let chunks = stmt
-        .query_map([format!("b3:{hash}:%")], |r| {
+        .query_map([chunk_uid_glob(hash)], |r| {
             Ok((ItemId::new(r.get(0)?), r.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     items.extend(chunks);
     Ok((document, items))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(uid: &str, content: &str) -> NewItem {
+        NewItem {
+            uid: uid.to_owned(),
+            kind: "chunk".to_owned(),
+            content: Some(content.to_owned()),
+            content_hash: None,
+            mime: None,
+        }
+    }
+
+    /// A chunk-uid prefix match takes `hash` literally. Ingest only ever passes blake3 hex, so
+    /// this pins the property of [`chunk_uid_glob`] rather than a reachable input: a `?` in
+    /// `hash` must not act as a one-character wildcard, nor its case fold, and pull in a sibling
+    /// document's chunks, which would let a re-capture delete them and a resume embed them as its
+    /// own.
+    #[test]
+    fn chunk_uid_matches_take_the_hash_literally() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |conn, meta| {
+            item::upsert(conn, meta, &note("b3:a?c", "the document"))?;
+            item::upsert(conn, meta, &note("b3:a?c:0", "its chunk"))?;
+            item::upsert(conn, meta, &note("b3:abc", "a sibling document"))?;
+            item::upsert(conn, meta, &note("b3:abc:0", "the sibling's chunk"))?;
+            item::upsert(conn, meta, &note("b3:A?C:0", "a case variant's chunk"))?;
+            Ok(())
+        })
+        .unwrap();
+
+        db.read(|conn| {
+            assert_eq!(count_chunks(conn, "a?c").unwrap(), 1);
+            assert_eq!(
+                surviving_fragments(conn, "a?c").unwrap().len(),
+                2,
+                "the document and its own chunk, not the sibling's"
+            );
+            let (_, items) = load_items(conn, "a?c").unwrap();
+            let texts: Vec<&str> = items.iter().map(|(_, c)| c.as_str()).collect();
+            assert_eq!(texts, ["the document", "its chunk"]);
+            Ok(())
+        })
+        .unwrap();
+    }
 }

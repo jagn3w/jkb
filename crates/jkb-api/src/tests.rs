@@ -638,6 +638,11 @@ fn samples() -> Vec<Request> {
             uid: "u".into(),
             number: 7,
         },
+        Request::TaskPrAbsent {
+            uid: "u".into(),
+            branch: "b".into(),
+            remote_head: None,
+        },
         Request::TaskCloseMerged {
             uid: "u".into(),
             merged: super::prs::Merged::Unknown,
@@ -1065,7 +1070,7 @@ fn read_fixture() -> LocalBackend {
     use jkb_types::{ConflictPolicy, PlacementRole, SyncMode};
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let repo = ns::ensure(c, "repos/jkb")?;
+        let repo = ns::ensure(c, m, "repos/jkb")?;
         mount::create(
             c,
             m,
@@ -1299,6 +1304,42 @@ fn a_task_shows_with_its_subtasks_and_holds_the_parent_off_the_frontier() {
     assert_eq!(children[0].reference, "task:child");
 }
 
+/// A listed item whose content is only whitespace is labelled by its uid, not served as a blank row.
+#[test]
+fn a_whitespace_only_item_is_listed_under_its_uid() {
+    use jkb_core::{item, ns, placement};
+    use jkb_types::PlacementRole;
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        let at = ns::ensure(c, m, "notes")?;
+        let id = item::upsert(
+            c,
+            m,
+            &item::NewItem {
+                uid: "note:blank".into(),
+                kind: "note".into(),
+                content: Some("  \n\t\n ".into()),
+                content_hash: None,
+                mime: None,
+            },
+        )?;
+        placement::place(c, m, id, at, PlacementRole::Primary, 0)
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    let Response::Listing { rows, .. } =
+        call(&b, json!({ "op": "kb.ls", "path": "notes" })).unwrap()
+    else {
+        panic!("kb.ls answers with a listing")
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.child.reference.as_str(), r.child.label.as_str()))
+            .collect::<Vec<_>>(),
+        [("note:blank", "note:blank")]
+    );
+}
+
 #[test]
 fn ls_and_tree_list_the_same_children() {
     let b = read_fixture();
@@ -1359,6 +1400,7 @@ fn a_search_score_crosses_the_wire_exactly() {
     let wire = serde_json::to_string(&Response::SearchHits {
         hits: vec![hit.clone()],
         truncated: false,
+        orphan_vectors: super::kb::OrphanVectors::default(),
     })
     .unwrap();
     let Response::SearchHits { hits, .. } = serde_json::from_str(&wire).unwrap() else {
@@ -1366,6 +1408,131 @@ fn a_search_score_crosses_the_wire_exactly() {
     };
     assert_eq!(hits[0].score.to_bits(), score.to_bits(), "{wire}");
     assert_eq!(hits[0], hit);
+}
+
+/// A constant dim-16 embedder, so a vector search runs without a model.
+struct Dim16;
+
+impl jkb_types::Embedder for Dim16 {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model(&self) -> &str {
+        "fake"
+    }
+    fn dim(&self) -> usize {
+        16
+    }
+    fn embed(&self, _text: &str) -> jkb_types::Result<Vec<f32>> {
+        Ok(vec![0.25; 16])
+    }
+    fn health_check(&self) -> jkb_types::Result<()> {
+        Ok(())
+    }
+    fn resolved_version(&self) -> jkb_types::Result<Option<String>> {
+        Ok(Some("fake:v1".to_owned()))
+    }
+}
+
+/// `kb.search` carries the orphan vector rows its scan dropped out to the client — the only way a
+/// caller can learn the table needs `jkb index --sweep`, since the dropped rows never reach the
+/// hits — and sends nothing for them on a clean table, so a client older than the field and a
+/// newer one read the same answer there.
+#[test]
+fn a_search_reports_the_orphan_vectors_it_dropped() {
+    use jkb_index::VectorIndexer;
+    let embedder: std::sync::Arc<dyn jkb_types::Embedder + Send + Sync> =
+        std::sync::Arc::new(Dim16);
+    let db = Db::open_in_memory_with(&[jkb_index::register]).unwrap();
+    let vector = VectorIndexer::new(embedder.clone());
+    db.write_txn("test", move |c, m| {
+        vector.ensure_ready(c).unwrap();
+        for n in 0..3 {
+            let id = jkb_core::item::upsert(
+                c,
+                m,
+                &jkb_core::item::NewItem {
+                    uid: format!("note:{n}"),
+                    kind: "note".into(),
+                    content: Some(format!("live note {n}")),
+                    content_hash: None,
+                    mime: None,
+                },
+            )?;
+            // Opposite the query, so the orphans planted below rank ahead of every live row.
+            vector.upsert_vector(c, id, &[-0.25; 16]).unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db.clone()).with_embedder(embedder);
+    let search = |b: &LocalBackend| {
+        let wire = serde_json::to_value(
+            call(
+                b,
+                json!({ "op": "kb.search", "dsl": "~\"note\"", "route": "vector", "limit": 3 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let Response::SearchHits {
+            hits,
+            orphan_vectors,
+            ..
+        } = serde_json::from_value(wire.clone()).unwrap()
+        else {
+            panic!("a search answers with hits: {wire}")
+        };
+        (hits.len(), orphan_vectors, wire)
+    };
+
+    let (found, clean, wire) = search(&b);
+    assert_eq!(found, 3);
+    assert_eq!(clean.dropped, 0, "{wire}");
+    assert!(!clean.needs_sweep());
+    assert!(
+        wire.get("orphan_vectors").is_none(),
+        "nothing on the wire for a clean table: {wire}"
+    );
+
+    // What a store ingested before the vector GC trigger and then undone carries.
+    db.write_txn("test", |c, _m| {
+        let bytes: Vec<u8> = [0.25f32; 16].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut insert =
+            c.prepare_cached("INSERT INTO vec_items_16(item_id, embedding) VALUES (?1, ?2)")?;
+        for orphan in 900_000..900_030_i64 {
+            insert.execute(rusqlite::params![orphan, bytes])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let (found, dirty, wire) = search(&b);
+    assert_eq!(found, 3, "the live notes are still found");
+    assert_eq!(dirty.dropped, 30, "{wire}");
+    assert_eq!(dirty.scanned, 33, "{wire}");
+    assert!(dirty.needs_sweep());
+    assert_eq!(wire["orphan_vectors"]["dropped"], 30, "{wire}");
+}
+
+/// The sweep hint's threshold: at least one scanned row in four an orphan, and never on none.
+#[test]
+fn the_sweep_hint_fires_from_a_quarter_of_the_scan() {
+    use super::kb::OrphanVectors;
+    let o = |dropped, scanned| OrphanVectors { dropped, scanned };
+    assert!(!o(0, 0).needs_sweep());
+    assert!(!o(0, 100).needs_sweep());
+    assert!(!o(24, 100).needs_sweep());
+    assert!(o(25, 100).needs_sweep());
+    assert!(o(100, 100).needs_sweep());
+    // An answer from a server that predates the field reads as clean.
+    let old: Response =
+        serde_json::from_value(json!({ "result": "search_hits", "hits": [] })).unwrap();
+    assert_eq!(
+        old,
+        Response::SearchHits {
+            hits: Vec::new(),
+            truncated: false,
+            orphan_vectors: OrphanVectors::default(),
+        }
+    );
 }
 
 /// Items and namespaces for the tree guards: `new(uid)` is a document with one chunk, so it expands.
@@ -1408,7 +1575,7 @@ fn a_tree_does_not_descend_into_a_node_that_lists_its_own_ancestor() {
     // check this walked to the depth cap with a fan-out of two at every level.
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let spaces = [ns::ensure(c, "a")?, ns::ensure(c, "b")?];
+        let spaces = [ns::ensure(c, m, "a")?, ns::ensure(c, m, "b")?];
         for uid in ["a", "b"] {
             let doc = expanding_document(c, m, uid)?;
             for (i, space) in spaces.iter().enumerate() {
@@ -1426,10 +1593,25 @@ fn a_tree_does_not_descend_into_a_node_that_lists_its_own_ancestor() {
     })
     .unwrap();
     let b = LocalBackend::new(db);
-    let started = std::time::Instant::now();
+    // Counted, not timed: the walk runs on the `Db`'s own thread, and the count is read there. A 5 s
+    // bound here would fail on a loaded machine rather than on the walk.
+    b.db.read(|_| {
+        super::kb::LEVELS_LISTED.set(0);
+        Ok(())
+    })
+    .unwrap();
     let nodes = tree_of(&b, "a");
+    let listed = b.db.read(|_| Ok(super::kb::LEVELS_LISTED.get())).unwrap();
+    // One level for `a`, and one for document `b` under it (which lists namespace `b`); every other
+    // node names an ancestor and is not descended into. Two, where the walk without the check
+    // listed a level per node to the node cap.
+    assert_eq!(
+        listed,
+        2,
+        "levels listed; {} nodes: {nodes:#?}",
+        count(&nodes)
+    );
     assert!(count(&nodes) <= 6, "{} nodes: {nodes:#?}", count(&nodes));
-    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
 
 #[test]
@@ -1438,9 +1620,9 @@ fn a_tree_stops_at_its_node_cap_and_says_so() {
     // More child namespaces than the cap, each with a namespace of its own under it.
     let db = Db::open_in_memory().unwrap();
     let width = super::kb::MAX_TREE_NODES + 50;
-    db.write_txn("t", move |c, _| {
+    db.write_txn("t", move |c, m| {
         for i in 0..width {
-            ns::ensure(c, &format!("w/{i:05}/x"))?;
+            ns::ensure(c, m, &format!("w/{i:05}/x"))?;
         }
         Ok(())
     })
@@ -1471,8 +1653,8 @@ fn a_tree_at_the_depth_cap_decodes_through_the_wire() {
     // Each tree level is two levels of JSON nesting and serde_json refuses past 128; a cap above it
     // printed on the host and failed to decode through the daemon.
     let db = Db::open_in_memory().unwrap();
-    db.write_txn("t", |c, _| {
-        ns::ensure(c, &vec!["d"; super::kb::MAX_TREE_DEPTH + 10].join("/"))?;
+    db.write_txn("t", |c, m| {
+        ns::ensure(c, m, &vec!["d"; super::kb::MAX_TREE_DEPTH + 10].join("/"))?;
         Ok(())
     })
     .unwrap();
@@ -1522,7 +1704,7 @@ fn every_listing_read_stays_within_its_budget_and_says_when_it_was_cut() {
     // task with many subtasks.
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let space = ns::ensure(c, "big")?;
+        let space = ns::ensure(c, m, "big")?;
         for i in 0..200 {
             let doc = item::upsert(
                 c,
@@ -1658,6 +1840,41 @@ fn a_task_s_subtasks_carry_their_titles_not_their_bodies() {
     assert_eq!(task.subtasks[0].title, "Child title");
 }
 
+/// A `Db`'s thread held inside a read until [`Held::release`]: what proves an op does not wait on that
+/// connection is the op answering while it is still held — an ordering, not a duration.
+struct Held(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>);
+
+/// How long a hold waits for its release before letting go by itself. Only a hang guard: an op that
+/// wrongly waits on the held connection runs once it lets go, and [`Held::release`] reports that it
+/// was not released — the assertion is that, never the time an op took.
+const HANG_GUARD: std::time::Duration = std::time::Duration::from_mins(1);
+
+impl Held {
+    /// Hold `db`'s thread, returning once the hold is in place.
+    fn hold(db: &Db) -> Self {
+        let db = db.clone();
+        let (held, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            db.read(move |_| {
+                held.send(()).unwrap();
+                Ok(released.recv_timeout(HANG_GUARD).is_ok())
+            })
+            .unwrap()
+        });
+        holding.recv().unwrap();
+        Self(release, thread)
+    }
+
+    /// Let go: whether the hold was still in place, i.e. had not let go by itself because whatever ran
+    /// in the meantime was waiting on it.
+    fn release(self) -> bool {
+        // Fails only when the hold already let go and dropped its end — which the join reports.
+        let _ = self.0.send(());
+        self.1.join().unwrap()
+    }
+}
+
 #[test]
 fn a_long_read_on_the_reader_does_not_hold_up_a_write() {
     // `Db` runs every call on one thread. Measured before `with_reader`: a read holding it made a
@@ -1670,30 +1887,14 @@ fn a_long_read_on_the_reader_does_not_hold_up_a_write() {
         json!({ "op": "mq.topic_create", "topic": "claude/notify" }),
     )
     .unwrap();
-    let reads = b.reads.clone();
-    let (held, holding) = std::sync::mpsc::channel();
-    let long_read = std::thread::spawn(move || {
-        reads
-            .read(move |_| {
-                held.send(()).unwrap();
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                Ok(())
-            })
-            .unwrap();
-    });
-    holding.recv().unwrap();
-    let started = std::time::Instant::now();
+    // The write is issued while the reader is held and must answer before the hold is let go.
+    let read = Held::hold(&b.reads);
     call(
         &b,
         json!({ "op": "notify.event", "session": "s", "event": "needed" }),
     )
     .unwrap();
-    let took = started.elapsed();
-    long_read.join().unwrap();
-    assert!(
-        took < std::time::Duration::from_millis(700),
-        "a write waited {took:?} behind a read"
-    );
+    assert!(read.release(), "a write waited behind a read");
 
     // And the reader cannot write.
     let e = b
@@ -1777,18 +1978,6 @@ fn every_op_is_served_on_the_connection_its_class_names() {
             );
         }
     }
-    let writer = b.db.clone();
-    let (held, holding) = std::sync::mpsc::channel();
-    let blocker = std::thread::spawn(move || {
-        writer
-            .read(move |_| {
-                held.send(()).unwrap();
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                Ok(())
-            })
-            .unwrap();
-    });
-    holding.recv().unwrap();
     for request in samples() {
         assert_eq!(
             request.is_agent_read(),
@@ -1797,43 +1986,22 @@ fn every_op_is_served_on_the_connection_its_class_names() {
             request.op()
         );
     }
+    // With the writer's thread held, every read answers before the hold is let go.
     for request in samples().into_iter().filter(|r| READS.contains(&r.op())) {
         let op = request.op();
-        let at = std::time::Instant::now();
+        let writer = Held::hold(&b.db);
         let _ = b.call(request);
-        assert!(
-            at.elapsed() < std::time::Duration::from_secs(1),
-            "{op} waited {:?} behind the writer",
-            at.elapsed()
-        );
+        assert!(writer.release(), "{op} waited behind the writer");
     }
-    blocker.join().unwrap();
 
     // And the other way: with the reader held — a container's long grep — every op outside the read
-    // set still answers at once. The hook's `notify.open_sessions` sweep has 1 s.
-    let reader = b.reads.clone();
-    let (held, holding) = std::sync::mpsc::channel();
-    let blocker = std::thread::spawn(move || {
-        reader
-            .read(move |_| {
-                held.send(()).unwrap();
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                Ok(())
-            })
-            .unwrap();
-    });
-    holding.recv().unwrap();
+    // set still answers before it is let go. The hook's `notify.open_sessions` sweep has 1 s.
     for request in samples().into_iter().filter(|r| !READS.contains(&r.op())) {
         let op = request.op();
-        let at = std::time::Instant::now();
+        let reader = Held::hold(&b.reads);
         let _ = b.call(request);
-        assert!(
-            at.elapsed() < std::time::Duration::from_secs(1),
-            "{op} waited {:?} behind the reader",
-            at.elapsed()
-        );
+        assert!(reader.release(), "{op} waited behind the reader");
     }
-    blocker.join().unwrap();
 }
 
 #[test]
@@ -1938,7 +2106,7 @@ pub(crate) fn mutate_fixture() -> (Db, String, String, String) {
             ("repos/in", "file:///Users/u/repos/in"),
             ("docs/out", "file:///Users/u/Documents/out"),
         ] {
-            let id = ns::ensure(c, path)?;
+            let id = ns::ensure(c, m, path)?;
             mount::create(
                 c,
                 m,
@@ -2220,7 +2388,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 29, "every write naming an item was asked");
+    assert_eq!(checked, 30, "every write naming an item was asked");
     many_task_writes_leave_a_task_outside_the_roots_alone(&db, &inside, &outside);
     // And a verb that does git work first can ask, before it does any.
     for (uid, writable) in [(&outside, false), (&inside, true)] {
@@ -2362,12 +2530,17 @@ fn a_namespace_path_too_long_or_too_deep_is_refused_before_any_row_is_written() 
         "x".repeat(jkb_core::ns::MAX_PATH_BYTES + 1),
         vec!["a"; 500_000].join("/"),
     ] {
-        let started = std::time::Instant::now();
+        // Rows written, counted on the writer's own connection: SQLite's total never goes back down,
+        // so it sees a row written and then rolled back with the refusal — the half-million-row
+        // transaction this guards — where a look at the tables afterwards would not. Counted rather
+        // than timed, so a loaded machine cannot fail it.
+        let written = || b.db.read(|c| Ok(c.total_changes())).unwrap();
+        let before = written();
         let e = call(&b, json!({ "op": "task.place", "uid": managed, "ns": ns })).unwrap_err();
         assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         let e = call(&b, json!({ "op": "task.add", "text": "t", "home": ns })).unwrap_err();
         assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+        assert_eq!(written(), before, "a refused path wrote rows");
     }
     let deepest = vec!["a"; jkb_core::ns::MAX_DEPTH].join("/");
     call(
@@ -2497,10 +2670,13 @@ fn an_edit_is_judged_by_the_body_it_leaves_and_bounded() {
 }
 
 /// The round-trip probe parses the whole edit inside the single writer's transaction, so an edit is
-/// held to its size before the probe, and the parse is linear in lines that mint the same id: 16k
-/// identical checkbox lines took 11 s to judge.
+/// held to its size before the probe, and one just under the size is judged on what it would read
+/// back as. That the parse is linear in lines that mint the same id (16k identical checkbox lines
+/// once took 11 s to judge) is pinned by a work count in `jkb-sync`
+/// (`minting_n_identical_ids_tries_each_name_once`), not here by a clock: a 5 s bound on this judge
+/// took 10.5 s on a loaded machine and failed an unrelated change's gate.
 #[test]
-fn an_edit_to_a_tasks_md_task_is_sized_before_it_is_parsed_and_parses_in_linear_time() {
+fn an_edit_to_a_tasks_md_task_is_sized_before_it_is_parsed_and_judged_under_its_size() {
     let (db, inside, _outside, _managed) = mutate_fixture();
     let b = rooted(&db);
     let over = format!(
@@ -2517,18 +2693,12 @@ fn an_edit_to_a_tasks_md_task_is_sized_before_it_is_parsed_and_parses_in_linear_
         "t{}",
         "\n- [ ] x".repeat(super::tasks::MAX_CONTENT_BYTES / 8 - 1)
     );
-    let started = std::time::Instant::now();
     let e = call(
         &b,
         json!({ "op": "task.edit", "uid": inside, "text": under }),
     )
     .unwrap_err();
     assert!(e.message.contains("a task of its own"), "{e:?}");
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "32k duplicate lines judged in {:?}",
-        started.elapsed()
-    );
 }
 
 /// A tasks-file task's line must come back from the file whatever field a write changed: a due date, a
@@ -2590,6 +2760,7 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         json!({ "op": "task.claim", "uid": inside, "owner": "box:4" }),
         json!({ "op": "task.reclaim", "dead": ["box:4"] }),
         json!({ "op": "task.pr_record", "uid": inside, "number": 12 }),
+        json!({ "op": "task.pr_absent", "uid": inside, "branch": "b2", "remote_head": "abcd" }),
         json!({ "op": "task.close_merged", "uid": inside, "merged": "unknown", "dry_run": true,
                 "observed": { "live_landing": false } }),
     ];
@@ -2708,7 +2879,7 @@ fn each_value_a_tasks_md_line_cannot_carry_is_refused_naming_its_field() {
 fn a_directory_mounted_as_documents_too_still_judges_its_task_lines() {
     let (db, inside, _outside, _managed) = mutate_fixture();
     db.write_txn("t", |c, m| {
-        let id = jkb_core::ns::ensure(c, "repos/aaa")?;
+        let id = jkb_core::ns::ensure(c, m, "repos/aaa")?;
         jkb_core::mount::create(
             c,
             m,
@@ -2759,7 +2930,7 @@ fn a_task_titled_in_any_script_is_filed_and_written_like_any_other() {
 fn a_backlog_add_whose_line_would_not_come_back_is_refused_before_the_question() {
     let (db, _inside, _outside, _managed) = mutate_fixture();
     db.write_txn("t", |c, m| {
-        let id = jkb_core::ns::ensure(c, "tasks/.backlog")?;
+        let id = jkb_core::ns::ensure(c, m, "tasks/.backlog")?;
         jkb_core::mount::create(
             c,
             m,

@@ -28,7 +28,9 @@ use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
 /// Record that `child` is contained by `parent`, at `position` among its siblings.
-/// Idempotent: re-containing the same pair updates the position.
+/// Idempotent: re-containing the same pair updates the position, and re-containing it at the
+/// same position writes nothing (no row, no changelog entry), so a caller reconciling a whole
+/// tree — the `tasks` file sync does, on every import — journals only what moved.
 ///
 /// Prefer `crate::task::add_subtask`, which also links the `parent_of` edge (cycle-guarded by
 /// [`crate::edge::link`]). Use this directly only where the relationship edge is already
@@ -50,8 +52,8 @@ pub fn contain(
         );
     }
     // Containment is a tree: refuse a parent already inside `child`. The edge guard
-    // (`edge::link`) cannot see this — a containment row can outlive its `parent_of` edge, which
-    // the `tasks` file sync removes without touching containment.
+    // (`edge::link`) cannot see this — a containment row is its own fact, and an out-of-order
+    // `jkb undo` can restore one without its `parent_of` edge.
     let inside: Option<i64> = conn
         .prepare_cached(
             "WITH RECURSIVE up(id) AS (
@@ -79,6 +81,9 @@ pub fn contain(
         )?
         .query_row([child.get()], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
+    if before == Some((parent.get(), position)) {
+        return Ok(());
+    }
     conn.prepare_cached(
         "INSERT INTO containment (child_item_id, parent_item_id, position)
          VALUES (?1, ?2, ?3)
@@ -103,6 +108,39 @@ pub fn contain(
         })),
     )?;
     Ok(())
+}
+
+/// Remove `child`'s containment row, so it is contained by nothing. Returns the container it
+/// left, or `None` (writing nothing) when it had none.
+///
+/// The whole row is journalled as a `delete`, so `jkb undo` puts it back where it was.
+///
+/// # Errors
+/// Returns an error if a statement or the changelog append fails.
+pub fn uncontain(conn: &Connection, meta: &WriteMeta, child: ItemId) -> Result<Option<ItemId>> {
+    let before: Option<(i64, i64)> = conn
+        .prepare_cached(
+            "DELETE FROM containment WHERE child_item_id = ?1 RETURNING parent_item_id, position",
+        )?
+        .query_row([child.get()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((parent, position)) = before else {
+        return Ok(None);
+    };
+    changelog::append(
+        conn,
+        meta,
+        changelog::Op::Delete,
+        Entity::Containment,
+        &child.get().to_string(),
+        Some(&json!({
+            "child_item_id": child.get(),
+            "parent_item_id": parent,
+            "position": position,
+        })),
+        None,
+    )?;
+    Ok(Some(ItemId::new(parent)))
 }
 
 /// The items contained by `parent`, in sibling order.
@@ -152,14 +190,16 @@ pub fn child_counts(
     if parents.is_empty() {
         return Ok(out);
     }
-    let mut stmt = conn.prepare_cached(
+    let mut stmt = conn.prepare_cached(concat!(
         "SELECT c.parent_item_id, COUNT(*),
-                SUM(CASE WHEN i.status IS NOT 'done' AND i.status IS NOT 'cancelled'
+                SUM(CASE WHEN ",
+        jkb_types::sql_not_terminal!("i.status"),
+        "
                          THEN 1 ELSE 0 END)
            FROM containment c JOIN items i ON i.id = c.child_item_id
           WHERE c.parent_item_id IN (SELECT value FROM json_each(?1))
           GROUP BY c.parent_item_id",
-    )?;
+    ))?;
     let ids = crate::sql::json_ids(parents.iter().map(|p| p.get()));
     let rows = stmt.query_map([ids], |r| {
         Ok((

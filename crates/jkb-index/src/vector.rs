@@ -40,9 +40,12 @@ const VECTOR_LOOKUP_BATCH: usize = 4096;
 /// offline; and it sweeps every dimension's table, because a database whose embedding model
 /// changed has more than one.
 ///
+/// Crate-private: [`sweep_stale`] is the one way in, because it also installs the delete-GC
+/// trigger, and a repair that skips that leaves a pre-trigger database generating more orphans.
+///
 /// # Errors
 /// Returns an error if a statement fails.
-pub fn drop_orphan_vectors(conn: &Connection) -> Result<usize> {
+pub(crate) fn drop_orphan_vectors(conn: &Connection) -> Result<usize> {
     let mut dropped = 0;
     for table in vector_tables(conn)? {
         // The name comes from `sqlite_master`, filtered to our own prefix — never from input.
@@ -61,11 +64,12 @@ pub fn drop_orphan_vectors(conn: &Connection) -> Result<usize> {
 /// `jkb doctor` can report what `jkb doctor --fix` would remove and stay read-only. It lives
 /// here beside the delete because the two must agree on what counts as an orphan and on which
 /// tables are ours; the CLI previously carried its own copy of both queries, including the
-/// `vec0` shadow-table filter that is the non-obvious part.
+/// `vec0` shadow-table filter that is the non-obvious part. Crate-private, like the delete:
+/// [`count_stale`] is the public spelling.
 ///
 /// # Errors
 /// Returns an error if a statement fails.
-pub fn count_orphan_vectors(conn: &Connection) -> Result<i64> {
+pub(crate) fn count_orphan_vectors(conn: &Connection) -> Result<i64> {
     let mut total = 0;
     for table in vector_tables(conn)? {
         total += conn
@@ -86,9 +90,10 @@ pub fn count_orphan_vectors(conn: &Connection) -> Result<i64> {
 /// index that grows monotonically, so it is worth finding and removing on demand.
 ///
 /// A struct rather than a bare count because the set of derived indexes is open: FTS is
-/// trigger-maintained today and a second vector backend is plausible, and a caller that
-/// pattern-matches on fields gets a compile error when one is added rather than a silently
-/// unreported total.
+/// trigger-maintained today and a second vector backend is plausible. Every reader of a field
+/// destructures it exhaustively (`let StaleRows { vectors } = …;`, no `..`), so adding a field is
+/// a compile error at each of them rather than a silently unreported total. [`StaleRows::total`]
+/// and [`StaleRows::is_empty`] cover every index.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StaleRows {
     /// Rows across every `vec_items_<dim>` table whose item is gone.
@@ -99,7 +104,8 @@ impl StaleRows {
     /// Every stale row, across all derived indexes.
     #[must_use]
     pub fn total(self) -> usize {
-        self.vectors
+        let Self { vectors } = self;
+        vectors
     }
 
     /// Whether the derived indexes are clean.
@@ -107,6 +113,23 @@ impl StaleRows {
     pub fn is_empty(self) -> bool {
         self.total() == 0
     }
+}
+
+/// One `vec0` KNN answer with its dead rows filtered out ([`VectorIndexer::knn_page`],
+/// [`VectorIndexer::knn_live`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KnnPage {
+    /// The neighbours whose item still exists, nearest-first.
+    pub live: Vec<(ItemId, f32)>,
+    /// Whether the caller has seen every live row: the index ran short of the fetch, and
+    /// nothing was withheld by a truncation.
+    pub index_exhausted: bool,
+    /// How many rows `vec0` returned for the page, before the liveness filter.
+    pub scanned: usize,
+    /// How many of those rows the liveness filter dropped because their item is gone — orphan
+    /// vectors that `jkb index --sweep` removes. `scanned - dead` is never less than
+    /// `live.len()` (more only when [`VectorIndexer::knn_live`] truncated).
+    pub dead: usize,
 }
 
 /// Find stale derived-index rows without changing anything.
@@ -152,12 +175,44 @@ pub fn sweep_stale(conn: &Connection) -> Result<StaleRows> {
 fn ensure_gc_trigger(conn: &Connection, table: &str) -> Result<()> {
     // `table` comes from `sqlite_master` filtered to our own prefix, or from a `VectorIndexer`'s
     // own dim — never from input.
+    let trigger = gc_trigger_name(table);
     conn.execute_batch(&format!(
-        "CREATE TRIGGER IF NOT EXISTS {table}_gc AFTER DELETE ON items BEGIN
+        "CREATE TRIGGER IF NOT EXISTS {trigger} AFTER DELETE ON items BEGIN
              DELETE FROM {table} WHERE item_id = old.id;
          END;"
     ))?;
     Ok(())
+}
+
+/// The name of the delete-GC trigger guarding one `vec_items_<dim>` table: the one spelling, so
+/// the installer and [`vector_tables_without_gc_trigger`] cannot disagree about it.
+fn gc_trigger_name(table: &str) -> String {
+    format!("{table}_gc")
+}
+
+/// Every `vec_items_<dim>` table that has no delete-GC trigger beside it.
+///
+/// Empty on a database whose vector tables were created or repaired by this version, since
+/// `ensure_ready` and [`sweep_stale`] both install the trigger. A table listed here belongs to a
+/// database written before the trigger existed, which still orphans a vector on every item
+/// delete — so a store with no stale rows *today* is not healthy if this is non-empty, and
+/// `jkb doctor` reports it. Checked by name, the same test `CREATE TRIGGER IF NOT EXISTS`
+/// applies when installing it.
+///
+/// # Errors
+/// Returns an error if a query fails.
+pub fn vector_tables_without_gc_trigger(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT 1 FROM sqlite_master
+          WHERE type = 'trigger' AND name = ?1 AND tbl_name = 'items'",
+    )?;
+    let mut missing = Vec::new();
+    for table in vector_tables(conn)? {
+        if !stmt.exists([gc_trigger_name(&table)])? {
+            missing.push(table);
+        }
+    }
+    Ok(missing)
 }
 
 /// Every `vec_items_<dim>` table in this database — one per embedding dimension the store has
@@ -308,12 +363,20 @@ impl VectorIndexer {
         Ok(())
     }
 
-    /// Add or replace the vector for `id`.
+    /// Add or replace the vector for `id`, if item `id` exists. Returns whether a vector was
+    /// written: `false` means the item is gone and nothing was.
+    ///
+    /// The existence check is here, inside the caller's write transaction, rather than at each
+    /// caller: embedding happens outside any transaction (it is the slow part), so an item can be
+    /// deleted between being read for embedding and its vector being stored. The GC trigger
+    /// removes a vector when its item is deleted, but cannot stop one being written afterwards —
+    /// a long `index_pending` backfill did exactly that, recreating the orphan the trigger exists
+    /// to prevent.
     ///
     /// # Errors
     /// Returns [`crate::Error`] if `embedding`'s length is not the table dim, or a
     /// statement fails.
-    pub fn upsert_vector(&self, conn: &Connection, id: ItemId, embedding: &[f32]) -> Result<()> {
+    pub fn upsert_vector(&self, conn: &Connection, id: ItemId, embedding: &[f32]) -> Result<bool> {
         if embedding.len() != self.dim {
             return Err(TypesError::Validation(format!(
                 "embedding length {} does not match vec table dim {}",
@@ -321,6 +384,12 @@ impl VectorIndexer {
                 self.dim
             ))
             .into());
+        }
+        let exists = conn
+            .prepare_cached("SELECT 1 FROM items WHERE id = ?1")?
+            .exists([id.get()])?;
+        if !exists {
+            return Ok(false);
         }
         let bytes = embedding_to_bytes(embedding);
         // Delete then insert, rather than `INSERT OR REPLACE`: vec0 is a virtual table and
@@ -335,7 +404,7 @@ impl VectorIndexer {
             self.table
         ))?
         .execute(params![id.get(), bytes])?;
-        Ok(())
+        Ok(true)
     }
 
     /// The stored vectors for `ids`, as an `item_id -> embedding` map. Ids with no vector
@@ -392,8 +461,13 @@ impl VectorIndexer {
     /// Returns [`crate::Error`] if `query`'s length is not the table dim, or a
     /// statement fails.
     pub fn knn(&self, conn: &Connection, query: &[f32], k: usize) -> Result<Vec<(ItemId, f32)>> {
-        Ok(self.knn_live(conn, query, k)?.0)
+        Ok(self.knn_live(conn, query, k)?.live)
     }
+
+    /// The largest `k` `sqlite-vec` accepts (`SQLITE_VEC_VEC0_K_MAX`, sqlite-vec.c:7111); it
+    /// hard-errors above it, so a caller that already over-fetches must not be multiplied into
+    /// a raw extension error on the flagship read.
+    const VEC0_K_MAX: usize = 4096;
 
     /// KNN, with the neighbours whose item no longer exists removed — and a flag saying whether
     /// the **index itself** ran out (design D42.3).
@@ -407,41 +481,91 @@ impl VectorIndexer {
     /// `LIMIT`/`k` constraint and rejects `ORDER BY` on anything but `distance`, and with `items`
     /// chosen as the outer loop a join would re-run the KNN once per item row.
     ///
-    /// The second return value distinguishes "the index has no more rows" from "live rows ran out
-    /// inside our budget". `jkb-search`'s growth loop tests `hits.len() < fetch` to decide it is
-    /// exhausted; once filtering happens in here that test is wrong, and the loop would stop
-    /// growing and return too few hits.
+    /// This **grows** its fetch (doubling up to `sqlite-vec`'s `k` limit) until it has `k` live
+    /// neighbours, so it is for a caller with no growth loop of its own — the unrestricted
+    /// search. A caller that already grows its own over-fetch must call [`Self::knn_page`]
+    /// instead: two nested growth loops multiply, and since every `vec0` KNN scans the whole
+    /// table whatever its `k`, an orphan-heavy database turned one scoped search into ~27 full
+    /// scans where the outer loop alone does at most six.
+    ///
+    /// [`KnnPage::index_exhausted`] is `true` only when the caller has seen **every** live row
+    /// (see [`Self::knn_page`]); [`KnnPage::scanned`] and [`KnnPage::dead`] describe the last,
+    /// largest, page — each page is a prefix of the next, so it covers every earlier one.
     ///
     /// # Errors
     /// Returns an error if the query is the wrong length or a statement fails.
-    pub fn knn_live(
-        &self,
-        conn: &Connection,
-        query: &[f32],
-        k: usize,
-    ) -> Result<(Vec<(ItemId, f32)>, bool)> {
-        // `sqlite-vec` hard-errors above this (`SQLITE_VEC_VEC0_K_MAX`, sqlite-vec.c:7111), so a
-        // caller that already over-fetches must not be multiplied into a raw extension error on
-        // the flagship read.
-        const VEC0_K_MAX: usize = 4096;
-        let mut fetch = k.min(VEC0_K_MAX);
+    pub fn knn_live(&self, conn: &Connection, query: &[f32], k: usize) -> Result<KnnPage> {
+        let mut fetch = k.min(Self::VEC0_K_MAX);
         loop {
-            let raw = self.knn_raw(conn, query, fetch)?;
-            let index_exhausted = raw.len() < fetch;
-            let live = Self::filter_live(conn, raw)?;
-            if live.len() >= k || index_exhausted || fetch >= VEC0_K_MAX {
+            let mut page = self.knn_page(conn, query, fetch)?;
+            if page.live.len() >= k || page.index_exhausted || fetch >= Self::VEC0_K_MAX {
                 // `index_exhausted` must mean "the caller has seen every live row", not merely
                 // "the table had no more rows to give". Truncating a full page withholds live
-                // neighbours, and `vector_ranked` reads this flag to decide whether to grow its
-                // own over-fetch — so reporting exhaustion after a truncation made a scoped
-                // search stop early and return fewer, often zero, in-scope hits.
-                let mut live = live;
-                let truncated = live.len() > k;
-                live.truncate(k);
-                return Ok((live, index_exhausted && !truncated));
+                // neighbours, so a truncation reports not-exhausted.
+                let truncated = page.live.len() > k;
+                page.live.truncate(k);
+                page.index_exhausted &= !truncated;
+                return Ok(page);
             }
-            fetch = (fetch * 2).min(VEC0_K_MAX);
+            fetch = (fetch * 2).min(Self::VEC0_K_MAX);
         }
+    }
+
+    /// **Exactly one** `vec0` KNN scan at `fetch` (clamped to `sqlite-vec`'s `k` limit), with
+    /// the neighbours whose item no longer exists removed, nearest-first.
+    ///
+    /// The building block for a caller that owns its own growth loop (`jkb-search`'s scoped
+    /// over-fetch): it never re-queries, so the caller's loop is the only thing that decides how
+    /// many scans one search costs. Nothing is truncated — every live row of the page is
+    /// returned — so the flag is simply whether the **index** ran out (`vec0` returned fewer
+    /// rows than asked for), which then means the caller has seen every live row. It is not
+    /// `live.len() < fetch`: once dead rows are filtered out that test reads a page full of
+    /// orphans as exhaustion and stops growth early.
+    ///
+    /// [`KnnPage::dead`] counts the rows the liveness filter removed, which is how a search learns
+    /// that the table needs `jkb index --sweep`: the filter otherwise hides the very rows that
+    /// would have told it.
+    ///
+    /// # Errors
+    /// Returns an error if the query is the wrong length or a statement fails.
+    pub fn knn_page(&self, conn: &Connection, query: &[f32], fetch: usize) -> Result<KnnPage> {
+        let fetch = fetch.min(Self::VEC0_K_MAX);
+        let raw = self.knn_raw(conn, query, fetch)?;
+        let scanned = raw.len();
+        let live = Self::filter_live(conn, raw)?;
+        Ok(KnnPage {
+            index_exhausted: scanned < fetch,
+            dead: scanned - live.len(),
+            scanned,
+            live,
+        })
+    }
+
+    /// How many times this connection has run the `vec0` KNN statement, as `SQLite` counts it
+    /// (`SQLITE_STMTSTATUS_RUN` on the cached statement) — `0` when no KNN has run or the
+    /// statement has been evicted from the connection's cache.
+    ///
+    /// Every run is a full scan of the vector table whatever its `k`, so this is the cost
+    /// measure for a search. A test seam: it lets a test bound the number of scans one search
+    /// makes without timing anything.
+    ///
+    /// # Errors
+    /// Returns an error if the statement cannot be prepared.
+    #[doc(hidden)]
+    pub fn knn_scans_run(&self, conn: &Connection) -> Result<i32> {
+        let stmt = conn.prepare_cached(&self.knn_sql())?;
+        Ok(stmt.get_status(rusqlite::StatementStatus::Run))
+    }
+
+    /// The `vec0` KNN statement — one spelling, shared by [`Self::knn_raw`] and
+    /// [`Self::knn_scans_run`] so the counter reads the statement the search actually ran.
+    fn knn_sql(&self) -> String {
+        format!(
+            "SELECT item_id, distance FROM {}
+             WHERE embedding MATCH ?1 AND k = ?2
+             ORDER BY distance",
+            self.table
+        )
     }
 
     /// Drop neighbours whose item row is gone, preserving distance order.
@@ -479,12 +603,7 @@ impl VectorIndexer {
         }
         let k = i64::try_from(k).map_err(|_| TypesError::Validation(format!("k {k} too large")))?;
         let bytes = embedding_to_bytes(query);
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT item_id, distance FROM {}
-             WHERE embedding MATCH ?1 AND k = ?2
-             ORDER BY distance",
-            self.table
-        ))?;
+        let mut stmt = conn.prepare_cached(&self.knn_sql())?;
         let rows = stmt
             .query_map(params![bytes, k], |row| {
                 Ok((ItemId::new(row.get(0)?), row.get::<_, f32>(1)?))

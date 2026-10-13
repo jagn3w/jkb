@@ -705,6 +705,15 @@ fn attest_log() -> PathBuf {
         .join(".jkb/logs/attest-hook.log")
 }
 
+/// A line of the attestation hook's log: stamped as `jkb serve` stamps `serve.log`
+/// ([`jkb_daemon::log`]: RFC 3339 UTC time, then `pid <n>`), so a failure to reach the daemon can be
+/// dated and set beside the daemon's own lines. `what` names the call that failed and why.
+fn failure_line(what: &str) -> String {
+    jkb_daemon::log::line(&format!("attest hook: {what}"))
+}
+
+/// Append a failure to the hook's log. Best-effort: a log that cannot be written is not a reason to
+/// hold up the tool call.
 fn log_failure(what: &str) {
     use std::io::Write as _;
     let path = attest_log();
@@ -716,7 +725,7 @@ fn log_failure(what: &str) {
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{}: {what}", std::process::id());
+        let _ = writeln!(f, "{}", failure_line(what));
     }
 }
 
@@ -1057,7 +1066,7 @@ pub fn attest(cmd: &AttestCmd) {
     let backend = match remote::client(&remote::daemon_url(), Purpose::Hook) {
         Ok(b) => b,
         Err(e) => {
-            log_failure(&format!("client: {}", e.message));
+            log_failure(&format!("building the daemon client: {}", e.message));
             return;
         }
     };
@@ -1129,10 +1138,35 @@ pub fn attest(cmd: &AttestCmd) {
 #[cfg(test)]
 mod tests {
     use super::{
-        attestation, driven, is_blank, pre_tool_use, runs_jkb, shell_commands, Attestation, Drive,
-        BREAKS, FATAL, HARMLESS, SEPARATORS, UNQUOTABLE,
+        attestation, driven, failure_line, is_blank, pre_tool_use, runs_jkb, shell_commands,
+        Attestation, Drive, BREAKS, FATAL, HARMLESS, SEPARATORS, UNQUOTABLE,
     };
     use serde_json::json;
+
+    /// A line of `attest-hook.log` can be dated: it opens with the RFC 3339 UTC stamp and pid that
+    /// `serve.log` lines carry, then names the failed call and why.
+    #[test]
+    fn a_hook_log_line_is_dated_and_names_the_failed_call() {
+        let l = failure_line("attest.mint: cannot reach jkb serve");
+        let mut words = l.splitn(4, ' ');
+        let stamp = words.next().unwrap();
+        assert!(
+            stamp.len() == "2026-10-10T08:15:02.317Z".len()
+                && stamp.as_bytes()[10] == b'T'
+                && stamp.ends_with('Z'),
+            "{l}"
+        );
+        assert_eq!(words.next(), Some("pid"), "{l}");
+        assert_eq!(
+            words.next(),
+            Some(std::process::id().to_string().as_str()),
+            "{l}"
+        );
+        assert_eq!(
+            words.next(),
+            Some("attest hook: attest.mint: cannot reach jkb serve")
+        );
+    }
 
     #[test]
     fn the_stop_hook_holds_only_a_session_that_opted_in() {

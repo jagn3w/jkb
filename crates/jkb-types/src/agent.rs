@@ -189,7 +189,11 @@ impl AgentId {
                     },
                 }
             }
-            AGENT if !rest.is_empty() => Self::Agent { id: rest.join("-") },
+            // The tail is rejoined with the `:` it was split on, like the other two arms: a stored
+            // `agent:a:b` must read back as `agent:a:b`, or every compare-and-set and owner-scoped
+            // clear built from the parsed value misses the stored bytes. Neutralizing a colon is
+            // the `AgentId::agent` constructor's job, done before anything is stored.
+            AGENT if !rest.is_empty() => Self::Agent { id: rest.join(":") },
             _ => match rest.split_first() {
                 Some((pid, tail)) => match pid.parse::<u32>() {
                     Ok(pid) => Self::Process {
@@ -208,7 +212,13 @@ impl AgentId {
         }
     }
 
-    /// The stored spelling. Inverse of [`AgentId::parse`].
+    /// The stored spelling.
+    ///
+    /// `AgentId::parse(s).as_str() == s` for every string already in this spelling — including an
+    /// `agent:` id whose tail carries a colon — but not for a non-canonical one: `host:007` reads
+    /// back as `host:7`. A claim is therefore taken only by an owner already in this spelling
+    /// (`jkb-api`'s `check_new_owner`), so the stored row, every comparison and the printed owner
+    /// are the same bytes.
     #[must_use]
     pub fn as_str(&self) -> String {
         match self {
@@ -319,6 +329,7 @@ mod tests {
             "session:99@0f1e-2d3c_4b:/tmp/work/a-task",
             "session:99:~/repos/jkb/.jkb/work/a-task",
             "agent:01JBX7Q4",
+            "agent:cloud:run-3",
             "garbage",
             "",
         ];
@@ -438,5 +449,21 @@ mod tests {
         let id = AgentId::agent("run:7");
         assert_eq!(id.as_str(), "agent:run-7");
         assert_eq!(AgentId::parse(&id.as_str()), id);
+    }
+
+    /// A stored agent id that already carries a colon — written by `jkb task claim --owner`, an
+    /// older binary or a hand edit, none of which go through [`AgentId::agent`] — reads back in
+    /// the spelling it is stored in, so a compare-and-set built from it matches the row.
+    #[test]
+    fn a_stored_agent_id_with_a_colon_keeps_its_spelling() {
+        let id = AgentId::parse("agent:cloud:run-3");
+        assert_eq!(
+            id,
+            AgentId::Agent {
+                id: "cloud:run-3".to_owned()
+            }
+        );
+        assert_eq!(id.as_str(), "agent:cloud:run-3");
+        assert_eq!(id.liveness(), Liveness::External);
     }
 }

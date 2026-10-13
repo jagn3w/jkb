@@ -437,13 +437,9 @@ fn an_unreachable_daemon_is_remembered_briefly_across_clients() {
     let token = dir.path().join("token");
     jkb_daemon::token::write(&token, "t").unwrap();
     let marker = dir.path().join("unreachable");
-    // Nothing listens on this port (bound then released).
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let base = format!("http://127.0.0.1:{port}");
+    // Nothing listens on this port, and nothing else can take it while `refusing` holds it.
+    let refusing = RefusingPort::new();
+    let base = format!("http://127.0.0.1:{}", refusing.port());
     let c = RemoteBackend::new(&base, token.clone())
         .unwrap()
         .with_down_marker(marker.clone());
@@ -465,13 +461,45 @@ fn an_unreachable_daemon_is_remembered_briefly_across_clients() {
     );
 }
 
-/// A loopback port nothing listens on: bound, then released.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A loopback port that refuses every connect and that no other process can take: a socket bound to
+/// it and not listening, held until dropped or [`RefusingPort::listen`]. On Linux a connect to a
+/// bound, non-listening TCP port is answered with a reset (`ECONNREFUSED`), exactly as for a port
+/// nobody holds, and the bind keeps another `bind` (without `SO_REUSEADDR`) or an outgoing connect's
+/// ephemeral port off it.
+///
+/// This replaced binding a listener on port 0 and releasing it: the port was free until the test
+/// bound it again ~120 ms later, and under a loaded parallel run another process took it in between
+/// (`AddrInUse` at the rebind, then the client's call failed `Unavailable`).
+struct RefusingPort {
+    socket: tokio::net::TcpSocket,
+    port: u16,
+}
+
+impl RefusingPort {
+    fn new() -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        Self { socket, port }
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Start listening on the held port — it never was free, so nothing can have taken it.
+    /// `TcpSocket::listen` registers the listener with a tokio reactor, so one is entered just for
+    /// the call and the listener handed back as a blocking std one.
+    fn listen(self) -> std::net::TcpListener {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let _entered = rt.enter();
+        let listener = self.socket.listen(16).unwrap().into_std().unwrap();
+        listener.set_nonblocking(false).unwrap();
+        listener
+    }
 }
 
 /// A connect that fails transiently — measured at about 0.5% through Docker Desktop's port forward,
@@ -490,17 +518,18 @@ fn a_connect_refused_briefly_is_retried_and_does_not_mark_the_daemon_down() {
     let call: &dyn Fn(&RemoteBackend) -> serde_json::Value =
         &|c| serde_json::to_value(c.call(Request::MqInspect {}).unwrap()).unwrap();
     for (name, ask) in [("call", call), ("hello", hello)] {
-        let port = free_port();
+        let refusing = RefusingPort::new();
+        let port = refusing.port();
         let reply = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: \
              close\r\n\r\n{body}",
             body.len()
         );
-        // Nothing listens when the call starts; the port is bound ~120 ms in, between the first
-        // retry (at 100 ms) and the second (at 400 ms).
+        // Nothing listens when the call starts (the port is held, refusing); it starts listening
+        // ~120 ms in, between the first retry (at 100 ms) and the second (at 400 ms).
         let server = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(120));
-            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let listener = refusing.listen();
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 8192];
             let _ = stream.read(&mut buf);
@@ -530,7 +559,8 @@ fn a_daemon_refusing_every_connect_is_marked_down_after_the_retries() {
     let token = dir.path().join("token");
     jkb_daemon::token::write(&token, "t").unwrap();
     let marker = dir.path().join("unreachable");
-    let c = RemoteBackend::new(&format!("http://127.0.0.1:{}", free_port()), token)
+    let refusing = RefusingPort::new();
+    let c = RemoteBackend::new(&format!("http://127.0.0.1:{}", refusing.port()), token)
         .unwrap()
         .with_down_marker(marker.clone());
     let started = Instant::now();
@@ -556,11 +586,12 @@ fn connect_retries_and_a_slow_answer_finish_by_the_one_deadline() {
     let token = dir.path().join("token");
     jkb_daemon::token::write(&token, "t").unwrap();
     let marker = dir.path().join("unreachable");
-    let port = free_port();
-    // Bound ~200 ms in: after the first retry (100 ms), before the second (400 ms).
+    let refusing = RefusingPort::new();
+    let port = refusing.port();
+    // Listening ~200 ms in: after the first retry (100 ms), before the second (400 ms).
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(200));
-        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let listener = refusing.listen();
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 8192];
         let _ = stream.read(&mut buf);
@@ -596,7 +627,8 @@ fn a_retry_that_would_not_fit_before_the_deadline_is_not_made() {
     let token = dir.path().join("token");
     jkb_daemon::token::write(&token, "t").unwrap();
     let marker = dir.path().join("unreachable");
-    let c = RemoteBackend::new(&format!("http://127.0.0.1:{}", free_port()), token)
+    let refusing = RefusingPort::new();
+    let c = RemoteBackend::new(&format!("http://127.0.0.1:{}", refusing.port()), token)
         .unwrap()
         .with_deadlines(Duration::from_millis(200), Duration::from_millis(250))
         .unwrap()
@@ -1183,9 +1215,9 @@ fn reads_have_their_own_permits_and_a_bounded_answer() {
     .expect("a write is served while reads are at their limit");
 
     let f = Fixture::with(|cfg| cfg.read_budget_bytes = 512);
-    f.db.write_txn("t", |c, _| {
+    f.db.write_txn("t", |c, m| {
         for i in 0..100 {
-            jkb_core::ns::ensure(c, &format!("n/{i:03}"))?;
+            jkb_core::ns::ensure(c, m, &format!("n/{i:03}"))?;
         }
         Ok(())
     })

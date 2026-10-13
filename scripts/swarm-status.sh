@@ -51,6 +51,21 @@ REPO="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 # =====================================================================
 # FILE view — per-task disk marker vs KB status for one tasks.md
 # =====================================================================
+# kb_unreadable <db> <status> — a `jkb_sqlite` read failed: say why, show no KB state, and exit
+# with the status (3 refused, 127 no database shell, 1 anything else). `jkb_sqlite` has already
+# put the specific reason on stderr; this line says what it means for the view.
+kb_unreadable() {
+    local db="$1" rc="$2" why
+    case "$rc" in
+        3)   why="the database was refused (reason above)" ;;
+        127) why="no SQLite shell is installed to read it with" ;;
+        *)   why="the database read failed (exit $rc)" ;;
+    esac
+    printf 'swarm-status: cannot read the KB at %s: %s — no sync or task state is shown\n' \
+        "$db" "$why" >&2
+    case "$rc" in 3|127) exit "$rc" ;; *) exit 1 ;; esac
+}
+
 file_view() {
     local file="$1"; shift || true
     local db="${JKB_DB:-$HOME/.jkb/jkb.db}"
@@ -63,57 +78,103 @@ file_view() {
     # data captured into $kb, which is a wrong answer rather than a refusal.
     refuse_shared_db "$db" || exit 3
 
-    local abs uri uri_sql
+    local abs uri uri_sql uri_glob
     abs=$(cd "$(dirname "$file")" && pwd)/$(basename "$file")
     uri="file://$abs"
     # Escape single quotes for safe embedding in a SQL string literal (a path with an
     # apostrophe would otherwise close the literal early and break the query).
     uri_sql=${uri//\'/\'\'}
+    # AND THE GLOB METACHARACTERS for the prefix match below, as `jkb_core::sql::prefix_glob`
+    # escapes them: each of `*`, `?` and `[` wrapped in a one-character class. GLOB, not LIKE,
+    # because LIKE folds ASCII case, so `tasks.md` also listed a sibling `Tasks.md`'s tasks; and
+    # an unescaped pattern let a path's metacharacters match a different sibling. Either way the
+    # table reported another file's tasks as this file's — in the tool used exactly when someone
+    # cannot tell whose state they are looking at. scripts/tests/swarm-status.test.sh pins both.
+    uri_glob=$(printf '%s' "$uri_sql" | sed 's/[*?[]/[&]/g')
+    # EVERY READ IS CHECKED, AND A FAILED ONE STOPS THE VIEW. The sync_state read used to fall back
+    # to "(no sync_state row — file not yet synced)" on ANY failure, and the task read to `|| true`
+    # with its stderr captured as data — so with the database shell not installed the view stated
+    # as facts that the file was never synced and that every task was unbound. A missing tool, a
+    # refused or unreadable database, is reported as itself (`kb_unreadable`), and nothing is shown
+    # as KB state. Probed up front so the report does not start and then stop half-way.
+    local probe_rc=0
+    jkb_sqlite "$db" "SELECT 1;" >/dev/null || probe_rc=$?
+    [ "$probe_rc" -eq 0 ] || kb_unreadable "$db" "$probe_rc"
+
     echo "file: $abs"
     echo "db:   $db"
     echo
 
     echo "=== sync_state ==="
-    jkb_sqlite "$db" "SELECT status, substr(last_synced_hash,1,12) AS last_hash,
-                substr(base_blob_hash,1,12)  AS base_hash,
-                substr(quarantine_blob_hash,1,12) AS quar_hash,
-                parse_error, updated_at
-         FROM sync_state WHERE uri = '$uri_sql';" -header -column 2>&1 \
-      || echo "(no sync_state row — file not yet synced)"
+    # Absence is ASKED, not inferred. The "not yet synced" line was the fallback for a FAILED read,
+    # and for no rows the read succeeds with no output — so the line never appeared for the case it
+    # names, and appeared for every failure. Counted rather than judged from empty output, because
+    # whether a header is printed for zero rows is the shell's formatting choice, not a fact.
+    local ss n_ss ss_rc=0
+    n_ss=$(jkb_sqlite "$db" "SELECT count(*) FROM sync_state WHERE uri = '$uri_sql';") || ss_rc=$?
+    [ "$ss_rc" -eq 0 ] || kb_unreadable "$db" "$ss_rc"
+    if [ "$n_ss" = 0 ]; then
+        echo "(no sync_state row — file not yet synced)"
+    else
+        ss=$(jkb_sqlite "$db" "SELECT status, substr(last_synced_hash,1,12) AS last_hash,
+                    substr(base_blob_hash,1,12)  AS base_hash,
+                    substr(quarantine_blob_hash,1,12) AS quar_hash,
+                    parse_error, updated_at
+             FROM sync_state WHERE uri = '$uri_sql';" -header -column) || ss_rc=$?
+        [ "$ss_rc" -eq 0 ] || kb_unreadable "$db" "$ss_rc"
+        printf '%s\n' "$ss"
+    fi
     echo
 
-    local kb
-    kb=$(jkb_sqlite "$db" "SELECT substr(b.uri, instr(b.uri,'#')+1) AS frag, i.status
+    local kb kb_rc=0
+    # The fragment is what follows this file's own uri and its `#`, not the first `#` in the uri:
+    # a directory with a `#` in its name would otherwise cut the fragment short.
+    kb=$(jkb_sqlite "$db" "SELECT substr(b.uri, length('$uri_sql') + 2) AS frag, i.status
          FROM bindings b JOIN items i ON i.id = b.item_id
-         WHERE b.uri LIKE '$uri_sql#%' AND i.kind = 'task';" -separator $'\t' 2>&1 || true)
+         WHERE b.uri GLOB '$uri_glob#*' AND i.kind = 'task';" -separator $'\t') || kb_rc=$?
+    [ "$kb_rc" -eq 0 ] || kb_unreadable "$db" "$kb_rc"
+
+    # The id-stamped checkbox lines, read BEFORE the table and judged by grep's status: 1 is "none"
+    # and 2 is an error. This was `grep … | awk` under `set -o pipefail`, so a tasks.md with no
+    # stamped checkbox — a fresh file, or one never synced — made grep exit 1, the pipeline fail,
+    # and `errexit` end the script after the table header: no legend, exit 1, no message.
+    local lines grep_rc=0
+    lines=$(grep -nE '^[[:space:]]*- \[.\].*\^[A-Za-z0-9-]+[[:space:]]*$' "$file") || grep_rc=$?
+    if [ "$grep_rc" -gt 1 ]; then
+        echo "swarm-status: could not read $abs (grep exit $grep_rc)" >&2
+        exit 1
+    fi
 
     echo "=== tasks (disk marker | kb status) ==="
-    printf '%-4s  %-13s  %s\n' "DISK" "KB-STATUS" "TASK"
-    printf '%-4s  %-13s  %s\n' "----" "---------" "----"
-    # One awk pass: preload the KB frag→status map once, then look up each checkbox line
-    # against it (an associative lookup, not a re-scan of $kb per line — avoids O(T²)).
-    grep -nE '^[[:space:]]*- \[.\].*\^[A-Za-z0-9-]+[[:space:]]*$' "$file" \
-      | KB="$kb" awk '
-        BEGIN {
-            n = split(ENVIRON["KB"], klines, "\n")
-            for (i = 1; i <= n; i++) {
-                p = index(klines[i], "\t")
-                if (p > 0) st[substr(klines[i], 1, p - 1)] = substr(klines[i], p + 1)
+    if [ -z "$lines" ]; then
+        echo "(no id-stamped checkbox lines (\`- [ ] … ^id\`) in this file — nothing to compare)"
+    else
+        printf '%-4s  %-13s  %s\n' "DISK" "KB-STATUS" "TASK"
+        printf '%-4s  %-13s  %s\n' "----" "---------" "----"
+        # One awk pass: preload the KB frag→status map once, then look up each checkbox line
+        # against it (an associative lookup, not a re-scan of $kb per line — avoids O(T²)).
+        printf '%s\n' "$lines" | KB="$kb" awk '
+            BEGIN {
+                n = split(ENVIRON["KB"], klines, "\n")
+                for (i = 1; i <= n; i++) {
+                    p = index(klines[i], "\t")
+                    if (p > 0) st[substr(klines[i], 1, p - 1)] = substr(klines[i], p + 1)
+                }
             }
-        }
-        {
-            line = $0
-            sub(/^[0-9]+:/, "", line)                              # drop grep -n prefix
-            if (!match(line, /- \[.\]/)) next
-            marker = substr(line, RSTART + 3, 1)                   # char inside [ ]
-            frag = line; sub(/^.*\^/, "", frag); sub(/[[:space:]]*$/, "", frag)
-            title = line
-            sub(/^[[:space:]]*- \[.\][[:space:]]*/, "", title)     # strip checkbox
-            sub(/[[:space:]]*\^[A-Za-z0-9-]+[[:space:]]*$/, "", title)
-            sub(/ —.*$/, "", title)                                # drop trailing " — note"
-            kbstatus = (frag in st) ? st[frag] : "(unbound)"
-            printf "[%s]   %-13s  %.60s\n", marker, kbstatus, title
-        }'
+            {
+                line = $0
+                sub(/^[0-9]+:/, "", line)                              # drop grep -n prefix
+                if (!match(line, /- \[.\]/)) next
+                marker = substr(line, RSTART + 3, 1)                   # char inside [ ]
+                frag = line; sub(/^.*\^/, "", frag); sub(/[[:space:]]*$/, "", frag)
+                title = line
+                sub(/^[[:space:]]*- \[.\][[:space:]]*/, "", title)     # strip checkbox
+                sub(/[[:space:]]*\^[A-Za-z0-9-]+[[:space:]]*$/, "", title)
+                sub(/ —.*$/, "", title)                                # drop trailing " — note"
+                kbstatus = (frag in st) ? st[frag] : "(unbound)"
+                printf "[%s]   %-13s  %.60s\n", marker, kbstatus, title
+            }'
+    fi
     echo
     echo "legend: [ ] todo  [x] done  [~] partial  [-] cancelled  [?] needs_review"
 }
@@ -305,9 +366,37 @@ PY
         local scope; scope="$(cat "$scope_file")"
         echo
         echo "=== jkb task statuses (ns:$scope/**) ==="
-        jkb query --global --json "kind:task ns:$scope/**" --limit 500 2>/dev/null \
-            | python3 -c "import json,sys;from collections import Counter;d=json.load(sys.stdin);print(dict(Counter(t['status'] for t in d)))" \
-            2>/dev/null || echo "(jkb query failed)"
+        # COUNTS, NOT A LISTING. This tallied `jkb query --json … --limit 500`, and a query lists
+        # in id order, so a scope with more than 500 tasks was summarised by its 500 OLDEST — the
+        # long-finished ones — under a heading that claims the whole scope: the run's live work
+        # was exactly what fell off the end. `--count` ignores any limit, so the total and each
+        # status are asked for directly, and whatever the five known statuses do not account for
+        # is shown as `other` rather than dropped. jkb's stderr is left on stderr, so a failed
+        # count says why.
+        local q="kind:task ns:$scope/**" total n s sum=0 line="" failed=""
+        if total="$(jkb query --global --count "$q")" && [[ "$total" =~ ^[0-9]+$ ]]; then
+            for s in open in_progress needs_review done cancelled; do
+                if n="$(jkb query --global --count "$q status:$s")" && [[ "$n" =~ ^[0-9]+$ ]]; then
+                    sum=$((sum + n)); line="$line $s=$n"
+                else
+                    failed="$failed $s"
+                fi
+            done
+            if [ -n "$failed" ]; then
+                echo "total=$total (jkb query failed for:$failed)"
+            else
+                # Six reads, not one snapshot: a task created or moved between them can make the
+                # parts disagree with the total, which is said rather than shown as a count.
+                if [ "$sum" -lt "$total" ]; then
+                    line="$line other=$((total - sum))"
+                elif [ "$sum" -gt "$total" ]; then
+                    line="$line (tasks changed while being counted; re-run)"
+                fi
+                echo "total=$total$line"
+            fi
+        else
+            echo "(jkb query failed)"
+        fi
     fi
     rm -f "$scope_file"
 }

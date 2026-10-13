@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use jkb_core::item::{upsert, NewItem};
 use jkb_core::Db;
-use jkb_index::{Dispatcher, FtsIndexer, IndexItem, Indexer, VectorIndexer};
+use jkb_index::{Dispatcher, FtsIndexer, IndexItem, Indexer, StaleRows, VectorIndexer};
 use jkb_types::{Embedder, ItemId, Result as TypesResult};
 
 /// A deterministic, offline embedder: content maps to a fixed unit vector, so the
@@ -340,7 +340,7 @@ fn a_deleted_items_vector_is_swept_and_a_successor_gets_a_fresh_id() {
                 remaining, 0,
                 "the trigger must remove the vector with its item, without jkb's help"
             );
-            Ok(jkb_index::drop_orphan_vectors(conn).unwrap())
+            Ok(jkb_index::sweep_stale(conn).unwrap().total())
         })
         .unwrap();
     assert_eq!(
@@ -516,7 +516,7 @@ fn knn_live_filters_dead_rows_and_reports_exhaustion_honestly() {
     })
     .unwrap();
 
-    let (hits, exhausted) = db
+    let page = db
         .read({
             let embedder = embedder.clone();
             let probe = probe.clone();
@@ -527,6 +527,7 @@ fn knn_live_filters_dead_rows_and_reports_exhaustion_honestly() {
             }
         })
         .unwrap();
+    let (hits, exhausted) = (&page.live, page.index_exhausted);
 
     assert_eq!(hits.len(), 4, "four live hits, orphans filtered out");
     assert!(
@@ -538,6 +539,73 @@ fn knn_live_filters_dead_rows_and_reports_exhaustion_honestly() {
         "two live rows were withheld by the truncation, so the index is NOT exhausted — \
          `vector_ranked` reads this flag to decide whether to keep growing"
     );
+    // The dead count describes the last page, before truncation: every row it read is either
+    // one of the six live items or one of the six orphans.
+    assert!(page.scanned >= page.live.len() + page.dead, "{page:?}");
+    assert!(page.scanned <= 12 && page.dead <= 6, "{page:?}");
+}
+
+/// `knn_page` is exactly one `vec0` scan: it never grows, never truncates, filters dead rows, and
+/// reports exhaustion only when the index itself ran short — the contract `jkb-search`'s growth
+/// loop relies on to be the only loop.
+#[test]
+fn knn_page_scans_once_and_reports_index_exhaustion() {
+    let db = open_db();
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let probe = embedder.embed("probe text").unwrap();
+
+    db.write_txn("test", {
+        let embedder = embedder.clone();
+        let probe = probe.clone();
+        move |conn, meta| {
+            let vector = VectorIndexer::new(embedder.clone());
+            vector.ensure_ready(conn).unwrap();
+            for i in 0..3 {
+                let id = add_item(conn, meta, &format!("n:live{i}"), "probe text");
+                vector.upsert_vector(conn, id, &probe).unwrap();
+            }
+            for fake in 9000..9030 {
+                conn.execute(
+                    "INSERT INTO vec_items_16(item_id, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![fake, embedding_bytes(&probe)],
+                )?;
+            }
+            Ok(())
+        }
+    })
+    .unwrap();
+
+    let (short_page, full_table) = db
+        .read(move |conn| {
+            let vector = VectorIndexer::new(embedder.clone());
+            let page = |fetch| {
+                let before = vector.knn_scans_run(conn).unwrap();
+                let got = vector.knn_page(conn, &probe, fetch).unwrap();
+                assert_eq!(
+                    vector.knn_scans_run(conn).unwrap() - before,
+                    1,
+                    "fetch {fetch}"
+                );
+                got
+            };
+            Ok((page(10), page(100)))
+        })
+        .unwrap();
+
+    // 33 rows, 30 of them orphans: a page of 10 is full, so the index did not run out — however
+    // few live rows it held — and the page is not grown to find more.
+    assert!(short_page.live.iter().all(|(id, _)| id.get() < 9000));
+    assert!(
+        !short_page.index_exhausted,
+        "a full page is not exhaustion: {short_page:?}"
+    );
+    // Every row of the page the filter did not return is a dead one it dropped.
+    assert_eq!(short_page.scanned, 10);
+    assert_eq!(short_page.dead, 10 - short_page.live.len());
+    // A page larger than the table returns every live row and says the index ran out.
+    assert_eq!(full_table.live.len(), 3);
+    assert!(full_table.index_exhausted);
+    assert_eq!((full_table.scanned, full_table.dead), (33, 30));
 }
 
 /// The **repair** half of index hygiene: `count_stale` finds orphan vector rows and
@@ -583,27 +651,27 @@ fn the_sweep_finds_and_removes_orphan_vector_rows() {
     let before = db
         .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
         .unwrap();
-    assert_eq!(before.vectors, 1, "count_stale did not see the orphan row");
+    let StaleRows { vectors } = before;
+    assert_eq!(vectors, 1, "count_stale did not see the orphan row");
     assert!(!before.is_empty());
 
-    let still_there = db
+    let StaleRows {
+        vectors: still_there,
+    } = db
         .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
         .unwrap();
     assert_eq!(
-        still_there.vectors, 1,
+        still_there, 1,
         "count_stale removed a row — it is the detect half and must not mutate"
     );
 
     // ...and the sweep removes exactly it, reporting what it removed.
-    let swept = db
+    let StaleRows { vectors: swept } = db
         .write_txn("test", |conn, _meta| {
             Ok(jkb_index::sweep_stale(conn).unwrap())
         })
         .unwrap();
-    assert_eq!(
-        swept.vectors, 1,
-        "sweep_stale did not report the row it removed"
-    );
+    assert_eq!(swept, 1, "sweep_stale did not report the row it removed");
 
     let after = db
         .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
@@ -653,12 +721,18 @@ fn a_repair_installs_the_trigger_on_a_legacy_database() {
         Ok(())
     })
     .unwrap();
-    let stale = db
+    let StaleRows { vectors: stale } = db
         .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
         .unwrap();
+    assert_eq!(stale, 1, "setup: the legacy delete should orphan a row");
+    // The detection `jkb doctor` reads: the unguarded table is named.
+    let unguarded = db
+        .read(|conn| Ok(jkb_index::vector_tables_without_gc_trigger(conn).unwrap()))
+        .unwrap();
     assert_eq!(
-        stale.vectors, 1,
-        "setup: the legacy delete should orphan a row"
+        unguarded,
+        ["vec_items_16"],
+        "the missing trigger went unseen"
     );
 
     // Repair.
@@ -666,6 +740,13 @@ fn a_repair_installs_the_trigger_on_a_legacy_database() {
         Ok(jkb_index::sweep_stale(conn).unwrap())
     })
     .unwrap();
+    let unguarded = db
+        .read(|conn| Ok(jkb_index::vector_tables_without_gc_trigger(conn).unwrap()))
+        .unwrap();
+    assert!(
+        unguarded.is_empty(),
+        "the repair installed the trigger but the check still reports {unguarded:?}"
+    );
 
     // The harm: a second delete after the repair must NOT orphan another row.
     let id2 = db
@@ -695,6 +776,36 @@ fn a_repair_installs_the_trigger_on_a_legacy_database() {
     );
 }
 
+/// `upsert_vector` writes nothing for an item that does not exist (one deleted after it was read
+/// for embedding): the GC trigger has already fired, so a vector written now would be an orphan.
+#[test]
+fn upsert_vector_writes_nothing_for_a_missing_item() {
+    let db = open_db();
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let (live, gone) = db
+        .write_txn("test", move |conn, meta| {
+            let vector = VectorIndexer::new(embedder.clone());
+            vector.ensure_ready(conn).unwrap();
+            let id = add_item(conn, meta, "n:gone", "gone content");
+            conn.execute("DELETE FROM items WHERE id = ?1", [id.get()])?;
+            let gone = vector
+                .upsert_vector(conn, id, &embedder.embed("gone content").unwrap())
+                .unwrap();
+            let id = add_item(conn, meta, "n:live", "live content");
+            let live = vector
+                .upsert_vector(conn, id, &embedder.embed("live content").unwrap())
+                .unwrap();
+            Ok((live, gone))
+        })
+        .unwrap();
+    assert!(live, "a live item's vector was not written");
+    assert!(!gone, "a missing item's vector was reported written");
+    let StaleRows { vectors: stale } = db
+        .read(|conn| Ok(jkb_index::count_stale(conn).unwrap()))
+        .unwrap();
+    assert_eq!(stale, 0, "a vector was written for a missing item");
+}
+
 /// A lookup of more ids than `SQLite` binds in one statement (32,766) answers them all: a resume of a
 /// capture with that many chunks asked for every one at once, and failed on every run.
 #[test]
@@ -705,14 +816,48 @@ fn vectors_for_answers_more_ids_than_one_statement_can_bind() {
         .write_txn("test", move |conn, _| {
             let vector = VectorIndexer::new(FakeEmbedder::arc("fake", 2));
             vector.ensure_ready(conn).unwrap();
-            for id in 1..=n {
-                vector
-                    .upsert_vector(conn, ItemId::new(id), &[1.0, 0.5])
-                    .unwrap();
+            // Real items, in one statement: `upsert_vector` writes no vector for an item that
+            // does not exist, and the item repo's per-row changelog would make this slow.
+            conn.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+                 INSERT INTO items (uid, kind) SELECT 'n:' || i, 'note' FROM n",
+                [n],
+            )?;
+            let ids: Vec<ItemId> = conn
+                .prepare("SELECT id FROM items")?
+                .query_map([], |r| r.get(0).map(ItemId::new))?
+                .collect::<rusqlite::Result<_>>()?;
+            assert_eq!(ids.len(), usize::try_from(n).unwrap());
+            for &id in &ids {
+                assert!(vector.upsert_vector(conn, id, &[1.0, 0.5]).unwrap());
             }
-            let ids: Vec<ItemId> = (1..=n).map(ItemId::new).collect();
             Ok(vector.vectors_for(conn, &ids).unwrap().len())
         })
         .unwrap();
     assert_eq!(found, usize::try_from(n).unwrap());
+}
+
+/// `FtsIndexer::search` takes search words: a word that is FTS5 syntax (`or`, `a-b`, a lone
+/// `"`) matches text instead of failing the statement.
+#[test]
+fn fts_search_words_are_never_fts5_syntax() {
+    let db = open_db();
+    let id = db
+        .write_txn("test", |conn, meta| {
+            Ok(add_item(conn, meta, "n:1", "this or the a-b thing"))
+        })
+        .unwrap();
+    let (or, dash, quote) = db
+        .read(|conn| {
+            let fts = FtsIndexer::new();
+            Ok((
+                fts.search(conn, "or", 10).unwrap(),
+                fts.search(conn, "a-b thing", 10).unwrap(),
+                fts.search(conn, "\"", 10).unwrap(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(or.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![id]);
+    assert_eq!(dash.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![id]);
+    assert!(quote.is_empty());
 }

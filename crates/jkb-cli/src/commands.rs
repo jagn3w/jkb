@@ -484,7 +484,8 @@ mod tests {
 
     /// Every `{dir}/<stem>.{ext}` path `body` names, as `(repo_local, stem)`.
     ///
-    /// `repo_local` is true only for a `./.claude/{dir}/…` reference — the in-repo fallback every
+    /// `repo_local` is true only for a relative `.claude/{dir}/…` reference, however spelled
+    /// (`./.claude/…` or `.claude/…`, see [`relative_claude_dir`]) — the in-repo fallback every
     /// launcher lists last, which reads this repo's own working tree and therefore uses the bare
     /// stem. Every other reference resolves inside the user's config directory, where the file is
     /// whatever [`super::install`] wrote it as; the two are told apart here so the test below can
@@ -502,11 +503,48 @@ mod tests {
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
                 .collect();
             if !stem.is_empty() && tail[stem.len()..].starts_with(&suffix) {
-                out.insert((body[..at].ends_with("./.claude/"), stem));
+                out.insert((relative_claude_dir(&body[..at]), stem));
             }
             from = at + marker.len();
         }
         out
+    }
+
+    /// Whether the text `before` a `{dir}/` ends in a **relative** `.claude/` — `./.claude/`,
+    /// `../.claude/`, or `.claude/` starting a word — rather than one under a config directory
+    /// (`~/.claude/`, `$HOME/.claude/`, `/abs/.claude/`). Keyed on the literal `./.claude/` it read
+    /// `.claude/agents/x.md` as a config-directory path and told the author to spell the installed
+    /// name, which does not exist in this repo's tree.
+    fn relative_claude_dir(before: &str) -> bool {
+        let Some(rest) = before.strip_suffix(".claude/") else {
+            return false;
+        };
+        rest.ends_with("./")
+            || !rest.chars().next_back().is_some_and(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '/' | '~' | '$' | '}' | '_' | '-' | '.')
+            })
+    }
+
+    #[test]
+    fn a_relative_claude_dir_is_repo_local_however_it_is_spelled() {
+        for (body, local) in [
+            ("run `./.claude/agents/jkb-x.md`", true),
+            ("run `../.claude/agents/jkb-x.md`", true),
+            ("run `.claude/agents/x.md`", true),
+            (".claude/agents/x.md", true),
+            ("(.claude/agents/x.md)", true),
+            ("run ~/.claude/agents/jkb-x.md", false),
+            ("run $HOME/.claude/agents/jkb-x.md", false),
+            ("run /home/me/.claude/agents/jkb-x.md", false),
+            ("run ${CLAUDE_CONFIG_DIR}/agents/jkb-x.md", false),
+        ] {
+            let want = if body.contains("jkb-x") { "jkb-x" } else { "x" };
+            assert_eq!(
+                path_refs(body, "agents", "md"),
+                BTreeSet::from([(local, want.to_owned())]),
+                "{body}"
+            );
+        }
     }
 
     /// Whether `body` names the slash command `stem` — `/stem` on both word boundaries, so

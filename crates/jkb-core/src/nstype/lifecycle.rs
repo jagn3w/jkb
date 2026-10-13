@@ -263,7 +263,7 @@ const BASE_ROWS: &[Transition<Resolution, UnitEvent, UnitFacts, UnitEffect>] = r
     // an escape hatch is not an exit — and counted by the reachability walk, which is what makes
     // `abandoned` a state the object can really be in rather than dead code.
     [Unresolved, Success, DeadEnd, Superseded, Abandoned]
-                                                 -Stated->     Dest::Stated(stated), |_: &UnitFacts| Verdict::Allow, plan_stated;
+                                                 -Stated->     Dest::Stated { pick: stated, among: Resolution::ALL }, |_: &UnitFacts| Verdict::Allow, plan_stated;
 };
 
 /// `debugging`'s table: the base, **minus** tombstone revival, **plus** staleness.
@@ -282,7 +282,7 @@ const DEBUGGING_ROWS: &[Transition<Resolution, UnitEvent, UnitFacts, UnitEffect>
     [Unresolved, Abandoned]                      -Confirmed->  Dest::To(Resolution::Success), confirmed, plan_confirmed;
     [Success]                                    -WentStale->  Dest::To(Resolution::Unresolved), went_stale, plan_stale;
     [Unresolved, Success, DeadEnd, Superseded, Abandoned]
-                                                 -Stated->     Dest::Stated(stated), |_: &UnitFacts| Verdict::Allow, plan_stated;
+                                                 -Stated->     Dest::Stated { pick: stated, among: Resolution::ALL }, |_: &UnitFacts| Verdict::Allow, plan_stated;
 };
 
 /// The machine every strategy uses unless it says otherwise.

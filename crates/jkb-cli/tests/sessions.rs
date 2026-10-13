@@ -283,6 +283,9 @@ fn opening_a_session_twice_returns_the_same_one() {
 }
 
 /// The collision this change exists to prevent: someone else is already on it.
+///
+/// Refused **before any git side effect**: no `.git/info/exclude` entry and no land target cut for
+/// work this run will never do. The refusal used to come from the claim's take, after both.
 #[test]
 fn a_task_held_by_another_live_owner_refuses_a_session() {
     let f = Fixture::new();
@@ -292,12 +295,29 @@ fn a_task_held_by_another_live_owner_refuses_a_session() {
         .args(["task", "claim", &uid, "--owner", "host:1"])
         .assert()
         .success();
+    let exclude = f.repo.join(".git/info/exclude");
+    let exclude_before = std::fs::read(&exclude).ok();
+    let branches_before = git(&f.repo, &["branch", "--format=%(refname:short)"]);
 
     f.jkb()
         .args(["task", "work", &uid])
         .assert()
         .failure()
         .stderr(predicate::str::contains("already being worked"));
+    assert_eq!(
+        std::fs::read(&exclude).ok(),
+        exclude_before,
+        "the refusal came after `.git/info/exclude` was written"
+    );
+    assert_eq!(
+        git(&f.repo, &["branch", "--format=%(refname:short)"]),
+        branches_before,
+        "the refusal came after a land target was cut"
+    );
+    assert!(
+        !f.repo.join(".jkb").exists(),
+        "the refusal came after the session directory was made"
+    );
 }
 
 /// A red gate must leave the target exactly as it was — that is the difference between a
@@ -548,6 +568,114 @@ fn abandoning_reopens_the_task_and_removes_the_worktree() {
     f.jkb().args(["task", "work", &uid]).assert().success();
 }
 
+/// Abandon refuses a dirty session the way land does — **with the deletions caveat**. It is the
+/// verb the disposal sweep's commit-or-force remedy names, and it used to say only "commit them",
+/// over exactly the part-way removal (tracked files missing, nothing else) whose remedy is
+/// `git restore .`. Ordinary edits get no caveat: the control.
+#[test]
+fn abandon_caveats_a_part_way_removal_like_land_does() {
+    let f = Fixture::new();
+    let uid = f.add_task("half removed task");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&wt, "e.txt", "work\n", "add e");
+
+    std::fs::remove_file(wt.join("e.txt")).unwrap();
+    f.jkb()
+        .args(["task", "abandon", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has uncommitted changes"))
+        .stderr(predicate::str::contains("part-way removal"))
+        .stderr(predicate::str::contains(format!(
+            "`git -C {} restore .`",
+            wt.display()
+        )));
+    assert!(wt.exists(), "a refused abandon leaves the checkout alone");
+
+    std::fs::write(wt.join("e.txt"), "edited\n").unwrap();
+    f.jkb()
+        .args(["task", "abandon", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has uncommitted changes"))
+        .stderr(predicate::str::contains("part-way removal").not());
+    assert_eq!(f.status_of(&uid), "in_progress", "nothing was abandoned");
+}
+
+/// The shape the caveat was introduced for: MANY tracked files missing at once (a `git worktree
+/// remove` that stopped part-way through 152 of them), nothing staged, nothing untracked. Abandon
+/// counts them through the same reader `land` uses and says so, rather than "commit them".
+#[test]
+fn abandon_caveats_a_many_file_part_way_removal_with_its_count() {
+    const N: usize = 40;
+    let f = Fixture::new();
+    let uid = f.add_task("mass removed task");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    for i in 0..N {
+        std::fs::write(wt.join(format!("f{i:02}.txt")), format!("{i}\n")).unwrap();
+    }
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "many files"]);
+    for i in 0..N {
+        std::fs::remove_file(wt.join(format!("f{i:02}.txt"))).unwrap();
+    }
+
+    f.jkb()
+        .args(["task", "abandon", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has uncommitted changes"))
+        .stderr(predicate::str::contains(format!(
+            "Those {N} change(s) are deletions of tracked files and nothing else"
+        )))
+        .stderr(predicate::str::contains(format!(
+            "`git -C {} restore .`",
+            wt.display()
+        )));
+    assert!(wt.exists(), "a refused abandon leaves the checkout alone");
+    assert_eq!(f.status_of(&uid), "in_progress", "nothing was abandoned");
+}
+
+/// A checkout git cannot read is refused apart from a dirty one: it may hold nothing to commit, so
+/// "commit them" is the wrong advice — it names `git status` to look and `--force` to proceed. Its
+/// `.git` link removed, git answers about the enclosing repository instead, which is no answer
+/// about this tree; the directory is still there, so it is not "already gone" either.
+#[test]
+fn abandon_refuses_a_checkout_git_cannot_read_apart_from_a_dirty_one() {
+    let f = Fixture::new();
+    let uid = f.add_task("unreadable task");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&wt, "e.txt", "work\n", "add e");
+    std::fs::remove_file(wt.join(".git")).unwrap();
+
+    f.jkb()
+        .args(["task", "abandon", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "git could not read {}",
+            wt.display()
+        )))
+        .stderr(predicate::str::contains(format!(
+            "`git -C {} status`",
+            wt.display()
+        )))
+        .stderr(predicate::str::contains("pass --force"))
+        .stderr(predicate::str::contains("has uncommitted changes").not());
+    assert!(wt.exists(), "a refused abandon leaves the checkout alone");
+    assert_eq!(f.status_of(&uid), "in_progress", "nothing was abandoned");
+
+    // `--force` is the answer the refusal names, and it is accepted.
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force"])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&uid), "open", "back on the frontier");
+}
+
 /// A session outlives the process that opened it: the worktree is the liveness signal, and
 /// the claim must survive the owner-existence reclaim.
 ///
@@ -580,6 +708,155 @@ fn a_session_survives_the_process_that_opened_it_and_is_reported_plainly() {
         .success()
         .stdout(predicate::str::contains("task sessions: 1 in flight"))
         .stdout(predicate::str::contains("unattended").not());
+}
+
+/// The untracked-directory lines of a `doctor` run's stdout.
+fn untracked_report(out: &std::process::Output) -> String {
+    assert!(out.status.success(), "doctor: {out:?}");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip_while(|l| !l.starts_with("untracked session directories"))
+        .take_while(|l| l.starts_with("untracked") || l.starts_with("  "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A directory under `.jkb/work` that git does not list is REPORTED, and only a provable stub is
+/// removed, and only under `--fix`.
+///
+/// The stub is what a hand-run `git worktree remove` leaves from inside a sandboxed session: git's
+/// half succeeds, the filesystem's stops at the protected `.claude`. The second directory holds a
+/// file — it may be a worktree whose registration was lost while holding real work — so `--fix`
+/// must leave every byte of it. A live session beside them is not reported at all.
+#[test]
+fn doctor_reports_session_directories_git_does_not_list_and_sweeps_only_stubs() {
+    let f = Fixture::new();
+    let uid = f.add_task("live session task");
+    let live = PathBuf::from(f.work(&uid)["worktree"].as_str().unwrap().to_owned());
+    let work = f.repo.join(".jkb/work");
+    let stub = work.join("removed-by-hand");
+    std::fs::create_dir_all(stub.join(".claude")).unwrap();
+    let lost = work.join("lost-registration");
+    std::fs::create_dir_all(&lost).unwrap();
+    std::fs::write(lost.join("only-copy.txt"), "real work\n").unwrap();
+
+    let report = untracked_report(&f.jkb().args(["doctor"]).output().unwrap());
+    assert!(
+        report.starts_with("untracked session directories: 2 "),
+        "{report}"
+    );
+    assert!(
+        report.contains("removed-by-hand — an empty stub"),
+        "{report}"
+    );
+    assert!(
+        report.contains("lost-registration — holds files"),
+        "{report}"
+    );
+    assert!(
+        !report.contains(live.file_name().unwrap().to_str().unwrap()),
+        "a session git lists is not untracked: {report}"
+    );
+    assert!(stub.exists(), "a plain `doctor` deletes nothing");
+
+    let fixed = untracked_report(&f.jkb().args(["doctor", "--fix"]).output().unwrap());
+    assert!(fixed.contains("removed-by-hand — removed"), "{fixed}");
+    assert!(!stub.exists(), "--fix sweeps the stub");
+    assert_eq!(
+        std::fs::read_to_string(lost.join("only-copy.txt")).unwrap(),
+        "real work\n",
+        "and never a directory that holds anything"
+    );
+    assert!(live.join(".git").exists(), "nor the live session");
+
+    let after = untracked_report(&f.jkb().args(["doctor"]).output().unwrap());
+    assert!(
+        after.starts_with("untracked session directories: 1 "),
+        "{after}"
+    );
+}
+
+/// A stub whose removal is refused is LEFT, said so, and `doctor --fix` still succeeds — the
+/// session's own stub answers `EPERM` on its `.claude` (D49), so a sweep that failed on a refusal
+/// would fail for ever in exactly the session that noticed the problem. The refusal is provoked
+/// with a read-only stub directory, which refuses the unlink of its `.claude` the same way.
+#[cfg(unix)]
+#[test]
+fn doctor_fix_leaves_a_stub_it_cannot_remove_and_says_so() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new();
+    let stub = f.repo.join(".jkb/work/own-session");
+    std::fs::create_dir_all(stub.join(".claude")).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = f.jkb().args(["doctor", "--fix"]).output().unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let report = untracked_report(&out);
+    assert!(
+        report.contains("own-session — an empty stub, left:"),
+        "{report}"
+    );
+    assert!(stub.join(".claude").exists(), "the refusal leaves it whole");
+}
+
+/// A directory a removal record names is the deferred-removal report's, not this one's: these
+/// lines are for directories NOTHING is tracking. The record's checkout is made unknown to git by
+/// dropping its registration, so the only thing that keeps it off this report is the record.
+#[test]
+fn a_directory_a_removal_record_names_is_not_reported_as_untracked() {
+    let f = Fixture::new();
+    let uid = f.add_task("recorded removal task");
+    let wt = PathBuf::from(f.work(&uid)["worktree"].as_str().unwrap().to_owned());
+    std::fs::write(f.repo.join(".jkb/archive"), b"in the way").expect("block the archive");
+    f.jkb().args(["task", "abandon", &uid]).assert().success();
+    assert!(wt.exists(), "the premise: the disposal was deferred");
+    std::fs::remove_dir_all(f.repo.join(".git/worktrees")).unwrap();
+    assert!(
+        !git(&f.repo, &["worktree", "list"]).contains(".jkb/work"),
+        "the premise: git no longer lists it"
+    );
+
+    let out = f.jkb().args(["doctor"]).output().unwrap();
+    assert!(
+        untracked_report(&out).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A registration whose path is not visible here — a session opened on the other side of the
+/// container bind, registered under that side's path — still covers the directory of that name
+/// here. Reproduced by moving a registered worktree out from under git: its registration names a
+/// path that no longer exists, and the directory it names lives on under `.jkb/work`.
+#[test]
+fn a_registration_this_process_cannot_see_still_covers_its_directory() {
+    let f = Fixture::new();
+    let elsewhere = f.home.path().join("other-side/proj/.jkb/work");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "task/across-the-bind",
+            elsewhere.join("across-the-bind").to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir_all(f.repo.join(".jkb/work")).unwrap();
+    std::fs::rename(
+        elsewhere.join("across-the-bind"),
+        f.repo.join(".jkb/work/across-the-bind"),
+    )
+    .unwrap();
+
+    let out = f.jkb().args(["doctor"]).output().unwrap();
+    assert!(
+        untracked_report(&out).is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 /// `.jkb/base` is a reusable checkout. Landing a second batch onto a different branch used to
@@ -1128,6 +1405,134 @@ fn no_review_lands_but_records_a_waiver() {
     );
 }
 
+/// Commit `file` on a side line off `main` in `repo`, tag that commit `tag`, and return it — a tag
+/// named like a work branch, pointing somewhere the branch never was.
+fn tag_side_commit(repo: &Path, tag: &str, file: &str) -> String {
+    git(repo, &["checkout", "-q", "-b", "side-line"]);
+    commit_in(
+        repo,
+        file,
+        "the tag's content",
+        "a commit only the tag names",
+    );
+    git(repo, &["tag", tag]);
+    git(repo, &["checkout", "-q", "main"]);
+    git(repo, &["rev-parse", &format!("refs/tags/{tag}")])
+}
+
+/// A tag named like the work branch does not stand in for it when a review is recorded. Asked by
+/// bare name, `rev-parse` ranks `refs/tags/<b>` above `refs/heads/<b>`, so the review was recorded
+/// against the tag's commit — a SHA the branch never had.
+#[test]
+fn a_review_is_recorded_against_the_branch_not_a_same_named_tag() {
+    let f = Fixture::new();
+    let uid = f.add_task("reviewed beside a tag");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    let tip = git(&f.repo, &["rev-parse", &format!("refs/heads/{branch}")]);
+    let tagged = tag_side_commit(&f.repo, &branch, "tag.txt");
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &branch]),
+        tagged,
+        "the premise: the bare name resolves to the tag"
+    );
+
+    f.add_concern("reviews/tagged", "a concern, not a must-fix");
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/tagged"])
+        .assert()
+        .success();
+    let t = &f.staging(&[])[0]["tasks"][0];
+    assert_eq!(t["uid"].as_str().unwrap(), uid);
+    assert_eq!(t["reviewed"].as_str().unwrap(), tip);
+}
+
+/// A git that cannot read the branch's ref refuses the recording. It read as "no branch", and
+/// the review was filed against no commit at all.
+#[test]
+fn a_review_is_refused_when_git_cannot_read_the_branch() {
+    let f = Fixture::new();
+    let uid = f.add_task("reviewed over a broken ref store");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    f.add_concern("reviews/unread", "a concern, not a must-fix");
+    // A corrupt `packed-refs`: every ref read exits 128 (measured on git 2.51.1), while finding
+    // the repository itself — `rev-parse --show-toplevel` — still works.
+    git(&f.repo, &["pack-refs", "--all"]);
+    let packed = f.repo.join(".git/packed-refs");
+    let mut text = std::fs::read_to_string(&packed).unwrap();
+    text.push_str("garbage line\n");
+    std::fs::write(&packed, text).unwrap();
+
+    f.jkb()
+        .args(["task", "review", "record", "--branch", &branch])
+        .args(["--findings", "reviews/unread"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("git did not answer"));
+}
+
+/// The land reads the branch it lands, not a same-named tag on another line: the head it is
+/// authorized and waived for is the branch's. Asked by bare name it was the tag's commit, while
+/// `checkout --detach` (which prefers a branch) grafted the branch — so the waiver, the land check
+/// and `landed_head` named a commit that never landed. The graft's own reads are pinned by
+/// `gitrepo`'s unit tests.
+#[test]
+fn a_land_lands_the_branch_not_a_same_named_tag() {
+    let f = Fixture::new();
+    let uid = f.add_task("landed beside a tag");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "branch.txt",
+        "the branch's content",
+        "the branch's work",
+    );
+    let tip = git(&f.repo, &["rev-parse", &format!("refs/heads/{branch}")]);
+    let tagged = tag_side_commit(&f.repo, &branch, "tag.txt");
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &branch]),
+        tagged,
+        "the premise: the bare name resolves to the tag"
+    );
+
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &uid,
+            "--no-gate",
+            "--no-review",
+            "--keep-worktree",
+        ])
+        .assert()
+        .success();
+
+    let t = &f.staging(&["--all"])[0]["tasks"][0];
+    assert_eq!(t["review_waived"].as_str().unwrap(), tip);
+    let landed = git(
+        &f.repo,
+        &["ls-tree", "--name-only", &format!("refs/heads/{onto}")],
+    );
+    assert!(landed.lines().any(|l| l == "branch.txt"), "{landed}");
+    assert!(!landed.lines().any(|l| l == "tag.txt"), "{landed}");
+}
+
 /// `tag add` appends and `tag set` replaces. The distinction is load-bearing: `/task-swarm`
 /// re-tags a group on every pass, and an appending `repo=` would leave the task claiming two
 /// repositories at once — while a command named `add` must not silently delete a value.
@@ -1331,6 +1736,198 @@ fn abandon_frees_a_dead_owners_claim() {
 
     f.jkb().args(["task", "abandon", &uid]).assert().success();
     assert_eq!(f.status_of(&uid), "open");
+}
+
+/// A `git` on `PATH` that runs `hook` (a shell fragment) once, the first time jkb asks git to remove a
+/// worktree, then hands every call to the real git — the window between a verb's read of the task and
+/// its record, opened deterministically. Returns the `PATH` to run `jkb` under, and the marker the hook
+/// leaves once it has run.
+fn git_shim_on_worktree_remove(f: &Fixture, hook: &str) -> (String, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    // Found by walking `PATH` rather than by asking a shell, so the shim adds no spawn of its own.
+    let real = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("git"))
+        .find(|g| g.is_file())
+        .expect("git on PATH")
+        .display()
+        .to_string();
+    let bin = f.home.path().join("shim-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let ran = f.home.path().join("shim-ran");
+    let shim = bin.join("git");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" worktree remove \"*)\n    if [ ! -e '{ran}' ]; then\n      \
+             : > '{ran}'\n      {hook}\n    fi ;;\nesac\nexec '{real}' \"$@\"\n",
+            ran = ran.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (path, ran)
+}
+
+/// A task **nobody held** when `jkb task abandon` read it, claimed while abandon removed the session,
+/// stays with its new holder: in progress, claimed, and still landing where it was going.
+///
+/// The reopen was guarded only when a claim had been read beforehand, so this case — a session whose
+/// claim `doctor --fix` or `task release` had freed, picked up by the SCHEDULER during the git work —
+/// was reopened under the new worker's claim and its land target cleared, and that worker's `task land`
+/// then failed for want of one. The race is opened by a `git` shim that claims the task from inside
+/// abandon's worktree removal.
+#[test]
+fn a_task_claimed_while_abandon_removes_its_session_is_left_to_its_new_holder() {
+    let f = Fixture::new();
+    let uid = f.add_task("claimed mid-abandon");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    let session_owner = claim_of(&f.db, &uid).expect("task work claims");
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "release",
+            &uid,
+            "--owner",
+            &session_owner,
+        ])
+        .assert()
+        .success();
+    assert_eq!(claim_of(&f.db, &uid), None);
+
+    let live = format!("swarm:{}", std::process::id());
+    let jkb_bin = Path::new(env!("CARGO_BIN_EXE_jkb"));
+    let hook = format!(
+        "'{}' --db '{}' --global task claim '{uid}' --owner '{live}' >/dev/null 2>&1 || \
+         : > '{}'",
+        jkb_bin.display(),
+        f.db.display(),
+        f.home.path().join("shim-claim-failed").display(),
+    );
+    let (path, ran) = git_shim_on_worktree_remove(&f, &hook);
+
+    let out = f
+        .jkb()
+        .env("PATH", &path)
+        .args(["--json", "task", "abandon", &uid])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        ran.exists(),
+        "the shim never saw a worktree removal: {out:?}"
+    );
+    assert!(
+        !f.home.path().join("shim-claim-failed").exists(),
+        "the mid-abandon claim did not take, so nothing was raced"
+    );
+    assert!(!wt.exists(), "the session itself is still disposed of");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["claim_released"], serde_json::json!(false), "{v}");
+
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "not reopened under a live claim"
+    );
+    assert_eq!(claim_of(&f.db, &uid).as_deref(), Some(live.as_str()));
+    let rows = f.staging(&["--all"]);
+    assert_eq!(
+        rows[0]["branch"],
+        serde_json::json!(onto),
+        "the land target is kept for the worker that holds the task: {rows}"
+    );
+}
+
+/// A landing frees the claim **whoever holds it by the time it records**, and the task is done.
+///
+/// The gate runs for minutes, and the session's owner can lose the claim in that time — `land` removes
+/// the worktree before it records, so the owner reads as gone and a `task reclaim` plus a SCHEDULER
+/// pass hand the task to someone else. `settle_landing` once carried an owner-scoped clear to spare
+/// that claim, and it was inert: the status write released it anyway. The decision is the lifecycle's,
+/// in one place — a terminal status takes its claim with it — because the commits are already on the
+/// target: a worker left holding a landed task could only redo landed work. The gate here moves the
+/// claim, which opens the same window deterministically.
+#[test]
+fn a_landing_frees_a_claim_taken_while_it_ran() {
+    let f = Fixture::new();
+    let uid = f.add_task("reclaimed mid-land");
+    let s = f.work(&uid);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    let session_owner = claim_of(&f.db, &uid).expect("task work claims");
+    let live = format!("swarm:{}", std::process::id());
+    let jkb_bin = Path::new(env!("CARGO_BIN_EXE_jkb"));
+    let jkb_sh = format!("'{}' --db '{}' --global", jkb_bin.display(), f.db.display());
+    let gate = format!(
+        "{jkb_sh} task release '{uid}' --owner '{session_owner}' && \
+         {jkb_sh} task claim '{uid}' --owner '{live}'"
+    );
+
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", &gate, "--no-review"])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&uid), "done");
+    assert_eq!(
+        claim_of(&f.db, &uid),
+        None,
+        "a terminal task holds no claim, whoever took it during the gate"
+    );
+}
+
+/// A start the record refuses leaves the repository exactly as it found it.
+///
+/// `task start` and `task work` once ran their whole git measurement — and two local `git config`
+/// writes retaining a branch's reflog — inside the write transaction, so a refusal rolled back the
+/// record and left the config entry behind, residue `jkb doctor` reported for a branch with no record.
+/// The record is now one op whose transaction runs no git; what git is asked happens first, and reads.
+/// Pinned by the refusal that comes from inside that transaction: the lifecycle's, for a finished task.
+#[test]
+fn a_start_refused_by_its_record_leaves_git_untouched() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "batch"]);
+    git(&f.repo, &["checkout", "-q", "-b", "feat"]);
+    let uid = f.add_task("already finished");
+    f.jkb()
+        .args(["--global", "task", "set", &uid, "--status", "done"])
+        .assert()
+        .success();
+    let git_dir = f.repo.join(".git");
+    let snapshot = || {
+        (
+            std::fs::read(git_dir.join("config")).unwrap(),
+            std::fs::read(git_dir.join("info/exclude")).ok(),
+            git(
+                &f.repo,
+                &["for-each-ref", "--format=%(refname) %(objectname)"],
+            ),
+            git(&f.repo, &["worktree", "list", "--porcelain"]),
+        )
+    };
+    let before = snapshot();
+
+    f.jkb()
+        .args(["task", "start", &uid, "--onto", "batch"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "`start` is not something that can happen",
+        ));
+
+    assert_eq!(snapshot(), before, "a refused start wrote into git");
+    assert_eq!(f.status_of(&uid), "done");
 }
 
 /// A finished task must not be **reopened** by either verb that could.
@@ -2405,6 +3002,70 @@ fn a_landing_recorded_while_a_task_was_held_closes_it_once_the_hold_lifts() {
     );
 }
 
+/// A task closed by the landing jkb recorded is reported **without** a pull request number, even when
+/// one is recorded in its history: that number was never asked about, so crediting it would report a
+/// close the pull request had no part in — "reported from what actually happened, never from what
+/// was intended" (`settle_landing`).
+#[test]
+fn a_close_by_a_recorded_landing_reports_no_pull_request() {
+    let f = Fixture::new();
+    let parent = f.add_task("parent task");
+    let s = f.work(&parent);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(&worktree, "p.txt", "parent work\n", "parent work");
+    let out = f
+        .jkb()
+        .args([
+            "--global",
+            "task",
+            "add",
+            "child task",
+            "--under",
+            &parent,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "task add --under: {out:?}");
+    let child = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The queue grafts the branch while the parent is held for its open subtask.
+    git(&f.repo, &["merge", "-q", "--ff-only", &branch]);
+    f.jkb()
+        .args(["task", "landed", &branch, "--onto", &onto])
+        .assert()
+        .success();
+    // A pull request number arrives in the history — one that had no part in the graft.
+    f.jkb()
+        .args(["task", "pr", &parent, "31"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "set", &child, "--status", "done"])
+        .assert()
+        .success();
+
+    let out = f
+        .jkb()
+        .args(["--json", "task", "close-merged"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "close-merged: {out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let closed = v["closed"].as_array().unwrap();
+    assert_eq!(closed.len(), 1, "{v}");
+    assert_eq!(closed[0]["uid"], parent.as_str(), "{v}");
+    assert!(
+        closed[0]["pr"].is_null(),
+        "credited a pull request it never read: {v}"
+    );
+    assert_eq!(f.status_of(&parent), "done");
+}
+
 /// A landing is spent once the task is put back to work — and **still closes it when it is not**.
 ///
 /// Both directions, because either alone passes with the rule broken the other way: refusing
@@ -2650,7 +3311,8 @@ fn a_task_retargeted_to_another_batch_is_not_credited_by_the_old_one() {
 
 /// A review still credits work jkb grafted onto the branch, even after the session was abandoned.
 ///
-/// `credited_by` asks the **historical** question — did jkb ever graft this onto this branch —
+/// `credited_by` asks the **historical** question — did jkb graft this onto this branch as the
+/// task's **latest** landing (an earlier landing, re-landed elsewhere since, is not seen) —
 /// because a graft does not un-happen: the reviewer read what is in the branch whatever the task
 /// did afterwards. Asking the present-tense question instead made such a task `Credit::Unrelated`,
 /// which this loop drops, so `review record` stamped nothing for it and said nothing about it,
@@ -3372,6 +4034,10 @@ fn a_branch_name_cannot_smuggle_a_git_option() {
 /// The rule was stated twice before: once here and once in the table. Two copies of a rule read
 /// as protection while diverging from the one that actually decides, which is how one click came
 /// to reopen a task that had already merged.
+///
+/// And it refuses **before any git side effect**: no `.git/info/exclude` entry, no branch, no
+/// session directory. A refusal the verb already had in hand and raised only after the git work
+/// left all three behind for a task that was never going to be worked.
 #[test]
 fn a_finished_task_cannot_be_worked() {
     let f = Fixture::new();
@@ -3380,12 +4046,29 @@ fn a_finished_task_cannot_be_worked() {
         .args(["--global", "task", "set", &uid, "--status", "done"])
         .assert()
         .success();
+    let exclude = f.repo.join(".git/info/exclude");
+    let exclude_before = std::fs::read(&exclude).ok();
+    let branches_before = git(&f.repo, &["branch", "--format=%(refname:short)"]);
     f.jkb()
         .args(["task", "work", &uid])
         .assert()
         .failure()
         .stderr(predicate::str::contains("is not something that can happen"));
     assert_eq!(f.status_of(&uid), "done", "the refusal changed the task");
+    assert_eq!(
+        std::fs::read(&exclude).ok(),
+        exclude_before,
+        "the refusal came after `.git/info/exclude` was written"
+    );
+    assert_eq!(
+        git(&f.repo, &["branch", "--format=%(refname:short)"]),
+        branches_before,
+        "the refusal came after a branch was cut"
+    );
+    assert!(
+        !f.repo.join(".jkb").exists(),
+        "the refusal came after the session directory was made"
+    );
 }
 
 /// An owner whose liveness cannot be established keeps its claim, and is **reported** rather
@@ -4183,7 +4866,8 @@ fn landing_is_serialised_by_a_lease_freed_only_when_its_holder_is_proven_gone() 
     let refused = |out: &std::process::Output| {
         assert!(!out.status.success(), "{out:?}");
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("another `jkb task land` is running"),
+            String::from_utf8_lossy(&out.stderr)
+                .contains("a `jkb task land` or `jkb task abandon` is running"),
             "{out:?}"
         );
     };
@@ -4221,6 +4905,44 @@ fn landing_is_serialised_by_a_lease_freed_only_when_its_holder_is_proven_gone() 
     assert!(out.status.success(), "{out:?}");
     assert_eq!(f.status_of(&uid), "done");
     assert_eq!(lease_of(&f.db, name), None, "released");
+}
+
+/// **Abandoning takes the land lock**: an abandon run while a land is mid-gate used to archive the
+/// session's worktree and reopen the task under it, and the land then finished grafting — the commits
+/// on the target, the task `open`. Held by a live land, abandon refuses and touches nothing; once the
+/// lock is free it proceeds and releases the lock again.
+#[test]
+fn abandoning_refuses_while_a_land_holds_the_land_lock() {
+    let f = Fixture::new();
+    let uid = f.add_task("abandoned mid-land");
+    let s = f.work(&uid);
+    let worktree = PathBuf::from(s["worktree"].as_str().unwrap());
+    let name = "land:proj";
+
+    // pid 1 on this host is alive: a land in progress.
+    set_lease(&f.db, name, Some("host:1 n -"));
+    let out = f.jkb().args(["task", "abandon", &uid]).output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("a `jkb task land` or `jkb task abandon` is running")
+            && stderr.contains("abandoning refuses while one runs"),
+        "{out:?}"
+    );
+    assert!(worktree.exists(), "the session is untouched");
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "and the task not reopened"
+    );
+    assert!(claim_of(&f.db, &uid).is_some(), "nor its claim released");
+    assert_eq!(lease_of(&f.db, name).as_deref(), Some("host:1 n -"));
+
+    set_lease(&f.db, name, None);
+    f.jkb().args(["task", "abandon", &uid]).assert().success();
+    assert!(!worktree.exists(), "abandoned");
+    assert_eq!(f.status_of(&uid), "open");
+    assert_eq!(lease_of(&f.db, name), None, "and the lock released");
 }
 
 /// **A container session lands through the daemon** (tasks S6.4 stage 4): the graft and the gate run
@@ -5047,6 +5769,86 @@ fn a_discovered_merged_pull_request_closes_its_task_in_one_run() {
     assert_eq!(f.status_of(&uid), "done");
 }
 
+/// **`close-merged` does not ask `gh` again about a branch it said has no pull request until the
+/// branch moves on the remote** — through the real `jkb` and git, with a stub `gh` that logs every
+/// question. The `post-merge` hook runs this on every `git pull`.
+#[test]
+fn close_merged_asks_gh_again_only_when_the_branch_moves_on_the_remote() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new();
+    let bin = f.home.path().join("stub-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = f.home.path().join("gh.log");
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$2\" in\n  list) printf '[]' ;;\nesac\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    // Without an `origin` nothing is kept: no tracking ref could ever move the key.
+    let uid = f.add_task("in flight, no pull request");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let asked = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("pr list"))
+            .count()
+    };
+    let close = || {
+        let out = f
+            .jkb()
+            .env("PATH", &path)
+            .args(["--json", "task", "close-merged"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["held"][0]["uid"], uid.as_str(), "{v}");
+        v["held"][0]["reason"].as_str().unwrap().to_owned()
+    };
+    close();
+    close();
+    assert_eq!(asked(), 2, "with no `origin`, every run asks");
+    let origin = f.home.path().join("origin.git");
+    git(&f.repo, &["init", "--bare", "-q", origin.to_str().unwrap()]);
+    git(
+        &f.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    close();
+    assert_eq!(asked(), 3);
+    let why = close();
+    assert_eq!(asked(), 3, "asked again with nothing moved: {why}");
+    assert!(why.contains("when last asked"), "{why}");
+
+    // Pushed: the remote-tracking ref appears, so the question is a new one.
+    let tip = git(&f.repo, &["rev-parse", &branch]);
+    git(
+        &f.repo,
+        &[
+            "update-ref",
+            &format!("refs/remotes/origin/{branch}"),
+            tip.trim(),
+        ],
+    );
+    close();
+    assert_eq!(asked(), 4);
+    close();
+    assert_eq!(asked(), 4, "and is then answered");
+    assert_eq!(f.status_of(&uid), "in_progress");
+}
+
 /// `--no-review` asks who this client is **before** anything moves, whatever credential it presents:
 /// a terminal in the dev container holds the container credential (a coordinator), not a ticket, and
 /// keying the check on a ticket in the environment let it graft and run the gate before its waiver
@@ -5575,4 +6377,168 @@ fn a_shared_doc_target_is_cleared_by_export_to() {
         .success()
         .stdout(predicate::str::contains("docs/b.md"));
     assert!(f.repo.join("docs/a.md").exists() && f.repo.join("docs/b.md").exists());
+}
+
+/// `jkb task landed` where **every** task on the branch is refused records nothing, and says so:
+/// a non-zero exit, no `recorded:` line, and a message about the refusals rather than one blaming
+/// the caller's permission — the refusal here has nothing to do with who is asking.
+///
+/// Through the daemon, because in-process the CLI is the operator and nothing refuses it. The
+/// refusal is the task's own: it is filed outside the directories the daemon serves, which no
+/// role can change. Without the `refused < uids.len()` guard this run exits zero having recorded
+/// nothing.
+#[test]
+fn a_landing_whose_every_task_is_refused_fails_and_records_nothing() {
+    let f = Fixture::new();
+    git(&f.repo, &["checkout", "-qb", "batch"]);
+    let filed = f.add_task("filed elsewhere");
+    for tag in ["branch=task/refused", "repo=proj"] {
+        f.jkb()
+            .args(["task", "tag", "set", &filed, tag])
+            .assert()
+            .success();
+    }
+    f.jkb()
+        .args(["task", "set", &filed, "--status", "in_progress"])
+        .assert()
+        .success();
+    f.jkb()
+        .args([
+            "task",
+            "bind",
+            &filed,
+            "--sync",
+            "file:///nowhere-the-daemon-serves/tasks.md",
+        ])
+        .assert()
+        .success();
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Serve::start(&f, &token);
+
+    let out = jkb(None)
+        .args(["task", "landed", "task/refused", "--onto", "batch"])
+        .current_dir(&f.repo)
+        .env("JKB_REMOTE", &url)
+        .env("JKB_REMOTE_TOKEN_FILE", &token)
+        .env("HOSTNAME", "container")
+        .env_remove("JKB_DB")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "every task was refused and the run still succeeded: {stdout}{stderr}"
+    );
+    assert!(
+        !stdout.contains("recorded:"),
+        "reported a landing it did not record: {stdout}"
+    );
+    assert!(
+        stderr.contains(&format!("{filed} not closed")),
+        "the refused task's own reason is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("every one of its tasks was refused"),
+        "the failure does not say why nothing was recorded: {stderr}"
+    );
+    assert!(
+        !stderr.contains("this caller may land none"),
+        "the failure blames the caller for a refusal that is about the task: {stderr}"
+    );
+    assert_eq!(f.status_of(&filed), "in_progress", "nothing closed it");
+}
+
+/// `close-merged` holds a task whose history names no branch with the reason it actually has, and
+/// a remedy that addresses it — two causes, two sentences.
+///
+/// A task started before the transition log existed carries a `branch=` facet and nothing in its
+/// history. The one sentence both used to get said *no branch recorded* — false for it — and
+/// pointed at `jkb task pr`, which does not touch the cause. Seen live on the first post-merge run
+/// after the transition log landed, on four such tasks.
+#[test]
+fn close_merged_tells_a_task_with_no_branch_from_one_whose_session_predates_the_log() {
+    let f = Fixture::new();
+    let bare = f.add_task("never started");
+    let legacy = f.add_task("started under an older jkb");
+    // Planted straight through the tag repo, as the older binary left them: a location facet and
+    // no transition naming it.
+    let db = f.db.to_str().unwrap().to_owned();
+    let store = jkb_core::Db::open(&db).unwrap();
+    let ids = store
+        .read({
+            let uids = [bare.clone(), legacy.clone()];
+            move |conn| {
+                uids.iter()
+                    .map(|u| jkb_core::item::id_for_uid(conn, u).map(Option::unwrap))
+                    .collect::<Result<Vec<_>, _>>()
+            }
+        })
+        .unwrap();
+    let (bare_id, legacy_id) = (ids[0], ids[1]);
+    store
+        .write_txn("t", move |conn, meta| {
+            jkb_core::tag::apply(conn, meta, bare_id, "repo", "proj")?;
+            jkb_core::tag::apply(conn, meta, legacy_id, "repo", "proj")?;
+            jkb_core::tag::apply(conn, meta, legacy_id, "branch", "task/old-session")
+        })
+        .unwrap();
+    drop(store);
+
+    let held = |f: &Fixture| -> std::collections::BTreeMap<String, String> {
+        let out = f
+            .jkb()
+            .args(["task", "close-merged", "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "close-merged: {out:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["held"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                (
+                    h["uid"].as_str().unwrap().to_owned(),
+                    h["reason"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let reasons = held(&f);
+
+    let bare_why = &reasons[&bare];
+    assert!(
+        bare_why.contains("records no branch") && bare_why.contains("jkb task pr"),
+        "{bare_why}"
+    );
+    assert!(!bare_why.contains("jkb task work"), "{bare_why}");
+
+    let legacy_why = &reasons[&legacy];
+    assert!(
+        !legacy_why.contains("records no branch"),
+        "a task with a `branch=` facet was told it records no branch: {legacy_why}"
+    );
+    assert!(
+        legacy_why.contains("task/old-session")
+            && legacy_why.contains(&format!("jkb task work {legacy} --onto")),
+        "{legacy_why}"
+    );
+    assert!(
+        !legacy_why.contains("jkb task pr"),
+        "the remedy points at a verb that does not address the cause: {legacy_why}"
+    );
+
+    // The remedy it names is the one that works: once a session records where the work lands, the
+    // pull request is looked up from its branch, and the hold — whatever it now is — is no longer
+    // this one.
+    git(&f.repo, &["branch", "batch"]);
+    f.work_onto(&legacy, "batch");
+    let after = held(&f);
+    assert!(
+        after
+            .get(&legacy)
+            .is_none_or(|why| !why.contains("no session in its history")),
+        "the named remedy did not clear the cause: {after:?}"
+    );
 }

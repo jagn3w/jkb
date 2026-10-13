@@ -23,7 +23,8 @@ use walkdir::WalkDir;
 
 use jkb_core::item::NewItem;
 use jkb_core::{
-    binding, blob, edge, item, mount, ns, placement, sync_state, tag, task, Db, WriteMeta,
+    binding, blob, containment, edge, item, mount, ns, placement, sync_state, tag, task, Db,
+    WriteMeta,
 };
 use jkb_types::{
     ConflictPolicy, EdgeType, Error as TypeError, ItemId, NamespaceId, PlacementRole, SyncMode,
@@ -32,7 +33,9 @@ use jkb_types::{
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::lifecycle::{FileEvent, FileState};
-use crate::serializers::{resolve, SyncBlock, SyncDoc, SyncItem, SyncSection, SyncSerializer};
+use crate::serializers::{
+    resolve, SyncBlock, SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer,
+};
 use crate::{Error, Result};
 
 /// What happened when reconciling one file.
@@ -101,6 +104,10 @@ pub struct FileResult {
     /// than restating the rule — a printer that restates it drifts from the engine, which is
     /// how a refused file came to be told to exclude a sibling that did not exist.
     pub reason: Option<String>,
+    /// What the serializer read in the file without taking it at face value (see
+    /// [`SyncSerializer::parse_with_warnings`]) — reported on every outcome, every time the file
+    /// is read, until the file no longer says it.
+    pub warnings: Vec<String>,
 }
 
 /// The outcome of a one-shot [`sync`] over a mount.
@@ -121,6 +128,15 @@ impl SyncReport {
     #[must_use]
     pub fn quarantined(&self) -> Vec<&Path> {
         self.paths_with(Outcome::Quarantined)
+    }
+
+    /// Every warning a file's parse raised, as `(path, warning)`, in file order.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<(&Path, &str)> {
+        self.results
+            .iter()
+            .flat_map(|r| r.warnings.iter().map(|w| (r.path.as_path(), w.as_str())))
+            .collect()
     }
 
     /// The paths that were three-way [`Outcome::Merged`].
@@ -309,7 +325,12 @@ fn settle_out_of_scope(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<usize> {
             } else {
                 filter.accepts(&ctx.dir, &path) && !through_link(&ctx.dir, &path)
             };
-            !in_scope || (!path.exists() && !bound.contains(&path))
+            //
+            // A third: an unbound path that is a directory. `discover` yields only files, so no
+            // reconcile revisits it — a row a watch event once journalled for a `mkdir` (before
+            // `sync_paths` skipped directories) was otherwise flagged for good, in `jkb doctor` but
+            // never in `jkb sync`'s report. A bound one stays: its reconcile owns the refusal.
+            !in_scope || (!bound.contains(&path) && (!path.exists() || is_dir_nofollow(&path)))
         })
         .map(|row| row.uri)
         .collect();
@@ -341,7 +362,10 @@ pub fn sync_paths(db: &Db, mount_ns: &str, paths: &[PathBuf]) -> Result<SyncRepo
     let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
     let mut bound: Option<BTreeSet<PathBuf>> = None;
     for path in paths {
-        if !filter.accepts(&ctx.dir, path) || seen.contains(path) {
+        // A watch event names directories too (a created or renamed folder whose name the
+        // globs happen to accept). [`discover`] keeps only files, so this does too; a path
+        // that no longer exists is kept, since a deleted file must still reconcile.
+        if !filter.accepts(&ctx.dir, path) || seen.contains(path) || is_dir_nofollow(path) {
             continue;
         }
         if through_link(&ctx.dir, path) {
@@ -526,6 +550,13 @@ fn judge_kb_side(conn: &Connection, ctx: &Ctx, path: &Path) -> KbSide {
 }
 
 /// Reconcile each path in its own audited transaction, collecting the outcomes.
+///
+/// **Never discards a result.** Every per-file transaction, the `tasks/**` mirror derivation
+/// included, is a result in the report; nothing runs after them that could turn the report into an
+/// `Err`. The mirror derivation used to be one trailing transaction after every file had committed,
+/// propagated with `?`: its failure threw away every file's outcome — refusals, conflicts,
+/// `disk_wins` resolutions the caller exists to report — and left the imported tasks unmirrored
+/// while their files read as settled, so the retry found nothing to do and never derived them.
 fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> {
     let mut results = Vec::with_capacity(paths.len());
     for path in paths {
@@ -539,8 +570,8 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
         // the rule, so three could destroy bytes no blob held. And the one that did carry it
         // ran inside the reconcile's transaction, so a later failure rolled the archive back
         // while the file stayed overwritten — losing exactly the bytes it existed to keep.
-        // Content-addressed and `INSERT OR IGNORE`, so a settled file costs one hash and one
-        // no-op insert.
+        // A settled file — bytes equal to the journal's archived base — costs one hash and one
+        // read, and no write transaction (`sync_state::base_is_archived`).
         // A failed archive STOPS this file. Dropping the error meant the guarantee degraded to
         // best-effort exactly when the database is contended — the reconcile went on to
         // overwrite bytes that were in no blob, with nothing printed and nothing journalled.
@@ -549,67 +580,76 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
             Ok(bytes) => bytes,
             Err(e) => {
                 let reason = format!("could not archive the current bytes before syncing: {e}");
-                let (p2, msg, ser) = (path.clone(), reason.clone(), ctx.serializer.clone());
-                let _ =
-                    db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
-                        let uri = file_uri(&p2);
-                        let prev = sync_state::get(conn, &uri)?;
-                        flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
-                    });
-                results.push(FileResult {
-                    path,
-                    outcome: Outcome::Failed,
-                    reason: Some(reason),
-                });
+                results.push(failed_file(db, ctx, path, reason));
                 continue;
             }
         };
-        let ser_name = ctx.serializer.clone();
-        let ctx = ctx.clone();
+        let txn_ctx = ctx.clone();
         let p = path.clone();
         // A per-file failure is a RESULT, not a run-ending error. `reconcile_all` used to
         // propagate with `?`, so a single unreadable file — a PNG dropped into a `document`
         // mount, whose serializer does not quarantine — returned `Err` out of the watcher
         // thread. `watch_all` then blocked joining the other threads until stop, launchd never
         // restarted the still-alive process, and that mount silently stopped syncing forever.
-        let outcome = db
-            .write_txn_with::<Outcome, Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
-                reconcile(conn, meta, &ctx, &p, archived)
-            });
-        let (outcome, reason) = match outcome {
-            Ok(o) => (o, outcome_reason(db, &path)?),
-            Err(e) => {
-                // Flag the journal in its OWN transaction: the reconcile's rolled back, so
-                // without this the row keeps `status='ok'` and the failure is invisible to
-                // `jkb doctor` — leaving one stderr line under the watcher as its only trace.
-                let (p2, msg) = (path.clone(), e.to_string());
-                let ser = ser_name.clone();
-                let _ =
-                    db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
-                        let uri = file_uri(&p2);
-                        let prev = sync_state::get(conn, &uri)?;
-                        flag_needs_attention(conn, meta, &uri, &ser, &msg, prev.as_ref())
-                    });
-                (Outcome::Failed, Some(e.to_string()))
-            }
-        };
-        results.push(FileResult {
-            path,
-            outcome,
-            reason,
-        });
-    }
-    // Any tasks just imported from `repos/<repo>/…/tasks.md` get a `tasks/…` mirror so
-    // `tasks/**` stays the complete task index. Only run when a file actually changed —
-    // a pure-no-op reconcile must not open a write txn, or the watcher would re-fire on
-    // its own commit and spin (the file-watch feedback loop).
-    let imported = results.iter().any(|r| brought_items_in(r.outcome));
-    if imported {
-        db.write_txn_with::<usize, Error, _>(sync_state::SYNC_ACTOR, |conn, meta| {
-            Ok(task::ensure_all_mirrors(conn, meta)?)
-        })?;
+        let outcome = db.write_txn_with::<(Outcome, Vec<String>), Error, _>(
+            sync_state::SYNC_ACTOR,
+            move |conn, meta| {
+                let mut warnings = Vec::new();
+                let outcome = reconcile(conn, meta, &txn_ctx, &p, archived, &mut warnings)?;
+                // Tasks this file just brought in from `repos/<repo>/…/tasks.md` get their
+                // `tasks/…` mirror IN THE SAME TRANSACTION, so `tasks/**` stays the complete task
+                // index. Atomic with the import, a failure rolls the import back and journals the
+                // file as failed, and the retry re-imports it and derives the mirrors again. Only
+                // when items came in: a no-op reconcile must not write, or the watcher would
+                // re-fire on its own commit and spin (the file-watch feedback loop).
+                //
+                // Only THIS file's tasks — the items bound to it, a superset of the ones this
+                // pass brought in. Not every task in the database: that was a full scan per
+                // importing file, and any unrelated task whose mirror cannot be derived rolled
+                // back every import until it was fixed.
+                if brought_items_in(outcome) {
+                    let uris = binding::synced_uris_for_file(conn, &file_uri(&p))?;
+                    let items: Vec<ItemId> = binding::items_for_uris(conn, &uris)?
+                        .into_values()
+                        .collect();
+                    task::ensure_mirrors_for(conn, meta, &items)?;
+                }
+                Ok((outcome, warnings))
+            },
+        );
+        match outcome {
+            Ok((outcome, warnings)) => results.push(FileResult {
+                reason: outcome_reason(db, &path)?,
+                path,
+                outcome,
+                warnings,
+            }),
+            Err(e) => results.push(failed_file(db, ctx, path, e.to_string())),
+        }
     }
     Ok(SyncReport { results })
+}
+
+/// A file that failed before or during its reconcile: flag its journal `needs_attention` with
+/// `reason` in a transaction of its OWN, and report it [`Outcome::Failed`].
+///
+/// Its own transaction because the failure may have rolled the reconcile's back: without it the
+/// row keeps `status='ok'` and the failure is invisible to `jkb doctor`, one stderr line under the
+/// watcher its only trace. The flag is best-effort — the database that just failed the file may
+/// fail this too — and the result is reported whether or not it lands.
+fn failed_file(db: &Db, ctx: &Ctx, path: PathBuf, reason: String) -> FileResult {
+    let (p, msg, ser) = (path.clone(), reason.clone(), ctx.serializer.clone());
+    let _ = db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
+        let uri = file_uri(&p);
+        let prev = sync_state::get(conn, &uri)?;
+        flag(conn, meta, &uri, &ser, prev.as_ref(), Flag::Blocked(&msg))
+    });
+    FileResult {
+        path,
+        outcome: Outcome::Failed,
+        reason: Some(reason),
+        warnings: Vec::new(),
+    }
 }
 
 /// Store the file's current bytes in the blob archive, in their own transaction.
@@ -642,12 +682,35 @@ fn archive_current_bytes(db: &Db, path: &Path) -> Result<Option<Vec<u8>>> {
     if bytes.is_empty() {
         return Ok(Some(bytes));
     }
+    // A settled file — its bytes are the journal's base, whose blob is stored — needs no write: a
+    // read answers it, where the unconditional store cost every file a write transaction on every
+    // pass (the watcher's startup pass, and each backed-off retry of a mount with one failing
+    // file) to insert nothing. Anything else is stored, so the archive-before-overwrite guarantee
+    // is unchanged: a skip happens only when these exact bytes are already in a blob.
+    let hash = blob::hash_bytes(&bytes);
+    let (uri, base) = (file_uri(path), hash.clone());
+    if db.read(move |conn| sync_state::base_is_archived(conn, &uri, &base))? {
+        return Ok(Some(bytes));
+    }
+    #[cfg(test)]
+    archive_probe::ARCHIVE_WRITES.with(|n| n.set(n.get() + 1));
     let stored = bytes.clone();
     db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, _meta| {
-        blob::store(conn, &blob::hash_bytes(&stored), &stored, None)?;
+        blob::store(conn, &hash, &stored, None)?;
         Ok(())
     })?;
     Ok(Some(bytes))
+}
+
+/// Counts the archive's write transactions on this thread, so a test can show a settled pass opens
+/// none. A write that inserts nothing changes no row a test could read back.
+#[cfg(test)]
+mod archive_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static ARCHIVE_WRITES: Cell<usize> = const { Cell::new(0) };
+    }
 }
 
 /// Whether this outcome may have brought items **in** from disk, so the `tasks/**` mirrors
@@ -1009,6 +1072,12 @@ fn is_temp(path: &Path) -> bool {
         .is_some_and(jkb_core::nofollow::is_temp_name)
 }
 
+/// Whether `path` is a directory itself, not following a symlink at its leaf (a link is
+/// [`through_link`]'s question). A path that cannot be read, including one just deleted, is not.
+fn is_dir_nofollow(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
+}
+
 /// Whether `path` (under `dir`) is reached through a symlink below the mount directory.
 ///
 /// Asked of paths nothing is bound to, by the watch filter and by the full sync's out-of-scope sweep
@@ -1089,12 +1158,40 @@ fn outcome_reason(db: &Db, path: &Path) -> Result<Option<String>> {
 }
 
 /// Reconcile a single file within the current transaction.
+fn reconcile(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ctx: &Ctx,
+    path: &Path,
+    disk_bytes: Option<Vec<u8>>,
+    warnings: &mut Vec<String>,
+) -> Result<Outcome> {
+    let mut cycles = Vec::new();
+    let outcome = reconcile_sides(conn, meta, ctx, path, disk_bytes, warnings, &mut cycles)?;
+    // A parked need left parked because it would close a cycle is judged on the store the pass
+    // starts from, and an import can drop it (the disk edit that breaks the cycle) or park one
+    // (`apply_doc`, for a `needs:` the disk declares that closes a cycle through an edge the file
+    // does not own), so the warning is judged again on the store the import left. Only then: the
+    // common pass reads nothing more.
+    if brought_items_in(outcome) {
+        let bare_uri = file_uri(path);
+        let journal = sync_state::get(conn, &bare_uri)?;
+        cycles = assemble_kb_doc_parts(conn, ctx, path, &bare_uri, journal.as_ref())?
+            .1
+            .warnings;
+    }
+    warnings.extend(cycles);
+    Ok(outcome)
+}
+
+/// [`reconcile`], with the warnings for parked needs left parked because they would close a cycle
+/// in `cycles`, judged on the store the pass started from.
 // A linear pipeline — read disk, assemble KB, decide direction, act — ending in one arm per
 // direction. Splitting it further would mean threading the same seven parameters through more
 // helpers than it saves; the stages that carry real logic (`decide_direction`, `export_or_skip`)
 // are already extracted and separately testable.
 #[allow(clippy::too_many_lines)]
-fn reconcile(
+fn reconcile_sides(
     conn: &Connection,
     meta: &WriteMeta,
     ctx: &Ctx,
@@ -1103,6 +1200,9 @@ fn reconcile(
     // version preserved. Reading the file again here left a window in which a save could land
     // between the two reads and be overwritten with only the older bytes archived.
     disk_bytes: Option<Vec<u8>>,
+    // Filled with the disk parse's warnings, for the file's `FileResult`.
+    warnings: &mut Vec<String>,
+    cycles: &mut Vec<String>,
 ) -> Result<Outcome> {
     let bare_uri = file_uri(path);
     let (ser_name, serializer) = resolve_serializer(conn, ctx, &bare_uri)?;
@@ -1120,8 +1220,11 @@ fn reconcile(
     // Parse the disk side (if the file exists). A quarantining serializer turns a parse
     // failure into a journal flag instead of a hard error, protecting last-good items.
     let disk = if let Some(bytes) = disk_bytes {
-        match serializer.parse(&bytes) {
-            Ok(doc) => Some((bytes, doc)),
+        match serializer.parse_with_warnings(&bytes) {
+            Ok((doc, raised)) => {
+                *warnings = raised;
+                Some((bytes, doc))
+            }
             Err(e) => {
                 if serializer.quarantine_on_parse_error() {
                     return quarantine(
@@ -1155,7 +1258,11 @@ fn reconcile(
     };
 
     // Assemble the KB side and render it, so we can hash it against the base.
-    let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri, journal.as_ref())?;
+    // A parked `needs:^id` this file now defines becomes the dependency it names, here and in the
+    // store, before anything is decided from the KB side (see `assemble_kb_doc_parts`).
+    let (kb_doc, resolution) = assemble_kb_doc_parts(conn, ctx, path, &bare_uri, journal.as_ref())?;
+    record_resolved_needs(conn, meta, &resolution.heals)?;
+    *cycles = resolution.warnings;
     let kb_bytes = serializer.render(&kb_doc)?;
     let kb_hash = hash(&kb_bytes);
 
@@ -1216,7 +1323,14 @@ fn reconcile(
             if ctx.imports() {
                 return finish_import(conn, meta, &f, disk_doc, Outcome::Imported);
             }
-            flag_refused(conn, meta, &bare_uri, &ser_name, &reason, journal.as_ref())?;
+            flag(
+                conn,
+                meta,
+                &bare_uri,
+                &ser_name,
+                journal.as_ref(),
+                Flag::Blocked(&reason),
+            )?;
             return Ok(Outcome::Refused);
         }
     }
@@ -1366,7 +1480,11 @@ fn decide_direction(
         return Ok((false, false, None));
     }
 
-    let base_doc = load_base_doc(conn, journal, serializer)?;
+    // A base that no longer parses compares as bytes, like a missing one, rather than failing the
+    // file: the KB can export text its own parser refuses (a parked `needs:^id` on each of two tasks
+    // naming the other is an in-file cycle once both are in the file), and the disk edit that breaks
+    // the cycle is the remedy, which a failed reconcile would never import.
+    let base_doc = load_base_bytes(conn, journal)?.and_then(|bytes| serializer.parse(&bytes).ok());
     match &base_doc {
         Some(doc) => {
             let canonical = serializer.render(doc)?;
@@ -1427,8 +1545,8 @@ fn finish_import(
     if !ctx.imports() {
         return Ok(Outcome::Skipped);
     }
-    let resolved = apply_doc(conn, meta, ctx, path, bare_uri, doc)?;
-    let rendered = serializer.render(doc)?;
+    let Applied { items, doc } = apply_doc(conn, meta, f, doc)?;
+    let rendered = serializer.render(&doc)?;
     // Persist identity / normalization back to disk (the rendered form is authoritative).
     if rendered != disk_bytes {
         // `snapshot`, not `Some(disk_bytes)`: they differ exactly when the file was absent,
@@ -1444,8 +1562,8 @@ fn finish_import(
         bare_uri,
         ser_name,
         &rendered,
-        &resolved,
-        Some(&document_json(doc)),
+        &items,
+        Some(&document_json(&doc)),
     )?;
     Ok(outcome)
 }
@@ -1482,7 +1600,14 @@ fn finish_export(
     // — `export_or_skip` and `three_way_resolve`'s `kb_wins` — and a guard at the `(false, true)`
     // arm would let both past (design D45.5).
     if let Some(reason) = export_blocker(conn, f, expected)? {
-        flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
+        flag(
+            conn,
+            meta,
+            bare_uri,
+            ser_name,
+            journal,
+            Flag::Blocked(&reason),
+        )?;
         return Ok(Outcome::Refused);
     }
 
@@ -1765,43 +1890,53 @@ fn populate_document(
     }))
 }
 
-/// Journal a refusal: nothing was written, and `jkb doctor` must be able to say why.
-fn flag_refused(
-    conn: &Connection,
-    meta: &WriteMeta,
-    bare_uri: &str,
-    ser_name: &str,
-    reason: &str,
-    journal: Option<&sync_state::SyncState>,
-) -> Result<()> {
-    flag_needs_attention(conn, meta, bare_uri, ser_name, reason, journal)
+/// Why [`flag`] marks a file, and so what it writes to the journal's two flag columns.
+#[derive(Clone, Copy)]
+enum Flag<'a> {
+    /// A refusal or a failure: nothing was written, and `jkb doctor` must be able to say why.
+    /// `needs_attention` with the reason; a stash an earlier quarantine left is kept.
+    Blocked(&'a str),
+    /// The bytes did not parse: the reason, and the hash of the stashed bytes.
+    ParseFailed { error: &'a str, stash: &'a str },
+    /// A `manual` conflict: neither side overwritten. No reason, and no stash.
+    Conflicted,
 }
 
-/// Mark a file `needs_attention` with `reason`, carrying every other journal field forward.
+/// Flag a file's journal, carrying the last-good fields forward.
 ///
-/// The ONE spelling of this write. It restates the full [`sync_state::SyncStateWrite`] field
-/// list, and that list has already been got wrong once — an earlier version of the undo snapshot
-/// dropped `parse_error` and `quarantine_blob_hash` — so a second hand-written copy is a second
-/// chance to drop a field.
-fn flag_needs_attention(
+/// The ONE spelling of this write. A flag learns nothing about the file — not its synced hash,
+/// not its base, not its structure — so those come forward from `journal` unchanged, and only
+/// the status and the two flag columns depend on [`Flag`]. The full
+/// [`sync_state::SyncStateWrite`] field list has already been got wrong once — an earlier version
+/// of the undo snapshot dropped `parse_error` and `quarantine_blob_hash` — and refusal,
+/// quarantine and conflict each used to hand-write it, three chances to drop a field.
+fn flag(
     conn: &Connection,
     meta: &WriteMeta,
     bare_uri: &str,
     ser_name: &str,
-    reason: &str,
     journal: Option<&sync_state::SyncState>,
+    why: Flag<'_>,
 ) -> Result<()> {
+    let carried_stash = journal.and_then(|j| j.quarantine_blob_hash.as_deref());
+    let (event, parse_error, quarantine_blob_hash) = match why {
+        Flag::Blocked(reason) => (FileEvent::WriteBlocked, Some(reason), carried_stash),
+        Flag::ParseFailed { error, stash } => (FileEvent::ParseFailed, Some(error), Some(stash)),
+        Flag::Conflicted => (FileEvent::Conflicted, None, None),
+    };
     sync_state::upsert(
         conn,
         meta,
         &sync_state::SyncStateWrite {
             uri: bare_uri,
             serializer: ser_name,
-            status: journal_status(conn, bare_uri, FileEvent::WriteBlocked)?,
+            status: journal_status(conn, bare_uri, event)?,
             last_synced_hash: journal.and_then(|j| j.last_synced_hash.as_deref()),
             base_blob_hash: journal.and_then(|j| j.base_blob_hash.as_deref()),
-            parse_error: Some(reason),
-            quarantine_blob_hash: journal.and_then(|j| j.quarantine_blob_hash.as_deref()),
+            parse_error,
+            quarantine_blob_hash,
+            // A flag keeps the last-good structure exactly as it keeps the last-good hashes:
+            // nothing was learned about the file's shape.
             document: journal.and_then(|j| j.document.as_deref()),
         },
     )?;
@@ -1846,10 +1981,17 @@ fn three_way_resolve(
             // what routes a refused file into this arm. Following the tool's instructions
             // deleted the line the refusal had just protected.
             if let Some(reason) = export_blocker(conn, f, Some(disk_doc))? {
-                flag_refused(conn, meta, bare_uri, ser_name, &reason, journal)?;
+                flag(
+                    conn,
+                    meta,
+                    bare_uri,
+                    ser_name,
+                    journal,
+                    Flag::Blocked(&reason),
+                )?;
                 return Ok(Outcome::Refused);
             }
-            let resolved = apply_doc(conn, meta, ctx, path, bare_uri, &merged)?;
+            let Applied { items, doc: merged } = apply_doc(conn, meta, f, &merged)?;
             let rendered = serializer.render(&merged)?;
             if ctx.exports() {
                 write_file(path, &rendered, snapshot)?;
@@ -1860,39 +2002,25 @@ fn three_way_resolve(
                 bare_uri,
                 ser_name,
                 &rendered,
-                &resolved,
+                &items,
                 Some(&document_json(&merged)),
             )?;
             Ok(Outcome::Merged)
         }
         ThreeWay::Conflict => match ctx.conflict_policy.as_str() {
             "disk_wins" => finish_import(conn, meta, f, disk_doc, Outcome::ResolvedFromDisk),
-            "kb_wins" => {
-                if finish_export(conn, meta, f, kb_doc, Some(disk_doc))? == Outcome::Refused {
-                    return Ok(Outcome::Refused);
-                }
-                Ok(Outcome::ResolvedFromKb)
-            }
+            // Only a completed export is a resolution. `finish_export` also answers `Skipped`
+            // (an import-only mount may not write the file) and `Refused`; reporting either as
+            // `ResolvedFromKb` would announce a destructive resolution that never happened.
+            "kb_wins" => Ok(
+                match finish_export(conn, meta, f, kb_doc, Some(disk_doc))? {
+                    Outcome::Exported => Outcome::ResolvedFromKb,
+                    other => other,
+                },
+            ),
             _ => {
                 // manual: overwrite neither side; flag the file so `doctor` can surface it.
-                let base = journal.and_then(|j| j.base_blob_hash.clone());
-                let last = journal.and_then(|j| j.last_synced_hash.clone());
-                sync_state::upsert(
-                    conn,
-                    meta,
-                    &sync_state::SyncStateWrite {
-                        uri: bare_uri,
-                        serializer: ser_name,
-                        status: journal_status(conn, bare_uri, FileEvent::Conflicted)?,
-                        last_synced_hash: last.as_deref(),
-                        base_blob_hash: base.as_deref(),
-                        parse_error: None,
-                        quarantine_blob_hash: None,
-                        // manual overwrites neither side, so neither side's structure is
-                        // adopted; the journal keeps what it had.
-                        document: journal.and_then(|j| j.document.as_deref()),
-                    },
-                )?;
+                flag(conn, meta, bare_uri, ser_name, journal, Flag::Conflicted)?;
                 Ok(Outcome::Conflict)
             }
         },
@@ -1912,22 +2040,16 @@ fn quarantine(
 ) -> Result<Outcome> {
     let qhash = blob::hash_bytes(bytes);
     blob::store(conn, &qhash, bytes, None)?;
-    let base = journal.and_then(|j| j.base_blob_hash.clone());
-    let last = journal.and_then(|j| j.last_synced_hash.clone());
-    sync_state::upsert(
+    let error = err.to_string();
+    flag(
         conn,
         meta,
-        &sync_state::SyncStateWrite {
-            uri: bare_uri,
-            serializer: ser_name,
-            status: journal_status(conn, bare_uri, FileEvent::ParseFailed)?,
-            last_synced_hash: last.as_deref(),
-            base_blob_hash: base.as_deref(),
-            parse_error: Some(&err.to_string()),
-            quarantine_blob_hash: Some(&qhash),
-            // A quarantine keeps the last-good structure exactly as it keeps the last-good
-            // hashes: the file failed to parse, so nothing was learned about its shape.
-            document: journal.and_then(|j| j.document.as_deref()),
+        bare_uri,
+        ser_name,
+        journal,
+        Flag::ParseFailed {
+            error: &error,
+            stash: &qhash,
         },
     )?;
     Ok(Outcome::Quarantined)
@@ -2048,7 +2170,8 @@ struct FileCtx<'a> {
 
 /// Apply `doc` to the KB (create/update items, place them under their section
 /// namespaces, reconcile tags and edges, cancel removed tasks). Two passes so edges
-/// resolve after every item exists. Returns the item ids the doc now maps to.
+/// resolve after every item exists. Returns the item ids the doc now maps to, and the doc as
+/// recorded ([`Applied`]).
 ///
 /// **This is the only path by which the disk side reaches the KB**, so the "does this mount
 /// import?" rule lives here rather than at each caller. `finish_import` had it and the
@@ -2060,11 +2183,16 @@ struct FileCtx<'a> {
 fn apply_doc(
     conn: &Connection,
     meta: &WriteMeta,
-    ctx: &Ctx,
-    path: &Path,
-    bare_uri: &str,
+    f: &FileCtx<'_>,
     doc: &SyncDoc,
-) -> Result<Vec<ItemId>> {
+) -> Result<Applied> {
+    let FileCtx {
+        ctx,
+        path,
+        bare_uri,
+        serializer,
+        ..
+    } = *f;
     if !ctx.imports() {
         return Err(Error::Types(TypeError::Validation(format!(
             "refusing to write the disk side of {} into the KB: this mount does not import. \
@@ -2073,7 +2201,7 @@ fn apply_doc(
         ))));
     }
     let file_ns_path = namespace_for(ctx, path);
-    let file_ns = ns::ensure(conn, &file_ns_path)?;
+    let file_ns = ns::ensure(conn, meta, &file_ns_path)?;
 
     // Sections → namespaces, carrying only their header text. Their ORDER (and the file's
     // prose) lives in the layout stored on the file namespace below — one sequence, so
@@ -2081,7 +2209,7 @@ fn apply_doc(
     let mut section_ns: HashMap<String, NamespaceId> = HashMap::new();
     for s in &doc.sections {
         let full = format!("{file_ns_path}/{}", s.path);
-        let id = ns::ensure(conn, &full)?;
+        let id = ns::ensure(conn, meta, &full)?;
         // `sync_section` marks a namespace as this file's, so `retire_undeclared_sections` can
         // find it later. `header_line` is kept **only** as a human label in the tree — since D45
         // the authority for both the header text and the block order is the journal row, and
@@ -2112,6 +2240,7 @@ fn apply_doc(
 
     // Pass 1 — items only (no edges yet).
     let mut resolved: HashMap<String, ItemId> = HashMap::new();
+    let mut declared_mirrors: HashMap<ItemId, HashSet<NamespaceId>> = HashMap::new();
     for it in &doc.items {
         let uri = item_uri(bare_uri, &it.local_id);
         let home = it
@@ -2126,11 +2255,31 @@ fn apply_doc(
             }
             None => create_item(conn, meta, ctx, it, &uri, home)?,
         };
+        let declared = declared_mirrors.entry(id).or_default();
         for m in &it.mirrors {
-            let mns = ns::ensure(conn, m)?;
+            let mns = ns::ensure(conn, meta, m)?;
             placement::place(conn, meta, id, mns, PlacementRole::Reference, 0)?;
+            declared.insert(mns);
         }
         resolved.insert(it.local_id.clone(), id);
+    }
+
+    // A mirror the file stopped declaring is a mirror the user removed. Placing is not enough
+    // on its own: without this the placement survived, the next render wrote `+ns` back onto
+    // the line, and the user's deletion was overwritten by the very sync that imported it.
+    //
+    // The removable set is exactly what the render would write — [`mirror_rows_for`], the one
+    // query both sides share — so a `tasks/…` index placement (`task::ensure_mirrors_for`) or a
+    // placement inside the file's own subtree, which the file never shows and so can never
+    // stop declaring, is untouched. A format that does not carry mirrors at all (`document`)
+    // declares nothing by omission, so it removes nothing.
+    if serializer.carries_mirrors() {
+        let ids: Vec<ItemId> = declared_mirrors.keys().copied().collect();
+        for (id, mns, _) in mirror_rows_for(conn, &ids, &file_ns_path)? {
+            if !declared_mirrors.get(&id).is_some_and(|d| d.contains(&mns)) {
+                placement::unplace(conn, meta, id, mns)?;
+            }
+        }
     }
 
     // Items that vanished from the file are detached (rebound to `managed:`) so they are
@@ -2148,9 +2297,58 @@ fn apply_doc(
     }
 
     // Pass 2 — reconcile edges now that every local_id resolves to an item.
-    reconcile_edges(conn, meta, doc, &resolved)?;
+    let parked = reconcile_edges(conn, meta, doc, &resolved, &existing)?;
+    let mut doc = doc.clone();
+    park_cycle_closing_needs(conn, meta, &mut doc, &resolved, &parked)?;
 
-    Ok(resolved.into_values().collect())
+    Ok(Applied {
+        items: resolved.into_values().collect(),
+        doc,
+    })
+}
+
+/// What [`apply_doc`] recorded: the items the doc maps to, and the doc as the store now holds it.
+struct Applied {
+    items: Vec<ItemId>,
+    /// The doc applied, with each `needs:^id` that would have closed a cycle parked on its task
+    /// rather than an edge. What the caller renders and settles, so the base and the file say
+    /// what the store says and the next pass does not read the parking as a KB edit.
+    doc: SyncDoc,
+}
+
+/// Park each declared `depends_on` that [`reconcile_edges`] could not record because it closes a
+/// cycle: drop it from `doc`'s edges and put its `^id` on its task's parked needs, ahead of the
+/// needs the parse parked (an edge's `needs:` renders before them), in the store and in `doc`.
+fn park_cycle_closing_needs(
+    conn: &Connection,
+    meta: &WriteMeta,
+    doc: &mut SyncDoc,
+    resolved: &HashMap<String, ItemId>,
+    parked: &[(String, String)],
+) -> Result<()> {
+    if parked.is_empty() {
+        return Ok(());
+    }
+    doc.edges.retain(|e| {
+        e.edge_type != EdgeType::DependsOn
+            || !parked.iter().any(|(s, d)| *s == e.src && *d == e.dst)
+    });
+    for item in &mut doc.items {
+        let mut needs: Vec<String> = parked
+            .iter()
+            .filter(|(s, _)| *s == item.local_id)
+            .map(|(_, d)| d.clone())
+            .collect();
+        if needs.is_empty() {
+            continue;
+        }
+        needs.append(&mut item.unresolved_needs);
+        item.unresolved_needs = needs;
+        if let Some(&id) = resolved.get(&item.local_id) {
+            item::set_unresolved_needs(conn, meta, id, &item.unresolved_needs)?;
+        }
+    }
+    Ok(())
 }
 
 /// A file's document **structure** — block order and section headers — as the JSON stored on its
@@ -2372,48 +2570,188 @@ fn set_task_columns(conn: &Connection, meta: &WriteMeta, id: ItemId, it: &SyncIt
     if it.due != due {
         task::set_due(conn, meta, id, it.due.as_deref())?;
     }
+    // Writes nothing when unchanged. Stored with the task's columns because it is read back with
+    // them (`assemble_kb_doc`), so the KB render carries the `needs:^id` the file does.
+    item::set_unresolved_needs(conn, meta, id, &it.unresolved_needs)?;
     Ok(())
 }
 
-/// Reconcile `parent_of` and `depends_on` edges to exactly what `doc` declares.
+/// Reconcile the `parent_of` and `depends_on` edges this file owns, and its tasks' containment
+/// rows, to exactly what `doc` declares. Returns each declared `depends_on` that was NOT recorded
+/// because it would close a cycle, as `(dependent, dependency)` local ids, for [`apply_doc`] to
+/// park.
+///
+/// **The file owns an edge between two of its tasks** — tasks in `doc`, or bound to the file until
+/// this import (`existing`, a line just removed) — as [`FileEdges::owns`] decides per type. Those
+/// are the edges a line can express or has just stopped expressing. An edge to a task that was
+/// never in the file (a `jkb task depend` from a filed task to a task in no file, or in another
+/// file) is left alone: this used to reset each filed task's outgoing edges to the in-file ones, so
+/// the next import of the file silently dropped every such dependency and put the task back on the
+/// frontier.
+///
+/// A removed task is cancelled and detached and keeps its edges and history (D25), so a
+/// `depends_on` FROM it is never touched: reopened, it still waits on what it waited on. The one
+/// exception is a `parent_of` from a removed parent to a task still in the file, which goes with
+/// its containment row — left in place, it kept the open child inside a cancelled parent that
+/// every listing hides, so the child was reachable nowhere.
+///
+/// An edge the file does not own can close a cycle with one it declares: `^ghost` depends, through
+/// a task outside the file, on `^fix`, and the file says `^fix needs:^ghost`. `edge::link` refuses
+/// that, and refusing it here failed the file on every pass with nothing in the file to edit away.
+/// The need is kept parked instead, as [`resolve_parked_needs`] keeps one it cannot resolve, and
+/// the pass after the import warns about it from there.
 fn reconcile_edges(
     conn: &Connection,
     meta: &WriteMeta,
     doc: &SyncDoc,
     resolved: &HashMap<String, ItemId>,
-) -> Result<()> {
-    let srcs: Vec<ItemId> = resolved.values().copied().collect();
+    existing: &HashMap<String, ItemId>,
+) -> Result<Vec<(String, String)>> {
+    // The file's items in file order, so which of two cycle-closing needs is parked does not
+    // depend on a hash map's order.
+    let ids: Vec<ItemId> = doc
+        .items
+        .iter()
+        .filter_map(|i| resolved.get(&i.local_id).copied())
+        .collect();
+    let in_doc: HashSet<ItemId> = ids.iter().copied().collect();
+    let removed = existing
+        .values()
+        .copied()
+        .filter(|id| !in_doc.contains(id))
+        .collect();
+    let file = FileEdges { in_doc, removed };
+    // Sources: the doc's tasks, then the removed ones, whose edges INTO the doc are owned.
+    let mut srcs = ids.clone();
+    srcs.extend(file.removed.iter().copied());
+    let local: HashMap<ItemId, &str> = resolved.iter().map(|(l, &id)| (id, l.as_str())).collect();
+    let mut parked = Vec::new();
     for kind in [EdgeType::ParentOf, EdgeType::DependsOn] {
-        // desired src -> set(dst) from the doc, mapped to item ids.
-        let mut desired: HashMap<ItemId, HashSet<ItemId>> = HashMap::new();
+        let mut want: HashSet<(ItemId, ItemId)> = HashSet::new();
+        let mut adds = Vec::new();
         for e in doc.edges.iter().filter(|e| e.edge_type == kind) {
             if let (Some(&s), Some(&d)) = (resolved.get(&e.src), resolved.get(&e.dst)) {
-                if s != d {
-                    desired.entry(s).or_default().insert(d);
+                if s != d && want.insert((s, d)) {
+                    adds.push((s, d));
                 }
             }
         }
-        // Current edges for all sources in one query, indexed by source.
-        let mut current = edge::edges_from_many(conn, &srcs, kind)?;
-        let mut adds = Vec::new();
-        for &src in &srcs {
-            let want = desired.get(&src).cloned().unwrap_or_default();
-            let have: HashSet<ItemId> = current
-                .remove(&src)
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            for &dst in have.difference(&want) {
-                edge::unlink(conn, meta, src, dst, kind)?;
+        let mut gone: Vec<(ItemId, ItemId)> = Vec::new();
+        let mut have: HashSet<(ItemId, ItemId)> = HashSet::new();
+        for (src, dsts) in edge::edges_from_many(conn, &srcs, kind)? {
+            for dst in dsts.into_iter().filter(|&d| file.owns(kind, src, d)) {
+                have.insert((src, dst));
+                if !want.contains(&(src, dst)) {
+                    gone.push((src, dst));
+                }
             }
-            adds.extend(want.difference(&have).map(|&dst| (src, dst)));
+        }
+        gone.sort_unstable();
+        for (src, dst) in gone {
+            edge::unlink(conn, meta, src, dst, kind)?;
         }
         // Every removal before any addition: `edge::link` refuses an edge that closes a cycle
         // with the edges present, so a file that swaps a parent and its child (or reverses a
         // dependency) would be refused against the old edge it is about to drop.
         for (src, dst) in adds {
+            if have.contains(&(src, dst)) {
+                continue;
+            }
+            // A `parent_of` cycle cannot come from edges the file does not own (a filed parent
+            // takes no child from outside its file, `task::add_subtask`), so only a need parks.
+            if kind == EdgeType::DependsOn && edge::closes_cycle(conn, src, dst, kind)? {
+                parked.push((local[&src].to_owned(), local[&dst].to_owned()));
+                continue;
+            }
             edge::link(conn, meta, src, dst, kind, None)?;
         }
+    }
+    reconcile_containment(conn, meta, doc, resolved, &ids, &file)?;
+    Ok(parked)
+}
+
+/// Which edges, and containment rows, an import owns: see [`reconcile_edges`].
+struct FileEdges {
+    /// The tasks `doc` holds.
+    in_doc: HashSet<ItemId>,
+    /// The tasks bound to the file until this import, whose lines are gone.
+    removed: HashSet<ItemId>,
+}
+
+impl FileEdges {
+    /// Whether the `kind` edge `src -> dst` is the file's. Both ends must be its tasks; then
+    /// a `depends_on` is owned only from a task still in the file, and a `parent_of` (and the
+    /// containment row of `dst` in `src`, which stands beside it) whenever either end still is.
+    /// No other type is reconciled by a file.
+    fn owns(&self, kind: EdgeType, src: ItemId, dst: ItemId) -> bool {
+        let mine = |id: ItemId| self.in_doc.contains(&id) || self.removed.contains(&id);
+        if !(mine(src) && mine(dst)) {
+            return false;
+        }
+        match kind {
+            EdgeType::DependsOn => self.in_doc.contains(&src),
+            EdgeType::ParentOf => self.in_doc.contains(&src) || self.in_doc.contains(&dst),
+            _ => false,
+        }
+    }
+}
+
+/// Set each of the file's tasks' container to the parent its indentation declares, at its position
+/// among that parent's children in the file.
+///
+/// The frontier holds a parent back by its CONTAINMENT row (`SUBTASK_CLAUSE`), not by its
+/// `parent_of` edge, so writing only the edge left every parent in a tasks file pickable beside
+/// its own open subtasks, and a re-indent left the old container in place. The rows are derived
+/// from the same declared edges [`reconcile_edges`] just wrote, in the same transaction, and
+/// journalled, so `jkb undo` takes both back together.
+///
+/// Owned exactly as the `parent_of` edge it stands beside ([`FileEdges::owns`]), so a row the
+/// file no longer declares goes with its edge — including one whose container's line was just
+/// removed, which otherwise left an open subtask listed only under a cancelled parent that every
+/// listing hides. A container outside the file is left alone unless the file now declares a parent
+/// for that task, since a task has one container; then [`task::set_container`] replaces it and
+/// unlinks its `parent_of` edge too, the one outside edge an import removes (the file declared a
+/// different parent, so the edge contradicts it), which [`FileEdges::owns`] does not otherwise own.
+fn reconcile_containment(
+    conn: &Connection,
+    meta: &WriteMeta,
+    doc: &SyncDoc,
+    resolved: &HashMap<String, ItemId>,
+    ids: &[ItemId],
+    file: &FileEdges,
+) -> Result<()> {
+    let order: HashMap<ItemId, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let mut declared: HashMap<ItemId, ItemId> = HashMap::new();
+    for e in doc
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::ParentOf)
+    {
+        if let (Some(&p), Some(&c)) = (resolved.get(&e.src), resolved.get(&e.dst)) {
+            if p != c {
+                declared.entry(c).or_insert(p);
+            }
+        }
+    }
+    // Every row that is about to change goes first, so `containment::contain`'s cycle guard never
+    // meets a row this pass is replacing (a parent and child swapped by a re-indent).
+    let mut children: Vec<ItemId> = file.in_doc.union(&file.removed).copied().collect();
+    children.sort_unstable();
+    for child in children {
+        if let Some(cur) = containment::parent(conn, child)? {
+            if file.owns(EdgeType::ParentOf, cur, child) && declared.get(&child) != Some(&cur) {
+                containment::uncontain(conn, meta, child)?;
+            }
+        }
+    }
+    let mut children: Vec<(ItemId, ItemId)> = declared.into_iter().collect();
+    children.sort_unstable_by_key(|&(c, _)| order.get(&c).copied());
+    let mut next_position: HashMap<ItemId, i64> = HashMap::new();
+    for (child, parent) in children {
+        let position = next_position.entry(parent).or_insert(0);
+        // A container outside the file is replaced here, with the `parent_of` edge beside it.
+        task::set_container(conn, meta, child, parent, *position)?;
+        *position += 1;
     }
     Ok(())
 }
@@ -2432,6 +2770,47 @@ fn assemble_kb_doc(
     bare_uri: &str,
     journal: Option<&sync_state::SyncState>,
 ) -> Result<SyncDoc> {
+    Ok(assemble_kb_doc_parts(conn, ctx, path, bare_uri, journal)?.0)
+}
+
+/// What [`resolve_parked_needs`] concluded about a doc's parked needs.
+#[derive(Default)]
+struct Resolution {
+    /// What the store must record to agree with the doc.
+    heals: Vec<ResolvedNeeds>,
+    /// One per need left parked because its dependency would close a cycle.
+    warnings: Vec<String>,
+}
+
+/// A task in the assembled doc whose parked `needs:^id`s ([`item::UNRESOLVED_NEEDS`]) name tasks
+/// its file now defines: the dependencies to record and the parked ids that stay parked.
+struct ResolvedNeeds {
+    /// The task holding the parked needs.
+    item: ItemId,
+    /// The tasks it depends on that the store has no `depends_on` edge to yet.
+    link: Vec<ItemId>,
+    /// Its parked needs that still name no task in the file, in order.
+    still_parked: Vec<String>,
+}
+
+/// [`assemble_kb_doc`], plus the parked needs it resolved, for [`record_resolved_needs`].
+///
+/// A parked `needs:^id` waits for its file to define the id, and a file can come to define it
+/// without the line ever being read again: the task is moved into another tasks.md that has the id
+/// (`jkb task place … --home`, `jkb task bind … --sync`), or the id's task is bound into this file.
+/// The disk parse resolves it only on a disk edit, so until then the file read `needs:^ghost`
+/// beside `- [ ] Ghost ^ghost` while the store had no edge, `jkb task next` offered the task as
+/// ready, and the sync reported the file up to date. So the rule lives HERE, in the one place a
+/// tasks file's KB side is put together: every read of it (the reconcile, the watcher's judgement,
+/// the line check after a task write) sees the dependency, and the reconcile's write transaction
+/// records it.
+fn assemble_kb_doc_parts(
+    conn: &Connection,
+    ctx: &Ctx,
+    path: &Path,
+    bare_uri: &str,
+    journal: Option<&sync_state::SyncState>,
+) -> Result<(SyncDoc, Resolution)> {
     let file_ns_path = namespace_for(ctx, path);
     let mut doc = SyncDoc::default();
 
@@ -2467,6 +2846,8 @@ fn assemble_kb_doc(
     let deps = edge::edges_from_many(conn, &ids, EdgeType::DependsOn)?;
     let mut item_rows = item_rows_for(conn, &ids)?;
     let placements = primary_placements_for(conn, &ids)?;
+    // The local ids of the items this doc holds, which are the ids its parked needs can name.
+    let mut in_doc: HashMap<String, ItemId> = HashMap::new();
 
     for (local_id, id) in &resolved {
         // Skip items with no row or no primary placement (mirrors the old `load_item`).
@@ -2474,6 +2855,10 @@ fn assemble_kb_doc(
             continue;
         };
         let mut item = build_sync_item(local_id, &file_ns_path, row, placement);
+        if item.kind == "task" {
+            item.unresolved_needs = item::unresolved_needs(conn, *id)?;
+        }
+        in_doc.insert(local_id.clone(), *id);
         item.tags = tags.remove(id).unwrap_or_default();
         item.mirrors = mirrors.remove(id).unwrap_or_default();
         doc.items.push(item);
@@ -2501,7 +2886,122 @@ fn assemble_kb_doc(
     // subsequent disk edit came back as a conflict. Re-homing a file-backed item therefore
     // does not move it between sections in its file; editing the file does.
     apply_layout_sections(&mut doc);
-    Ok(doc)
+    let resolution = resolve_parked_needs(conn, &mut doc, &in_doc)?;
+    Ok((doc, resolution))
+}
+
+/// Turn each parked need in `doc` that names an item of the doc (`in_doc`) into a `depends_on` edge
+/// of the doc, returning what the store must record to agree. Read-only: it decides, and
+/// [`record_resolved_needs`] writes.
+///
+/// A need stays parked, and the line keeps it as it reads, when the dependency is not one the store
+/// can hold: one naming its own task, and one that would close a `depends_on` cycle with the edges
+/// the store has PLUS the ones this pass has already resolved (a task moved beside the task its
+/// parked need names can find that task's own parked need naming it back). That one is warned
+/// about, by `^id`. Resolving it anyway made `edge::link` refuse inside the reconcile, so the file
+/// failed on every pass with nothing to edit away, because the need lives in the store, not in a
+/// line the file still had to read. Needs resolve in the doc's item order (by binding uri, so by
+/// local id), so the same need is chosen each pass.
+fn resolve_parked_needs(
+    conn: &Connection,
+    doc: &mut SyncDoc,
+    in_doc: &HashMap<String, ItemId>,
+) -> Result<Resolution> {
+    let mut out = Resolution::default();
+    let mut new_edges: Vec<SyncEdge> = Vec::new();
+    // The edges this pass has resolved, by item, for the cycle check.
+    let mut pending: HashMap<ItemId, Vec<ItemId>> = HashMap::new();
+    for item in &mut doc.items {
+        if item.unresolved_needs.is_empty() {
+            continue;
+        }
+        let Some(&src) = in_doc.get(&item.local_id) else {
+            continue;
+        };
+        let mut link = Vec::new();
+        let mut still = Vec::new();
+        let mut resolved_any = false;
+        for dep in std::mem::take(&mut item.unresolved_needs) {
+            let Some(&dst) = in_doc.get(&dep).filter(|_| dep != item.local_id) else {
+                still.push(dep);
+                continue;
+            };
+            let has = |e: &SyncEdge| {
+                e.edge_type == EdgeType::DependsOn && e.src == item.local_id && e.dst == dep
+            };
+            if doc.edges.iter().any(has) || new_edges.iter().any(has) {
+                resolved_any = true;
+                continue;
+            }
+            if reaches(conn, &pending, dst, src)? {
+                out.warnings.push(format!(
+                    "task `^{}`: `needs:^{dep}` would close a dependency cycle, so no dependency \
+                     was recorded; the line keeps it until the cycle is broken",
+                    item.local_id
+                ));
+                still.push(dep);
+                continue;
+            }
+            resolved_any = true;
+            pending.entry(src).or_default().push(dst);
+            link.push(dst);
+            new_edges.push(SyncEdge {
+                src: item.local_id.clone(),
+                dst: dep,
+                edge_type: EdgeType::DependsOn,
+            });
+        }
+        item.unresolved_needs.clone_from(&still);
+        if resolved_any {
+            out.heals.push(ResolvedNeeds {
+                item: src,
+                link,
+                still_parked: still,
+            });
+        }
+    }
+    doc.edges.extend(new_edges);
+    Ok(out)
+}
+
+/// Whether `to` can be reached from `from` along `depends_on` edges: the store's, plus `pending`.
+fn reaches(
+    conn: &Connection,
+    pending: &HashMap<ItemId, Vec<ItemId>>,
+    from: ItemId,
+    to: ItemId,
+) -> Result<bool> {
+    let mut seen = HashSet::from([from]);
+    let mut stack = vec![from];
+    while let Some(at) = stack.pop() {
+        if at == to {
+            return Ok(true);
+        }
+        let mut next = edge::edges_from(conn, at, EdgeType::DependsOn)?;
+        next.extend(pending.get(&at).into_iter().flatten().copied());
+        stack.extend(next.into_iter().filter(|n| seen.insert(*n)));
+    }
+    Ok(false)
+}
+
+/// Record what [`assemble_kb_doc_parts`] resolved: each new `depends_on` edge, and the parked needs
+/// that are left. Inside the file's reconcile transaction, so it commits with the pass that renders
+/// the dependency, and both writes are changelogged (and undone) like any other. Cannot close a
+/// cycle: [`resolve_parked_needs`] left any such need parked. Recorded before the direction is
+/// chosen, and harmless to an import, which then sets the task's edges and parked needs to exactly
+/// what the disk line says, so a need the disk has since dropped is not brought back.
+fn record_resolved_needs(
+    conn: &Connection,
+    meta: &WriteMeta,
+    heals: &[ResolvedNeeds],
+) -> Result<()> {
+    for heal in heals {
+        for &dst in &heal.link {
+            edge::link(conn, meta, heal.item, dst, EdgeType::DependsOn, None)?;
+        }
+        item::set_unresolved_needs(conn, meta, heal.item, &heal.still_parked)?;
+    }
+    Ok(())
 }
 
 /// Set each item's `section` from its position in the layout (the nearest preceding section
@@ -2634,39 +3134,55 @@ fn mirror_paths_for(
     file_ns_path: &str,
 ) -> Result<HashMap<ItemId, Vec<String>>> {
     let mut out: HashMap<ItemId, Vec<String>> = HashMap::new();
-    if ids.is_empty() {
-        return Ok(out);
+    for (id, _, path) in mirror_rows_for(conn, ids, file_ns_path)? {
+        out.entry(id).or_default().push(path);
     }
-    // Escape LIKE metacharacters in the path (namespace paths contain `_`), so the subtree
-    // exclusion is literal and doesn't spuriously match a sibling namespace.
-    let subtree_like = format!("{}/%", jkb_core::sql::like_escape(file_ns_path));
+    Ok(out)
+}
+
+/// The mirror placements a file renders for the given items: `(item, namespace, path)` for
+/// each reference placement outside the file's own namespace subtree and outside `tasks/**`,
+/// ordered by item then path. The **one** definition of "the mirrors this file shows", read
+/// by the render ([`mirror_paths_for`]) and by the import that removes the ones a file stopped
+/// declaring ([`apply_doc`]) — two copies of the filter would let the import remove a
+/// placement the file never showed.
+fn mirror_rows_for(
+    conn: &Connection,
+    ids: &[ItemId],
+    file_ns_path: &str,
+) -> Result<Vec<(ItemId, NamespaceId, String)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let placeholders = vec!["?"; ids.len()].join(", ");
     // `tasks/**` reference placements are the internal task index (auto-mirrored by
     // `task::ensure_task_mirror`), not user-authored `+ns` mirrors — never serialize
     // them back into the file, or they'd leak in as `+tasks/…` and break byte-stability.
     let sql = format!(
-        "SELECT p.item_id, n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-         WHERE p.role = 'reference' AND n.path != ? AND n.path NOT LIKE ? ESCAPE '\\'
-           AND n.path != 'tasks' AND n.path NOT LIKE 'tasks/%'
+        "SELECT p.item_id, n.id, n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+         WHERE p.role = 'reference' AND n.path != ? AND n.path NOT GLOB ?
+           AND n.path != 'tasks' AND n.path NOT GLOB 'tasks/*'
            AND p.item_id IN ({placeholders})
-         ORDER BY p.item_id, n.path"
+         ORDER BY p.item_id, n.path",
     );
     let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
     params.push(rusqlite::types::Value::Text(file_ns_path.to_owned()));
-    params.push(rusqlite::types::Value::Text(subtree_like));
+    params.push(rusqlite::types::Value::Text(jkb_core::sql::subtree_glob(
+        file_ns_path,
+    )));
     params.extend(
         ids.iter()
             .map(|id| rusqlite::types::Value::Integer(id.get())),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
-        Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?))
+        Ok((
+            ItemId::new(r.get::<_, i64>(0)?),
+            NamespaceId::new(r.get::<_, i64>(1)?),
+            r.get::<_, String>(2)?,
+        ))
     })?;
-    for row in rows {
-        let (id, path) = row?;
-        out.entry(id).or_default().push(path);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -2690,29 +3206,68 @@ struct Sig {
     priority: Option<i64>,
     due: Option<String>,
     section: Option<String>,
-    /// The item's parent `local_id` (its `parent_of` incoming edge). Part of the
-    /// signature so a re-parenting/indentation change on either side is detected —
-    /// without it a nesting edit has an identical `Sig` and is silently reverted.
-    parent: Option<String>,
     tags: Vec<(String, String)>,
     mirrors: Vec<String>,
-    deps: Vec<String>,
+    /// Every edge this item OWNS ([`edge_owner`]), as `(type, the other end)`, sorted — its
+    /// `depends_on` targets and its parent (its incoming `parent_of`) among them. Part of the
+    /// signature so an edge edit on either side is detected: without its parent here a nesting
+    /// edit had an identical `Sig` and was silently reverted.
+    edges: Vec<(&'static str, String)>,
+    /// Its parked `needs:^id`s ([`SyncItem::unresolved_needs`]), in order: a dependency the line
+    /// declares as much as an edge is, so a disk or KB edit to one is a change to this item.
+    unresolved_needs: Vec<String>,
+}
+
+/// The item that OWNS an edge in a three-way merge, and the edge's other end.
+///
+/// The owner is the item whose line expresses the edge, so the edge is taken from whichever side
+/// changed that item and is part of that item's [`Sig`]. Exhaustive on purpose: the previous
+/// spelling special-cased `parent_of` and sent every other type to `src` through a wildcard, and
+/// its signature listed only `depends_on` and `parent_of` — so a new edge type would have been
+/// owned by a guess and invisible to change detection, the merge loss `parent_of` once had. A
+/// new variant does not compile until its owner is decided here.
+fn edge_owner(e: &SyncEdge) -> (&str, &str) {
+    match e.edge_type {
+        // The child's indentation declares its parent.
+        EdgeType::ParentOf => (&e.dst, &e.src),
+        // A dependent's `needs:` declares what it depends on, and every other type reads as a
+        // statement its source makes about the destination ("derived from", "supports",
+        // "fixes", …), so it is the source's line that would carry it.
+        EdgeType::DependsOn
+        | EdgeType::DerivedFrom
+        | EdgeType::References
+        | EdgeType::Supports
+        | EdgeType::Contradicts
+        | EdgeType::Refutes
+        | EdgeType::Supersedes
+        | EdgeType::RulesOut
+        | EdgeType::Narrows
+        | EdgeType::Constrains
+        | EdgeType::Confirms
+        | EdgeType::Answers
+        | EdgeType::Spawns
+        | EdgeType::DiscoveredFrom
+        | EdgeType::MemberOf
+        | EdgeType::Tests
+        | EdgeType::Verifies
+        | EdgeType::Fixes
+        | EdgeType::ReducesTo
+        | EdgeType::EquivalentInStrengthTo
+        | EdgeType::ExplainsFailure
+        | EdgeType::Informs
+        | EdgeType::Stages => (&e.src, &e.dst),
+    }
 }
 
 /// Signatures of every item in `doc`, keyed by `local_id`.
 fn sigs(doc: &SyncDoc) -> HashMap<String, Sig> {
-    let mut deps: HashMap<&str, Vec<String>> = HashMap::new();
-    // `parent_of` edges run parent(src) -> child(dst); key the child's parent by dst so
-    // a re-parenting shows up in the child's signature (the edge's authoritative form).
-    let mut parent_of: HashMap<&str, String> = HashMap::new();
+    let mut by_owner: HashMap<&str, Vec<(&'static str, String)>> = HashMap::new();
     for e in &doc.edges {
-        match e.edge_type {
-            EdgeType::DependsOn => deps.entry(&e.src).or_default().push(e.dst.clone()),
-            EdgeType::ParentOf => {
-                parent_of.insert(&e.dst, e.src.clone());
-            }
-            _ => {}
-        }
+        let (owner, other) = edge_owner(e);
+        by_owner
+            .entry(owner)
+            .or_default()
+            .push((e.edge_type.as_str(), other.to_owned()));
     }
     doc.items
         .iter()
@@ -2721,8 +3276,8 @@ fn sigs(doc: &SyncDoc) -> HashMap<String, Sig> {
             tags.sort();
             let mut mirrors = i.mirrors.clone();
             mirrors.sort();
-            let mut d = deps.get(i.local_id.as_str()).cloned().unwrap_or_default();
-            d.sort();
+            let mut edges = by_owner.remove(i.local_id.as_str()).unwrap_or_default();
+            edges.sort();
             (
                 i.local_id.clone(),
                 Sig {
@@ -2731,10 +3286,10 @@ fn sigs(doc: &SyncDoc) -> HashMap<String, Sig> {
                     priority: i.priority,
                     due: i.due.clone(),
                     section: i.section.clone(),
-                    parent: parent_of.get(i.local_id.as_str()).cloned(),
                     tags,
                     mirrors,
-                    deps: d,
+                    edges,
+                    unresolved_needs: i.unresolved_needs.clone(),
                 },
             )
         })
@@ -2801,18 +3356,13 @@ fn three_way(base: &SyncDoc, disk: &SyncDoc, kb: &SyncDoc) -> ThreeWay {
         }
     }
 
-    // Emit each edge from its *owner's* chosen side, so a per-item edit picks up its own
-    // edges: `depends_on` is owned by its `src` (the dependent), `parent_of` by its `dst`
-    // (the child — its indentation). Taking every edge by `src` alone drops a re-parented
-    // child's incoming edge when only the child changed (its parent item stays on `base`).
+    // Emit each edge from its *owner's* chosen side ([`edge_owner`]), so a per-item edit picks
+    // up its own edges. Taking every edge by `src` alone drops a re-parented child's incoming
+    // edge when only the child changed (its parent item stays on `base`).
     for id in &ids {
         let side = chosen_side(id);
         for e in &side.edges {
-            let owner = match e.edge_type {
-                EdgeType::ParentOf => &e.dst,
-                _ => &e.src,
-            };
-            if owner == id {
+            if edge_owner(e).0 == id {
                 merged.edges.push(e.clone());
             }
         }
@@ -2847,13 +3397,21 @@ fn load_base_doc(
     journal: Option<&sync_state::SyncState>,
     serializer: &dyn SyncSerializer,
 ) -> Result<Option<SyncDoc>> {
-    let Some(hash) = journal.and_then(|j| j.base_blob_hash.as_deref()) else {
-        return Ok(None);
-    };
-    match blob::load(conn, hash)? {
+    match load_base_bytes(conn, journal)? {
         Some(bytes) => Ok(Some(serializer.parse(&bytes)?)),
         None => Ok(None),
     }
+}
+
+/// The bytes of the file's last-synced base, if its blob is stored.
+fn load_base_bytes(
+    conn: &Connection,
+    journal: Option<&sync_state::SyncState>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(hash) = journal.and_then(|j| j.base_blob_hash.as_deref()) else {
+        return Ok(None);
+    };
+    Ok(blob::load(conn, hash)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -3019,5 +3577,160 @@ fn sync_mode_of(s: &str) -> SyncMode {
         "import" => SyncMode::Import,
         "export" => SyncMode::Export,
         _ => SyncMode::Bidirectional,
+    }
+}
+
+#[cfg(test)]
+mod edge_ownership {
+    use super::{three_way, SyncDoc, SyncEdge, SyncItem, ThreeWay};
+    use jkb_types::EdgeType;
+
+    fn doc(items: &[(&str, &str)], edges: &[(&str, &str, EdgeType)]) -> SyncDoc {
+        SyncDoc {
+            items: items
+                .iter()
+                .map(|(id, text)| SyncItem::new(*id, "task", *text))
+                .collect(),
+            edges: edges
+                .iter()
+                .map(|(src, dst, edge_type)| SyncEdge {
+                    src: (*src).to_owned(),
+                    dst: (*dst).to_owned(),
+                    edge_type: *edge_type,
+                })
+                .collect(),
+            ..SyncDoc::default()
+        }
+    }
+
+    /// An edge of a type beyond `depends_on`/`parent_of`, added on one side, survives a merge
+    /// with a disjoint edit on the other.
+    ///
+    /// The owner match sent every other type to `src` by a wildcard and the signature listed only
+    /// `depends_on` and `parent_of`, so the edge's owner looked unchanged on both sides, was taken
+    /// from `base`, and the new edge was dropped without a conflict.
+    #[test]
+    fn an_edge_of_any_type_added_on_one_side_survives_a_disjoint_merge() {
+        let items = [("a", "alpha"), ("b", "beta")];
+        let base = doc(&items, &[]);
+        let disk = doc(&items, &[("a", "b", EdgeType::References)]);
+        let kb = doc(&[("a", "alpha"), ("b", "beta, edited")], &[]);
+
+        let ThreeWay::Merged(merged) = three_way(&base, &disk, &kb) else {
+            panic!("disjoint edits must merge");
+        };
+        assert!(
+            merged
+                .edges
+                .iter()
+                .any(|e| e.src == "a" && e.dst == "b" && e.edge_type == EdgeType::References),
+            "the disk side's new edge must survive: {:?}",
+            merged.edges
+        );
+        assert!(
+            merged.items.iter().any(|i| i.content == "beta, edited"),
+            "and the KB side's edit too"
+        );
+    }
+
+    /// The same edge type edited differently on both sides is a conflict, not a silent pick.
+    #[test]
+    fn an_edge_edited_on_both_sides_conflicts() {
+        let items = [("a", "alpha"), ("b", "beta"), ("c", "gamma")];
+        let base = doc(&items, &[]);
+        let disk = doc(&items, &[("a", "b", EdgeType::Supports)]);
+        let kb = doc(&items, &[("a", "c", EdgeType::Supports)]);
+        assert!(matches!(three_way(&base, &disk, &kb), ThreeWay::Conflict));
+    }
+}
+
+#[cfg(test)]
+mod archive_skip {
+    use super::archive_probe::ARCHIVE_WRITES;
+    use super::sync;
+    use jkb_core::{blob, ns, Db};
+    use jkb_types::{ConflictPolicy, SyncMode};
+
+    fn archive_writes() -> usize {
+        ARCHIVE_WRITES.with(std::cell::Cell::get)
+    }
+
+    fn archived(db: &Db, bytes: &[u8]) -> bool {
+        let hash = blob::hash_bytes(bytes);
+        db.read(move |conn| blob::load(conn, &hash))
+            .unwrap()
+            .is_some()
+    }
+
+    /// A pass over a settled file opens no archive write, and every byte a pass overwrites is
+    /// still archived first — whether the skip applied (only the KB changed) or not (disk did).
+    #[test]
+    fn a_settled_file_costs_no_archive_write_and_overwrites_stay_archived() {
+        let dir =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let path = dir.path().join("tasks.md");
+        std::fs::write(&path, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let backing = format!("file://{}", dir.path().to_string_lossy());
+        db.write_txn("t", move |conn, meta| {
+            let ns_id = ns::ensure(conn, meta, "docs/plan")?;
+            jkb_core::mount::create(
+                conn,
+                meta,
+                ns_id,
+                &backing,
+                SyncMode::Bidirectional,
+                "tasks",
+                Some("**/*.md"),
+                None,
+                ConflictPolicy::KbWins,
+            )
+        })
+        .unwrap();
+        sync(&db, "docs/plan").unwrap();
+        // The first pass may normalize the file; settle whatever it wrote.
+        sync(&db, "docs/plan").unwrap();
+
+        // Unchanged on both sides: no archive write at all.
+        let before = archive_writes();
+        sync(&db, "docs/plan").unwrap();
+        assert_eq!(
+            archive_writes(),
+            before,
+            "a settled pass must not open an archive write"
+        );
+
+        // Only the KB changed: the export overwrites bytes the skip found already archived.
+        let settled = std::fs::read(&path).unwrap();
+        db.write_txn("t", |conn, _m| {
+            conn.execute("UPDATE items SET status = 'done' WHERE kind = 'task'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let before = archive_writes();
+        sync(&db, "docs/plan").unwrap();
+        assert_eq!(
+            archive_writes(),
+            before,
+            "the disk bytes were the archived base"
+        );
+        assert_ne!(
+            std::fs::read(&path).unwrap(),
+            settled,
+            "the export overwrote the file"
+        );
+        assert!(
+            archived(&db, &settled),
+            "the overwritten bytes are in the archive"
+        );
+
+        // Disk changed: bytes the archive has never seen are stored before anything else.
+        let edited =
+            String::from_utf8(std::fs::read(&path).unwrap()).unwrap() + "- [ ] and another !p2\n";
+        std::fs::write(&path, &edited).unwrap();
+        let before = archive_writes();
+        sync(&db, "docs/plan").unwrap();
+        assert_eq!(archive_writes(), before + 1, "new bytes must be archived");
+        assert!(archived(&db, edited.as_bytes()));
     }
 }

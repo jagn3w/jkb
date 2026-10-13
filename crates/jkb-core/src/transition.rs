@@ -282,13 +282,17 @@ pub fn history(conn: &Connection, task: ItemId) -> Result<Vec<TransitionRow>> {
 /// last recorded as being on. A branch name that has since changed hands cannot make an older
 /// row describe newer work, because nothing is keyed by it.
 ///
+/// A [`no_pull_request`] row is **not** one: its `branch` label names the branch a question was
+/// asked about, not where the work is, and letting it answer here would let an answer about an old
+/// branch — or any branch a caller names — become the task's branch.
+///
 /// # Errors
 /// Returns a database error if the query fails.
 pub fn latest_with_branch(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> {
     Ok(history(conn, task)?
         .into_iter()
         .rev()
-        .find(|r| r.labels.branch.is_some()))
+        .find(|r| r.labels.branch.is_some() && r.event != NO_PULL_REQUEST))
 }
 
 /// The branch this task's work lands on, as most recently recorded.
@@ -460,6 +464,7 @@ pub struct Landing {
     recorded: Option<TransitionRow>,
     resumed: Option<TransitionRow>,
     pr_number: Option<i64>,
+    pr_absent: Option<TransitionRow>,
 }
 
 impl Landing {
@@ -487,11 +492,13 @@ impl Landing {
         }
     }
 
-    /// The landing **whenever it happened**, spent or not.
+    /// The **latest** recorded landing, spent or not — an earlier one is not kept.
     ///
-    /// For the historical question — *did jkb ever graft this work onto that branch?* — which is
-    /// what `jkb task review record` asks: a graft does not un-happen, and the reviewer read what
-    /// is in the branch whatever the task did afterwards.
+    /// For the historical question — *did jkb graft this work onto that branch?* — which is what
+    /// `jkb task review record` asks: a graft does not un-happen, and the reviewer read what is in
+    /// the branch whatever the task did afterwards. It answers that **only for the latest
+    /// landing**: a task that landed on one branch and was then re-landed on another shows only the
+    /// second, so the first graft is not seen here.
     #[must_use]
     pub fn recorded(&self) -> Option<&TransitionRow> {
         self.recorded.as_ref()
@@ -507,6 +514,14 @@ impl Landing {
     #[must_use]
     pub fn pr_number(&self) -> Option<i64> {
         self.pr_number
+    }
+
+    /// The latest [`no_pull_request`] answer, if one was recorded: its `branch` label is the branch
+    /// asked about, its `ref_commit` the remote-tracking tip the question was asked at (`None` when
+    /// the branch had none). Whether it still holds is the client's to judge, against the tip now.
+    #[must_use]
+    pub fn pr_absent(&self) -> Option<&TransitionRow> {
+        self.pr_absent.as_ref()
     }
 }
 
@@ -532,7 +547,47 @@ pub fn landing(conn: &Connection, task: ItemId) -> Result<Landing> {
             .cloned(),
         resumed: resumption(&rows).cloned(),
         pr_number: rows.iter().rev().find_map(|r| r.labels.pr_number),
+        pr_absent: rows
+            .iter()
+            .rev()
+            .find(|r| r.event == NO_PULL_REQUEST)
+            .cloned(),
     })
+}
+
+/// The event name of a [`no_pull_request`] row.
+pub const NO_PULL_REQUEST: &str = "no_pull_request";
+
+/// Record that `gh` was asked for a pull request headed by `branch` and answered **none**, with
+/// the remote-tracking tip of that branch the question was asked at (`None` when there was none).
+///
+/// A negative answer is not proof about the future: a pull request can be opened after it. It is
+/// recorded so that `close-merged`, which the `post-merge` hook runs over every unfinished task on
+/// every `git pull`, does not ask GitHub the same question again while nothing it depends on has
+/// moved. What it depends on is the branch **as GitHub can see it** — a pull request is opened
+/// from a pushed branch, and a push moves (or creates) the remote-tracking ref, while a merge that
+/// deletes the remote branch removes it on the next pruning fetch — so the tip is the key, and a
+/// different tip, or a different branch, is a question not yet asked.
+///
+/// Like [`note`], it changes no state and has no guard; its own event name is what lets
+/// [`Landing::pr_absent`] find it without mistaking a branch being written down for an answer.
+///
+/// # Errors
+/// Returns a database error if the write fails.
+pub fn no_pull_request(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    facts: &TaskFacts,
+    branch: &str,
+    remote_head: Option<&str>,
+) -> Result<()> {
+    let labels = Labels {
+        branch: Some(branch.to_owned()),
+        ref_commit: remote_head.map(str::to_owned),
+        ..Labels::default()
+    };
+    append(conn, meta, task, facts, NO_PULL_REQUEST, &labels)
 }
 
 /// Append a fact to a task's history without moving it.
@@ -571,6 +626,13 @@ pub fn note(
 /// re-ran the verb: `close-merged` then asked GitHub for a pull request that never existed,
 /// because the queue grafts locally. Held for ever, which is the shape D48 exists to end.
 ///
+/// It takes the machine's `outcome` — what [`perform`] returned for these `facts` — rather than an
+/// event, so it can only record an event the machine was asked and refused on a guard. Any other
+/// outcome records nothing and returns `false`: a [`Outcome::Moved`] was recorded by [`perform`]
+/// already, an [`Outcome::Idempotent`] did not happen again, and an [`Outcome::Undefined`] is an
+/// event the machine has no edge for from this state (an abandoned task keeps `branch=`, and must
+/// not be revived by a landing of it).
+///
 /// # Errors
 /// Returns a database error if the insert fails.
 pub fn observed(
@@ -578,11 +640,15 @@ pub fn observed(
     meta: &WriteMeta,
     task: ItemId,
     facts: &TaskFacts,
-    event: TaskEvent,
+    outcome: &TaskOutcome,
     labels: &Labels,
-) -> Result<()> {
+) -> Result<bool> {
     use jkb_fsm::Event as _;
-    append(conn, meta, task, facts, event.name(), labels)
+    let Outcome::Refused { event, .. } = outcome else {
+        return Ok(false);
+    };
+    append(conn, meta, task, facts, event.name(), labels)?;
+    Ok(true)
 }
 
 /// One row, `from_status == to_status`, under whatever name the caller gives the event.
@@ -705,8 +771,11 @@ pub struct Reclaimed {
 
 #[cfg(test)]
 mod tests {
-    use super::{history, perform, reclaim_dead, Labels, Landing, TransitionRow};
-    use crate::lifecycle::{TaskEvent, TaskFacts};
+    use super::{
+        history, landing, latest_with_branch, no_pull_request, note, observed, perform,
+        reclaim_dead, Labels, Landing, TransitionRow,
+    };
+    use crate::lifecycle::{self, TaskEvent, TaskFacts};
     use crate::task::{create, NewTask};
     use crate::Db;
     use jkb_fsm::{Fact, Outcome};
@@ -1043,6 +1112,7 @@ mod tests {
                 recorded,
                 resumed,
                 pr_number: None,
+                pr_absent: None,
             };
             assert_eq!(l.live().is_some(), expect_live, "live");
             assert_eq!(l.superseded().is_some(), expect_spent, "superseded");
@@ -1054,8 +1124,144 @@ mod tests {
                 "live and superseded are not complements over a recorded landing"
             );
             // ...and the historical answer ignores the split entirely, which is what makes it the
-            // right question for "did jkb ever graft this" and the wrong one for "may it land".
+            // right question for "did jkb graft this" (for the latest landing only — an earlier
+            // one is not kept) and the wrong one for "may it land".
             assert_eq!(l.recorded().is_some(), had_landing, "recorded");
         }
+    }
+
+    /// Facts under which the merge queue's landing is refused on a guard: the work landed, the
+    /// task still has an open subtask.
+    fn held_landing() -> TaskFacts {
+        TaskFacts {
+            status: TaskStatus::InProgress,
+            landed_elsewhere: Fact::Yes,
+            open_subtasks: Fact::Yes,
+            ..TaskFacts::default()
+        }
+    }
+
+    fn onto(branch: &str) -> Labels {
+        Labels {
+            onto: Some(branch.to_owned()),
+            ..Labels::default()
+        }
+    }
+
+    /// `observed` records only what the machine refused, under the event the machine was asked —
+    /// never a moved, idempotent or undefined outcome.
+    #[test]
+    fn observed_records_only_a_refused_outcome_under_its_own_event() {
+        let db = db();
+        let id = a_task(&db);
+        let refused = lifecycle::apply(&held_landing(), TaskEvent::ObservedLanded);
+        assert!(matches!(refused, Outcome::Refused { .. }), "{refused:?}");
+        let cancelled = TaskFacts {
+            status: TaskStatus::Cancelled,
+            landed_elsewhere: Fact::Yes,
+            ..TaskFacts::default()
+        };
+        let undefined = lifecycle::apply(&cancelled, TaskEvent::ObservedLanded);
+        assert!(
+            matches!(undefined, Outcome::Undefined { .. }),
+            "{undefined:?}"
+        );
+        let starting = TaskFacts {
+            status: TaskStatus::Open,
+            actor: Some(AgentId::agent("a")),
+            ..TaskFacts::default()
+        };
+        let moved = lifecycle::apply(&starting, TaskEvent::Start);
+        assert!(matches!(moved, Outcome::Moved { .. }), "{moved:?}");
+        let idempotent = Outcome::Idempotent {
+            state: TaskStatus::Done,
+            event: TaskEvent::Land,
+        };
+
+        let written = db
+            .write_txn("test", move |conn, meta| {
+                let mut written = Vec::new();
+                for (facts, outcome) in [
+                    (cancelled, undefined),
+                    (starting, moved),
+                    (held_landing(), idempotent),
+                    (held_landing(), refused),
+                ] {
+                    written.push(observed(conn, meta, id, &facts, &outcome, &onto("main"))?);
+                }
+                Ok(written)
+            })
+            .expect("observed");
+        assert_eq!(written, [false, false, false, true]);
+
+        let rows = db.read(move |conn| history(conn, id)).expect("history");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].event, "observed_landed");
+        assert_eq!(rows[0].from_status.as_deref(), Some("in_progress"));
+        assert_eq!(rows[0].to_status, "in_progress");
+        assert_eq!(rows[0].labels.onto.as_deref(), Some("main"));
+    }
+
+    /// `Landing::recorded` is the **latest** landing in the history, not the first.
+    #[test]
+    fn recorded_is_the_latest_landing() {
+        let db = db();
+        let id = a_task(&db);
+        db.write_txn("test", move |conn, meta| {
+            for branch in ["first", "second"] {
+                let outcome = lifecycle::apply(&held_landing(), TaskEvent::ObservedLanded);
+                assert!(observed(
+                    conn,
+                    meta,
+                    id,
+                    &held_landing(),
+                    &outcome,
+                    &onto(branch)
+                )?);
+            }
+            Ok(())
+        })
+        .expect("observed");
+        let found = db.read(move |conn| landing(conn, id)).expect("landing");
+        let recorded = found.recorded().expect("a landing was recorded");
+        assert_eq!(recorded.labels.onto.as_deref(), Some("second"));
+    }
+
+    /// A *no pull request* answer is never the task's branch: [`latest_with_branch`] passes over it,
+    /// whatever branch it names, while [`Landing::pr_absent`] finds it.
+    #[test]
+    fn a_no_pull_request_answer_is_not_the_task_s_branch() {
+        let db = db();
+        let id = a_task(&db);
+        db.write_txn("test", move |conn, meta| {
+            let facts = TaskFacts::default();
+            note(
+                conn,
+                meta,
+                id,
+                &facts,
+                &Labels {
+                    branch: Some("feat".to_owned()),
+                    ..Labels::default()
+                },
+            )?;
+            no_pull_request(conn, meta, id, &facts, "elsewhere", Some("abcd"))
+        })
+        .expect("written");
+        let (branch, absent) = db
+            .read(move |conn| Ok((latest_with_branch(conn, id)?, landing(conn, id)?)))
+            .expect("read");
+        assert_eq!(
+            branch.and_then(|r| r.labels.branch).as_deref(),
+            Some("feat")
+        );
+        let absent = absent.pr_absent().expect("the answer is found").clone();
+        assert_eq!(
+            (
+                absent.labels.branch.as_deref(),
+                absent.labels.ref_commit.as_deref()
+            ),
+            (Some("elsewhere"), Some("abcd"))
+        );
     }
 }

@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use jkb_core::query::{self, Scope};
-use jkb_core::{containment, item, mount, ns, nstype, placement, tag, task, transition, Db};
+use jkb_core::{
+    binding, containment, design, item, mount, ns, nstype, placement, tag, task, transition, Db,
+};
 use jkb_search::{Route, Searcher};
 use jkb_types::{Embedder, ItemId, TaskStatus};
 use rusqlite::{Connection, OptionalExtension};
@@ -329,6 +331,60 @@ pub struct SearchHit {
     pub context: Vec<ContextLine>,
 }
 
+/// Orphan vector rows — rows of the vector table whose item is gone — that a `kb.search` dropped
+/// from its nearest-neighbour scan rather than return as hits (design D42.3).
+///
+/// The liveness filter that keeps them out of the hits also hides the only sign that the table
+/// needs `jkb index --sweep`, so the search carries the count out to its caller.
+/// [`Self::needs_sweep`] is the one place that decides when that is worth telling the user.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanVectors {
+    /// Rows dropped because their item is gone.
+    pub dropped: usize,
+    /// Rows the scan returned before the filter: the largest page the search read.
+    pub scanned: usize,
+}
+
+impl OrphanVectors {
+    /// [`Self::needs_sweep`] fires when at least one in this many scanned rows was an orphan.
+    ///
+    /// A database written since the vector GC trigger has none, so any orphan is a legacy store
+    /// that a sweep repairs. A quarter rather than one: a handful of stragglers costs a search
+    /// nothing visible, while a quarter or more makes every scoped search over-fetch up to its
+    /// cap, which is the latency the hint exists to explain. On the store the hint was written
+    /// for (~56k dead rows beside ~1k live) every scan is over 90% orphans.
+    pub const SWEEP_HINT_ONE_IN: usize = 4;
+
+    /// Whether nothing was dropped (and so nothing is sent on the wire).
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.dropped == 0
+    }
+
+    /// Whether enough of the scan was orphans to point the user at `jkb index --sweep`: at least
+    /// one row in [`Self::SWEEP_HINT_ONE_IN`].
+    #[must_use]
+    pub const fn needs_sweep(&self) -> bool {
+        self.dropped > 0 && self.dropped.saturating_mul(Self::SWEEP_HINT_ONE_IN) >= self.scanned
+    }
+}
+
+impl From<jkb_search::OrphanVectors> for OrphanVectors {
+    fn from(o: jkb_search::OrphanVectors) -> Self {
+        let jkb_search::OrphanVectors { dropped, scanned } = o;
+        Self { dropped, scanned }
+    }
+}
+
+/// What `kb.search` answers: the hits, and the orphan vector rows dropped to find them.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Searched {
+    /// Best first.
+    pub hits: Vec<SearchHit>,
+    /// Orphan vector rows the scan dropped.
+    pub orphan_vectors: OrphanVectors,
+}
+
 /// A tag application.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TagPair {
@@ -389,6 +445,69 @@ pub struct SubtaskSummary {
     pub status: Option<String>,
 }
 
+/// An item a task sits under, as `task.show` names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceRef {
+    /// Its uid.
+    pub uid: String,
+    /// Its title: the first non-blank line of its content (`item::title_from`).
+    pub title: String,
+}
+
+/// The plan step a task sits under, as `task.show` names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepRef {
+    /// Its uid.
+    pub uid: String,
+    /// Its title: the first non-blank line of its words.
+    pub title: String,
+    /// Its place among its plan's steps, from 1.
+    pub number: usize,
+}
+
+/// Where a task sits in a design (`design::plan::ancestry_of`): what an implementer reads to find
+/// the design that governs it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskPlacement {
+    /// The plan step, when the task (or a task it is a subtask of) is under one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<StepRef>,
+    /// That step's plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlaceRef>,
+    /// The design the plan (or the one-off task) belongs to.
+    pub design: PlaceRef,
+    /// The top of the design's tree, when the design is nested under another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PlaceRef>,
+}
+
+impl From<design::plan::Ancestry> for TaskPlacement {
+    fn from(a: design::plan::Ancestry) -> Self {
+        let place = |n: design::plan::Named| PlaceRef {
+            title: item::title_from(&n.uid, Some(&n.text)),
+            uid: n.uid,
+        };
+        let (step, plan) = match a.step {
+            Some(s) => (
+                Some(StepRef {
+                    title: item::title_from(&s.step.uid, Some(&s.step.text)),
+                    uid: s.step.uid,
+                    number: s.number,
+                }),
+                Some(place(s.plan)),
+            ),
+            None => (None, None),
+        };
+        Self {
+            step,
+            plan,
+            design: place(a.design),
+            root: a.root.map(place),
+        }
+    }
+}
+
 /// `task.show`'s answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskDetail {
@@ -404,6 +523,22 @@ pub struct TaskDetail {
         skip_serializing_if = "jkb_core::reviews::ReviewState::is_empty"
     )]
     pub review: jkb_core::reviews::ReviewState,
+    /// The plan step, plan and design it sits under; `None` for a task under no design. Absent
+    /// from an older daemon's answer, which decodes as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<TaskPlacement>,
+    /// The `^id`s its tasks.md line `needs:` that no task in that file defines yet
+    /// (`jkb_core::item::UNRESOLVED_NEEDS`): dependencies the file declares but cannot record.
+    /// Absent when there are none, and from an older daemon's answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_needs: Vec<String>,
+    /// Its `unresolved_needs` are kept from a tasks.md it is no longer written into (rebound
+    /// `--managed`, or to a file no `tasks` mount covers). They are kept rather than dropped, because
+    /// they are the only record of what the line said it needed; they become dependencies when the
+    /// task is bound into a tasks.md that defines those ids. Absent when false, and from an older
+    /// daemon's answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_outside_tasks_file: bool,
 }
 
 fn not_found(what: impl Into<String>) -> ApiError {
@@ -838,6 +973,14 @@ pub enum TreeCut {
     NodeCap,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// How many levels [`TreeWalk::level`] has listed on this thread — one `children` read each: the
+    /// work count that pins a walk's cost without a clock. A `Db` runs every call on its own thread,
+    /// so a test reads it there.
+    pub(crate) static LEVELS_LISTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct TreeWalk<'c, 'b> {
     conn: &'c Connection,
     all: bool,
@@ -852,6 +995,8 @@ struct TreeWalk<'c, 'b> {
 
 impl TreeWalk<'_, '_> {
     fn level(&mut self, path: Option<&str>, depth: usize) -> jkb_core::Result<Vec<TreeNode>> {
+        #[cfg(test)]
+        LEVELS_LISTED.set(LEVELS_LISTED.get() + 1);
         let mut out = Vec::new();
         for child in children(self.conn, path, self.all)? {
             if self.cut != TreeCut::Whole {
@@ -985,7 +1130,8 @@ pub struct SearchAsk {
     pub context: Option<usize>,
 }
 
-/// `kb.search`: hits best-first, each resolved to its item.
+/// `kb.search`: hits best-first, each resolved to its item, and the orphan vector rows the scan
+/// dropped on the way ([`OrphanVectors`]).
 ///
 /// # Errors
 /// [`ErrorCode::Unsupported`] for a route that embeds text with no `embedder`; [`ErrorCode::Invalid`]
@@ -995,7 +1141,7 @@ pub fn search(
     embedder: Option<&Arc<dyn Embedder + Send + Sync>>,
     ask: &SearchAsk,
     budget: &mut Budget,
-) -> Result<Vec<SearchHit>, ApiError> {
+) -> Result<Searched, ApiError> {
     if ask.limit > MAX_SEARCH_LIMIT {
         return Err(ApiError::with_code(
             ErrorCode::Invalid,
@@ -1020,7 +1166,7 @@ pub fn search(
             ))
         }
     };
-    let hits = searcher
+    let jkb_search::Searched { hits, orphans } = searcher
         .search(db, &query, ask.route.into(), ask.limit)
         .map_err(search_error)?;
     let mut out = Vec::with_capacity(hits.len());
@@ -1068,7 +1214,10 @@ pub fn search(
         }
         out.push(hit);
     }
-    Ok(out)
+    Ok(Searched {
+        hits: out,
+        orphan_vectors: orphans.into(),
+    })
 }
 
 fn search_error(e: jkb_search::Error) -> ApiError {
@@ -1222,7 +1371,12 @@ pub fn task_show(
             .collect(),
         subtasks: Vec::new(),
         review: jkb_core::reviews::state(conn, id)?,
+        place: design::plan::ancestry_of(conn, id)?.map(TaskPlacement::from),
+        unresolved_needs: item::unresolved_needs(conn, id)?,
+        needs_outside_tasks_file: false,
     };
+    detail.needs_outside_tasks_file = !detail.unresolved_needs.is_empty()
+        && binding::serializer_for(conn, id)?.as_deref() != Some("tasks");
     // The task itself is not charged: it is what was asked for, and charging a large body marked the
     // answer cut when no subtask had been dropped at all.
     task::subtasks_each(conn, id, |t| {
@@ -1264,7 +1418,48 @@ pub fn subtasks(
 mod tests {
     use std::path::Path;
 
-    use super::rerooted;
+    use super::{rerooted, ItemDetail, PlaceRef, TaskDetail, TaskPlacement};
+
+    /// `place` is additive on the wire: an older daemon's answer, which has no `place`, still
+    /// decodes; and a task under no design sends none.
+    #[test]
+    fn a_task_detail_without_a_place_decodes_and_sends_none() {
+        let mut detail = TaskDetail {
+            item: ItemDetail {
+                id: 1,
+                uid: "task:t".into(),
+                kind: "task".into(),
+                status: None,
+                priority: None,
+                due: None,
+                namespace: None,
+                content: None,
+                tags: Vec::new(),
+            },
+            transitions: Vec::new(),
+            subtasks: Vec::new(),
+            review: jkb_core::reviews::ReviewState::default(),
+            place: None,
+            unresolved_needs: Vec::new(),
+            needs_outside_tasks_file: false,
+        };
+        let sent = serde_json::to_value(&detail).unwrap();
+        assert!(sent.get("place").is_none(), "{sent}");
+        assert_eq!(serde_json::from_value::<TaskDetail>(sent).unwrap(), detail);
+
+        detail.place = Some(TaskPlacement {
+            step: None,
+            plan: None,
+            design: PlaceRef {
+                uid: "design:d".into(),
+                title: "D".into(),
+            },
+            root: None,
+        });
+        let sent = serde_json::to_value(&detail).unwrap();
+        assert_eq!(sent["place"]["design"]["uid"], "design:d");
+        assert_eq!(serde_json::from_value::<TaskDetail>(sent).unwrap(), detail);
+    }
 
     #[test]
     fn a_client_path_under_its_home_is_looked_up_under_the_server_s() {
