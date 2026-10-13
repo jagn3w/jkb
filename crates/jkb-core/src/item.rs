@@ -1160,8 +1160,8 @@ mod tests {
     fn grep_is_literal_case_sensitive_and_scoped() {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
-            let a = ns::ensure(conn, "proj/a")?;
-            let b = ns::ensure(conn, "proj/b")?;
+            let a = ns::ensure(conn, meta, "proj/a")?;
+            let b = ns::ensure(conn, meta, "proj/b")?;
             for (uid, body, at) in [
                 ("n:1", "buy a 6-inch Pipe", a),
                 ("n:2", "review the pipe", a),
@@ -1218,7 +1218,7 @@ mod tests {
                 ("n:accent", "the RÉSUMÉ is ready", "_sys/z"),
                 ("n:bleed", "résumé elsewhere", "xsys/z"),
             ] {
-                let at = ns::ensure(conn, ns_path)?;
+                let at = ns::ensure(conn, meta, ns_path)?;
                 let item = upsert(
                     conn,
                     meta,
@@ -1260,7 +1260,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
             for (uid, ns_path) in [("n:lower", "notes/a"), ("n:upper", "Notes/a")] {
-                let at = ns::ensure(conn, ns_path)?;
+                let at = ns::ensure(conn, meta, ns_path)?;
                 let item = upsert(
                     conn,
                     meta,

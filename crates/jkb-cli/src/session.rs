@@ -366,7 +366,7 @@ pub fn set_gate(db: &Db, repo_key: &str, cmd: Option<&str>) -> Result<()> {
     let path = repo_ns(repo_key);
     let cmd = cmd.map(str::to_owned);
     db.write_txn("cli", move |conn, meta| {
-        let id = ns::ensure(conn, &path)?;
+        let id = ns::ensure(conn, meta, &path)?;
         let mut metadata = ns::get_metadata(conn, id)?.unwrap_or_else(|| json!({}));
         if !metadata.is_object() {
             metadata = json!({});

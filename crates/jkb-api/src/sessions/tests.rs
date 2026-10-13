@@ -250,7 +250,7 @@ fn a_take_refuses_a_place_the_task_s_line_cannot_carry_and_writes_nothing() {
     use jkb_types::{ConflictPolicy, SyncMode};
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let id = ns::ensure(c, "repos/in")?;
+        let id = ns::ensure(c, m, "repos/in")?;
         mount::create(
             c,
             m,
@@ -401,7 +401,7 @@ fn the_gate_is_read_only() {
     };
     assert_eq!(gate("proj"), None);
     db.write_txn("t", |c, m| {
-        let id = jkb_core::ns::ensure(c, "repos/proj")?;
+        let id = jkb_core::ns::ensure(c, m, "repos/proj")?;
         jkb_core::ns::set_metadata(c, m, id, &json!({ "gate": "make test", "type": "repo" }))
     })
     .unwrap();

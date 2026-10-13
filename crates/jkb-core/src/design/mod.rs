@@ -474,7 +474,7 @@ pub fn create(
             mime: None,
         },
     )?;
-    let home = ns::ensure(conn, &path)?;
+    let home = ns::ensure(conn, meta, &path)?;
     placement::place(conn, meta, id, home, PlacementRole::Primary, 0)?;
     ensure_topic(conn, meta, &uid)?;
     let mut seq = 0;

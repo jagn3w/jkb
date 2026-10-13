@@ -376,7 +376,7 @@ fn index_pending_skips_a_rejected_item_and_keeps_the_rest() {
                 mime: None,
             },
         )?;
-        let ns = jkb_core::ns::ensure(conn, "docs")?;
+        let ns = jkb_core::ns::ensure(conn, meta, "docs")?;
         jkb_core::placement::place(conn, meta, id, ns, jkb_types::PlacementRole::Primary, 0)
     })
     .unwrap();

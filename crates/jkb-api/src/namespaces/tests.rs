@@ -97,9 +97,9 @@ fn a_rooted_move_is_bounded() {
     .unwrap();
 
     // Nor a subtree of too many namespaces, however few items.
-    db.write_txn("t", |c, _| {
+    db.write_txn("t", |c, m| {
         for i in 0..=super::MAX_MOVED_NAMESPACES {
-            jkb_core::ns::ensure(c, &format!("wide/n{i}"))?;
+            jkb_core::ns::ensure(c, m, &format!("wide/n{i}"))?;
         }
         Ok(())
     })
@@ -127,7 +127,7 @@ fn a_rooted_move_is_bounded() {
     assert!(e.message.contains("filed in a tasks.md"), "{e:?}");
     // Items filed in a document mount have no line to check, so they do not count toward it.
     db.write_txn("t", |c, m| {
-        let id = jkb_core::ns::ensure(c, "repos/in/docs")?;
+        let id = jkb_core::ns::ensure(c, m, "repos/in/docs")?;
         jkb_core::mount::create(
             c,
             m,

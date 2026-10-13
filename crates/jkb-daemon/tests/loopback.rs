@@ -1215,9 +1215,9 @@ fn reads_have_their_own_permits_and_a_bounded_answer() {
     .expect("a write is served while reads are at their limit");
 
     let f = Fixture::with(|cfg| cfg.read_budget_bytes = 512);
-    f.db.write_txn("t", |c, _| {
+    f.db.write_txn("t", |c, m| {
         for i in 0..100 {
-            jkb_core::ns::ensure(c, &format!("n/{i:03}"))?;
+            jkb_core::ns::ensure(c, m, &format!("n/{i:03}"))?;
         }
         Ok(())
     })

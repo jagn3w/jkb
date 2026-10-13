@@ -335,7 +335,7 @@ mod tests {
                 ("notes", "file:///n", "document"),
                 ("notes/plan", "file:///n/plan", "tasks"),
             ] {
-                let id = ns::ensure(c, path)?;
+                let id = ns::ensure(c, m, path)?;
                 mount::create(
                     c,
                     m,
@@ -495,7 +495,7 @@ mod tests {
                         mime: None,
                     },
                 )?;
-                let at = crate::ns::ensure(conn, ns_path)?;
+                let at = crate::ns::ensure(conn, meta, ns_path)?;
                 crate::placement::place(
                     conn,
                     meta,

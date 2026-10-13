@@ -195,10 +195,10 @@ pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<Ite
         })),
     )?;
 
-    let home = ns::ensure(conn, &task.home)?;
+    let home = ns::ensure(conn, meta, &task.home)?;
     placement::place(conn, meta, item_id, home, PlacementRole::Primary, 0)?;
     for mirror in &task.mirrors {
-        let ns_id = ns::ensure(conn, mirror)?;
+        let ns_id = ns::ensure(conn, meta, mirror)?;
         placement::place(conn, meta, item_id, ns_id, PlacementRole::Reference, 0)?;
     }
 
@@ -270,7 +270,7 @@ pub fn ensure_task_mirror(
         ))
         .into());
     }
-    let ns_id = ns::ensure(conn, &mirror)?;
+    let ns_id = ns::ensure(conn, meta, &mirror)?;
     let exists = conn
         .prepare_cached(
             "SELECT 1 FROM placements WHERE item_id = ?1 AND namespace_id = ?2 LIMIT 1",
@@ -1345,7 +1345,7 @@ mod tests {
 
         // Re-home to a different repo subtree; the stale `tasks/jkb/a` mirror must go.
         db.write_txn("t", move |conn, meta| {
-            let dst = ns::ensure(conn, "repos/jkb/b")?;
+            let dst = ns::ensure(conn, meta, "repos/jkb/b")?;
             set_primary_home(conn, meta, id, dst, 0)
         })
         .unwrap();

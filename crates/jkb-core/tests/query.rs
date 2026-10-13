@@ -36,7 +36,7 @@ fn add_task(
         rusqlite::params![status, priority, due, id.get()],
     )
     .unwrap();
-    let ns_id = ns::ensure(conn, ns_path).unwrap();
+    let ns_id = ns::ensure(conn, meta, ns_path).unwrap();
     placement::place(conn, meta, id, ns_id, PlacementRole::Primary, 0).unwrap();
     if let Some(size) = size {
         tag::apply(conn, meta, id, "size", size).unwrap();
@@ -130,7 +130,7 @@ fn books_read_in_2025() {
                 },
             )
             .unwrap();
-            let ns_id = ns::ensure(conn, "books/2025").unwrap();
+            let ns_id = ns::ensure(conn, meta, "books/2025").unwrap();
             placement::place(conn, meta, id, ns_id, PlacementRole::Primary, 0).unwrap();
             tag::apply(conn, meta, id, "read_year", year).unwrap();
         };
@@ -228,7 +228,7 @@ fn add_node(
         },
     )
     .unwrap();
-    let ns_id = ns::ensure(conn, ns_path).unwrap();
+    let ns_id = ns::ensure(conn, meta, ns_path).unwrap();
     placement::place(conn, meta, id, ns_id, PlacementRole::Primary, 0).unwrap();
     if let Some(r) = resolution {
         item::set_resolution(conn, meta, id, r).unwrap();

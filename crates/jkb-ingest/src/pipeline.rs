@@ -309,7 +309,7 @@ impl Pipeline {
                     })
                 }
                 None => {
-                    let ns_id = ns::ensure(conn, &namespace)?;
+                    let ns_id = ns::ensure(conn, meta, &namespace)?;
                     let document = item::upsert(
                         conn,
                         meta,

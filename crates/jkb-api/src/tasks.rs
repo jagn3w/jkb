@@ -774,7 +774,7 @@ pub fn place(
     if let Some(scope) = scope {
         crate::rbac::check_destination(conn, scope, namespace)?;
     }
-    let ns_id = ns::ensure(conn, namespace)?;
+    let ns_id = ns::ensure(conn, meta, namespace)?;
     if home {
         task::set_primary_home(conn, meta, id, ns_id, 0)?;
     } else {

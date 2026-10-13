@@ -108,7 +108,7 @@ fn end_to_end_full_flow() {
     // --- mount + import ---
     let repo_dir = repo.path().to_string_lossy().into_owned();
     db.write_txn("t", move |conn, meta| {
-        let ns_id = ns::ensure(conn, "docs/repo")?;
+        let ns_id = ns::ensure(conn, meta, "docs/repo")?;
         mount::create(
             conn,
             meta,
@@ -281,7 +281,7 @@ fn ingest_and_sync_are_idempotent_and_audited() {
 
     let repo_dir = repo.path().to_string_lossy().into_owned();
     db.write_txn("t", move |conn, meta| {
-        let ns_id = ns::ensure(conn, "docs/repo")?;
+        let ns_id = ns::ensure(conn, meta, "docs/repo")?;
         mount::create(
             conn,
             meta,

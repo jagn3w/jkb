@@ -23,7 +23,7 @@ pub fn save(conn: &Connection, meta: &WriteMeta, name: &str, query_str: &str) ->
     // Reject an unparseable query up front.
     query::parse(query_str)?;
 
-    let ns_id = ns::ensure(conn, VIEWS_NS)?;
+    let ns_id = ns::ensure(conn, meta, VIEWS_NS)?;
     let uid = format!("view:{name}");
     // Read what is there **before** the upsert: saving over an existing view updates its row, and
     // logging that as an insert made `jkb undo` delete the view outright — reporting success while

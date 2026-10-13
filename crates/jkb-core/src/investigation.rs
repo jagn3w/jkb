@@ -113,7 +113,7 @@ pub fn create(
     if !strategy.accepts_kind(goal_kind) {
         return Err(reject_kind(strategy, goal_kind));
     }
-    let root = ns::ensure(conn, path)?;
+    let root = ns::ensure(conn, meta, path)?;
 
     // Re-typing an existing investigation is refused, not silently applied. The units
     // already stored here were written under the old strategy's vocabulary: after a re-type
@@ -217,7 +217,7 @@ pub fn add(conn: &Connection, meta: &WriteMeta, unit: &NewUnit) -> Result<ItemId
             mime: None,
         },
     )?;
-    let home = ns::ensure(conn, &unit.namespace)?;
+    let home = ns::ensure(conn, meta, &unit.namespace)?;
     placement::place(conn, meta, id, home, PlacementRole::Primary, 0)?;
     for (facet, value) in &unit.tags {
         tag::apply(conn, meta, id, facet, value)?;
@@ -838,7 +838,7 @@ pub fn write_digest(
                 mime: Some("text/markdown".to_owned()),
             },
         )?;
-        let home = ns::ensure(conn, ns_path)?;
+        let home = ns::ensure(conn, meta, ns_path)?;
         placement::place(conn, meta, id, home, PlacementRole::Primary, 0)?;
         id
     };

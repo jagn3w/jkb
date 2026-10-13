@@ -291,7 +291,7 @@ mod tests {
                     } else {
                         "document"
                     };
-                    let id = ns::ensure(c, path)?;
+                    let id = ns::ensure(c, m, path)?;
                     create(
                         c,
                         m,
@@ -317,7 +317,7 @@ mod tests {
                 );
                 assert_eq!(ambient_namespace(c, file)?.as_deref(), Some("repos/jkb"));
                 // A document mount nested inside does not take a task line from the tasks mount around it.
-                let id = ns::ensure(c, "repos/jkb-openspec")?;
+                let id = ns::ensure(c, m, "repos/jkb-openspec")?;
                 create(
                     c,
                     m,
@@ -351,7 +351,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let ns_id = db
             .write_txn("t", |conn, meta| {
-                let ns_id = ns::ensure(conn, "docs/monorepo")?;
+                let ns_id = ns::ensure(conn, meta, "docs/monorepo")?;
                 create(
                     conn,
                     meta,
@@ -392,7 +392,7 @@ mod tests {
                 ("repos/mono", "file:///Users/j/repos/mono"),
                 ("repos/mono/backend", "file:///Users/j/repos/mono/backend"),
             ] {
-                let ns_id = ns::ensure(conn, path)?;
+                let ns_id = ns::ensure(conn, meta, path)?;
                 create(
                     conn,
                     meta,

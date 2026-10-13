@@ -41,7 +41,7 @@ fn mount_dir(
     let include = include.map(str::to_owned);
     let exclude = exclude.map(str::to_owned);
     db.write_txn("t", move |conn, meta| {
-        let ns_id = ns::ensure(conn, &ns_path)?;
+        let ns_id = ns::ensure(conn, meta, &ns_path)?;
         jkb_core::mount::create(
             conn,
             meta,
@@ -1447,7 +1447,7 @@ fn document_order_survives_kb_side_changes_and_merges() {
         let u = format!("{uri}#first");
         move |conn, meta| {
             let id = binding::item_for_uri(conn, &u)?.expect("bound");
-            let beta = ns::ensure(conn, "docs/plan/tasks-md/beta")?;
+            let beta = ns::ensure(conn, meta, "docs/plan/tasks-md/beta")?;
             jkb_core::placement::set_primary(conn, meta, id, beta, 99)
         }
     })
@@ -2315,7 +2315,7 @@ fn an_export_only_mount_overwrites_a_file_it_has_never_imported() {
     // A KB item bound to that path, created without ever importing the file.
     let bound_uri = uri.clone();
     db.write_txn("t", move |conn, meta| {
-        let ns_id = ns::ensure(conn, "docs/out")?;
+        let ns_id = ns::ensure(conn, meta, "docs/out")?;
         let id = item::upsert(
             conn,
             meta,
@@ -3567,8 +3567,8 @@ fn a_refused_file_is_re_judged_after_its_database_remedy() {
     assert_eq!(journal(&db, &uri_for(&tasks)).unwrap().0, "needs_attention");
     // Another write elsewhere, with nothing changed for this file: judged on the same render, it is not
     // reconciled — and so not re-archived, re-refused and re-logged — again.
-    db.write_txn("cli", |conn, _| {
-        jkb_core::ns::ensure(conn, "elsewhere")?;
+    db.write_txn("cli", |conn, meta| {
+        jkb_core::ns::ensure(conn, meta, "elsewhere")?;
         Ok(())
     })
     .unwrap();
@@ -4089,7 +4089,7 @@ fn a_mirror_added_in_the_kb_survives_a_merge_with_a_disk_edit() {
     let placed = setup.clone();
     db.write_txn("cli", move |conn, meta| {
         let id = item::id_for_uid(conn, &placed)?.expect("setup exists");
-        let mns = ns::ensure(conn, "repos/extra")?;
+        let mns = ns::ensure(conn, meta, "repos/extra")?;
         jkb_core::placement::place(conn, meta, id, mns, jkb_types::PlacementRole::Reference, 0)
     })
     .unwrap();
@@ -4158,7 +4158,7 @@ fn a_document_import_leaves_the_items_mirrors_alone() {
     let placed_uri = uri.clone();
     db.write_txn("cli", move |conn, meta| {
         let id = binding::item_for_uri(conn, &placed_uri)?.expect("bound");
-        let mns = ns::ensure(conn, "references/readmes")?;
+        let mns = ns::ensure(conn, meta, "references/readmes")?;
         jkb_core::placement::place(conn, meta, id, mns, jkb_types::PlacementRole::Reference, 0)
     })
     .unwrap();
@@ -4230,7 +4230,7 @@ fn a_mirror_to_a_case_variant_of_tasks_is_rendered() {
     let setup = format!("{}#setup", uri_for(&file));
     db.write_txn("cli", move |conn, meta| {
         let id = item::id_for_uid(conn, &setup)?.expect("setup exists");
-        let mns = ns::ensure(conn, "Tasks/later")?;
+        let mns = ns::ensure(conn, meta, "Tasks/later")?;
         jkb_core::placement::place(conn, meta, id, mns, jkb_types::PlacementRole::Reference, 0)
     })
     .unwrap();

@@ -2078,9 +2078,9 @@ fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
         }
         NsCmd::Mk { paths } => {
             let to_make = paths.clone();
-            db.write_txn("cli", move |conn, _meta| {
+            db.write_txn("cli", move |conn, meta| {
                 for p in &to_make {
-                    ns::ensure(conn, p)?;
+                    ns::ensure(conn, meta, p)?;
                 }
                 Ok(())
             })?;
@@ -2183,7 +2183,7 @@ fn cmd_ns_type(
     let ty = nstype::resolve(&type_name)?;
     let (p, t) = (path.clone(), type_name.clone());
     db.write_txn("cli", move |conn, meta| {
-        let id = ns::ensure(conn, &p)?;
+        let id = ns::ensure(conn, meta, &p)?;
         ns::set_type(conn, meta, id, &t)
     })?;
     if json {
@@ -2421,7 +2421,7 @@ fn cmd_mount_create(db: &Db, ns_path: &str, dir: &Path, edit: MountEdit) -> Resu
     let updating = existing.is_some();
     let (ser, inc, exc) = (serializer.clone(), include.clone(), exclude.clone());
     db.write_txn("cli", move |conn, meta| {
-        let ns_id = ns::ensure(conn, &ns_path)?;
+        let ns_id = ns::ensure(conn, meta, &ns_path)?;
         mount::create(
             conn,
             meta,

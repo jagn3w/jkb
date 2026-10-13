@@ -1065,7 +1065,7 @@ fn read_fixture() -> LocalBackend {
     use jkb_types::{ConflictPolicy, PlacementRole, SyncMode};
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let repo = ns::ensure(c, "repos/jkb")?;
+        let repo = ns::ensure(c, m, "repos/jkb")?;
         mount::create(
             c,
             m,
@@ -1408,7 +1408,7 @@ fn a_tree_does_not_descend_into_a_node_that_lists_its_own_ancestor() {
     // check this walked to the depth cap with a fan-out of two at every level.
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let spaces = [ns::ensure(c, "a")?, ns::ensure(c, "b")?];
+        let spaces = [ns::ensure(c, m, "a")?, ns::ensure(c, m, "b")?];
         for uid in ["a", "b"] {
             let doc = expanding_document(c, m, uid)?;
             for (i, space) in spaces.iter().enumerate() {
@@ -1453,9 +1453,9 @@ fn a_tree_stops_at_its_node_cap_and_says_so() {
     // More child namespaces than the cap, each with a namespace of its own under it.
     let db = Db::open_in_memory().unwrap();
     let width = super::kb::MAX_TREE_NODES + 50;
-    db.write_txn("t", move |c, _| {
+    db.write_txn("t", move |c, m| {
         for i in 0..width {
-            ns::ensure(c, &format!("w/{i:05}/x"))?;
+            ns::ensure(c, m, &format!("w/{i:05}/x"))?;
         }
         Ok(())
     })
@@ -1486,8 +1486,8 @@ fn a_tree_at_the_depth_cap_decodes_through_the_wire() {
     // Each tree level is two levels of JSON nesting and serde_json refuses past 128; a cap above it
     // printed on the host and failed to decode through the daemon.
     let db = Db::open_in_memory().unwrap();
-    db.write_txn("t", |c, _| {
-        ns::ensure(c, &vec!["d"; super::kb::MAX_TREE_DEPTH + 10].join("/"))?;
+    db.write_txn("t", |c, m| {
+        ns::ensure(c, m, &vec!["d"; super::kb::MAX_TREE_DEPTH + 10].join("/"))?;
         Ok(())
     })
     .unwrap();
@@ -1537,7 +1537,7 @@ fn every_listing_read_stays_within_its_budget_and_says_when_it_was_cut() {
     // task with many subtasks.
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let space = ns::ensure(c, "big")?;
+        let space = ns::ensure(c, m, "big")?;
         for i in 0..200 {
             let doc = item::upsert(
                 c,
@@ -1939,7 +1939,7 @@ pub(crate) fn mutate_fixture() -> (Db, String, String, String) {
             ("repos/in", "file:///Users/u/repos/in"),
             ("docs/out", "file:///Users/u/Documents/out"),
         ] {
-            let id = ns::ensure(c, path)?;
+            let id = ns::ensure(c, m, path)?;
             mount::create(
                 c,
                 m,
@@ -2711,7 +2711,7 @@ fn each_value_a_tasks_md_line_cannot_carry_is_refused_naming_its_field() {
 fn a_directory_mounted_as_documents_too_still_judges_its_task_lines() {
     let (db, inside, _outside, _managed) = mutate_fixture();
     db.write_txn("t", |c, m| {
-        let id = jkb_core::ns::ensure(c, "repos/aaa")?;
+        let id = jkb_core::ns::ensure(c, m, "repos/aaa")?;
         jkb_core::mount::create(
             c,
             m,
@@ -2762,7 +2762,7 @@ fn a_task_titled_in_any_script_is_filed_and_written_like_any_other() {
 fn a_backlog_add_whose_line_would_not_come_back_is_refused_before_the_question() {
     let (db, _inside, _outside, _managed) = mutate_fixture();
     db.write_txn("t", |c, m| {
-        let id = jkb_core::ns::ensure(c, "tasks/.backlog")?;
+        let id = jkb_core::ns::ensure(c, m, "tasks/.backlog")?;
         jkb_core::mount::create(
             c,
             m,

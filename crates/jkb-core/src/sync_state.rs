@@ -444,7 +444,7 @@ mod tests {
         let start = db.read(super::latest_write).unwrap();
         let write = |actor: &'static str| {
             db.write_txn(actor, move |c, m| {
-                crate::ns::ensure(c, "a")?;
+                crate::ns::ensure(c, m, "a")?;
                 crate::item::upsert(
                     c,
                     m,

@@ -97,15 +97,21 @@ fn kind_for(path: &str) -> &'static str {
 /// Ensure the namespace at `path` and all of its ancestors exist, returning the
 /// id of the leaf. Idempotent: already-present namespaces are left untouched.
 ///
+/// **Every row this creates is changelogged**, as an `insert` `undo` reverses by deleting it. It
+/// used to take no [`WriteMeta`] and log nothing, which made a transaction whose only work was
+/// creating a namespace — `jkb ns mk` — invisible to [`crate::undo::undo_last`]: a bare `jkb
+/// undo` straight after it reached past it and reverted the user's *previous* change, reporting
+/// success. A namespace that already existed is not logged, because nothing was written to it.
+///
 /// A path listed in [`crate::nstype::RESERVED_TYPES`] is stamped with its type as it is
 /// created (design D33.4), so a reserved root is never left untyped — whether it arrives
 /// on a fresh database, via `jkb ns mk tasks`, or as a side effect of the first
-/// `task add`. The stamp is seeded rather than changelogged, matching how `V001` seeds the
-/// `_sys` namespaces: it is schema, not a user edit.
+/// `task add`. On a row created here the stamp is part of the logged row; on an existing one
+/// whose type was cleared it is logged as the metadata update it is.
 ///
 /// # Errors
-/// Returns an error if the path is invalid or a statement fails.
-pub fn ensure(conn: &Connection, path: &str) -> Result<NamespaceId> {
+/// Returns an error if the path is invalid, a statement fails, or the changelog append fails.
+pub fn ensure(conn: &Connection, meta: &WriteMeta, path: &str) -> Result<NamespaceId> {
     let normalized = normalize(path)?;
     let mut parent: Option<i64> = None;
     let mut current = String::new();
@@ -115,38 +121,80 @@ pub fn ensure(conn: &Connection, path: &str) -> Result<NamespaceId> {
             current.push('/');
         }
         current.push_str(segment);
-        id = conn
-            .prepare_cached(
-                "INSERT INTO namespaces (path, parent_id, kind) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(path) DO UPDATE SET path = path
-                 RETURNING id",
-            )?
-            .query_row(params![current, parent, kind_for(&current)], |row| {
-                row.get(0)
-            })?;
-        seed_reserved_type(conn, &current)?;
+        let existing: Option<(i64, String)> = conn
+            .prepare_cached("SELECT id, metadata FROM namespaces WHERE path = ?1")?
+            .query_row([&current], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        if let Some((found, before)) = existing {
+            id = found;
+            if seed_reserved_type(conn, &current)? {
+                let after: String = conn
+                    .prepare_cached("SELECT metadata FROM namespaces WHERE id = ?1")?
+                    .query_row([id], |row| row.get(0))?;
+                changelog::append(
+                    conn,
+                    meta,
+                    Op::Update,
+                    Entity::Namespaces,
+                    &id.to_string(),
+                    Some(&json!({ "metadata": before })),
+                    Some(&json!({ "metadata": after })),
+                )?;
+            }
+        } else {
+            id = conn
+                .prepare_cached(
+                    "INSERT INTO namespaces (path, parent_id, kind) VALUES (?1, ?2, ?3)
+                     RETURNING id",
+                )?
+                .query_row(params![current, parent, kind_for(&current)], |row| {
+                    row.get(0)
+                })?;
+            seed_reserved_type(conn, &current)?;
+            let row = conn
+                .prepare_cached(
+                    "SELECT path, parent_id, kind, metadata FROM namespaces WHERE id = ?1",
+                )?
+                .query_row([id], |r| {
+                    Ok(json!({
+                        "path": r.get::<_, String>(0)?,
+                        "parent_id": r.get::<_, Option<i64>>(1)?,
+                        "kind": r.get::<_, String>(2)?,
+                        "metadata": r.get::<_, String>(3)?,
+                    }))
+                })?;
+            changelog::upsert(
+                conn,
+                meta,
+                Entity::Namespaces,
+                &id.to_string(),
+                None,
+                Some(&row),
+            )?;
+        }
         parent = Some(id);
     }
     Ok(NamespaceId::new(id))
 }
 
 /// Stamp the declared type on a reserved namespace, if `path` is one and it is not already
-/// typed. Never clobbers an existing type, so re-typing by hand survives.
-fn seed_reserved_type(conn: &Connection, path: &str) -> Result<()> {
+/// typed, and say whether it did. Never clobbers an existing type, so re-typing by hand survives.
+fn seed_reserved_type(conn: &Connection, path: &str) -> Result<bool> {
     let Some((_, type_name)) = crate::nstype::RESERVED_TYPES
         .iter()
         .find(|(reserved, _)| *reserved == path)
     else {
-        return Ok(());
+        return Ok(false);
     };
     let sql = format!(
         "UPDATE namespaces SET metadata = json_set({METADATA_OBJ}, '$.{TYPE_KEY}', ?2)
          WHERE path = ?1 AND {} IS NULL",
         type_expr()
     );
-    conn.prepare_cached(&sql)?
-        .execute(params![path, type_name])?;
-    Ok(())
+    Ok(conn
+        .prepare_cached(&sql)?
+        .execute(params![path, type_name])?
+        > 0)
 }
 
 /// `namespaces.metadata` as a JSON object, tolerating NULL and (only reachable if written
@@ -566,7 +614,7 @@ pub fn move_subtree(conn: &Connection, meta: &WriteMeta, from: &str, to: &str) -
     }
     // Only once every path is known to be nameable: `ensure` writes the target's ancestors.
     let new_parent: Option<i64> = match to.rsplit_once('/') {
-        Some((parent, _)) => Some(ensure(conn, parent)?.get()),
+        Some((parent, _)) => Some(ensure(conn, meta, parent)?.get()),
         None => None,
     };
 
@@ -689,7 +737,7 @@ mod tests {
     fn a_move_that_would_push_a_descendant_past_the_limits_writes_nothing() {
         let db = crate::Db::open_in_memory().unwrap();
         db.write_txn("t", |c, m| {
-            super::ensure(c, "notes/a/b")?;
+            super::ensure(c, m, "notes/a/b")?;
             let target = vec!["x"; super::MAX_DEPTH - 1].join("/");
             assert!(super::move_subtree(c, m, "notes", &target).is_err());
             assert!(super::get(c, "notes/a/b")?.is_some(), "nothing moved");
@@ -720,8 +768,8 @@ mod tests {
     fn subtree_leaf_count_spans_descendants_dedups_and_honours_terminal() {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
-            let deep = ensure(conn, "tasks/jkb/openspec")?;
-            let leaf = ensure(conn, "tasks/jkb/openspec/changes")?;
+            let deep = ensure(conn, meta, "tasks/jkb/openspec")?;
+            let leaf = ensure(conn, meta, "tasks/jkb/openspec/changes")?;
             let new = |uid: &str| NewItem {
                 uid: uid.to_owned(),
                 kind: "task".to_owned(),
@@ -756,7 +804,7 @@ mod tests {
             .unwrap();
         assert_eq!(all, 3);
         // A sibling branch with no placements has no leaves.
-        db.write_txn("t", |conn, _m| ensure(conn, "tasks/other"))
+        db.write_txn("t", |conn, meta| ensure(conn, meta, "tasks/other"))
             .unwrap();
         let none = db
             .read(|conn| subtree_leaf_count(conn, "tasks/other", true))
@@ -768,9 +816,9 @@ mod tests {
     fn subtree_leaf_counts_matches_per_child_and_covers_roots() {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
-            let a_leaf = ensure(conn, "tasks/jkb/a/deep")?;
-            let b_leaf = ensure(conn, "tasks/other/b")?;
-            ensure(conn, "tasks/empty")?; // a child with no placements at all
+            let a_leaf = ensure(conn, meta, "tasks/jkb/a/deep")?;
+            let b_leaf = ensure(conn, meta, "tasks/other/b")?;
+            ensure(conn, meta, "tasks/empty")?; // a child with no placements at all
             let new = |uid: &str| NewItem {
                 uid: uid.to_owned(),
                 kind: "task".to_owned(),
@@ -827,7 +875,7 @@ mod tests {
     fn subtree_leaf_counts_break_down_by_kind() {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
-            let mixed = ensure(conn, "repos/jkb/notes")?;
+            let mixed = ensure(conn, meta, "repos/jkb/notes")?;
             for (uid, kind) in [
                 ("task:a", "task"),
                 ("task:b", "task"),
@@ -882,9 +930,9 @@ mod tests {
     #[test]
     fn ensure_creates_ancestors_and_subtree_lists_them() {
         let db = Db::open_in_memory().unwrap();
-        db.write_txn("test", |conn, _meta| {
-            ensure(conn, "books/sicp/ch1")?;
-            ensure(conn, "books/dragon")?;
+        db.write_txn("test", |conn, meta| {
+            ensure(conn, meta, "books/sicp/ch1")?;
+            ensure(conn, meta, "books/dragon")?;
             Ok(())
         })
         .unwrap();
@@ -906,7 +954,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let item = db
             .write_txn("t", |conn, meta| {
-                let leaf = ensure(conn, "tasks/mono/backend")?;
+                let leaf = ensure(conn, meta, "tasks/mono/backend")?;
                 let item = upsert(
                     conn,
                     meta,
@@ -951,7 +999,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .write_txn("t", |conn, meta| {
-                let id = ensure(conn, "docs/plan/backend")?;
+                let id = ensure(conn, meta, "docs/plan/backend")?;
                 set_metadata(
                     conn,
                     meta,
@@ -971,7 +1019,7 @@ mod tests {
 
         // A namespace with no metadata set reads back the `'{}'` default (no header_line).
         let bare = db
-            .write_txn("t", |conn, _m| ensure(conn, "docs/plan"))
+            .write_txn("t", |conn, meta| ensure(conn, meta, "docs/plan"))
             .unwrap();
         let bare_meta = db
             .read(move |conn| get_metadata(conn, bare))
@@ -986,12 +1034,12 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
-            let root = ensure(conn, "memory/jkb/heisenbug")?;
+            let root = ensure(conn, meta, "memory/jkb/heisenbug")?;
             // Pre-existing metadata must survive typing the namespace.
             set_metadata(conn, meta, root, &json!({ "position": 3 }))?;
             set_type(conn, meta, root, "debugging")?;
-            ensure(conn, "memory/jkb/heisenbug/hypotheses")?;
-            ensure(conn, "memory/jkb/other")?;
+            ensure(conn, meta, "memory/jkb/heisenbug/hypotheses")?;
+            ensure(conn, meta, "memory/jkb/other")?;
             Ok(())
         })
         .unwrap();
@@ -1040,7 +1088,7 @@ mod tests {
         use crate::nstype::for_namespace;
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
-            let id = ensure(conn, "memory/oops")?;
+            let id = ensure(conn, meta, "memory/oops")?;
             set_type(conn, meta, id, "debugging")
         })
         .unwrap();
@@ -1084,7 +1132,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
             for path in ["work/todo", "alpha/queue", "a/b/c/d"] {
-                let id = ensure(conn, path)?;
+                let id = ensure(conn, meta, path)?;
                 set_type(conn, meta, id, nstype::tasks::NAME)?;
             }
             Ok(())

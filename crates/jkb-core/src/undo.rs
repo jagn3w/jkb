@@ -493,7 +493,7 @@ fn reinsert_row(conn: &Connection, op: &str, table: &str, before: Option<&Value>
     // *"so a re-run is not an error."* A completed undo is refused by `already_undone`; a
     // rolled-back one left nothing behind to collide with.
     //
-    // What `OR IGNORE` did do was swallow the case this whole module exists for: an unlogged
+    // What `OR IGNORE` did do was swallow the case this whole module exists for: a later
     // writer re-taking a UNIQUE key (`ns::ensure` re-creating a deleted `namespaces.path`,
     // `apply_doc` re-placing a placement, `jkb task depend` re-linking an edge). The conflict
     // vanished, the arm answered `Ok(0)`, the CLI printed "reverted 0 change(s)" and exited 0 —
@@ -785,12 +785,60 @@ fn invert_entry(
                 .ok_or_else(|| {
                     TypeError::Validation(format!("cannot undo unknown table '{table}'"))
                 })?;
+            if entity == Entity::Namespaces {
+                refuse_occupied_namespace(conn, rowid()?)?;
+            }
             rows += conn
                 .prepare_cached(&format!("DELETE FROM {} WHERE rowid = ?1", entity.as_str()))?
                 .execute([rowid()?])?;
         }
     }
     Ok(rows)
+}
+
+/// Refuse to undo the creation of namespace `id` while something a *later* transaction made still
+/// lives in it: a child namespace, an item placement, or a mount.
+///
+/// Deleting the row would cascade the placements and the mount away (`ON DELETE CASCADE`) — work
+/// the user never asked to take back, gone with no entry of its own to restore it from. A child
+/// would fail the `parent_id` foreign key anyway, but with a message naming nothing. The same rule
+/// as `ns::remove`, which refuses a namespace that is not empty. Anything the transaction being
+/// undone put there itself was logged after the namespace and is inverted first (`undo` walks its
+/// entries newest first), so by the time this runs only other transactions' work can remain.
+fn refuse_occupied_namespace(conn: &Connection, id: i64) -> Result<()> {
+    let (path, children, placements, mounted): (String, i64, i64, bool) = match conn
+        .prepare_cached(
+            "SELECT n.path,
+                    (SELECT count(*) FROM namespaces c WHERE c.parent_id = n.id),
+                    (SELECT count(*) FROM placements p WHERE p.namespace_id = n.id),
+                    EXISTS (SELECT 1 FROM mounts m WHERE m.namespace_id = n.id)
+               FROM namespaces n WHERE n.id = ?1",
+        )?
+        .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .optional()?
+    {
+        Some(found) => found,
+        // Already gone: the absence the inverse promises holds (see the `DeleteRow` arm).
+        None => return Ok(()),
+    };
+    let held = [
+        (children, "child namespace(s)"),
+        (placements, "item placement(s)"),
+        (i64::from(mounted), "mount"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect::<Vec<_>>();
+    if held.is_empty() {
+        return Ok(());
+    }
+    Err(TypeError::Validation(format!(
+        "namespace '{path}' was created by this transaction but now holds {} that later work put \
+         there; deleting it would take that work with it — undo or move it first",
+        held.join(", ")
+    ))
+    .into())
 }
 
 /// Put an edge's previous weight back on the row `row` identifies.
@@ -1172,9 +1220,9 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     // reverts the one before it, and the explicit form answers "already undone". That is the
     // silent retarget this module was rewritten to delete, arriving from the other end.
     //
-    // It covers the harmless-looking case too: an id that *was* issued by a writer logging nothing
-    // (`ns::ensure`, see [`undo_last`]). Nothing is there to revert either way, and the answer to
-    // "revert nothing" is to say so, not to record a reversal.
+    // It covers the harmless-looking case too: an id that *was* issued to a transaction logging
+    // nothing (a derived-index write, see [`undo_last`]). Nothing is there to revert either way, and
+    // the answer to "revert nothing" is to say so, not to record a reversal.
     if entries.is_empty() {
         return Err(TypeError::Validation(refusal(
             conn,
@@ -1589,12 +1637,14 @@ fn snapshot_row_id(what: &str, row: &Value) -> Result<Option<i64>> {
 /// say — is therefore still selected, because it is still the user's last change; reaching past
 /// it to revert unrelated earlier work is exactly the behaviour being removed.
 ///
-/// **The claim is about transactions that logged something, and only those.** A mutation that
-/// writes no changelog entry at all is invisible here, so `jkb undo` still reaches past it and
-/// reverts the change before it. `ns::ensure` (`jkb ns mk`) is the live example — it takes no
-/// [`WriteMeta`] and logs nothing — and the ingest embed stage and `jkb index --sweep` share the
-/// shape. That is a gap in what the *writers* record, not in this selection, and it is filed
-/// rather than fixed here.
+/// **The claim is about transactions that logged something, and only those.** A transaction that
+/// writes no changelog entry does not even take a transaction id (`write_txn` numbers from the
+/// changelog), so nothing here could see it; the guarantee rests on every mutation logging. The
+/// writers that do not are the derived-index ones — the ingest embed stage, `index_pending` and
+/// `jkb index --sweep` write vectors, which are rebuildable from the VFS and are nobody's change
+/// to take back — so reaching past them to the user's last change is the right answer. `ns::ensure`
+/// was the content writer that did not: `jkb ns mk` logged nothing, and a bare `jkb undo` after it
+/// reverted the change before it. It now logs every namespace it creates.
 ///
 /// # Errors
 /// Propagates any error from [`undo`], including its refusal; and says so rather than answering
@@ -1679,7 +1729,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let id = db.write_txn("t", |c, m| upsert(c, m, &note("a"))).unwrap();
         let ns = db
-            .write_txn("t", |c, _| crate::ns::ensure(c, "x/y"))
+            .write_txn("t", |c, m| crate::ns::ensure(c, m, "x/y"))
             .unwrap();
         db.write_txn("t", move |c, m| {
             crate::placement::place(c, m, id, ns, PlacementRole::Primary, 0)
@@ -1800,8 +1850,8 @@ mod tests {
             .write_txn("t", |c, m| {
                 let victim = upsert(c, m, &note("doomed"))?;
                 let neighbour = upsert(c, m, &note("neighbour"))?;
-                let home = ns::ensure(c, "notes/home")?;
-                let mirror = ns::ensure(c, "notes/mirror")?;
+                let home = ns::ensure(c, m, "notes/home")?;
+                let mirror = ns::ensure(c, m, "notes/mirror")?;
                 placement::place(c, m, victim, home, PlacementRole::Primary, 3)?;
                 placement::place(c, m, victim, mirror, PlacementRole::Reference, 0)?;
                 tag::apply(c, m, victim, "size", "small")?;
@@ -2332,7 +2382,9 @@ mod tests {
         use jkb_types::PlacementRole;
 
         let db = Db::open_in_memory().unwrap();
-        let home = db.write_txn("t", |c, _| ns::ensure(c, "x/home")).unwrap();
+        let home = db
+            .write_txn("t", |c, m| ns::ensure(c, m, "x/home"))
+            .unwrap();
         let a = db
             .write_txn("t", move |c, m| {
                 let a = upsert(c, m, &note("a"))?;
@@ -2395,7 +2447,7 @@ mod tests {
         let (a, mirror) = db
             .write_txn("t", |c, m| {
                 let a = upsert(c, m, &note("a"))?;
-                let mirror = ns::ensure(c, "x/mirror")?;
+                let mirror = ns::ensure(c, m, "x/mirror")?;
                 placement::place(c, m, a, mirror, PlacementRole::Reference, 3)?;
                 tag::apply(c, m, a, "f", "v")?;
                 c.execute(
@@ -2518,8 +2570,8 @@ mod tests {
         let (a, home, mirror) = db
             .write_txn("t", |c, m| {
                 let a = upsert(c, m, &note("a"))?;
-                let home = ns::ensure(c, "x/home")?;
-                let mirror = ns::ensure(c, "x/mirror")?;
+                let home = ns::ensure(c, m, "x/home")?;
+                let mirror = ns::ensure(c, m, "x/mirror")?;
                 placement::place(c, m, a, home, PlacementRole::Primary, 0)?;
                 Ok((a, home, mirror))
             })
@@ -2938,7 +2990,7 @@ mod tests {
         use crate::ns;
 
         let db = Db::open_in_memory().unwrap();
-        db.write_txn("t", |c, _| ns::ensure(c, "notes/old/deep"))
+        db.write_txn("t", |c, m| ns::ensure(c, m, "notes/old/deep"))
             .unwrap();
         db.write_txn("t", |c, m| ns::move_subtree(c, m, "notes/old", "notes/new"))
             .unwrap();
@@ -2969,8 +3021,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let id = db.write_txn("t", |c, m| upsert(c, m, &note("a"))).unwrap();
         let (from, to) = db
-            .write_txn("t", |c, _| {
-                Ok((ns::ensure(c, "x/from")?, ns::ensure(c, "x/to")?))
+            .write_txn("t", |c, m| {
+                Ok((ns::ensure(c, m, "x/from")?, ns::ensure(c, m, "x/to")?))
             })
             .unwrap();
         db.write_txn("t", move |c, m| placement::set_primary(c, m, id, from, 7))
@@ -3070,7 +3122,7 @@ mod tests {
             .write_txn("t", |c, m| {
                 let item = upsert(c, m, &note("a"))?;
                 let other = upsert(c, m, &note("b"))?;
-                let ns_id = ns::ensure(c, "x/y")?;
+                let ns_id = ns::ensure(c, m, "x/y")?;
                 Ok((item, other, ns_id))
             })
             .unwrap();
@@ -3089,7 +3141,7 @@ mod tests {
                 Some(2.5),
                 Some(&json!({ "why": "evidence" })),
             )?;
-            ns::ensure(c, "x/doomed")?;
+            ns::ensure(c, m, "x/doomed")?;
             Ok(())
         })
         .unwrap();
@@ -3347,8 +3399,8 @@ mod tests {
                 let other = upsert(c, m, &note("other"))?;
                 let parent = upsert(c, m, &note("parent"))?;
                 let kid = upsert(c, m, &note("kid"))?;
-                let home = ns::ensure(c, "notes/home")?;
-                let mirror = ns::ensure(c, "notes/mirror")?;
+                let home = ns::ensure(c, m, "notes/home")?;
+                let mirror = ns::ensure(c, m, "notes/mirror")?;
                 placement::place(c, m, victim, home, PlacementRole::Primary, 3)?;
                 placement::place(c, m, victim, mirror, PlacementRole::Reference, 5)?;
                 tag::apply(c, m, victim, "size", "small")?;
@@ -3480,7 +3532,7 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let id = db.write_txn("t", |c, m| upsert(c, m, &note("a"))).unwrap();
-        let nsid = db.write_txn("t", |c, _| ns::ensure(c, "x/y")).unwrap();
+        let nsid = db.write_txn("t", |c, m| ns::ensure(c, m, "x/y")).unwrap();
         db.write_txn("t", move |c, m| {
             ns::set_metadata(c, m, nsid, &json!({ "layout": "first" }))?;
             binding::set(c, m, id, "file:///tmp/a.md", None, None)?;
@@ -3642,14 +3694,18 @@ mod tests {
         use crate::ns;
 
         let db = Db::open_in_memory().unwrap();
-        let gone = db.write_txn("t", |c, _| ns::ensure(c, "x/gone")).unwrap();
+        let gone = db
+            .write_txn("t", |c, m| ns::ensure(c, m, "x/gone"))
+            .unwrap();
         let removed = db
             .write_txn("t", |c, m| {
                 ns::remove(c, m, "x/gone")?;
                 Ok(m.txn_id)
             })
             .unwrap();
-        let other = db.write_txn("t", |c, _| ns::ensure(c, "x/other")).unwrap();
+        let other = db
+            .write_txn("t", |c, m| ns::ensure(c, m, "x/other"))
+            .unwrap();
         assert_ne!(
             other, gone,
             "the later namespace was handed the removed one's id: namespaces.id is being reused"
@@ -3708,7 +3764,9 @@ mod tests {
         use jkb_types::PlacementRole;
 
         let db = Db::open_in_memory().unwrap();
-        let home = db.write_txn("t", |c, _| ns::ensure(c, "x/home")).unwrap();
+        let home = db
+            .write_txn("t", |c, m| ns::ensure(c, m, "x/home"))
+            .unwrap();
         let (a, created) = db
             .write_txn("t", move |c, m| {
                 let a = upsert(c, m, &note("a"))?;
@@ -3763,8 +3821,8 @@ mod tests {
             .write_txn("t", |c, m| {
                 let a = upsert(c, m, &note("a"))?;
                 let b = upsert(c, m, &note("b"))?;
-                let home = ns::ensure(c, "x/home")?;
-                let mirror = ns::ensure(c, "x/mirror")?;
+                let home = ns::ensure(c, m, "x/home")?;
+                let mirror = ns::ensure(c, m, "x/mirror")?;
                 placement::place(c, m, a, home, PlacementRole::Primary, 0)?;
                 placement::place(c, m, b, home, PlacementRole::Primary, 0)?;
                 Ok((a, b, home, mirror))
@@ -4294,12 +4352,13 @@ mod tests {
         );
     }
 
-    /// A re-insert whose key an **unlogged** writer has re-taken refuses, and the retry works
-    /// once the obstruction is cleared.
+    /// A re-insert whose key a **later** writer has re-taken refuses, and the retry works once the
+    /// obstruction is cleared.
     ///
     /// The finding's exact sequence: `jkb ns mk probe/zone` → `jkb ns rm probe/zone` (logging the
-    /// whole row) → `jkb ns mk probe/zone` again — `ns::ensure` takes no `WriteMeta`, logs nothing,
-    /// and re-takes the UNIQUE `namespaces.path` — → `jkb undo`. The reinsert was
+    /// whole row) → `jkb ns mk probe/zone` again, re-taking the UNIQUE `namespaces.path` → `jkb undo
+    /// <the rm>`. (At the time `ns::ensure` logged nothing, so a bare `jkb undo` reached the rm; it
+    /// logs the re-creation now, but the explicit form still meets the same conflict.) The reinsert was
     /// `INSERT OR IGNORE`, so the conflict vanished, the arm answered `Ok(0)`, and the CLI printed
     /// "reverted 0 change(s)" and exited 0. **The marker was then written**, so clearing the
     /// conflicting namespace and re-running the documented recovery met "it has already been
@@ -4315,7 +4374,7 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let zone = db
-            .write_txn("t", |c, _| ns::ensure(c, "probe/zone"))
+            .write_txn("t", |c, m| ns::ensure(c, m, "probe/zone"))
             .unwrap();
         // Something worth losing, on the row the delete snapshots.
         db.write_txn("t", move |c, m| {
@@ -4328,9 +4387,9 @@ mod tests {
                 Ok(m.txn_id)
             })
             .unwrap();
-        // …and the unlogged writer takes the path back. No changelog entry, so nothing about the
-        // log foresees the conflict.
-        db.write_txn("t", |c, _| ns::ensure(c, "probe/zone"))
+        // …and a later writer takes the path back. Nothing about the rm's own entries foresees
+        // the conflict.
+        db.write_txn("t", |c, m| ns::ensure(c, m, "probe/zone"))
             .unwrap();
 
         let err = db
@@ -4430,8 +4489,10 @@ mod tests {
     /// under which a partially-applied undo exists at all.
     ///
     /// So: one transaction whose highest-id entry (`item::set_content`, applied first) inverts
-    /// cleanly and whose next entry (the rename's `tag_defs` row) hits the UNIQUE index. The
-    /// content must be back at its **post-transaction** value afterwards.
+    /// cleanly and whose next entry (the rename's `tag_defs` row) hits the UNIQUE index. Read
+    /// through the failing transaction's own connection, the content is at its **pre**-transaction
+    /// value — the first inverse ran — and once `write_txn` has rolled back it is at its
+    /// **post**-transaction value again.
     #[test]
     fn a_partly_applied_undo_is_rolled_back_whole() {
         use crate::{item, tag};
@@ -4461,8 +4522,19 @@ mod tests {
         })
         .unwrap();
 
+        // WHAT THE FAILED UNDO LEFT ON ITS OWN CONNECTION, read inside the same transaction before
+        // `write_txn` rolls it back. Without this probe the test cannot tell "an inverse ran and
+        // was rolled back" from "no inverse ran at all": if the log order or the loop order ever
+        // changed so that the failing entry came first, nothing would be applied, the content
+        // would still read "after the change" below, and the rollback would have no test.
+        let seen_mid_txn = std::sync::Arc::new(std::sync::Mutex::new(None::<Option<String>>));
+        let probe = std::sync::Arc::clone(&seen_mid_txn);
         let err = db
-            .write_txn("t", move |c, m| super::undo(c, m, mixed))
+            .write_txn("t", move |c, m| {
+                let refused = super::undo(c, m, mixed);
+                *probe.lock().unwrap() = Some(item::get_content(c, a)?);
+                refused
+            })
             .expect_err("the mixed transaction was undone despite an inverse the database refuses")
             .to_string();
         assert!(
@@ -4470,11 +4542,154 @@ mod tests {
             "the refusal does not claim nothing moved: {err}"
         );
         assert_eq!(
+            seen_mid_txn.lock().unwrap().clone(),
+            Some(Some("before the change".to_owned())),
+            "no inverse had been applied when the failing one ran, so there was nothing to roll \
+             back and this test no longer exercises the rollback"
+        );
+        assert_eq!(
             db.read(move |c| item::get_content(c, a)).unwrap(),
             Some("after the change".to_owned()),
             "the inverse that ran before the failing one was left applied, so `Nothing was \
              changed.` is false and half the transaction is undone"
         );
+    }
+
+    /// A bare `jkb undo` straight after `jkb ns mk` takes back the namespace, not the change
+    /// before it.
+    ///
+    /// `ns::ensure` used to log nothing, and `write_txn` numbers transactions from the changelog,
+    /// so `jkb ns mk` was invisible to [`undo_last`]: it reverted the user's previous change —
+    /// here, deleting the note — reported success, and left the namespace standing.
+    #[test]
+    fn a_bare_undo_after_making_a_namespace_takes_back_the_namespace() {
+        use crate::{item, ns};
+
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| upsert(c, m, &note("my-last-change")))
+            .unwrap();
+        // Exactly what `NsCmd::Mk` runs.
+        db.write_txn("cli", |c, m| ns::ensure(c, m, "media/photos"))
+            .unwrap();
+
+        let reverted = db.write_txn("cli", undo_last).unwrap();
+        assert_eq!(reverted, 2, "both rows `ensure` created are deleted");
+        assert!(
+            db.read(|c| item::id_for_uid(c, "my-last-change"))
+                .unwrap()
+                .is_some(),
+            "`jkb undo` reached past the namespace and reverted the change before it"
+        );
+        for path in ["media/photos", "media"] {
+            assert!(
+                db.read(move |c| ns::get(c, path)).unwrap().is_none(),
+                "`{path}` survived the undo of the transaction that made it"
+            );
+        }
+    }
+
+    /// Ensuring a namespace that already exists writes nothing, so it logs nothing — it is not a
+    /// change `jkb undo` should find, and logging it would make the undo delete a namespace that
+    /// predates the transaction.
+    #[test]
+    fn ensuring_an_existing_namespace_logs_nothing() {
+        use crate::ns;
+
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| ns::ensure(c, m, "a/b")).unwrap();
+        let count = || {
+            db.read(|c| {
+                Ok(c.query_row("SELECT count(*) FROM changelog", [], |r| r.get::<_, i64>(0))?)
+            })
+            .unwrap()
+        };
+        let logged = count();
+        db.write_txn("t", |c, m| ns::ensure(c, m, "a/b")).unwrap();
+        assert_eq!(count(), logged, "re-ensuring an existing path was logged");
+    }
+
+    /// Re-stamping a reserved root whose type was cleared is a change to an existing row, logged
+    /// as one: undoing it puts the cleared type back rather than deleting the root.
+    #[test]
+    fn re_stamping_a_cleared_reserved_type_is_undone_as_an_update() {
+        use crate::ns;
+
+        let db = Db::open_in_memory().unwrap();
+        let tasks = db.write_txn("t", |c, m| ns::ensure(c, m, "tasks")).unwrap();
+        db.write_txn("t", move |c, m| ns::clear_type(c, m, tasks))
+            .unwrap();
+        db.write_txn("t", |c, m| ns::ensure(c, m, "tasks")).unwrap();
+        assert!(db.read(|c| ns::get_type(c, "tasks")).unwrap().is_some());
+
+        db.write_txn("t", undo_last).unwrap();
+        assert_eq!(db.read(|c| ns::get(c, "tasks")).unwrap(), Some(tasks));
+        assert_eq!(
+            db.read(|c| ns::get_type(c, "tasks")).unwrap(),
+            None,
+            "the undo did not take back the re-stamp"
+        );
+    }
+
+    /// Undoing a namespace's creation refuses while later work lives in it, rather than letting
+    /// `ON DELETE CASCADE` take that work away with it.
+    #[test]
+    fn undoing_a_namespace_creation_refuses_while_later_work_lives_in_it() {
+        use crate::{ns, placement};
+        use jkb_types::PlacementRole;
+
+        let db = Db::open_in_memory().unwrap();
+        let (made, at) = db
+            .write_txn("t", |c, m| Ok((m.txn_id, ns::ensure(c, m, "x/y")?)))
+            .unwrap();
+        let a = db.write_txn("t", |c, m| upsert(c, m, &note("a"))).unwrap();
+        db.write_txn("t", move |c, m| {
+            placement::place(c, m, a, at, PlacementRole::Reference, 0)
+        })
+        .unwrap();
+
+        let err = db
+            .write_txn("t", move |c, m| super::undo(c, m, made))
+            .expect_err("undoing the namespace's creation cascaded a later placement away")
+            .to_string();
+        assert!(
+            err.contains("Nothing was changed.") && err.contains("1 item placement(s)"),
+            "the refusal does not name what is in the way: {err}"
+        );
+        assert_eq!(
+            db.read(move |c| crate::placement::items_directly_in(c, at))
+                .unwrap(),
+            vec![a],
+            "the placement did not survive"
+        );
+
+        // A child made by a later transaction is in the way too.
+        db.write_txn("t", |c, m| ns::ensure(c, m, "x/y/z")).unwrap();
+        db.write_txn("t", move |c, m| placement::unplace(c, m, a, at))
+            .unwrap();
+        let err = db
+            .write_txn("t", move |c, m| super::undo(c, m, made))
+            .expect_err("undoing the namespace's creation orphaned a later child")
+            .to_string();
+        assert!(err.contains("1 child namespace(s)"), "{err}");
+    }
+
+    /// Undoing `jkb ns mv` onto a new parent also removes the parent the move created.
+    #[test]
+    fn undoing_a_move_removes_the_parent_it_created() {
+        use crate::ns;
+
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| ns::ensure(c, m, "a/b")).unwrap();
+        db.write_txn("t", |c, m| ns::move_subtree(c, m, "a/b", "fresh/parent/b"))
+            .unwrap();
+        db.write_txn("t", undo_last).unwrap();
+        assert!(db.read(|c| ns::get(c, "a/b")).unwrap().is_some());
+        for path in ["fresh/parent", "fresh"] {
+            assert!(
+                db.read(move |c| ns::get(c, path)).unwrap().is_none(),
+                "`{path}`, made by the move, survived its undo"
+            );
+        }
     }
 
     /// A transaction is undone **once**. Asked again, it refuses.
@@ -4490,7 +4705,7 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let ns = db
-            .write_txn("t", |c, _| crate::ns::ensure(c, "x/y"))
+            .write_txn("t", |c, m| crate::ns::ensure(c, m, "x/y"))
             .unwrap();
         let mine = db
             .write_txn("t", |c, m| upsert(c, m, &note("mine")))
@@ -4623,7 +4838,7 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let ns_id = db
-            .write_txn("t", |c, _m| ns::ensure(c, "repos/x/docs"))
+            .write_txn("t", |c, m| ns::ensure(c, m, "repos/x/docs"))
             .unwrap();
         db.write_txn("t", move |c, m| {
             mount::create(

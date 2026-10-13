@@ -2162,7 +2162,7 @@ fn apply_doc(
         ))));
     }
     let file_ns_path = namespace_for(ctx, path);
-    let file_ns = ns::ensure(conn, &file_ns_path)?;
+    let file_ns = ns::ensure(conn, meta, &file_ns_path)?;
 
     // Sections → namespaces, carrying only their header text. Their ORDER (and the file's
     // prose) lives in the layout stored on the file namespace below — one sequence, so
@@ -2170,7 +2170,7 @@ fn apply_doc(
     let mut section_ns: HashMap<String, NamespaceId> = HashMap::new();
     for s in &doc.sections {
         let full = format!("{file_ns_path}/{}", s.path);
-        let id = ns::ensure(conn, &full)?;
+        let id = ns::ensure(conn, meta, &full)?;
         // `sync_section` marks a namespace as this file's, so `retire_undeclared_sections` can
         // find it later. `header_line` is kept **only** as a human label in the tree — since D45
         // the authority for both the header text and the block order is the journal row, and
@@ -2218,7 +2218,7 @@ fn apply_doc(
         };
         let declared = declared_mirrors.entry(id).or_default();
         for m in &it.mirrors {
-            let mns = ns::ensure(conn, m)?;
+            let mns = ns::ensure(conn, meta, m)?;
             placement::place(conn, meta, id, mns, PlacementRole::Reference, 0)?;
             declared.insert(mns);
         }
@@ -3281,7 +3281,7 @@ mod archive_skip {
         let db = Db::open_in_memory().unwrap();
         let backing = format!("file://{}", dir.path().to_string_lossy());
         db.write_txn("t", move |conn, meta| {
-            let ns_id = ns::ensure(conn, "docs/plan")?;
+            let ns_id = ns::ensure(conn, meta, "docs/plan")?;
             jkb_core::mount::create(
                 conn,
                 meta,

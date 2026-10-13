@@ -268,8 +268,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let (task_id, home, mirror) = db
             .write_txn("t", |conn, meta| {
-                let home = ns::ensure(conn, "tasks/inbox")?;
-                let mirror = ns::ensure(conn, "repos/monorepo/backend")?;
+                let home = ns::ensure(conn, meta, "tasks/inbox")?;
+                let mirror = ns::ensure(conn, meta, "repos/monorepo/backend")?;
                 let task_id = upsert(
                     conn,
                     meta,
@@ -299,8 +299,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let (item, a, b) = db
             .write_txn("t", |conn, meta| {
-                let a = ns::ensure(conn, "docs/a")?;
-                let b = ns::ensure(conn, "docs/b")?;
+                let a = ns::ensure(conn, meta, "docs/a")?;
+                let b = ns::ensure(conn, meta, "docs/b")?;
                 let item = upsert(
                     conn,
                     meta,
@@ -352,8 +352,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let (item, home, mirror) = db
             .write_txn("t", |conn, meta| {
-                let home = ns::ensure(conn, "tasks/jkb/.backlog")?;
-                let mirror = ns::ensure(conn, ".backlog")?;
+                let home = ns::ensure(conn, meta, "tasks/jkb/.backlog")?;
+                let mirror = ns::ensure(conn, meta, ".backlog")?;
                 let item = upsert(
                     conn,
                     meta,

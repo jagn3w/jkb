@@ -224,8 +224,8 @@ fn selective_large_scope_returns_results_via_overfetch() {
     let vector = VectorIndexer::new(FakeEmbedder::arc());
     db.write_txn_with::<(), jkb_search::Error, _>("seed", move |conn, meta| {
         vector.ensure_ready(conn)?;
-        let out_ns = ns::ensure(conn, "out")?;
-        let in_ns = ns::ensure(conn, "in")?;
+        let out_ns = ns::ensure(conn, meta, "out")?;
+        let in_ns = ns::ensure(conn, meta, "in")?;
         // 60 out-of-scope decoys sitting exactly on the query (distance ~0): far more
         // than the initial over-fetch batch, so growth is forced.
         for i in 0..60 {
