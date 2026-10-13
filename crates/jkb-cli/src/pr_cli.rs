@@ -265,7 +265,7 @@ trait Github {
     /// Whether pull request `number` proves the work landed ([`pr::merged_fact`]).
     fn merged(&self, number: Option<i64>, resumed_at: Option<&str>) -> (Fact, Option<String>);
     /// The commit `branch`'s remote-tracking ref names, `None` when there is no such ref; `Err` when
-    /// git could not say.
+    /// git could not say, or there is no remote for a ref to track.
     fn remote_head(&self, branch: &str) -> Result<Option<String>>;
 }
 
@@ -282,6 +282,12 @@ impl Github for Checkout<'_> {
     }
 
     fn remote_head(&self, branch: &str) -> Result<Option<String>> {
+        // With no `origin` there is no tracking ref to move, so "no such ref" would key a *none*
+        // that no push ever retires. Unreadable instead: never cached, `gh` asked every run.
+        anyhow::ensure!(
+            crate::gitrepo::has_remote(self.0, "origin")?,
+            "this repository has no `origin` remote, so a branch's remote tip cannot be read"
+        );
         // `origin`, as `gitrepo::branch_ref` reads it, spelled in full so a local branch named
         // `origin/<branch>` cannot answer for it.
         crate::gitrepo::rev_commit(self.0, &format!("refs/remotes/origin/{branch}"))
@@ -727,6 +733,7 @@ mod tests {
         discovery: RefCell<Discovery>,
         merged: RefCell<(Fact, Option<String>)>,
         tip: RefCell<Option<String>>,
+        no_remote: Cell<bool>,
         discovered: Cell<usize>,
         merged_asked: Cell<usize>,
     }
@@ -737,6 +744,7 @@ mod tests {
                 discovery: RefCell::new(Discovery::None),
                 merged: RefCell::new((Fact::Unknown, Some("not asked".to_owned()))),
                 tip: RefCell::new(None),
+                no_remote: Cell::new(false),
                 discovered: Cell::new(0),
                 merged_asked: Cell::new(0),
             }
@@ -759,6 +767,7 @@ mod tests {
         }
 
         fn remote_head(&self, _branch: &str) -> anyhow::Result<Option<String>> {
+            anyhow::ensure!(!self.no_remote.get(), "no `origin` remote");
             Ok(self.tip.borrow().clone())
         }
     }
@@ -934,5 +943,55 @@ mod tests {
         assert_eq!((closed.pr, closed.held), (Some(31), None));
         assert_eq!(b.writes(), ["task.close_merged"]);
         assert_eq!(status(&b.inner, &uid), "done");
+    }
+
+    /// A task re-worked on another branch is asked about **that** branch: the answer recorded for the
+    /// old one, at the same remote tip, does not stand for it.
+    #[test]
+    fn a_none_for_the_old_branch_does_not_stand_for_a_re_worked_task() {
+        let db = jkb_core::Db::open_in_memory().unwrap();
+        let b = Counting {
+            inner: LocalBackend::new(db),
+            ops: RefCell::new(Vec::new()),
+        };
+        let kb = Kb::new(&b);
+        let uid = started(&b.inner, "re-worked", "feat");
+        let gh = FakeGh::new();
+        *gh.tip.borrow_mut() = Some("aa".to_owned());
+        one(decide_all(&kb, &gh, "proj", false).unwrap());
+        one(decide_all(&kb, &gh, "proj", false).unwrap());
+        assert_eq!(gh.discovered.get(), 1);
+        op(
+            &b.inner,
+            serde_json::json!({ "op": "task.locate", "uid": uid, "owner": "box:1",
+                                "place": { "branch": "next", "repo": "proj" } }),
+        );
+        one(decide_all(&kb, &gh, "proj", false).unwrap());
+        assert_eq!(gh.discovered.get(), 2, "the new branch is asked about");
+        let facts = kb.pr_facts(&uid).unwrap();
+        assert_eq!(facts.branch.as_deref(), Some("next"));
+        assert_eq!(facts.pr_absent.map(|a| a.branch).as_deref(), Some("next"));
+        one(decide_all(&kb, &gh, "proj", false).unwrap());
+        assert_eq!(gh.discovered.get(), 2);
+    }
+
+    /// With no remote to read a tip from, a *none* is neither reused nor recorded: `gh` is asked every
+    /// run, as it was before any were kept — a key no push can move would hold for ever.
+    #[test]
+    fn without_a_readable_remote_tip_gh_is_asked_every_run() {
+        let db = jkb_core::Db::open_in_memory().unwrap();
+        let b = Counting {
+            inner: LocalBackend::new(db),
+            ops: RefCell::new(Vec::new()),
+        };
+        let kb = Kb::new(&b);
+        started(&b.inner, "no origin", "feat");
+        let gh = FakeGh::new();
+        gh.no_remote.set(true);
+        for asked in 1..=3 {
+            one(decide_all(&kb, &gh, "proj", false).unwrap());
+            assert_eq!(gh.discovered.get(), asked);
+        }
+        assert!(b.writes().is_empty(), "{:?}", b.writes());
     }
 }

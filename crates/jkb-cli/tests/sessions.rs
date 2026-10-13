@@ -5794,6 +5794,7 @@ fn close_merged_asks_gh_again_only_when_the_branch_moves_on_the_remote() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    // Without an `origin` nothing is kept: no tracking ref could ever move the key.
     let uid = f.add_task("in flight, no pull request");
     let s = f.work(&uid);
     let branch = s["branch"].as_str().unwrap().to_owned();
@@ -5817,9 +5818,18 @@ fn close_merged_asks_gh_again_only_when_the_branch_moves_on_the_remote() {
         v["held"][0]["reason"].as_str().unwrap().to_owned()
     };
     close();
-    assert_eq!(asked(), 1);
+    close();
+    assert_eq!(asked(), 2, "with no `origin`, every run asks");
+    let origin = f.home.path().join("origin.git");
+    git(&f.repo, &["init", "--bare", "-q", origin.to_str().unwrap()]);
+    git(
+        &f.repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    close();
+    assert_eq!(asked(), 3);
     let why = close();
-    assert_eq!(asked(), 1, "asked again with nothing moved: {why}");
+    assert_eq!(asked(), 3, "asked again with nothing moved: {why}");
     assert!(why.contains("when last asked"), "{why}");
 
     // Pushed: the remote-tracking ref appears, so the question is a new one.
@@ -5833,9 +5843,9 @@ fn close_merged_asks_gh_again_only_when_the_branch_moves_on_the_remote() {
         ],
     );
     close();
-    assert_eq!(asked(), 2);
+    assert_eq!(asked(), 4);
     close();
-    assert_eq!(asked(), 2, "and is then answered");
+    assert_eq!(asked(), 4, "and is then answered");
     assert_eq!(f.status_of(&uid), "in_progress");
 }
 

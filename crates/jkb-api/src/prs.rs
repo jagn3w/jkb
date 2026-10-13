@@ -178,8 +178,9 @@ pub fn record(
 /// tip moves (`jkb_core::transition::no_pull_request`).
 ///
 /// # Errors
-/// [`ErrorCode::Invalid`] for a malformed branch or tip, [`ErrorCode::NotFound`],
-/// [`ErrorCode::Forbidden`] under `roots`, or a failed write.
+/// [`ErrorCode::Invalid`] for a malformed branch or tip, [`ErrorCode::Stale`] when `branch` is not
+/// the task's latest recorded branch, [`ErrorCode::NotFound`], [`ErrorCode::Forbidden`] under
+/// `roots`, or a failed write.
 pub fn record_absent(
     conn: &Connection,
     meta: &WriteMeta,
@@ -199,6 +200,20 @@ pub fn record_absent(
         }
     }
     let id = writable(conn, reference, roots)?;
+    // Only about the branch the task is on now, read in this transaction: an answer about a branch
+    // the task has since left — `close-merged` asked, and the task was re-worked meanwhile — would
+    // otherwise stand in for a question nobody asked about the new one.
+    let current = transition::latest_with_branch(conn, id)?.and_then(|r| r.labels.branch);
+    if current.as_deref() != Some(branch) {
+        return Err(ApiError::with_code(
+            ErrorCode::Stale,
+            format!(
+                "`{branch}` is not the branch this task's history records it on ({}); the answer \
+                 is not recorded",
+                current.as_deref().unwrap_or("none")
+            ),
+        ));
+    }
     let facts = task::observe(conn, id)?;
     transition::no_pull_request(conn, meta, id, &facts, branch, remote_head)?;
     Ok(())

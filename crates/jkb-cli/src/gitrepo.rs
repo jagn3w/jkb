@@ -1286,6 +1286,18 @@ fn git(dir: &Path, args: &[&str]) -> Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()))
 }
 
+/// Whether the repository containing `dir` has a remote called `name` (one with a URL).
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed.
+pub fn has_remote(dir: &Path, name: &str) -> Result<bool> {
+    valid_ref(name)?;
+    Ok(
+        git(dir, &["config", "--get", &format!("remote.{name}.url")])?
+            .is_some_and(|url| !url.is_empty()),
+    )
+}
+
 /// The repository root containing `dir`, or `None` if it is not inside a work tree.
 ///
 /// # Errors

@@ -312,10 +312,37 @@ fn a_recorded_none_is_read_back_with_what_it_was_asked_at() {
         "an answer of none is not a landing and moves no branch"
     );
     assert_eq!(status(&b, &uid), "in_progress");
+    // About another branch than the one the task is on: refused, and the task's branch stays.
+    let e = call(
+        &b,
+        json!({ "op": "task.pr_absent", "uid": uid, "branch": "elsewhere", "remote_head": head }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Stale, "{e:?}");
+    let still = facts(&b, &uid);
+    assert_eq!(still.branch.as_deref(), Some("feat"));
+    assert_eq!(still.pr_absent, after.pr_absent);
+    // Re-worked on another branch: an answer about the old one is refused, and the one recorded
+    // does not speak for the new branch (the client compares the branch).
+    call(
+        &b,
+        json!({ "op": "task.locate", "uid": uid, "owner": "box:1",
+                "place": { "branch": "next", "repo": "proj" } }),
+    )
+    .unwrap();
+    let e = call(
+        &b,
+        json!({ "op": "task.pr_absent", "uid": uid, "branch": "feat" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Stale, "{e:?}");
+    let moved = facts(&b, &uid);
+    assert_eq!(moved.branch.as_deref(), Some("next"));
+    assert_eq!(moved.pr_absent.map(|a| a.branch).as_deref(), Some("feat"));
     for bad in ["", "not-hex", &"a".repeat(65)] {
         let e = call(
             &b,
-            json!({ "op": "task.pr_absent", "uid": uid, "branch": "feat", "remote_head": bad }),
+            json!({ "op": "task.pr_absent", "uid": uid, "branch": "next", "remote_head": bad }),
         )
         .unwrap_err();
         assert_eq!(e.code, ErrorCode::Invalid, "{bad:?}");

@@ -282,13 +282,17 @@ pub fn history(conn: &Connection, task: ItemId) -> Result<Vec<TransitionRow>> {
 /// last recorded as being on. A branch name that has since changed hands cannot make an older
 /// row describe newer work, because nothing is keyed by it.
 ///
+/// A [`no_pull_request`] row is **not** one: its `branch` label names the branch a question was
+/// asked about, not where the work is, and letting it answer here would let an answer about an old
+/// branch — or any branch a caller names — become the task's branch.
+///
 /// # Errors
 /// Returns a database error if the query fails.
 pub fn latest_with_branch(conn: &Connection, task: ItemId) -> Result<Option<TransitionRow>> {
     Ok(history(conn, task)?
         .into_iter()
         .rev()
-        .find(|r| r.labels.branch.is_some()))
+        .find(|r| r.labels.branch.is_some() && r.event != NO_PULL_REQUEST))
 }
 
 /// The branch this task's work lands on, as most recently recorded.
@@ -768,7 +772,8 @@ pub struct Reclaimed {
 #[cfg(test)]
 mod tests {
     use super::{
-        history, landing, observed, perform, reclaim_dead, Labels, Landing, TransitionRow,
+        history, landing, latest_with_branch, no_pull_request, note, observed, perform,
+        reclaim_dead, Labels, Landing, TransitionRow,
     };
     use crate::lifecycle::{self, TaskEvent, TaskFacts};
     use crate::task::{create, NewTask};
@@ -1220,5 +1225,43 @@ mod tests {
         let found = db.read(move |conn| landing(conn, id)).expect("landing");
         let recorded = found.recorded().expect("a landing was recorded");
         assert_eq!(recorded.labels.onto.as_deref(), Some("second"));
+    }
+
+    /// A *no pull request* answer is never the task's branch: [`latest_with_branch`] passes over it,
+    /// whatever branch it names, while [`Landing::pr_absent`] finds it.
+    #[test]
+    fn a_no_pull_request_answer_is_not_the_task_s_branch() {
+        let db = db();
+        let id = a_task(&db);
+        db.write_txn("test", move |conn, meta| {
+            let facts = TaskFacts::default();
+            note(
+                conn,
+                meta,
+                id,
+                &facts,
+                &Labels {
+                    branch: Some("feat".to_owned()),
+                    ..Labels::default()
+                },
+            )?;
+            no_pull_request(conn, meta, id, &facts, "elsewhere", Some("abcd"))
+        })
+        .expect("written");
+        let (branch, absent) = db
+            .read(move |conn| Ok((latest_with_branch(conn, id)?, landing(conn, id)?)))
+            .expect("read");
+        assert_eq!(
+            branch.and_then(|r| r.labels.branch).as_deref(),
+            Some("feat")
+        );
+        let absent = absent.pr_absent().expect("the answer is found").clone();
+        assert_eq!(
+            (
+                absent.labels.branch.as_deref(),
+                absent.labels.ref_commit.as_deref()
+            ),
+            (Some("elsewhere"), Some("abcd"))
+        );
     }
 }
