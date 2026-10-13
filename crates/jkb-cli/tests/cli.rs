@@ -877,6 +877,112 @@ fn an_import_keeps_a_filed_tasks_dependency_on_a_task_outside_its_file() {
     );
 }
 
+/// The uids of the items with a `parent_of` edge into `uid`, from `jkb related`.
+fn parent_edges_into(db: &Path, uid: &str) -> Vec<String> {
+    let out = jkb(db)
+        .args([
+            "--json",
+            "related",
+            uid,
+            "--direction",
+            "in",
+            "--edge",
+            "parent_of",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut uids: Vec<String> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["uid"].as_str().map(str::to_owned))
+        .collect();
+    uids.sort();
+    uids
+}
+
+/// A filed task given a container outside its file (`jkb task add --sync --under`) and then
+/// indented under another of the file's tasks moves to the file's parent, and the outside parent's
+/// `parent_of` edge goes with its containment row: the import used to replace only the row, so the
+/// edge named a second parent the frontier and `ls` no longer agreed with. `jkb undo` of the import
+/// brings both back, and the next sync finds the file up to date.
+#[test]
+fn a_file_parent_replaces_an_outside_container_with_its_edge() {
+    let dir = TempDir::new().unwrap();
+    let (db, _pfile, ofile) = two_tasks_files(&dir);
+    let outside = add_task(&db, "Outside");
+    let out = jkb(&db)
+        .args(["--json", "task", "add", "Kid", "+oth/tasks.md/x", "--sync"])
+        .args(["--under", &outside])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let kid = v["uid"].as_str().unwrap().to_owned();
+    sync_ok(&db, "oth");
+    let ghost = task_json(&db, &format!("file://{}#ghost", ofile.display()))["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let subtasks = |parent: &str| -> Vec<String> {
+        let out = jkb(&db)
+            .args(["--json", "task", "subtasks", parent])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["ref"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let outside_held = || {
+        assert_eq!(subtasks(&outside), [kid.as_str()]);
+        assert!(subtasks(&ghost).is_empty());
+        assert_eq!(parent_edges_into(&db, &kid), [outside.as_str()]);
+    };
+    outside_held();
+
+    let text = std::fs::read_to_string(&ofile).unwrap();
+    assert!(text.contains("\n- [ ] Kid "), "{text}");
+    std::fs::write(&ofile, text.replace("\n- [ ] Kid ", "\n  - [ ] Kid ")).unwrap();
+    let file_held = || {
+        assert_eq!(subtasks(&ghost), [kid.as_str()]);
+        assert!(subtasks(&outside).is_empty());
+        assert_eq!(
+            parent_edges_into(&db, &kid),
+            [ghost.as_str()],
+            "the outside parent's edge left with its row"
+        );
+    };
+    let edited = sync_ok(&db, "oth");
+    assert!(edited.contains("1 imported"), "{edited}");
+    file_held();
+    let settled = sync_ok(&db, "oth");
+    assert!(settled.contains("1 up-to-date"), "{settled}");
+
+    // The settled pass wrote nothing, so the import is the last change, and undoing it puts the
+    // outside container back with its edge.
+    jkb(&db).arg("undo").assert().success();
+    outside_held();
+}
+
 #[test]
 fn ns_ls_shows_created_namespaces() {
     let dir = TempDir::new().unwrap();

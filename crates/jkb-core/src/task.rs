@@ -459,7 +459,35 @@ pub fn add_subtask(
     // inside the parent. Both here so they cannot drift — this is the only supported way to
     // make a subtask.
     edge::link(conn, meta, parent, child, EdgeType::ParentOf, None)?;
-    crate::containment::contain(conn, meta, child, parent, 0)
+    set_container(conn, meta, child, parent, 0)
+}
+
+/// Make `parent` the container of `child`, at `position` among its siblings, and drop the
+/// `parent_of` edge from the container it leaves, if it had another.
+///
+/// A task has one container, and its `parent_of` edge stands beside that row, so replacing the
+/// row alone left the old parent's edge behind: `jkb related` and the edge listings showed two
+/// parents while the frontier and `ls`, which read containment, showed one. Every replacement of
+/// a task's container goes through here so the two move together; both writes are journalled,
+/// so `jkb undo` puts the old row and its edge back. The caller links `parent`'s own edge (as
+/// [`add_subtask`] does, or the tasks file import before reconciling containment).
+///
+/// # Errors
+/// A validation error from [`crate::containment::contain`] (`child` is `parent` or contains it);
+/// otherwise a database error.
+pub fn set_container(
+    conn: &Connection,
+    meta: &WriteMeta,
+    child: ItemId,
+    parent: ItemId,
+    position: i64,
+) -> Result<()> {
+    if let Some(old) = crate::containment::parent(conn, child)? {
+        if old != parent {
+            edge::unlink(conn, meta, old, child, EdgeType::ParentOf)?;
+        }
+    }
+    crate::containment::contain(conn, meta, child, parent, position)
 }
 
 /// What [`move_under`] did.

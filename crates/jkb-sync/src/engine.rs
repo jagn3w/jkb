@@ -2709,7 +2709,9 @@ impl FileEdges {
 /// file no longer declares goes with its edge — including one whose container's line was just
 /// removed, which otherwise left an open subtask listed only under a cancelled parent that every
 /// listing hides. A container outside the file is left alone unless the file now declares a parent
-/// for that task, since a task has one container.
+/// for that task, since a task has one container; then [`task::set_container`] replaces it and
+/// unlinks its `parent_of` edge too, the one outside edge an import removes (the file declared a
+/// different parent, so the edge contradicts it), which [`FileEdges::owns`] does not otherwise own.
 fn reconcile_containment(
     conn: &Connection,
     meta: &WriteMeta,
@@ -2747,7 +2749,8 @@ fn reconcile_containment(
     let mut next_position: HashMap<ItemId, i64> = HashMap::new();
     for (child, parent) in children {
         let position = next_position.entry(parent).or_insert(0);
-        containment::contain(conn, meta, child, parent, *position)?;
+        // A container outside the file is replaced here, with the `parent_of` edge beside it.
+        task::set_container(conn, meta, child, parent, *position)?;
         *position += 1;
     }
     Ok(())
