@@ -3719,6 +3719,72 @@ fn a_mirror_deleted_from_the_file_stays_deleted_through_a_merge() {
     assert!(text.contains("- [x] Fix flaky test"), "{text}");
 }
 
+/// The converse of the test above: a mirror ADDED in the KB survives a three-way merge with a
+/// disk edit to a different task. The merge takes `setup` from the KB side only because its
+/// `Sig` differs from base there — the mirror is the only difference — and `apply_doc` must then
+/// see the KB's mirror in the merged doc as declared rather than remove it as dropped.
+#[test]
+fn a_mirror_added_in_the_kb_survives_a_merge_with_a_disk_edit() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, MIRRORED_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let setup = format!("{}#setup", uri_for(&file));
+    let fix = format!("{}#fix", uri_for(&file));
+    assert!(!reference_paths(&db, &setup).contains(&"repos/extra".to_owned()));
+
+    // KB side: add a `+ns` mirror to `setup` as a real placement write. Disk side: retitle `fix`.
+    let placed = setup.clone();
+    db.write_txn("cli", move |conn, meta| {
+        let id = item::id_for_uid(conn, &placed)?.expect("setup exists");
+        let mns = ns::ensure(conn, "repos/extra")?;
+        jkb_core::placement::place(conn, meta, id, mns, jkb_types::PlacementRole::Reference, 0)
+    })
+    .unwrap();
+    fs::write(
+        &file,
+        MIRRORED_MD.replace("Fix flaky test ^fix", "Fix the flaky test ^fix"),
+    )
+    .unwrap();
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(
+        report.count(Outcome::Merged),
+        1,
+        "expected a three-way merge: {:?}",
+        report.results
+    );
+
+    // The KB's mirror survived in the KB…
+    let after = reference_paths(&db, &setup);
+    assert!(
+        after.contains(&"repos/extra".to_owned()),
+        "the KB-added mirror must survive the merge: {after:?}"
+    );
+    assert!(after.contains(&"repos/app".to_owned()), "{after:?}");
+    assert!(after.contains(&"repos/web".to_owned()), "{after:?}");
+    // …and the file now shows it on `setup`'s line, beside the disk's edit to `fix`.
+    let text = fs::read_to_string(&file).unwrap();
+    let setup_line = text
+        .lines()
+        .find(|l| l.ends_with("^setup"))
+        .unwrap_or_else(|| panic!("setup's line is gone: {text}"));
+    assert!(setup_line.contains("+repos/extra"), "{text}");
+    assert!(text.contains("- [ ] Fix the flaky test ^fix"), "{text}");
+    // The disk's edit to `fix` is in the KB.
+    assert_eq!(
+        content_for(&db, &fix).as_deref(),
+        Some("Fix the flaky test")
+    );
+
+    // And it settles: the next pass is a no-op that keeps the mirror.
+    assert_eq!(sync(&db, "docs/plan").unwrap().count(Outcome::UpToDate), 1);
+    assert!(reference_paths(&db, &setup).contains(&"repos/extra".to_owned()));
+}
+
 /// A format that never writes mirrors cannot remove one by omission: a `document` file's item
 /// keeps a placement made in the KB across an import of a disk edit.
 #[test]
