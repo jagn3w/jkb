@@ -769,16 +769,21 @@ pub(crate) fn work(
     // Asked of the lifecycle rather than re-stated here, and honoured whole: every refusal the
     // facts carry stops the verb before any git side effect. `task.facts` reports only the
     // machine's refusal from the task's *state* (no `start` edge out of it); the guard's half
-    // depends on who asks and is decided by the write, after everything a session needs exists.
+    // depends on who asks — judged read-only below, before any write, and decided by the take.
     refuse_unstartable(uid, &facts)?;
 
-    // Session worktrees live inside the repo, so the first one must not make it dirty.
-    session::ensure_excluded(&ctx.root)?;
-
+    // Read-only, so it can all come before the first write.
     let sessions = session::discover(&ctx.root)?;
     let name = session_name(kb, &ctx, &facts, &sessions, uid, onto)?;
     let branch = session::branch_for(&name);
     let worktree = session::worktree_path(&ctx.root, &name);
+    // Whether this run may take the claim at all — another live owner, or a running session in this
+    // checkout — is judged here too, before any git side effect: refused only after them, the verb
+    // left an `.git/info/exclude` entry and a freshly cut land target behind for work it never did.
+    let judged = judge_claim(kb, &facts, uid, &worktree)?;
+
+    // Session worktrees live inside the repo, so the first one must not make it dirty.
+    session::ensure_excluded(&ctx.root)?;
     let onto = resolve_onto(kb, &ctx, &cwd, facts.land_target.as_deref(), onto, &name)?;
 
     // Claim first: if someone else is on this task, stop before making a worktree they
@@ -800,7 +805,7 @@ pub(crate) fn work(
         repo: ctx.key.clone(),
         onto: Some(onto.clone()),
     };
-    let owner = claim_session(kb, &facts, uid, &worktree, place.clone())?;
+    let owner = claim_session(kb, judged, &facts, uid, &worktree, place.clone())?;
 
     // CANCELLED FIRST, and a refusal stops the verb.
     //
@@ -1197,8 +1202,15 @@ fn release_base_worktree(ctx: &repo::RepoCtx) -> Result<()> {
     Ok(())
 }
 
-/// Take the session's claim, taking over from this session's own previous process (a resume)
-/// or from a dead owner, and refusing any other live owner **by name** (design D36.6).
+/// The claim a session may take over, as [`judge_claim`] read and judged it. Only that function
+/// makes one, so [`claim_session`] cannot take a claim nobody judged.
+struct JudgedClaim {
+    held: Option<String>,
+}
+
+/// Whether this run may take the session's claim: taking over from this session's own previous
+/// process (a resume) or from a dead owner, and refusing any other live owner **by name** (design
+/// D36.6). Read-only, so `task work` asks it before any git side effect.
 ///
 /// **A session another Claude Code session is still running in is not taken over** (tasks S6.4,
 /// decision E). Taking over the same worktree is otherwise how a session resumes, and it still is —
@@ -1206,15 +1218,7 @@ fn release_base_worktree(ctx: &repo::RepoCtx) -> Result<()> {
 /// opener has ended or is unknown to the registry. What is refused is a second Claude session starting
 /// work in a checkout the registry says the first is still working in. Only a registry answer of
 /// `live` refuses: unknown holds nothing back, as before.
-///
-/// Returns the owner the claim was taken as.
-fn claim_session(
-    kb: &Kb<'_>,
-    facts: &TaskState,
-    uid: &str,
-    worktree: &Path,
-    place: Place,
-) -> Result<String> {
+fn judge_claim(kb: &Kb<'_>, facts: &TaskState, uid: &str, worktree: &Path) -> Result<JudgedClaim> {
     let held = facts.claim.clone();
     if let Some(prev) = &held {
         let same_session =
@@ -1234,6 +1238,22 @@ fn claim_session(
             refuse_a_running_opener(kb, uid, prev, worktree)?;
         }
     }
+    Ok(JudgedClaim { held })
+}
+
+/// Take the session's claim [`judge_claim`] allowed — a compare-and-set against the owner it judged,
+/// so a claim that changed hands since is refused rather than taken.
+///
+/// Returns the owner the claim was taken as.
+fn claim_session(
+    kb: &Kb<'_>,
+    judged: JudgedClaim,
+    facts: &TaskState,
+    uid: &str,
+    worktree: &Path,
+    place: Place,
+) -> Result<String> {
+    let JudgedClaim { held } = judged;
     let opener = opener_for(kb, held.as_deref(), worktree)?;
     let owner = owner::session_owner(worktree, opener.as_deref());
     let ok = kb.take(TakeAsk {

@@ -283,6 +283,9 @@ fn opening_a_session_twice_returns_the_same_one() {
 }
 
 /// The collision this change exists to prevent: someone else is already on it.
+///
+/// Refused **before any git side effect**: no `.git/info/exclude` entry and no land target cut for
+/// work this run will never do. The refusal used to come from the claim's take, after both.
 #[test]
 fn a_task_held_by_another_live_owner_refuses_a_session() {
     let f = Fixture::new();
@@ -292,12 +295,29 @@ fn a_task_held_by_another_live_owner_refuses_a_session() {
         .args(["task", "claim", &uid, "--owner", "host:1"])
         .assert()
         .success();
+    let exclude = f.repo.join(".git/info/exclude");
+    let exclude_before = std::fs::read(&exclude).ok();
+    let branches_before = git(&f.repo, &["branch", "--format=%(refname:short)"]);
 
     f.jkb()
         .args(["task", "work", &uid])
         .assert()
         .failure()
         .stderr(predicate::str::contains("already being worked"));
+    assert_eq!(
+        std::fs::read(&exclude).ok(),
+        exclude_before,
+        "the refusal came after `.git/info/exclude` was written"
+    );
+    assert_eq!(
+        git(&f.repo, &["branch", "--format=%(refname:short)"]),
+        branches_before,
+        "the refusal came after a land target was cut"
+    );
+    assert!(
+        !f.repo.join(".jkb").exists(),
+        "the refusal came after the session directory was made"
+    );
 }
 
 /// A red gate must leave the target exactly as it was — that is the difference between a
