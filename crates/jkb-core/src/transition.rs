@@ -1069,7 +1069,8 @@ mod tests {
                 "live and superseded are not complements over a recorded landing"
             );
             // ...and the historical answer ignores the split entirely, which is what makes it the
-            // right question for "did jkb ever graft this" and the wrong one for "may it land".
+            // right question for "did jkb graft this" (for the latest landing only — an earlier
+            // one is not kept) and the wrong one for "may it land".
             assert_eq!(l.recorded().is_some(), had_landing, "recorded");
         }
     }

@@ -2834,7 +2834,8 @@ fn a_task_retargeted_to_another_batch_is_not_credited_by_the_old_one() {
 
 /// A review still credits work jkb grafted onto the branch, even after the session was abandoned.
 ///
-/// `credited_by` asks the **historical** question — did jkb ever graft this onto this branch —
+/// `credited_by` asks the **historical** question — did jkb graft this onto this branch as the
+/// task's **latest** landing (an earlier landing, re-landed elsewhere since, is not seen) —
 /// because a graft does not un-happen: the reviewer read what is in the branch whatever the task
 /// did afterwards. Asking the present-tense question instead made such a task `Credit::Unrelated`,
 /// which this loop drops, so `review record` stamped nothing for it and said nothing about it,
