@@ -1294,8 +1294,9 @@ enum TaskCmd {
         #[arg(long)]
         onto: Option<String>,
     },
-    /// Land a session: rebase its branch onto the target, fast-forward, run the gate, and on
-    /// green mark the task done and clean the session up. Serialized per repo.
+    /// Land a session: rebase its branch onto the target, run the gate on the result, and only
+    /// on green fast-forward the target, mark the task done and clean the session up. Serialized
+    /// per repo.
     Land {
         /// The task uid.
         #[arg(required_unless_present = "break_lock")]
@@ -1975,7 +1976,7 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
                               --onto <branch> names the STAGING branch it lands on; omit it
                               and jkb joins the batch in flight, or cuts one from trunk.
   jkb task land <uid>         rebase the session onto its target, run the repo's gate, and
-                              on green mark the task done and ARCHIVE the session (moved to
+                              only on green advance the target, mark the task done and ARCHIVE the session (moved to
                               .jkb/archive, deleted after 30 days — never deleted here). Serial:
                               one land at a time, so a red gate means YOUR branch broke it.
                               REFUSES a task with no recorded review, or whose review left a
@@ -3107,55 +3108,59 @@ pub(crate) fn cmd_task_land(
     let land_dir = land_dir_for(&ctx, &onto)?;
     let gate_place = gate_place_for(kb, uid, &head, &land_dir, no_gate, gate_on_host)?;
 
+    // GRAFT, GATE, THEN ADVANCE — the order `scripts/merge-queue.sh` settled on. The graft leaves
+    // the land checkout detached at the rebased result and `onto` where it was; the gate runs on
+    // that detached tree, which is byte-identical to what `onto` becomes; and only a green gate
+    // moves `onto`, by a compare-and-swap against the tip the graft rebased onto. This used to
+    // fast-forward `onto` first and rewind it with `reset --hard` on red, so for the whole gate
+    // `onto` pointed at commits that had passed nothing — and a gate that was interrupted, or a
+    // rollback that failed, left it there with no record that it had moved.
     let (outcome, pre) = gitrepo::graft(&land_dir, &branch, &onto)?;
-    // TWO FAILURES, TWO REMEDIES. They were one arm, and the message it printed was written for
-    // the rebase conflict — so a refused fast-forward sent the user to rebase a branch that had
-    // rebased cleanly, which reproduces every time it is tried. `scripts/merge-queue.sh` splits
-    // the same pair (exit 1 against exit 4) and for the same reason: only one of them is the
-    // branch's fault.
     let grafted = match outcome {
-        gitrepo::Graft::Landed { grafted } => grafted,
+        gitrepo::Graft::Rebased { grafted } => grafted,
         gitrepo::Graft::Conflict => anyhow::bail!(
             "{branch} does not rebase cleanly onto {onto} — nothing changed. Rebase it where \
              the context is: cd {} && git rebase {onto}, fix the conflict, then land again",
             sess.worktree.display()
         ),
-        gitrepo::Graft::CouldNotAdvance { why } => anyhow::bail!(
-            "{branch} rebased onto {onto} cleanly, but {onto} could not be advanced onto the \
-             result. Nothing changed, and the branch is fine — rebasing it will not help. This is \
-             usually transient: something else moved or held {onto} while the graft ran. git \
-             said: {why}\n\nTry landing again; if it repeats, look at what else is writing to \
-             {onto} (`git worktree list`, a running watcher, a held index.lock in {})",
-            land_dir.display()
-        ),
     };
 
-    let (gate, source) = session::resolve_gate(store, kb, &ctx.root, &ctx.key, gate_flag, no_gate)?;
-    if !json {
-        println!(
-            "gate: {} ({})",
-            gate.as_deref().unwrap_or("(none)"),
-            source.label()
-        );
-    }
-    if let Some(cmd) = &gate {
-        if let (session::GatePlace::Container { name, .. }, false) = (&gate_place, json) {
-            println!("gate: running in the dev container `{name}`");
-        }
-        let (passed, output) = session::run_gate(&land_dir, cmd, &gate_place, json)?;
-        if !passed {
-            gitrepo::reset_hard(&land_dir, &pre)?;
-            let tail = output
-                .map(|o| format!("\n{}", tail_lines(&o, 20)))
-                .unwrap_or_default();
-            anyhow::bail!(
-                "gate failed on the integrated result — {onto} rolled back to {}, {branch} \
-                 untouched. Reproduce in the session (cd {} && {cmd}) and land again.{tail}",
-                &pre[..pre.len().min(8)],
-                sess.worktree.display()
+    // Everything between the graft and the verdict, in one place, so that EVERY way out of it that
+    // is not green — a red gate, a gate that could not be spawned, a gate lookup that failed —
+    // puts the land checkout back on `onto`. None of them has moved `onto`.
+    let gated = (|| -> Result<_> {
+        let (gate, source) =
+            session::resolve_gate(store, kb, &ctx.root, &ctx.key, gate_flag, no_gate)?;
+        if !json {
+            println!(
+                "gate: {} ({})",
+                gate.as_deref().unwrap_or("(none)"),
+                source.label()
             );
         }
-    }
+        let mut verdict = Verdict::Green;
+        if let Some(cmd) = &gate {
+            if let (session::GatePlace::Container { name, .. }, false) = (&gate_place, json) {
+                println!("gate: running in the dev container `{name}`");
+            }
+            let (passed, output) = session::run_gate(&land_dir, cmd, &gate_place, json)?;
+            if !passed {
+                verdict = Verdict::Red { output };
+            }
+        }
+        Ok((gate, source, verdict))
+    })();
+    let (gate, source) = conclude_graft(
+        &PendingGraft {
+            land_dir: &land_dir,
+            onto: &onto,
+            branch: &branch,
+            pre: &pre,
+            grafted: &grafted,
+            session: &sess.worktree,
+        },
+        gated,
+    )?;
 
     settle_landing(
         kb,
@@ -3180,6 +3185,97 @@ pub(crate) fn cmd_task_land(
         },
         json,
     )
+}
+
+/// What a landing's gate said. No gate at all is `Green`: `--no-gate`, or none found, which the
+/// gate line printed before it says.
+enum Verdict {
+    Green,
+    /// Red, with the gate's output when it was captured (`--json`).
+    Red {
+        output: Option<String>,
+    },
+}
+
+/// A graft [`gitrepo::graft`] left detached in the land checkout, awaiting its gate's verdict.
+struct PendingGraft<'a> {
+    land_dir: &'a Path,
+    onto: &'a str,
+    branch: &'a str,
+    /// `onto`'s tip when the graft rebased onto it — what the advance compares against.
+    pre: &'a str,
+    grafted: &'a str,
+    /// The session worktree, where a red gate is reproduced.
+    session: &'a Path,
+}
+
+/// The gate's verdict on a detached graft, acted on: green puts `onto` on the graft — only if it is
+/// still at `pre` — and anything else puts the land checkout back on `onto`, which never moved.
+/// Returns the gate and where it came from, for the landing's record.
+///
+/// `gated` is the gate's run: `Err` when it could not be resolved or spawned.
+fn conclude_graft(
+    g: &PendingGraft<'_>,
+    gated: Result<(Option<String>, session::GateSource, Verdict)>,
+) -> Result<(Option<String>, session::GateSource)> {
+    let PendingGraft {
+        land_dir,
+        onto,
+        branch,
+        pre,
+        grafted,
+        session,
+    } = *g;
+    // Said whenever the checkout could not be put back: the one state an operator must not
+    // misread, because fast-forwarding `onto` to where this tree sits lands ungated commits.
+    let left_detached = |e: anyhow::Error| {
+        format!(
+            " But {} could not be returned to {onto} and is left detached at {} — a commit that \
+             did NOT pass the gate; never fast-forward {onto} onto it. Switch it back by hand \
+             ({e:#}).",
+            land_dir.display(),
+            &grafted[..grafted.len().min(8)]
+        )
+    };
+    match gated {
+        Err(e) => {
+            let back =
+                gitrepo::leave_graft(land_dir, onto).map_or_else(left_detached, |()| String::new());
+            Err(e.context(format!(
+                "the landing stopped before its gate passed — {onto} never moved.{back}"
+            )))
+        }
+        Ok((gate, _, Verdict::Red { output })) => {
+            let back =
+                gitrepo::leave_graft(land_dir, onto).map_or_else(left_detached, |()| String::new());
+            let tail = output
+                .map(|o| format!("\n{}", tail_lines(&o, 20)))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "gate failed on the integrated result — {onto} never moved (still {}), {branch} \
+                 untouched.{back} Reproduce in the session (cd {} && {}) and land again.{tail}",
+                &pre[..pre.len().min(8)],
+                session.display(),
+                gate.as_deref().unwrap_or_default()
+            );
+        }
+        Ok((gate, source, Verdict::Green)) => {
+            // Green: put `onto` on the gated commit — only if it is still where the graft found it.
+            if let gitrepo::Advance::Refused { why } =
+                gitrepo::advance(land_dir, onto, pre, grafted)?
+            {
+                anyhow::bail!(
+                    "{branch} rebased onto {onto} cleanly and PASSED the gate, but {onto} was not \
+                     advanced onto the result: {why}\n\nNothing was landed and the branch is fine \
+                     — rebasing it will not help. Land again; if it repeats, look at what else is \
+                     writing to {onto} (`git worktree list`, a running watcher, a held index.lock \
+                     in {})",
+                    land_dir.display()
+                );
+            }
+            Ok((gate, source))
+        }
+    }
 }
 
 /// Whether this caller may land `uid` from `branch` onto `onto` at all — asked with the payload the

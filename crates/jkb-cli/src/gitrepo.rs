@@ -2121,42 +2121,45 @@ pub fn switch_to(dir: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// The outcome of [`graft`]: what happened to the target branch.
+/// The outcome of [`graft`]: what the rebase produced. **Neither arm has moved `onto`.**
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Graft {
-    /// `onto` was fast-forwarded to `branch`'s commits, rebased onto its live tip. Carries
-    /// the commit the rebase produced, so the caller can point the branch at what actually
-    /// landed instead of leaving it on its pre-rebase commits.
-    Landed { grafted: String },
-    /// The rebase hit a conflict; nothing changed. The branch's author must rebase it.
+    /// The branch rebased cleanly onto `onto`'s live tip. The working tree at `dir` is left
+    /// **detached at `grafted`** — byte-identical to what `onto` becomes if [`advance`] is called
+    /// — so the gate runs here, on the integrated result, while `onto` still points at its
+    /// pre-graft tip.
+    Rebased { grafted: String },
+    /// The rebase hit a conflict; nothing changed, and the tree is back on `onto`. The branch's
+    /// author must rebase it.
     Conflict,
-    /// The graft is good — the rebase was clean — but `onto` could not be advanced onto it: it
-    /// moved under us, another checkout holds it, or the working tree has something the
-    /// fast-forward would overwrite. **Not the branch's fault**, which is the whole reason this
-    /// is not [`Graft::Conflict`].
-    ///
-    /// It used to be. A refused fast-forward ran `reset_hard` and returned `Conflict`, so
-    /// `jkb task land` told the user "does not rebase cleanly onto {onto} — nothing changed.
-    /// Rebase it…" — and all three claims were false: the rebase WAS clean so the advice is
-    /// unfollowable and reproduces every time, "nothing changed" was asserted immediately after a
-    /// `git reset --hard`, and if `onto` had moved forward the reset dragged it back. The shell
-    /// twin (`scripts/merge-queue.sh`, exit 4) split this case out with its own wording for
-    /// exactly these reasons; this is the Rust spelling of it.
-    ///
-    /// No rollback on this arm, for the reason the shell deleted both of its own: nothing has
-    /// moved, so there is nothing to restore and a reset can only destroy.
-    ///
-    /// Carries git's own explanation, because the caller cannot infer it: the checkout of `onto`
-    /// has already succeeded by the time this can fire, so "another worktree holds it" is exactly
-    /// what it is NOT, and the cause that does reach here — a held `index.lock`, a tracked file
-    /// the fast-forward would overwrite, `onto` moved on by a concurrent writer — is whatever git
-    /// says it is.
-    CouldNotAdvance { why: String },
 }
 
-/// Rebase `branch` onto the live tip of `onto` and fast-forward `onto` to the result, in the
-/// working tree at `dir` (which must be checked out to `onto`). Returns the pre-graft tip of
-/// `onto` alongside the outcome, so a caller whose gate goes red can roll back to it.
+/// The outcome of [`advance`]: whether `onto` was put on a gated graft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Advance {
+    /// `onto` now points at the graft.
+    Advanced,
+    /// The graft passed its gate but `onto` was NOT moved onto it: `onto` moved while the gate
+    /// ran, or could not be checked out again, or git refused the fast-forward. **Not the
+    /// branch's fault**, and `onto` is wherever it was — a concurrent move is refused, never
+    /// clobbered. Carries the reason, git's own text where git gave one.
+    ///
+    /// No rollback on this arm, for the reason `scripts/merge-queue.sh` deleted both of its own:
+    /// nothing has moved, so there is nothing to restore and a reset can only destroy.
+    Refused { why: String },
+}
+
+/// Rebase `branch` onto the live tip of `onto`, in the working tree at `dir` (which must be able
+/// to check `onto` out), and leave that tree **detached at the result** — WITHOUT moving `onto`.
+/// Returns the pre-graft tip of `onto` alongside the outcome: [`advance`] compares `onto` against
+/// it, so a concurrent move during the gate is refused rather than overwritten.
+///
+/// THE GATE RUNS BETWEEN THIS AND [`advance`], the order `scripts/merge-queue.sh` settled on. This
+/// used to fast-forward `onto` here, before `jkb task land` ran its gate, and rewind it with
+/// `reset --hard` on red: for the whole gate `onto` pointed at commits that had passed nothing, an
+/// implementer cutting from it carried them away, and a gate that was interrupted (or a rollback
+/// that failed) left `onto` there with no record that it had moved. Now `onto` only ever advances
+/// to a commit that has already passed, and there is no rollback to fail.
 ///
 /// The rebase runs on a **detached HEAD** at `branch` rather than via `git rebase <onto>
 /// <branch>`, because that form checks `branch` out first and git refuses while the session
@@ -2241,20 +2244,74 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
         return Ok((Graft::Conflict, pre));
     }
     let grafted = rev(dir, "HEAD")?.context("rebase produced no commit")?;
-    git_must(dir, &["switch", onto])?;
+    Ok((Graft::Rebased { grafted }, pre))
+}
+
+/// Put the working tree at `dir` back on `onto`, leaving a graft that will not land — after a red
+/// gate, or a gate that could not be run. `onto` itself never moved, so this restores nothing; it
+/// only re-attaches the tree so the next landing starts from the branch.
+///
+/// # Errors
+/// Returns an error carrying git's own text if the switch is refused — typically because the gate
+/// left a tracked modification the checkout would overwrite. The tree is then still detached at
+/// the ungated graft, and the caller must say so: that commit must never be fast-forwarded onto.
+pub fn leave_graft(dir: &Path, onto: &str) -> Result<()> {
+    valid_ref(onto)?;
+    let (back, why) = git_run(dir, &["switch", onto])?;
+    anyhow::ensure!(back, "git said: {why}");
+    Ok(())
+}
+
+/// Fast-forward `onto` to `grafted` — which the caller has gated — in the working tree at `dir`,
+/// **only if `onto` still points at `pre`**, the tip [`graft`] rebased onto.
+///
+/// THE COMPARE-AND-SWAP IS THE POINT. [`graft`] detached `dir`, releasing `onto` for the whole
+/// gate; anything may have moved it meanwhile. A fast-forward from wherever it is now would
+/// either fail with git's opaque refusal or — when the new tip happens to be an ancestor of the
+/// graft — succeed over a move this side never saw. So `onto` is checked out, its tip compared
+/// against `pre`, and a mismatch refused with both commits named. Past the comparison, `git
+/// merge` itself updates the ref against the HEAD it read, so a move in the remaining instant is
+/// either refused by git or is to a commit the gated graft already contains.
+///
+/// # Errors
+/// Returns an error if `git` cannot be executed or a revision cannot be read. Every refusal is an
+/// [`Advance::Refused`], never an error, because the caller owes the user a sentence saying the
+/// graft passed and `onto` did not move.
+pub fn advance(dir: &Path, onto: &str, pre: &str, grafted: &str) -> Result<Advance> {
+    valid_ref(onto)?;
+    valid_ref(pre)?;
+    valid_ref(grafted)?;
+    // CHECKED, as `scripts/merge-queue.sh` step 3 checks it: if another worktree claimed `onto`
+    // during the gate this switch fails, and an unchecked one would leave HEAD detached AT the
+    // graft — where the fast-forward below trivially "succeeds" while `onto` never moved.
+    let (switched, why) = git_run(dir, &["switch", onto])?;
+    if !switched {
+        return Ok(Advance::Refused {
+            why: format!(
+                "{onto} could not be checked out again in {} — another worktree may hold it, the                  tree may have changes the switch would overwrite, or an index.lock is held; the                  tree is left detached at the gated graft. git said: {why}",
+                dir.display()
+            ),
+        });
+    }
+    let now = rev(dir, "HEAD")?.context("the target branch has no commit")?;
+    if now != pre {
+        return Ok(Advance::Refused {
+            why: format!(
+                "{onto} moved while the gate ran, from {} to {} — the graft was gated against the                  old tip, so it is not put over the new one",
+                short(pre),
+                short(&now)
+            ),
+        });
+    }
     // HOOKS OFF FOR THE FAST-FORWARD, the same rule `scripts/merge-queue.sh` states at its own
     // graft. A fast-forward fires `post-merge`, which in this repository runs setup.sh —
     // cargo-installing the jkb binary, rebuilding the VS Code extension, reinstalling the watcher
-    // service. `jkb task land` does not run its gate until after this returns, so the human path
-    // was installing a binary built from a candidate that could go red seconds later and be rolled
-    // back by `reset_hard`, leaving the operator's `jkb` newer than any branch carries.
+    // service. Even with the gate already passed, a landing is not the place to reinstall an
+    // operator's tooling.
     //
-    // The suppression belongs HERE, with the graft, rather than with one of its two callers: the
-    // shell queue had it and this did not, which is the twinned-rule drift this branch has now
-    // paid for on three separate pairs.
-    // GIT'S OWN TEXT TRAVELS WITH THE REFUSAL. The first version of this arm dropped it and the
-    // caller then guessed at causes — naming two that cannot reach this line, because
-    // `git_must(switch onto)` has already succeeded just above, and omitting the one that can.
+    // GIT'S OWN TEXT TRAVELS WITH THE REFUSAL: the switch has just succeeded and `onto` is at
+    // `pre`, so what reaches here — a held `index.lock`, a tracked file the fast-forward would
+    // overwrite — is whatever git says it is.
     let (advanced, why) = git_run(
         dir,
         &[
@@ -2262,13 +2319,20 @@ pub fn graft(dir: &Path, branch: &str, onto: &str) -> Result<(Graft, String)> {
             "core.hooksPath=/dev/null",
             "merge",
             "--ff-only",
-            &grafted,
+            grafted,
         ],
     )?;
     if !advanced {
-        return Ok((Graft::CouldNotAdvance { why }, pre));
+        return Ok(Advance::Refused {
+            why: format!("git refused the fast-forward: {why}"),
+        });
     }
-    Ok((Graft::Landed { grafted }, pre))
+    Ok(Advance::Advanced)
+}
+
+/// The first eight characters of a commit id, for a message.
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
 }
 
 /// Hard-reset the working tree at `dir` to `reference` — the rollback after a red gate.
@@ -3236,6 +3300,138 @@ mod tests {
         );
     }
 
+    /// Graft `branch` onto `onto` and advance `onto` onto the result, as a green landing does.
+    fn land(dir: &Path, branch: &str, onto: &str) {
+        let (outcome, pre) = super::graft(dir, branch, onto).expect("grafted");
+        let super::Graft::Rebased { grafted } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(
+            super::advance(dir, onto, &pre, &grafted).expect("advanced"),
+            super::Advance::Advanced
+        );
+    }
+
+    /// A fixture whose graft commits: the rebase needs an identity, and jkb's git sees no global
+    /// one.
+    fn grafting_fixture(dir: &Path) {
+        fixture(dir);
+        for kv in [["user.name", "t"], ["user.email", "t@example.com"]] {
+            assert!(fixture_git(dir, &["config", kv[0], kv[1]])
+                .status()
+                .unwrap()
+                .success());
+        }
+    }
+
+    fn rev_of(dir: &Path, reference: &str) -> String {
+        let out = fixture_git(dir, &["rev-parse", reference])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// **The graft does not move `onto`.** It leaves the tree detached at the rebased result, so
+    /// the gate runs there while `onto` still points at its pre-graft tip. It used to
+    /// fast-forward `onto` here, before the gate, so for the whole gate `onto` named commits that
+    /// had passed nothing.
+    #[test]
+    fn a_graft_leaves_the_target_where_it_was_and_the_tree_detached_at_the_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        grafting_fixture(dir);
+        let before = rev_of(dir, "refs/heads/main");
+
+        let (outcome, pre) = super::graft(dir, "unmerged", "main").expect("grafted");
+        let super::Graft::Rebased { grafted } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(pre, before);
+        assert_eq!(
+            rev_of(dir, "refs/heads/main"),
+            before,
+            "the target moved before any gate could run"
+        );
+        assert_eq!(current_branch(dir).unwrap(), None, "the tree is detached");
+        assert_eq!(rev_of(dir, "HEAD"), grafted);
+        assert!(
+            dir.join("unmerged.txt").exists(),
+            "the gate sees the integrated result"
+        );
+
+        // A red gate: back on the target, which never moved.
+        super::leave_graft(dir, "main").expect("left");
+        assert_eq!(current_branch(dir).unwrap().as_deref(), Some("main"));
+        assert_eq!(rev_of(dir, "HEAD"), before);
+        assert!(!dir.join("unmerged.txt").exists());
+    }
+
+    /// **The advance is a compare-and-swap.** A target that moved while the gate ran is refused,
+    /// with both commits named, and left exactly where the other writer put it — never
+    /// fast-forwarded from there, and never rewound.
+    #[test]
+    fn an_advance_refuses_a_target_that_moved_during_the_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        grafting_fixture(dir);
+        let (outcome, pre) = super::graft(dir, "unmerged", "main").expect("grafted");
+        let super::Graft::Rebased { grafted } = outcome else {
+            panic!("{outcome:?}");
+        };
+        // Somebody moves `main` while the gate runs: to a commit the graft does not contain.
+        let moved = rev_of(dir, "refs/heads/squash");
+        assert!(fixture_git(dir, &["update-ref", "refs/heads/main", &moved])
+            .status()
+            .unwrap()
+            .success());
+
+        let outcome = super::advance(dir, "main", &pre, &grafted).expect("answered");
+        let super::Advance::Refused { why } = outcome else {
+            panic!("a moved target was advanced: {outcome:?}");
+        };
+        assert!(
+            why.contains("moved while the gate ran") && why.contains(&moved[..8]),
+            "{why}"
+        );
+        assert_eq!(
+            rev_of(dir, "refs/heads/main"),
+            moved,
+            "the concurrent move is kept, not clobbered"
+        );
+    }
+
+    /// **A target another checkout claimed during the gate is refused, not "advanced" in place.**
+    /// The switch back is checked: unchecked, HEAD would stay detached AT the graft and the
+    /// fast-forward would trivially succeed while the target never moved.
+    #[test]
+    fn an_advance_refuses_a_target_another_worktree_claimed_during_the_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        grafting_fixture(&dir);
+        let before = rev_of(&dir, "refs/heads/main");
+        let (outcome, pre) = super::graft(&dir, "unmerged", "main").expect("grafted");
+        let super::Graft::Rebased { grafted } = outcome else {
+            panic!("{outcome:?}");
+        };
+        let other = tmp.path().join("other");
+        assert!(fixture_git(
+            &dir,
+            &["worktree", "add", "-q", other.to_str().unwrap(), "main"]
+        )
+        .status()
+        .unwrap()
+        .success());
+
+        let outcome = super::advance(&dir, "main", &pre, &grafted).expect("answered");
+        assert!(
+            matches!(outcome, super::Advance::Refused { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(rev_of(&dir, "refs/heads/main"), before);
+    }
+
     /// The graft counts the BRANCH's commits, not a same-named tag's. A tag `unmerged` left at
     /// `main`'s tip outranks `refs/heads/unmerged` in `rev-list`'s lookup, so the branch's two
     /// commits counted as none and the landing was refused as having nothing to land.
@@ -3250,11 +3446,7 @@ mod tests {
         git_ok(&["config", "user.email", "t@example.com"]);
         git_ok(&["tag", "unmerged", "main"]);
 
-        let (outcome, _) = super::graft(dir, "unmerged", "main").expect("grafted");
-        assert!(
-            matches!(outcome, super::Graft::Landed { .. }),
-            "{outcome:?}"
-        );
+        land(dir, "unmerged", "main");
         assert!(
             dir.join("unmerged.txt").exists(),
             "the branch's work is on main"
@@ -3275,11 +3467,7 @@ mod tests {
         git_ok(&["config", "user.email", "t@example.com"]);
         git_ok(&["tag", "main", "squash"]);
 
-        let (outcome, _) = super::graft(dir, "unmerged", "main").expect("grafted");
-        assert!(
-            matches!(outcome, super::Graft::Landed { .. }),
-            "{outcome:?}"
-        );
+        land(dir, "unmerged", "main");
         let log = fixture_git(dir, &["log", "--format=%s", "refs/heads/main"])
             .output()
             .unwrap();

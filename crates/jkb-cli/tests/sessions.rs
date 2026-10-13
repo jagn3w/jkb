@@ -321,9 +321,10 @@ fn a_task_held_by_another_live_owner_refuses_a_session() {
 }
 
 /// A red gate must leave the target exactly as it was — that is the difference between a
-/// merge queue and just merging.
+/// merge queue and just merging. It is never moved in the first place: the gate runs on the
+/// graft while it is detached, and only green advances the target.
 #[test]
-fn a_red_gate_rolls_the_target_back_and_keeps_the_session() {
+fn a_red_gate_leaves_the_target_where_it_was_and_keeps_the_session() {
     let f = Fixture::new();
     let uid = f.add_task("failing task");
     let s = f.work(&uid);
@@ -347,6 +348,173 @@ fn a_red_gate_rolls_the_target_back_and_keeps_the_session() {
     );
     assert_eq!(f.status_of(&uid), "in_progress", "still yours to fix");
     assert!(wt.exists(), "the session survives a red gate");
+}
+
+/// **The gate runs before the target moves** — the order `scripts/merge-queue.sh` settled on. The
+/// gate itself checks that the target still points at its pre-graft tip, so it goes red under the
+/// old fast-forward-then-gate order, in which the target named ungated commits for the whole gate
+/// and anyone cutting from it carried them away.
+#[test]
+fn the_target_does_not_move_until_the_gate_has_passed() {
+    let f = Fixture::new();
+    let uid = f.add_task("gated before it lands");
+    let s = f.work(&uid);
+    let (onto, wt) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        PathBuf::from(s["worktree"].as_str().unwrap()),
+    );
+    commit_in(&wt, "g.txt", "x\n", "add g");
+    let before = git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]);
+
+    let gate = format!(
+        "test \"$(git -C '{}' rev-parse refs/heads/{onto})\" = {before}",
+        f.repo.display()
+    );
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", &gate, "--no-review"])
+        .assert()
+        .success();
+
+    let after = git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]);
+    assert_ne!(after, before, "a green gate advances the target");
+    assert_eq!(
+        git(&f.repo, &["show", &format!("{after}:g.txt")]),
+        "x",
+        "onto the graft the gate passed"
+    );
+    assert_eq!(f.status_of(&uid), "done");
+}
+
+/// **A gate that never finishes leaves the target where it was.** The landing is killed mid-gate
+/// — no red verdict, no rollback, nothing after the gate runs at all. Under the old order the
+/// target had already been fast-forwarded, so it was left on ungated commits with no record that
+/// it had moved. Now the target is untouched, and the next landing goes through.
+#[test]
+fn an_interrupted_gate_leaves_the_target_where_it_was() {
+    let f = Fixture::new();
+    let uid = f.add_task("interrupted mid-gate");
+    let s = f.work(&uid);
+    let (onto, wt) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        PathBuf::from(s["worktree"].as_str().unwrap()),
+    );
+    commit_in(&wt, "i.txt", "x\n", "add i");
+    let before = git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]);
+
+    // The gate's shell is the landing's own child: killing its parent is the landing being
+    // interrupted while the gate runs.
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &uid,
+            "--gate",
+            "kill -9 $PPID",
+            "--no-review",
+        ])
+        .assert()
+        .failure();
+
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]),
+        before,
+        "an interrupted gate left the target on commits that never passed it"
+    );
+    assert_eq!(f.status_of(&uid), "in_progress");
+    assert!(wt.exists(), "the session survives");
+
+    // The checkout the interrupted landing left detached is no obstacle to the next one.
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", "true", "--no-review"])
+        .assert()
+        .success();
+    assert_ne!(
+        git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]),
+        before
+    );
+    assert_eq!(f.status_of(&uid), "done");
+}
+
+/// **A red gate whose checkout cannot be switched back says where it is left.** The gate edits a
+/// file only the graft has, so returning the land checkout to the target would overwrite the edit
+/// and git refuses. The target still never moved, and the refusal names the detached, ungated
+/// commit the checkout is left at — the one thing an operator must not fast-forward onto.
+#[test]
+fn a_red_gate_that_cannot_be_left_names_the_ungated_commit() {
+    let f = Fixture::new();
+    let uid = f.add_task("red and stuck");
+    let s = f.work(&uid);
+    let (onto, wt) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        PathBuf::from(s["worktree"].as_str().unwrap()),
+    );
+    commit_in(&wt, "only-here.txt", "x\n", "add only-here");
+    let before = git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]);
+
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &uid,
+            "--gate",
+            "echo edited > only-here.txt; false",
+            "--no-review",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("gate failed"))
+        .stderr(predicate::str::contains("left detached at"))
+        .stderr(predicate::str::contains("never fast-forward"));
+
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]),
+        before
+    );
+    assert_eq!(f.status_of(&uid), "in_progress");
+}
+
+/// **A target moved during the gate is refused, not clobbered.** The advance is a
+/// compare-and-swap against the tip the graft rebased onto: something else moving the target
+/// while the gate runs gets its commit kept and the landing refused, and the task stays open.
+/// Under the old order the target had already been advanced before the gate, so the other
+/// writer's move silently replaced the landing and the task was marked done over work that was
+/// not in the target.
+#[test]
+fn a_target_moved_during_the_gate_is_refused_not_clobbered() {
+    let f = Fixture::new();
+    let uid = f.add_task("raced during the gate");
+    let s = f.work(&uid);
+    let (onto, wt) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        PathBuf::from(s["worktree"].as_str().unwrap()),
+    );
+    commit_in(&wt, "r.txt", "x\n", "add r");
+    let before = git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]);
+    // A commit on top of the target that the graft does not contain — another writer's.
+    let tree = git(&f.repo, &["rev-parse", &format!("{before}^{{tree}}")]);
+    let other = git(
+        &f.repo,
+        &["commit-tree", &tree, "-p", &before, "-m", "someone else"],
+    );
+
+    let gate = format!(
+        "git -C '{}' update-ref refs/heads/{onto} {other}",
+        f.repo.display()
+    );
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", &gate, "--no-review"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("PASSED the gate"))
+        .stderr(predicate::str::contains("moved while the gate ran"));
+
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]),
+        other,
+        "the other writer's move was overwritten"
+    );
+    assert_eq!(f.status_of(&uid), "in_progress", "nothing landed");
+    assert!(wt.exists());
 }
 
 /// Two sessions touching the same lines: the second must eject, not be resolved blind.
