@@ -10,7 +10,8 @@
 #
 # Case 1 below is that exact shape. Swap `install_exec` back for `cp` in scripts/lib.sh
 # and it fails (verified: stderr gains a "command not found" for a fragment of an
-# earlier line).
+# earlier line). It carries its own negative control: the same fixture with an in-place
+# write must break, or the case fails rather than passing on a shell that cannot show it.
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -22,8 +23,11 @@ repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 new_workdir
 
 # --- 1. a script survives being replaced, by a longer version, while it is running -------
-case1() {
-    local d="$work/running" out err status
+# _self_replace <dir> <install-command> — run a script whose child installs a longer version of
+# it over itself with `<install-command> "$dest" <"$new"`, while the parent shell is still
+# reading it. Sets `_sr_out`, `_sr_err` and `_sr_status`.
+_self_replace() {
+    local d="$1" how="$2"
     mkdir -p "$d"
     cat >"$d/new" <<'EOF'
 #!/usr/bin/env bash
@@ -38,19 +42,44 @@ EOF
     cat >"$d/installer" <<EOF
 #!/usr/bin/env bash
 . "$repo_root/scripts/lib.sh"
-install_exec "$d/script" <"$d/new"
+in_place() { cat >"\$1"; }
+$how "$d/script" <"$d/new"
 EOF
     chmod +x "$d/installer"
 
-    out="$("$d/script" 2>"$d/stderr")"; status=$?
-    err="$(cat "$d/stderr")"
+    _sr_out="$("$d/script" 2>"$d/stderr")"; _sr_status=$?
+    _sr_err="$(cat "$d/stderr")"
+}
 
-    [ "$status" -eq 0 ] || fail "self-replacement: exit status" "expected 0, got $status"
-    [ -z "$err" ] || fail "self-replacement: clean stderr" "the running shell executed a fragment: $err"
-    if [ "$out" = "$(printf 'start\ntail ran')" ]; then
+_self_replace_clean() {
+    [ "$_sr_status" -eq 0 ] && [ -z "$_sr_err" ] && [ "$_sr_out" = "$(printf 'start\ntail ran')" ]
+}
+
+case1() {
+    local d="$work/running"
+    # THE NEGATIVE CONTROL FIRST. The assertion below can only detect a non-atomic install
+    # because bash reads its script lazily by byte offset and the stale offset lands on a
+    # fragment that misbehaves. A bash that buffered the whole file would run this fixture
+    # cleanly whatever the installer did, and the assertion would print `ok` for a property it
+    # no longer measures. So the same fixture is run once with the in-place write `cp` and
+    # `cat >"$dest"` do, and it MUST break; if it does not, this environment cannot reproduce
+    # the harm and that is a failure, not a pass.
+    _self_replace "$work/in-place" in_place
+    if _self_replace_clean; then
+        fail "self-replacement: negative control" "an in-place rewrite of the running script \
+ran cleanly too, so this shell does not re-read its script by offset and the atomicity check \
+below cannot tell an atomic install from a non-atomic one"
+    else
+        ok "negative control: an in-place rewrite of the running script breaks it here"
+    fi
+
+    _self_replace "$d" install_exec
+    [ "$_sr_status" -eq 0 ] || fail "self-replacement: exit status" "expected 0, got $_sr_status"
+    [ -z "$_sr_err" ] || fail "self-replacement: clean stderr" "the running shell executed a fragment: $_sr_err"
+    if [ "$_sr_out" = "$(printf 'start\ntail ran')" ]; then
         ok "a running script replaced by a longer one still runs to completion"
     else
-        fail "self-replacement: output" "expected 'start' then 'tail ran', got: $(printf '%s' "$out" | tr '\n' '|')"
+        fail "self-replacement: output" "expected 'start' then 'tail ran', got: $(printf '%s' "$_sr_out" | tr '\n' '|')"
     fi
     # And the replacement really did land.
     grep -q 'longer than the one it replaces' "$d/script" \
