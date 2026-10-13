@@ -551,8 +551,8 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
         // the rule, so three could destroy bytes no blob held. And the one that did carry it
         // ran inside the reconcile's transaction, so a later failure rolled the archive back
         // while the file stayed overwritten — losing exactly the bytes it existed to keep.
-        // Content-addressed and `INSERT OR IGNORE`, so a settled file costs one hash and one
-        // no-op insert.
+        // A settled file — bytes equal to the journal's archived base — costs one hash and one
+        // read, and no write transaction (`sync_state::base_is_archived`).
         // A failed archive STOPS this file. Dropping the error meant the guarantee degraded to
         // best-effort exactly when the database is contended — the reconcile went on to
         // overwrite bytes that were in no blob, with nothing printed and nothing journalled.
@@ -657,12 +657,35 @@ fn archive_current_bytes(db: &Db, path: &Path) -> Result<Option<Vec<u8>>> {
     if bytes.is_empty() {
         return Ok(Some(bytes));
     }
+    // A settled file — its bytes are the journal's base, whose blob is stored — needs no write: a
+    // read answers it, where the unconditional store cost every file a write transaction on every
+    // pass (the watcher's startup pass, and each backed-off retry of a mount with one failing
+    // file) to insert nothing. Anything else is stored, so the archive-before-overwrite guarantee
+    // is unchanged: a skip happens only when these exact bytes are already in a blob.
+    let hash = blob::hash_bytes(&bytes);
+    let (uri, base) = (file_uri(path), hash.clone());
+    if db.read(move |conn| sync_state::base_is_archived(conn, &uri, &base))? {
+        return Ok(Some(bytes));
+    }
+    #[cfg(test)]
+    archive_probe::ARCHIVE_WRITES.with(|n| n.set(n.get() + 1));
     let stored = bytes.clone();
     db.write_txn_with::<(), Error, _>(sync_state::SYNC_ACTOR, move |conn, _meta| {
-        blob::store(conn, &blob::hash_bytes(&stored), &stored, None)?;
+        blob::store(conn, &hash, &stored, None)?;
         Ok(())
     })?;
     Ok(Some(bytes))
+}
+
+/// Counts the archive's write transactions on this thread, so a test can show a settled pass opens
+/// none. A write that inserts nothing changes no row a test could read back.
+#[cfg(test)]
+mod archive_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static ARCHIVE_WRITES: Cell<usize> = const { Cell::new(0) };
+    }
 }
 
 /// Whether this outcome may have brought items **in** from disk, so the `tasks/**` mirrors
@@ -3188,5 +3211,79 @@ mod edge_ownership {
         let disk = doc(&items, &[("a", "b", EdgeType::Supports)]);
         let kb = doc(&items, &[("a", "c", EdgeType::Supports)]);
         assert!(matches!(three_way(&base, &disk, &kb), ThreeWay::Conflict));
+    }
+}
+
+#[cfg(test)]
+mod archive_skip {
+    use super::archive_probe::ARCHIVE_WRITES;
+    use super::sync;
+    use jkb_core::{blob, ns, Db};
+    use jkb_types::{ConflictPolicy, SyncMode};
+
+    fn archive_writes() -> usize {
+        ARCHIVE_WRITES.with(std::cell::Cell::get)
+    }
+
+    fn archived(db: &Db, bytes: &[u8]) -> bool {
+        let hash = blob::hash_bytes(bytes);
+        db.read(move |conn| blob::load(conn, &hash)).unwrap().is_some()
+    }
+
+    /// A pass over a settled file opens no archive write, and every byte a pass overwrites is
+    /// still archived first — whether the skip applied (only the KB changed) or not (disk did).
+    #[test]
+    fn a_settled_file_costs_no_archive_write_and_overwrites_stay_archived() {
+        let dir =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let path = dir.path().join("tasks.md");
+        std::fs::write(&path, "## Plan\n\n- [ ] ship it !p1\n").unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let backing = format!("file://{}", dir.path().to_string_lossy());
+        db.write_txn("t", move |conn, meta| {
+            let ns_id = ns::ensure(conn, "docs/plan")?;
+            jkb_core::mount::create(
+                conn,
+                meta,
+                ns_id,
+                &backing,
+                SyncMode::Bidirectional,
+                "tasks",
+                Some("**/*.md"),
+                None,
+                ConflictPolicy::KbWins,
+            )
+        })
+        .unwrap();
+        sync(&db, "docs/plan").unwrap();
+        // The first pass may normalize the file; settle whatever it wrote.
+        sync(&db, "docs/plan").unwrap();
+
+        // Unchanged on both sides: no archive write at all.
+        let before = archive_writes();
+        sync(&db, "docs/plan").unwrap();
+        assert_eq!(archive_writes(), before, "a settled pass must not open an archive write");
+
+        // Only the KB changed: the export overwrites bytes the skip found already archived.
+        let settled = std::fs::read(&path).unwrap();
+        db.write_txn("t", |conn, _m| {
+            conn.execute("UPDATE items SET status = 'done' WHERE kind = 'task'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let before = archive_writes();
+        sync(&db, "docs/plan").unwrap();
+        assert_eq!(archive_writes(), before, "the disk bytes were the archived base");
+        assert_ne!(std::fs::read(&path).unwrap(), settled, "the export overwrote the file");
+        assert!(archived(&db, &settled), "the overwritten bytes are in the archive");
+
+        // Disk changed: bytes the archive has never seen are stored before anything else.
+        let edited = String::from_utf8(std::fs::read(&path).unwrap()).unwrap()
+            + "- [ ] and another !p2\n";
+        std::fs::write(&path, &edited).unwrap();
+        let before = archive_writes();
+        sync(&db, "docs/plan").unwrap();
+        assert_eq!(archive_writes(), before + 1, "new bytes must be archived");
+        assert!(archived(&db, edited.as_bytes()));
     }
 }

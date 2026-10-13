@@ -65,6 +65,27 @@ pub struct SyncStateWrite<'a> {
     pub document: Option<&'a str>,
 }
 
+/// Whether `hash` is the journal's base for `uri` AND the blob it names is in the archive: the
+/// settled case, where bytes hashing to `hash` are provably already stored. The archive-before-
+/// overwrite step asks this to skip a write transaction a settled file does not need.
+///
+/// Asks for the blob as well as the journal so the answer does not rest on every writer of
+/// `base_blob_hash` having stored its blob first (they do, and blobs are never deleted — but the
+/// guarantee this guards is "no overwrite without a copy", so it is checked, not inferred).
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn base_is_archived(conn: &Connection, uri: &str, hash: &str) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT 1 FROM sync_state s JOIN blobs b ON b.hash = s.base_blob_hash
+             WHERE s.uri = ?1 AND s.base_blob_hash = ?2",
+        )?
+        .query_row([uri, hash], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
 /// Fetch the journal row for `uri`, if one exists.
 ///
 /// # Errors
