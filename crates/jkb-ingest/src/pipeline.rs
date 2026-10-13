@@ -429,14 +429,15 @@ impl Pipeline {
         db.read_with::<Vec<(Pending, bool)>, Error, _>(move |conn| {
             let sql = format!(
                 "SELECT i.id, i.content, i.kind, i.content_rev,
-                        i.chunked_rev IS NOT NULL AND i.chunked_rev <> i.content_rev
+                        {rechunk}
                    FROM items i
                   WHERE ({pending})
                      OR (i.kind = '{KIND_DOCUMENT}' AND i.content IS NOT NULL AND ({rule}))",
                 pending = jkb_index::pending_predicate(conn, &vector, "i")?,
                 rule = document_rule("i"),
+                rechunk = needs_rechunk_sql("i"),
             );
-            let mut stmt = conn.prepare(&sql)?;
+            let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt
                 .query_map([], |r| {
                     Ok((
@@ -491,7 +492,8 @@ impl Pipeline {
     /// replacing any old vector, and re-derive every document whose chunks changed (the `jkb index`
     /// pass, D21). Returns what it wrote.
     ///
-    /// Items other than documents are embedded from their own text, in committed batches. Then every
+    /// Documents whose chunks were cut from text they no longer hold are re-cut first. Items other
+    /// than documents are then embedded from their own text, in committed batches. Then every
     /// document still pending goes through [`Pipeline::embed_document`] — listed again **after** that
     /// pass, because a chunk whose vector was just written has a later `seq` than its document's,
     /// which is what makes the document pending ([`document_rule`]).
@@ -500,16 +502,30 @@ impl Pipeline {
     /// Returns [`jkb_types::Error::EmbedderUnavailable`] (via [`Error::Types`]) if
     /// the embedder is down, or a database error.
     pub fn index_pending(&self, db: &Db) -> Result<IndexReport> {
-        let pending = self.pending_items(db)?;
+        let rows = self.pending_rows(db)?;
         let mut report = IndexReport::default();
-        if pending.is_empty() {
+        if !rows
+            .iter()
+            .any(|(p, rechunk)| !is_blank(&p.content) || *rechunk)
+        {
             self.drop_blank_vectors(db)?;
             return Ok(report);
         }
         // Actionable failure if the embedder is down (D21 / task 7.5).
         self.embedder.health_check()?;
 
-        let direct: Vec<Pending> = pending
+        // Re-cut first — no model call — so the pass below never embeds chunks of text a document
+        // no longer holds, only for the re-cut to delete them. After an upgrade every vector is
+        // pending, and a document edited before it would otherwise have its old chunks embedded
+        // once more for nothing.
+        for (p, rechunk) in &rows {
+            if *rechunk {
+                self.rechunk_if_stale(db, p.id)?;
+            }
+        }
+
+        let direct: Vec<Pending> = self
+            .pending_items(db)?
             .into_iter()
             .filter(|p| p.kind != KIND_DOCUMENT)
             .collect();
@@ -534,8 +550,7 @@ impl Pipeline {
     /// Bring `document`'s vector up to date: **the only writer of a document vector**, called by
     /// both [`Pipeline::index_pending`] and the ingest path, so the two cannot come to disagree.
     ///
-    /// 1. If its `chunked_rev` is not its `content_rev`, its chunks were cut from text it no longer
-    ///    holds: they are removed and new ones cut from the current text, in one write transaction
+    /// 1. If its chunks were cut from text it no longer holds ([`needs_rechunk`]), they are removed and new ones cut from the current text, in one write transaction
     ///    with no model call ([`Pipeline::rechunk_if_stale`]).
     /// 2. Its pending chunks are embedded.
     /// 3. If it is pending — its own vector stale, or a chunk's written after it — its vector
@@ -598,8 +613,8 @@ impl Pipeline {
         Ok(())
     }
 
-    /// Re-cut `document`'s chunks if they were cut from text it no longer holds — its
-    /// `chunked_rev` is set and is not its `content_rev`. Returns whether it did.
+    /// Re-cut `document`'s chunks if they were cut from text it no longer holds
+    /// ([`needs_rechunk`]). Returns whether it did.
     ///
     /// One write transaction with no model call: the old chunk items are removed (and their
     /// vectors with them, by the GC trigger and `vector_sources`' cascade), new ones are cut from
@@ -618,21 +633,14 @@ impl Pipeline {
     fn rechunk_if_stale(&self, db: &Db, document: ItemId) -> Result<bool> {
         let chunking = self.chunking;
         db.write_txn_with::<bool, Error, _>(self.actor, move |conn, meta| {
-            let row: Option<DocumentRow> = conn
-                .prepare_cached(
-                    "SELECT uid, content, content_rev, chunked_rev, mime FROM items WHERE id = ?1",
-                )?
-                .query_row([document.get()], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                })
-                .optional()?;
-            let Some((uid, content, rev, Some(chunked), mime)) = row else {
-                // Gone, or never cut by the chunker: nothing of its own to re-cut.
-                return Ok(false);
-            };
-            if chunked == rev {
+            if !needs_rechunk(conn, document)? {
                 return Ok(false);
             }
+            let (uid, content, rev, mime): DocumentRow = conn
+                .prepare_cached("SELECT uid, content, content_rev, mime FROM items WHERE id = ?1")?
+                .query_row([document.get()], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?;
             for old in chunk_ids_of(conn, document)? {
                 item::remove(conn, meta, old, true)?;
             }
@@ -723,14 +731,50 @@ fn is_blank(text: &str) -> bool {
 /// crate's identifiers, never input.
 fn document_rule(alias: &str) -> String {
     format!(
-        "({alias}.chunked_rev IS NOT NULL AND {alias}.chunked_rev <> {alias}.content_rev)
+        "({rechunk})
          OR EXISTS (SELECT 1 FROM edges e
                       JOIN items c ON c.id = e.src_item_id AND c.kind = 'chunk'
                       JOIN vector_sources cs ON cs.item_id = c.id
                      WHERE e.dst_item_id = {alias}.id AND e.type = 'derived_from'
                        AND cs.seq > (SELECT ds.seq FROM vector_sources ds
-                                      WHERE ds.item_id = {alias}.id))"
+                                      WHERE ds.item_id = {alias}.id))",
+        rechunk = needs_rechunk_sql(alias),
     )
+}
+
+/// The SQL condition under which document `alias`'s chunks were cut from text it no longer holds,
+/// so they must be re-cut before it is embedded. **The** re-chunk rule: [`needs_rechunk`], the
+/// pending listing and [`document_rule`] all splice this in.
+///
+/// The revision its chunks were cut from is `chunked_rev`, or — when that is NULL but the document
+/// has chunks — 0. NULL with chunks is a chunked document `chunked_rev` cannot describe: one
+/// deleted before `V030` and restored by `jkb undo` after it, whose snapshot had no such column. Its
+/// chunks were cut at capture, and the revision count starts at 0 for every pre-`V030` item. NULL
+/// with no chunks is a document no chunker cut (a synced file), which is never re-cut. `alias` is one
+/// of this crate's identifiers, never input; the result is never NULL.
+fn needs_rechunk_sql(alias: &str) -> String {
+    format!(
+        "coalesce(coalesce({alias}.chunked_rev,
+                           CASE WHEN EXISTS (SELECT 1 FROM edges rce
+                                               JOIN items rcc ON rcc.id = rce.src_item_id
+                                                             AND rcc.kind = 'chunk'
+                                              WHERE rce.dst_item_id = {alias}.id
+                                                AND rce.type = 'derived_from')
+                                THEN 0 END) <> {alias}.content_rev, 0)"
+    )
+}
+
+/// Whether `document`'s chunks must be re-cut ([`needs_rechunk_sql`]); false for an item that is
+/// gone.
+fn needs_rechunk(conn: &Connection, document: ItemId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(&format!(
+            "SELECT {} FROM items d WHERE d.id = ?1",
+            needs_rechunk_sql("d")
+        ))?
+        .query_row([document.get()], |r| r.get::<_, bool>(0))
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// `document`'s chunks that [`jkb_index::pending_predicate`] names, minus blank ones.
@@ -747,7 +791,7 @@ fn stale_chunks(
           ORDER BY c.id",
         pending = jkb_index::pending_predicate(conn, vector, "c")?
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt
         .query_map([document.get()], |r| {
             Ok(Pending {
@@ -779,21 +823,19 @@ enum Derivation {
 /// [`document_rule`]), and if so from what.
 fn derivation(conn: &Connection, vector: &VectorIndexer, document: ItemId) -> Result<Derivation> {
     let sql = format!(
-        "SELECT d.content, d.content_rev, d.chunked_rev, ({pending}) OR ({rule})
+        "SELECT d.content, d.content_rev, ({pending}) OR ({rule})
            FROM items d WHERE d.id = ?1",
         pending = jkb_index::pending_predicate(conn, vector, "d")?,
         rule = document_rule("d"),
     );
-    let row: Option<(Option<String>, i64, Option<i64>, bool)> = conn
-        .prepare(&sql)?
-        .query_row([document.get()], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })
+    let row: Option<(Option<String>, i64, bool)> = conn
+        .prepare_cached(&sql)?
+        .query_row([document.get()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional()?;
-    let Some((Some(text), rev, chunked, true)) = row else {
+    let Some((Some(text), rev, true)) = row else {
         return Ok(Derivation::Current);
     };
-    if chunked.is_some_and(|c| c != rev) {
+    if needs_rechunk(conn, document)? {
         return Ok(Derivation::Wait);
     }
 
@@ -804,7 +846,7 @@ fn derivation(conn: &Connection, vector: &VectorIndexer, document: ItemId) -> Re
           WHERE e.dst_item_id = ?1 AND e.type = 'derived_from' AND c.kind = 'chunk'",
         pending = jkb_index::pending_predicate(conn, vector, "c")?
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&sql)?;
     let chunks = stmt
         .query_map([document.get()], |r| {
             Ok((
@@ -845,9 +887,8 @@ fn derivation(conn: &Connection, vector: &VectorIndexer, document: ItemId) -> Re
     })
 }
 
-/// A document as [`Pipeline::rechunk_if_stale`] reads it: uid, content, `content_rev`,
-/// `chunked_rev`, mime.
-type DocumentRow = (String, Option<String>, i64, Option<i64>, Option<String>);
+/// A document as [`Pipeline::rechunk_if_stale`] reads it: uid, content, `content_rev`, mime.
+type DocumentRow = (String, Option<String>, i64, Option<String>);
 
 /// One cut of a document's chunks, for [`write_chunks`].
 struct Cut<'a> {

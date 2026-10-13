@@ -221,9 +221,11 @@ const LATER_ID_COLUMNS: &[Entity] = &[Entity::Placements, Entity::TagApplication
 
 /// The `items` columns added after item deletes had been logged, whole, without them: V030's
 /// vector provenance. A replayed delete that names neither puts the item back at `content_rev` 0
-/// and `chunked_rev` NULL, which loses nothing a restore needs. Its vector and `vector_sources` row
-/// went with the delete, so it is pending whatever its rev, and a NULL `chunked_rev` only means its
-/// chunks — restored or not — are not re-cut: it still takes their centroid if it has any.
+/// and `chunked_rev` NULL. Its vector and `vector_sources` row went with the delete, so it is
+/// pending whatever its rev. A NULL `chunked_rev` on a document that has chunks is read by the
+/// chunker as "cut at revision 0" (`jkb-ingest`'s `needs_rechunk_sql`, the one place that rule
+/// lives), so a later edit still re-cuts it. What a restore cannot recover is an edit made *before*
+/// such a delete and before V030: nothing recorded it, and its chunks are taken as current.
 /// **Replay only**, like [`LATER_ID_COLUMNS`]: `item::remove` logs both.
 const LATER_ITEM_COLUMNS: &[&str] = &["content_rev", "chunked_rev"];
 

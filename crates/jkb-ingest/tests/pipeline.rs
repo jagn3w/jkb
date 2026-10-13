@@ -1297,3 +1297,83 @@ fn an_item_edited_to_blank_loses_its_vector_and_a_document_its_chunks() {
     }
     assert_eq!(pipe.unembedded_count(&db).unwrap(), 0);
 }
+
+/// A document edited before the upgrade still holds its captured chunks, and V030 records it as cut
+/// at -1 (its `content_hash` no longer matches its uid). The upgrade's re-embed then re-cuts it — the
+/// cut asks no model — and its vector is the centroid of the NEW chunks, never the old chunks'
+/// centroid stored under the new text.
+#[test]
+fn a_document_edited_before_the_upgrade_is_re_cut_by_the_upgrade_re_embed() {
+    let db = open_db();
+    let pipe = pipeline(true);
+    let document = pipe
+        .ingest(&db, Some(OLD_TEXT.as_bytes()), &doc(OLD_TEXT), "docs")
+        .unwrap()
+        .document;
+    let old_chunks = chunks_of(&db, document);
+    edit(&db, document, NEW_TEXT);
+    // What V030 leaves such a store with: the backfill's -1, and no provenance for any vector.
+    // (The revision itself counts from 0 there; it cannot be lowered here, and only "the cut is
+    // not the text's revision" matters.)
+    db.write_txn("t", move |c, _| {
+        c.execute(
+            "UPDATE items SET chunked_rev = -1 WHERE id = ?1",
+            [document.get()],
+        )?;
+        c.execute("DELETE FROM vector_sources", [])?;
+        Ok(())
+    })
+    .unwrap();
+
+    let recorder = RecordingEmbedder::new(None);
+    recording_pipeline(&recorder).index_pending(&db).unwrap();
+    for (id, _, _) in &old_chunks {
+        assert!(
+            !exists(&db, *id),
+            "an old chunk survived the upgrade's re-embed"
+        );
+    }
+    let expected = jkb_ingest::chunk::chunk_text(
+        NEW_TEXT,
+        &ChunkConfig::new(40, 10, 10).expect("valid chunk config"),
+    );
+    assert_eq!(
+        recorder.seen(),
+        expected,
+        "the model was asked for something other than the new chunks"
+    );
+    assert_is_centroid_of_its_chunks(&db, document);
+    assert_eq!(pipe.unembedded_count(&db).unwrap(), 0);
+}
+
+/// A chunked document restored by `jkb undo` from a delete logged before V030 comes back with a NULL
+/// `chunked_rev`. It still counts as cut at revision 0: it is not re-cut for nothing, and a later
+/// edit re-cuts it rather than averaging its old chunks.
+#[test]
+fn a_chunked_document_with_no_recorded_cut_counts_as_cut_at_zero() {
+    let db = open_db();
+    let pipe = pipeline(true);
+    let document = pipe
+        .ingest(&db, Some(OLD_TEXT.as_bytes()), &doc(OLD_TEXT), "docs")
+        .unwrap()
+        .document;
+    db.write_txn("t", move |c, _| {
+        c.execute(
+            "UPDATE items SET chunked_rev = NULL WHERE id = ?1",
+            [document.get()],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let old_chunks = chunks_of(&db, document);
+    assert_eq!(pipe.unembedded_count(&db).unwrap(), 0, "re-cut for nothing");
+
+    edit(&db, document, NEW_TEXT);
+    assert_eq!(pipe.unembedded_count(&db).unwrap(), 1);
+    pipe.index_pending(&db).unwrap();
+    for (id, _, _) in &old_chunks {
+        assert!(!exists(&db, *id), "the edit did not re-cut the document");
+    }
+    assert_eq!(revs(&db, document), (1, Some(1)));
+    assert_is_centroid_of_its_chunks(&db, document);
+}
