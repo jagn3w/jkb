@@ -2581,13 +2581,14 @@ fn set_task_columns(conn: &Connection, meta: &WriteMeta, id: ItemId, it: &SyncIt
 /// because it would close a cycle, as `(dependent, dependency)` local ids, for [`apply_doc`] to
 /// park.
 ///
-/// **The file owns an edge from one of its tasks to a task of this file** — one in `doc`, or one
-/// bound to the file until this import (`existing`), whose line was just removed. Those are the
-/// edges a line can express. An edge to a task that was never in the file (a `jkb task depend`
-/// from a filed task to a task in no file, or in another file) is left alone: this used to reset
-/// each filed task's outgoing edges to the in-file ones, so the next import of the file silently
-/// dropped every such dependency and put the task back on the frontier. An edge FROM a task whose
-/// line was removed is left alone too: that task is cancelled and detached, and keeps its edges.
+/// **The file owns an edge between two of its tasks, at least one of them still in it**
+/// ([`FileEdges::owns`]): both ends in `doc` or bound to the file until this import (`existing`, a
+/// line just removed), and not both removed. Those are the edges a line can express or has just
+/// stopped expressing. An edge to a task that was never in the file (a `jkb task depend` from a
+/// filed task to a task in no file, or in another file) is left alone: this used to reset each
+/// filed task's outgoing edges to the in-file ones, so the next import of the file silently
+/// dropped every such dependency and put the task back on the frontier. An edge between two
+/// removed tasks is left alone too: they are cancelled and detached, and keep their history.
 ///
 /// An edge the file does not own can close a cycle with one it declares: `^ghost` depends, through
 /// a task outside the file, on `^fix`, and the file says `^fix needs:^ghost`. `edge::link` refuses
@@ -2609,7 +2610,15 @@ fn reconcile_edges(
         .filter_map(|i| resolved.get(&i.local_id).copied())
         .collect();
     let in_doc: HashSet<ItemId> = ids.iter().copied().collect();
-    let owned: HashSet<ItemId> = in_doc.iter().chain(existing.values()).copied().collect();
+    let removed = existing
+        .values()
+        .copied()
+        .filter(|id| !in_doc.contains(id))
+        .collect();
+    let file = FileEdges { in_doc, removed };
+    // Sources: the doc's tasks, then the removed ones, whose edges INTO the doc are owned.
+    let mut srcs = ids.clone();
+    srcs.extend(file.removed.iter().copied());
     let local: HashMap<ItemId, &str> = resolved.iter().map(|(l, &id)| (id, l.as_str())).collect();
     let mut parked = Vec::new();
     for kind in [EdgeType::ParentOf, EdgeType::DependsOn] {
@@ -2624,8 +2633,8 @@ fn reconcile_edges(
         }
         let mut gone: Vec<(ItemId, ItemId)> = Vec::new();
         let mut have: HashSet<(ItemId, ItemId)> = HashSet::new();
-        for (src, dsts) in edge::edges_from_many(conn, &ids, kind)? {
-            for dst in dsts.into_iter().filter(|d| owned.contains(d)) {
+        for (src, dsts) in edge::edges_from_many(conn, &srcs, kind)? {
+            for dst in dsts.into_iter().filter(|&d| file.owns(src, d)) {
                 have.insert((src, dst));
                 if !want.contains(&(src, dst)) {
                     gone.push((src, dst));
@@ -2652,8 +2661,25 @@ fn reconcile_edges(
             edge::link(conn, meta, src, dst, kind, None)?;
         }
     }
-    reconcile_containment(conn, meta, doc, resolved, &ids, &in_doc, &owned)?;
+    reconcile_containment(conn, meta, doc, resolved, &ids, &file)?;
     Ok(parked)
+}
+
+/// Which edges, and containment rows, an import owns: see [`reconcile_edges`].
+struct FileEdges {
+    /// The tasks `doc` holds.
+    in_doc: HashSet<ItemId>,
+    /// The tasks bound to the file until this import, whose lines are gone.
+    removed: HashSet<ItemId>,
+}
+
+impl FileEdges {
+    /// Whether the edge `src -> dst` (or the containment row of `dst` in `src`) is the file's:
+    /// both ends are its tasks and at least one is still in it.
+    fn owns(&self, src: ItemId, dst: ItemId) -> bool {
+        let mine = |id: ItemId| self.in_doc.contains(&id) || self.removed.contains(&id);
+        mine(src) && mine(dst) && (self.in_doc.contains(&src) || self.in_doc.contains(&dst))
+    }
 }
 
 /// Set each of the file's tasks' container to the parent its indentation declares, at its position
@@ -2665,18 +2691,18 @@ fn reconcile_edges(
 /// from the same declared edges [`reconcile_edges`] just wrote, in the same transaction, and
 /// journalled, so `jkb undo` takes both back together.
 ///
-/// Owned exactly as the `parent_of` edge it stands beside ([`reconcile_edges`]): a row whose
-/// container is in `doc` and whose child is a task of the file (`owned`) is removed when the file
-/// no longer declares it. A container outside the file is left alone unless the file now declares
-/// a parent for that task, since a task has one container.
+/// Owned exactly as the `parent_of` edge it stands beside ([`FileEdges::owns`]), so a row the
+/// file no longer declares goes with its edge — including one whose container's line was just
+/// removed, which otherwise left an open subtask listed only under a cancelled parent that every
+/// listing hides. A container outside the file is left alone unless the file now declares a parent
+/// for that task, since a task has one container.
 fn reconcile_containment(
     conn: &Connection,
     meta: &WriteMeta,
     doc: &SyncDoc,
     resolved: &HashMap<String, ItemId>,
     ids: &[ItemId],
-    in_doc: &HashSet<ItemId>,
-    owned: &HashSet<ItemId>,
+    file: &FileEdges,
 ) -> Result<()> {
     let order: HashMap<ItemId, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
     let mut declared: HashMap<ItemId, ItemId> = HashMap::new();
@@ -2693,11 +2719,11 @@ fn reconcile_containment(
     }
     // Every row that is about to change goes first, so `containment::contain`'s cycle guard never
     // meets a row this pass is replacing (a parent and child swapped by a re-indent).
-    let mut children: Vec<ItemId> = owned.iter().copied().collect();
+    let mut children: Vec<ItemId> = file.in_doc.union(&file.removed).copied().collect();
     children.sort_unstable();
     for child in children {
         if let Some(cur) = containment::parent(conn, child)? {
-            if in_doc.contains(&cur) && declared.get(&child) != Some(&cur) {
+            if file.owns(cur, child) && declared.get(&child) != Some(&cur) {
                 containment::uncontain(conn, meta, child)?;
             }
         }

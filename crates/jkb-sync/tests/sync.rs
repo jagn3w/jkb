@@ -3924,6 +3924,64 @@ fn a_deleted_subtask_line_leaves_its_parent() {
     assert!(ready_uids(&db).contains(&ship));
 }
 
+/// A parent whose line is deleted is cancelled, and its open subtask must not stay contained by it:
+/// every listing hides a cancelled item, so the child would be reachable nowhere. The `parent_of`
+/// edge goes with the row, and `jkb undo` of the import brings both back.
+#[test]
+fn a_deleted_parent_line_releases_its_open_subtask() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let (ship, write) = (format!("{uri}#ship"), format!("{uri}#write"));
+    let (ship_id, write_id) = (item_of(&db, &ship), item_of(&db, &write));
+    let section = db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT namespace_id FROM placements WHERE item_id = ?1 AND role = 'primary'",
+                [write_id.get()],
+                |r| r.get::<_, i64>(0),
+            )?)
+        })
+        .map(jkb_types::NamespaceId::new)
+        .unwrap();
+    let listed = || {
+        db.read(move |conn| jkb_core::placement::items_directly_in(conn, section))
+            .unwrap()
+    };
+    let parent_edge = || {
+        db.read(move |conn| {
+            jkb_core::edge::edges_from(conn, ship_id, jkb_types::EdgeType::ParentOf)
+        })
+        .unwrap()
+        .contains(&write_id)
+    };
+    assert!(!listed().contains(&write_id));
+
+    fs::write(&file, "## Work\n- [ ] Write it ^write\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(kb_status(&db, &ship).as_deref(), Some("cancelled"));
+    assert_eq!(container_of(&db, &write), None);
+    assert!(listed().contains(&write_id), "{:?}", listed());
+    assert!(
+        !parent_edge(),
+        "the cancelled parent's edge went with the row"
+    );
+    let again = sync(&db, "docs/plan").unwrap();
+    assert_eq!(again.count(Outcome::UpToDate), 1, "{:?}", again.results);
+
+    db.write_txn("t", jkb_core::undo::undo_last).unwrap();
+    assert!(parent_edge());
+    assert_eq!(container_of(&db, &write), Some(ship_id));
+}
+
 /// An import that changes nothing about a task's parent journals no containment write, so a sync
 /// of an unrelated edit does not grow the changelog by a row per subtask.
 #[test]

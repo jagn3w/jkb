@@ -809,6 +809,46 @@ fn a_parked_needs_closing_a_cycle_through_another_file_stays_parked() {
     assert!(settled.contains("1 up-to-date"), "{settled}");
 }
 
+/// A disk edit that adds a `needs:^id` closing a cycle through a dependency the file does not own
+/// is warned about on the very import that parks it, though the pass started with no cycle to warn
+/// about.
+#[test]
+fn a_disk_need_closing_a_cycle_is_warned_about_on_its_own_import() {
+    let dir = TempDir::new().unwrap();
+    let (db, _pfile, ofile) = two_tasks_files(&dir);
+    std::fs::write(&ofile, "## X\n- [ ] Ghost ^ghost\n- [ ] Fix ^fx\n").unwrap();
+    sync_ok(&db, "oth");
+    let (ghost, fx) = (
+        format!("file://{}#ghost", ofile.display()),
+        format!("file://{}#fx", ofile.display()),
+    );
+    let between = add_task(&db, "Between");
+    for (task, dep) in [(&ghost, &between), (&between, &fx)] {
+        jkb(&db)
+            .args(["task", "depend", task, dep])
+            .assert()
+            .success();
+    }
+    let quiet = sync_ok(&db, "oth");
+    assert!(!quiet.contains("cycle"), "{quiet}");
+
+    std::fs::write(
+        &ofile,
+        "## X\n- [ ] Ghost ^ghost\n- [ ] Fix needs:^ghost ^fx\n",
+    )
+    .unwrap();
+    let edited = sync_ok(&db, "oth");
+    assert!(edited.contains("1 imported"), "{edited}");
+    assert!(
+        edited.contains("`^fx`: `needs:^ghost` would close a dependency cycle"),
+        "{edited}"
+    );
+    assert_eq!(
+        task_json(&db, &fx)["unresolved_needs"],
+        serde_json::json!(["ghost"])
+    );
+}
+
 /// A dependency recorded with `jkb task depend` from a filed task to a task outside its file is
 /// not one the file can express, so importing the file keeps it. The import used to reset each
 /// filed task's dependencies to the in-file ones, dropping it on any unrelated edit to the file and
