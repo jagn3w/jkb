@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use jkb_core::query::{self, Scope};
 use jkb_core::{
-    containment, design, item, mount, ns, nstype, placement, tag, task, transition, Db,
+    binding, containment, design, item, mount, ns, nstype, placement, tag, task, transition, Db,
 };
 use jkb_search::{Route, Searcher};
 use jkb_types::{Embedder, ItemId, TaskStatus};
@@ -532,6 +532,13 @@ pub struct TaskDetail {
     /// Absent when there are none, and from an older daemon's answer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved_needs: Vec<String>,
+    /// Its `unresolved_needs` are kept from a tasks.md it is no longer written into (rebound
+    /// `--managed`, or to a file no `tasks` mount covers). They are kept rather than dropped, because
+    /// they are the only record of what the line said it needed; they become dependencies when the
+    /// task is bound into a tasks.md that defines those ids. Absent when false, and from an older
+    /// daemon's answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_outside_tasks_file: bool,
 }
 
 fn not_found(what: impl Into<String>) -> ApiError {
@@ -1366,7 +1373,10 @@ pub fn task_show(
         review: jkb_core::reviews::state(conn, id)?,
         place: design::plan::ancestry_of(conn, id)?.map(TaskPlacement::from),
         unresolved_needs: item::unresolved_needs(conn, id)?,
+        needs_outside_tasks_file: false,
     };
+    detail.needs_outside_tasks_file = !detail.unresolved_needs.is_empty()
+        && binding::serializer_for(conn, id)?.as_deref() != Some("tasks");
     // The task itself is not charged: it is what was asked for, and charging a large body marked the
     // answer cut when no subtask had been dropped at all.
     task::subtasks_each(conn, id, |t| {
@@ -1431,6 +1441,7 @@ mod tests {
             review: jkb_core::reviews::ReviewState::default(),
             place: None,
             unresolved_needs: Vec::new(),
+            needs_outside_tasks_file: false,
         };
         let sent = serde_json::to_value(&detail).unwrap();
         assert!(sent.get("place").is_none(), "{sent}");

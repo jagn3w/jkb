@@ -1055,6 +1055,8 @@ fn task_json(task: &TaskDetail) -> serde_json::Value {
         "place": task.place,
         // Additive: the `needs:^id`s its tasks.md line declares that name no task in the file yet.
         "unresolved_needs": task.unresolved_needs,
+        // Additive: those needs are kept from a tasks.md the task is no longer written into.
+        "needs_outside_tasks_file": task.needs_outside_tasks_file,
     })
 }
 
@@ -1119,10 +1121,18 @@ fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
             .iter()
             .map(|id| format!("^{id}"))
             .collect();
-        println!(
-            "needs:     {} (named in its tasks.md, but no task there has that id yet)",
-            ids.join(", ")
-        );
+        if task.needs_outside_tasks_file {
+            println!(
+                "needs:     {} (parked: this task is in no tasks.md; each becomes a dependency once \
+                 it is bound into a tasks.md that defines that id)",
+                ids.join(", ")
+            );
+        } else {
+            println!(
+                "needs:     {} (named in its tasks.md, but no task there has that id yet)",
+                ids.join(", ")
+            );
+        }
     }
     if let Some(line) = review_line(&task.review) {
         println!("review:    {line}");
@@ -1288,6 +1298,7 @@ mod tests {
                         subtasks: Vec::new(),
                         place: None,
                         unresolved_needs: Vec::new(),
+                        needs_outside_tasks_file: false,
                     }),
                     truncated: true,
                 },

@@ -445,6 +445,163 @@ fn a_needs_word_in_a_file_backed_tasks_text_is_refused_and_a_parked_one_holds_it
     );
 }
 
+/// Two `tasks` mounts, `work` over `proj/tasks.md` (whose `^fix` and `^ship` name tasks it does
+/// not define) and `oth` over `other/tasks.md` (which defines `^ghost`), both synced once. Returns
+/// the database and the two files.
+fn two_tasks_files(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let db = db_path(dir);
+    let root = dir.path().canonicalize().unwrap();
+    let (proj, other) = (root.join("proj"), root.join("other"));
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let (pfile, ofile) = (proj.join("tasks.md"), other.join("tasks.md"));
+    std::fs::write(
+        &pfile,
+        "## Backend\n- [ ] Fix flaky test needs:^ghost needs:^phantom ^fix\n\
+         - [ ] Ship button needs:^later ^ship\n",
+    )
+    .unwrap();
+    std::fs::write(&ofile, "## X\n- [ ] Ghost ^ghost\n").unwrap();
+    for (name, path) in [("work", &proj), ("oth", &other)] {
+        jkb(&db)
+            .args(["mount", "create", name, path.to_str().unwrap()])
+            .args(["--serializer", "tasks"])
+            .assert()
+            .success();
+        jkb(&db).args(["sync", name]).assert().success();
+    }
+    (db, pfile, ofile)
+}
+
+/// `jkb --json task show <uid>`.
+fn task_json(db: &Path, uid: &str) -> serde_json::Value {
+    let out = jkb(db)
+        .args(["--json", "task", "show", uid])
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// What `jkb task next` offers, across every namespace.
+fn ready_tasks(db: &Path) -> String {
+    let out = jkb(db).args(["--global", "task", "next"]).output().unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// A parked `needs:^id` becomes the dependency it names as soon as its task is moved into a
+/// tasks.md that defines the id, without the line being edited. It used to stay parked until the
+/// next disk edit, so the file read `needs:^ghost` beside `- [ ] Ghost ^ghost` while the store had
+/// no edge, `task next` offered the task as ready and the sync said the file was up to date.
+#[test]
+fn a_parked_needs_resolves_when_its_task_moves_into_a_file_that_defines_the_id() {
+    let dir = TempDir::new().unwrap();
+    let (db, pfile, ofile) = two_tasks_files(&dir);
+    let fix = format!("file://{}#fix", pfile.display());
+    assert!(ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
+
+    // The first sync of the file that defines `^ghost` records the dependency, keeps `^phantom`
+    // parked, and leaves the line as the file reads it.
+    jkb(&db)
+        .args(["task", "place", &fix, "oth/tasks.md/x", "--home"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["task", "bind", &fix, "--sync"])
+        .arg(format!("file://{}#fix", ofile.display()))
+        .assert()
+        .success();
+    jkb(&db).args(["sync", "oth"]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(&ofile).unwrap(),
+        "## X\n- [ ] Ghost ^ghost\n- [ ] Fix flaky test needs:^ghost needs:^phantom ^fix\n"
+    );
+    let moved = task_json(&db, &fix);
+    assert_eq!(
+        moved["unresolved_needs"],
+        serde_json::json!(["phantom"]),
+        "{moved}"
+    );
+    assert!(!ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
+    jkb(&db)
+        .args(["sync", "oth"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 up-to-date"));
+
+    // The file and the knowledge base agree from either side: the dependency survives the line
+    // being re-read from disk.
+    std::fs::write(
+        &ofile,
+        "## X\n- [ ] Ghost ^ghost\n- [ ] Fix flaky test !p2 needs:^ghost needs:^phantom ^fix\n",
+    )
+    .unwrap();
+    jkb(&db).args(["sync", "oth"]).assert().success();
+    assert!(!ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
+}
+
+/// The other direction: the task a parked `needs:^id` names is bound into the file holding it.
+#[test]
+fn a_parked_needs_resolves_when_the_named_task_is_bound_into_its_file() {
+    let dir = TempDir::new().unwrap();
+    let (db, pfile, _) = two_tasks_files(&dir);
+    let ship = format!("file://{}#ship", pfile.display());
+    let later = jkb(&db)
+        .args([
+            "--json",
+            "task",
+            "add",
+            "Do it later +work/tasks.md/backend",
+        ])
+        .output()
+        .unwrap();
+    let later: serde_json::Value = serde_json::from_slice(&later.stdout).unwrap();
+    let later = later["uid"].as_str().expect("a uid").to_owned();
+    jkb(&db)
+        .args(["task", "bind", &later, "--sync"])
+        .arg(format!("file://{}#later", pfile.display()))
+        .assert()
+        .success();
+    jkb(&db).args(["sync", "work"]).assert().success();
+    let healed = task_json(&db, &ship);
+    assert_eq!(
+        healed["unresolved_needs"],
+        serde_json::json!([]),
+        "{healed}"
+    );
+    assert!(!ready_tasks(&db).contains("#ship"), "{}", ready_tasks(&db));
+}
+
+/// A task rebound `--managed` keeps a parked need, the only record of what its line said it
+/// needed, and `task show` says it is parked outside any tasks.md rather than naming one.
+#[test]
+fn a_task_rebound_managed_keeps_its_parked_needs_and_says_where_they_stand() {
+    let dir = TempDir::new().unwrap();
+    let (db, pfile, _) = two_tasks_files(&dir);
+    let fix = format!("file://{}#fix", pfile.display());
+    jkb(&db)
+        .args(["task", "show", &fix])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("named in its tasks.md"));
+    jkb(&db)
+        .args(["task", "bind", &fix, "--managed"])
+        .assert()
+        .success();
+    let managed = task_json(&db, &fix);
+    assert_eq!(
+        managed["unresolved_needs"],
+        serde_json::json!(["ghost", "phantom"]),
+        "{managed}"
+    );
+    assert_eq!(managed["needs_outside_tasks_file"], true, "{managed}");
+    jkb(&db)
+        .args(["task", "show", &fix])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("this task is in no tasks.md"))
+        .stdout(predicate::str::contains("named in its tasks.md").not());
+}
+
 #[test]
 fn ns_ls_shows_created_namespaces() {
     let dir = TempDir::new().unwrap();

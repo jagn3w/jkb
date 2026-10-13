@@ -1228,7 +1228,10 @@ fn reconcile(
     };
 
     // Assemble the KB side and render it, so we can hash it against the base.
-    let kb_doc = assemble_kb_doc(conn, ctx, path, &bare_uri, journal.as_ref())?;
+    // A parked `needs:^id` this file now defines becomes the dependency it names, here and in the
+    // store, before anything is decided from the KB side (see `assemble_kb_doc_parts`).
+    let (kb_doc, heals) = assemble_kb_doc_parts(conn, ctx, path, &bare_uri, journal.as_ref())?;
+    record_resolved_needs(conn, meta, &heals)?;
     let kb_bytes = serializer.render(&kb_doc)?;
     let kb_hash = hash(&kb_bytes);
 
@@ -2545,6 +2548,38 @@ fn assemble_kb_doc(
     bare_uri: &str,
     journal: Option<&sync_state::SyncState>,
 ) -> Result<SyncDoc> {
+    Ok(assemble_kb_doc_parts(conn, ctx, path, bare_uri, journal)?.0)
+}
+
+/// A task in the assembled doc whose parked `needs:^id`s ([`item::UNRESOLVED_NEEDS`]) name tasks
+/// its file now defines: the dependencies to record and the parked ids that stay parked.
+struct ResolvedNeeds {
+    /// The task holding the parked needs.
+    item: ItemId,
+    /// The tasks it depends on that the store has no `depends_on` edge to yet.
+    link: Vec<ItemId>,
+    /// Its parked needs that still name no task in the file, in order.
+    still_parked: Vec<String>,
+}
+
+/// [`assemble_kb_doc`], plus the parked needs it resolved, for [`record_resolved_needs`].
+///
+/// A parked `needs:^id` waits for its file to define the id, and a file can come to define it
+/// without the line ever being read again: the task is moved into another tasks.md that has the id
+/// (`jkb task place … --home`, `jkb task bind … --sync`), or the id's task is bound into this file.
+/// The disk parse resolves it only on a disk edit, so until then the file read `needs:^ghost`
+/// beside `- [ ] Ghost ^ghost` while the store had no edge, `jkb task next` offered the task as
+/// ready, and the sync reported the file up to date. So the rule lives HERE, in the one place a
+/// tasks file's KB side is put together: every read of it (the reconcile, the watcher's judgement,
+/// the line check after a task write) sees the dependency, and the reconcile's write transaction
+/// records it.
+fn assemble_kb_doc_parts(
+    conn: &Connection,
+    ctx: &Ctx,
+    path: &Path,
+    bare_uri: &str,
+    journal: Option<&sync_state::SyncState>,
+) -> Result<(SyncDoc, Vec<ResolvedNeeds>)> {
     let file_ns_path = namespace_for(ctx, path);
     let mut doc = SyncDoc::default();
 
@@ -2580,6 +2615,8 @@ fn assemble_kb_doc(
     let deps = edge::edges_from_many(conn, &ids, EdgeType::DependsOn)?;
     let mut item_rows = item_rows_for(conn, &ids)?;
     let placements = primary_placements_for(conn, &ids)?;
+    // The local ids of the items this doc holds, which are the ids its parked needs can name.
+    let mut in_doc: HashMap<String, ItemId> = HashMap::new();
 
     for (local_id, id) in &resolved {
         // Skip items with no row or no primary placement (mirrors the old `load_item`).
@@ -2590,6 +2627,7 @@ fn assemble_kb_doc(
         if item.kind == "task" {
             item.unresolved_needs = item::unresolved_needs(conn, *id)?;
         }
+        in_doc.insert(local_id.clone(), *id);
         item.tags = tags.remove(id).unwrap_or_default();
         item.mirrors = mirrors.remove(id).unwrap_or_default();
         doc.items.push(item);
@@ -2617,7 +2655,73 @@ fn assemble_kb_doc(
     // subsequent disk edit came back as a conflict. Re-homing a file-backed item therefore
     // does not move it between sections in its file; editing the file does.
     apply_layout_sections(&mut doc);
-    Ok(doc)
+    let heals = resolve_parked_needs(&mut doc, &in_doc);
+    Ok((doc, heals))
+}
+
+/// Turn each parked need in `doc` that names an item of the doc (`in_doc`) into a `depends_on` edge
+/// of the doc, returning what the store must record to agree. A need naming its own task stays
+/// parked: an edge to itself is no dependency, and dropping the word would lose the line's text.
+fn resolve_parked_needs(doc: &mut SyncDoc, in_doc: &HashMap<String, ItemId>) -> Vec<ResolvedNeeds> {
+    let mut heals = Vec::new();
+    let mut new_edges: Vec<SyncEdge> = Vec::new();
+    for item in &mut doc.items {
+        if item.unresolved_needs.is_empty() {
+            continue;
+        }
+        let Some(&src) = in_doc.get(&item.local_id) else {
+            continue;
+        };
+        let (now, still): (Vec<String>, Vec<String>) = std::mem::take(&mut item.unresolved_needs)
+            .into_iter()
+            .partition(|dep| *dep != item.local_id && in_doc.contains_key(dep));
+        item.unresolved_needs.clone_from(&still);
+        if now.is_empty() {
+            continue;
+        }
+        let mut link = Vec::new();
+        for dep in now {
+            let has = |e: &SyncEdge| {
+                e.edge_type == EdgeType::DependsOn && e.src == item.local_id && e.dst == dep
+            };
+            if doc.edges.iter().any(has) || new_edges.iter().any(has) {
+                continue;
+            }
+            link.push(in_doc[&dep]);
+            new_edges.push(SyncEdge {
+                src: item.local_id.clone(),
+                dst: dep,
+                edge_type: EdgeType::DependsOn,
+            });
+        }
+        heals.push(ResolvedNeeds {
+            item: src,
+            link,
+            still_parked: still,
+        });
+    }
+    doc.edges.extend(new_edges);
+    heals
+}
+
+/// Record what [`assemble_kb_doc_parts`] resolved: each new `depends_on` edge, and the parked needs
+/// that are left. Inside the file's reconcile transaction, so it commits with the pass that renders
+/// the dependency, and both writes are changelogged (and undone) like any other. A dependency that
+/// would close a cycle with edges outside the file is refused by [`edge::link`]: that file's
+/// reconcile fails and rolls back, leaving the file and the store as they were, rather than a cycle
+/// being recorded.
+fn record_resolved_needs(
+    conn: &Connection,
+    meta: &WriteMeta,
+    heals: &[ResolvedNeeds],
+) -> Result<()> {
+    for heal in heals {
+        for &dst in &heal.link {
+            edge::link(conn, meta, heal.item, dst, EdgeType::DependsOn, None)?;
+        }
+        item::set_unresolved_needs(conn, meta, heal.item, &heal.still_parked)?;
+    }
+    Ok(())
 }
 
 /// Set each item's `section` from its position in the layout (the nearest preceding section
