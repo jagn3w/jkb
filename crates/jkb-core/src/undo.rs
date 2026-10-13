@@ -1324,13 +1324,20 @@ fn restore_item(conn: &Connection, snapshot: &Value) -> Result<usize> {
 /// `undoing_an_item_delete_restores_every_cascaded_row_whole` compares every cascaded row, every
 /// column — `edges.id` included — before the delete and after the undo.
 ///
-/// **A cascaded edge comes back under its own id.** V027 made `edges.id` AUTOINCREMENT, so a
-/// freed id is never reissued and writing the logged one back cannot collide: the row that held
-/// it is the one being restored, and nothing else can have been handed it. That keeps the
-/// changelog rows keyed by the edge's id (`edge::link_weighted`, `edge::unlink`) addressing the
-/// restored row. A snapshot written before the id was captured has no `id` on its edges; it binds
-/// NULL, so the edge takes a fresh id, which is what every restore did until then — the changelog
-/// is replayed by undo indefinitely, so those rows must stay restorable.
+/// **A cascaded edge comes back under its own id when that id is free** — which, for an edge
+/// created after V027 made `edges.id` AUTOINCREMENT, it always is: a freed id is never reissued,
+/// so the only row that ever held it is the one being restored. That keeps the changelog rows
+/// keyed by the edge's id (`edge::link_weighted`, `edge::unlink`) addressing the restored row.
+///
+/// The id is **not** always free on a database with history from before V027, when ids were
+/// reused: an unlink logged `id = N`, a later link was handed N, and that edge then cascaded away
+/// with an item. Undoing the old unlink out of order puts N back, and writing the snapshot's N
+/// would then refuse the item-delete undo on `UNIQUE constraint failed: edges.id`. So
+/// [`restore_edge`] checks, in the same statement, whether a row holds the id, and if one does the
+/// edge takes a fresh id exactly as every restore did before ids were captured. An older changelog
+/// row keyed by the logged id then misses and is refused by name, as it was then. A snapshot
+/// written before the id was captured has no `id` on its edges and takes a fresh id the same way
+/// — the changelog is replayed by undo indefinitely, so those rows must stay restorable.
 ///
 /// **The `WHERE EXISTS` guards are the one sanctioned way a restore in this module reports zero**,
 /// and they say exactly what they skip: a row whose *other* endpoint is not there to point at.
@@ -1443,7 +1450,9 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
     Ok(put_back)
 }
 
-/// Re-insert one edge from a cascade snapshot, under its logged id (see [`restore_children`]).
+/// Re-insert one edge from a cascade snapshot, under its logged id if no row holds that id and
+/// under a fresh one otherwise (see [`restore_children`] for when an id can be taken: only by
+/// history from before V027).
 fn restore_edge(conn: &Connection, edge: &Value) -> Result<usize> {
     // The `EXISTS` guards skip an edge whose other endpoint is gone — better than failing the
     // whole undo on a foreign key. They, not the removed `OR IGNORE`, are what does that: an
@@ -1452,7 +1461,8 @@ fn restore_edge(conn: &Connection, edge: &Value) -> Result<usize> {
         .prepare_cached(
             "INSERT INTO edges
                  (id, src_item_id, dst_item_id, type, props, weight, created_at)
-             SELECT ?7, ?1, ?2, ?3, ?4, ?5, ?6
+             SELECT CASE WHEN EXISTS (SELECT 1 FROM edges WHERE id = ?7) THEN NULL ELSE ?7 END,
+                    ?1, ?2, ?3, ?4, ?5, ?6
              WHERE EXISTS (SELECT 1 FROM items WHERE id = ?1)
                AND EXISTS (SELECT 1 FROM items WHERE id = ?2)",
         )?
@@ -2052,6 +2062,115 @@ mod tests {
             })
             .unwrap();
         assert_eq!(weight, Some(1.0), "the weight change was not undone");
+    }
+
+    /// An item delete stays undoable when the id its snapshot logged for an edge is **held by
+    /// another edge** — the shape only history from before V027 can produce, when an unlinked
+    /// edge's id was reissued to a later link and that link then cascaded away with an item (and
+    /// the old unlink was undone out of order). The restored edge takes a fresh id, as every
+    /// restore did before ids were captured, and the edge holding the id is untouched.
+    ///
+    /// The holder is put in place by a direct insert: `SQLite` will not reissue the id any more,
+    /// which is the point of V027, so this is the only way to reach the shape on a fresh database.
+    #[test]
+    fn an_item_delete_restores_its_edge_under_a_fresh_id_when_the_logged_one_is_taken() {
+        use crate::edge;
+        use crate::item;
+        use jkb_types::EdgeType;
+
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, c_id, d_id) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let b = upsert(c, m, &note("b"))?;
+                let c_id = upsert(c, m, &note("c"))?;
+                let d_id = upsert(c, m, &note("d"))?;
+                edge::link(c, m, a, b, EdgeType::References, None)?;
+                Ok((a, b, c_id, d_id))
+            })
+            .unwrap();
+        let logged = db
+            .read(|c| Ok(c.query_row("SELECT id FROM edges", [], |r| r.get::<_, i64>(0))?))
+            .unwrap();
+        let removed = db
+            .write_txn("t", move |c, m| {
+                item::remove(c, m, a, true)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        // The pre-V027 reissue: another edge now holds the id the snapshot names. Test fixture.
+        db.write_txn("t", move |c, _| {
+            c.execute(
+                "INSERT INTO edges (id, src_item_id, dst_item_id, type, props, created_at)
+                 VALUES (?1, ?2, ?3, 'supports', '{\"holder\":true}', '2001-01-01T00:00:00Z')",
+                rusqlite::params![logged, c_id.get(), d_id.get()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let holder_before = db
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT src_item_id, dst_item_id, type, props, created_at FROM edges
+                      WHERE id = ?1",
+                    [logged],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap();
+
+        db.write_txn("t", move |c, m| super::undo(c, m, removed))
+            .expect("the item-delete undo collided with the edge holding its logged edge id");
+
+        assert_eq!(
+            db.read(move |c| edge::edges_from(c, a, EdgeType::References))
+                .unwrap(),
+            vec![b],
+            "the cascaded edge did not come back"
+        );
+        let restored = db
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT id FROM edges WHERE src_item_id = ?1",
+                    [a.get()],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap();
+        assert_ne!(
+            restored, logged,
+            "the restore took the id another edge holds"
+        );
+        let holder_after = db
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT src_item_id, dst_item_id, type, props, created_at FROM edges
+                      WHERE id = ?1",
+                    [logged],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            holder_after, holder_before,
+            "the edge holding the logged id was disturbed by the restore"
+        );
     }
 
     /// A cascade snapshot written **before edge ids were captured** still undoes: the edge comes
