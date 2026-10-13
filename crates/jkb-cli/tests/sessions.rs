@@ -583,6 +583,41 @@ fn abandon_caveats_a_part_way_removal_like_land_does() {
     assert_eq!(f.status_of(&uid), "in_progress", "nothing was abandoned");
 }
 
+/// The shape the caveat was introduced for: MANY tracked files missing at once (a `git worktree
+/// remove` that stopped part-way through 152 of them), nothing staged, nothing untracked. Abandon
+/// counts them through the same reader `land` uses and says so, rather than "commit them".
+#[test]
+fn abandon_caveats_a_many_file_part_way_removal_with_its_count() {
+    const N: usize = 40;
+    let f = Fixture::new();
+    let uid = f.add_task("mass removed task");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    for i in 0..N {
+        std::fs::write(wt.join(format!("f{i:02}.txt")), format!("{i}\n")).unwrap();
+    }
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-qm", "many files"]);
+    for i in 0..N {
+        std::fs::remove_file(wt.join(format!("f{i:02}.txt"))).unwrap();
+    }
+
+    f.jkb()
+        .args(["task", "abandon", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has uncommitted changes"))
+        .stderr(predicate::str::contains(format!(
+            "Those {N} change(s) are deletions of tracked files and nothing else"
+        )))
+        .stderr(predicate::str::contains(format!(
+            "`git -C {} restore .`",
+            wt.display()
+        )));
+    assert!(wt.exists(), "a refused abandon leaves the checkout alone");
+    assert_eq!(f.status_of(&uid), "in_progress", "nothing was abandoned");
+}
+
 /// A checkout git cannot read is refused apart from a dirty one: it may hold nothing to commit, so
 /// "commit them" is the wrong advice — it names `git status` to look and `--force` to proceed. Its
 /// `.git` link removed, git answers about the enclosing repository instead, which is no answer

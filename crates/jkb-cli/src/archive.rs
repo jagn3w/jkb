@@ -3067,6 +3067,112 @@ pub(crate) mod tests {
         );
     }
 
+    /// A planned deletion whose branch is already gone locally, beside refs that a by-name lookup
+    /// would still resolve: the record's `delete_branch` with no local branch left.
+    fn gone_branch(t: &Path) -> (PathBuf, Entry, String) {
+        let (repo, e, head) = moved_branch(t);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &e.worktree.to_string_lossy(),
+            ],
+        );
+        git(
+            &repo,
+            &["update-ref", "-d", &format!("refs/heads/{}", e.branch)],
+        );
+        (repo, e, head)
+    }
+
+    /// With NO local branch, a tag named like it is not the branch: the tip reads as proven absent,
+    /// nothing is deleted, nothing is reported, and the tag is untouched. Read by bare name, the
+    /// tag matched the plan and the sweep tried to delete — and reported a branch it had not read.
+    #[test]
+    fn a_tag_named_like_a_gone_branch_reads_as_absent_and_is_left_alone() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, head) = gone_branch(t.path());
+        git(&repo, &["tag", &e.branch, &head]);
+        assert_eq!(
+            git(&repo, &["rev-parse", &e.branch]),
+            head,
+            "the premise: the bare name still resolves, to the tag"
+        );
+
+        assert_eq!(branch_tip(&repo, &e.branch), Tip::Absent);
+        let mut r = Report::default();
+        delete_branch_if_any(&e, &mut r);
+
+        assert!(
+            r.kept_branches.is_empty(),
+            "an absent branch is what was wanted: {r:?}"
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/tags/{}", e.branch)]),
+            head,
+            "the tag is not touched"
+        );
+    }
+
+    /// With no local branch, `origin/<b>` is not the branch either: the remote-tracking copy is
+    /// not what a deletion removes, so it cannot make the local branch read as present.
+    #[test]
+    fn a_remote_tracking_copy_of_a_gone_branch_reads_as_absent_and_is_left_alone() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, head) = gone_branch(t.path());
+        let remote = format!("refs/remotes/origin/{}", e.branch);
+        git(&repo, &["update-ref", &remote, &head]);
+
+        assert_eq!(branch_tip(&repo, &e.branch), Tip::Absent);
+        let mut r = Report::default();
+        delete_branch_if_any(&e, &mut r);
+
+        assert!(
+            r.kept_branches.is_empty(),
+            "an absent branch is what was wanted: {r:?}"
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", &remote]),
+            head,
+            "the remote-tracking ref is not touched"
+        );
+    }
+
+    /// Git not answering is neither present nor absent. A repo whose `.git` names a git dir that
+    /// does not exist fails every question; the planned deletion is reported as not carried out,
+    /// never folded into "already gone" and dropped with the record.
+    #[test]
+    fn a_branch_git_cannot_answer_for_is_reported_not_read_as_gone() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, mut e, head) = moved_branch(t.path());
+        let broken = t.path().join("broken");
+        fs::create_dir_all(&broken).expect("mk");
+        fs::write(
+            broken.join(".git"),
+            format!("gitdir: {}\n", t.path().join("no-such-gitdir").display()),
+        )
+        .expect("write");
+        e.repo_root.clone_from(&broken);
+
+        assert_eq!(branch_tip(&broken, &e.branch), Tip::Unanswered);
+        let mut r = Report::default();
+        delete_branch_if_any(&e, &mut r);
+
+        assert_eq!(r.kept_branches.len(), 1, "reported: {r:?}");
+        assert!(
+            r.kept_branches[0].1.contains("did not answer"),
+            "as unanswered: {r:?}"
+        );
+        assert!(
+            r.kept_branches[0].1.contains(&head),
+            "naming the planned head: {r:?}"
+        );
+        // The real repository's branch was never in question, and is still there.
+        assert!(!git(&repo, &["branch", "--list", &e.branch]).is_empty());
+    }
+
     /// The delete is conditional on the tip that was read. A commit landing between the read and
     /// the delete — simulated by moving the branch, then deleting at the head read before it moved
     /// — is kept with its branch, and the refusal reported. `git branch -D` deleted it.
