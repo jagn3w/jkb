@@ -40,6 +40,21 @@ pub struct PrFacts {
     /// Whether this client may write the task — `false` for one filed outside `jkb serve`'s file
     /// roots, which `close-merged` holds rather than failing the whole run on.
     pub writable: bool,
+    /// The latest recorded *no pull request* answer ([`record_absent`]), which the client judges
+    /// against the branch's remote-tracking tip now. Defaulted, so an older daemon reads as never
+    /// asked — and the client asks.
+    #[serde(default)]
+    pub pr_absent: Option<PrAbsent>,
+}
+
+/// A recorded *no pull request is headed by this branch*, and what it was asked at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrAbsent {
+    /// The branch asked about.
+    pub branch: String,
+    /// Its remote-tracking tip when asked; `None` when it had none.
+    #[serde(default)]
+    pub remote_head: Option<String>,
 }
 
 /// `task.pr_facts`.
@@ -76,6 +91,12 @@ pub fn facts(
         }),
         resumed_at: landing.resumed_at().map(str::to_owned),
         writable,
+        pr_absent: landing.pr_absent().and_then(|row| {
+            Some(PrAbsent {
+                branch: row.labels.branch.clone()?,
+                remote_head: row.labels.ref_commit.clone(),
+            })
+        }),
     })
 }
 
@@ -149,6 +170,37 @@ pub fn record(
         ..transition::Labels::default()
     };
     transition::note(conn, meta, id, &facts, &labels)?;
+    Ok(())
+}
+
+/// `task.pr_absent`: note that no pull request is headed by `branch`, asked when its remote-tracking
+/// tip was `remote_head` (`None`: it had none) — so `close-merged` does not ask `gh` again until that
+/// tip moves (`jkb_core::transition::no_pull_request`).
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for a malformed branch or tip, [`ErrorCode::NotFound`],
+/// [`ErrorCode::Forbidden`] under `roots`, or a failed write.
+pub fn record_absent(
+    conn: &Connection,
+    meta: &WriteMeta,
+    reference: &str,
+    branch: &str,
+    remote_head: Option<&str>,
+    roots: Option<&FileRoots>,
+) -> Result<(), ApiError> {
+    check_name("branch", branch)?;
+    if let Some(head) = remote_head {
+        // An object name: what `git rev-parse` prints, sha-1 or sha-256.
+        if head.is_empty() || head.len() > 64 || !head.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ApiError::with_code(
+                ErrorCode::Invalid,
+                "a remote head is a commit's object name",
+            ));
+        }
+    }
+    let id = writable(conn, reference, roots)?;
+    let facts = task::observe(conn, id)?;
+    transition::no_pull_request(conn, meta, id, &facts, branch, remote_head)?;
     Ok(())
 }
 

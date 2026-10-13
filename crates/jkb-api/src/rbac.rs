@@ -264,7 +264,8 @@ impl Request {
             | Self::IngestText(_)
             | Self::InvWrite(_)
             | Self::TaskLocate { .. }
-            | Self::TaskPrRecord { .. } => OpPermission::TaskWrite,
+            | Self::TaskPrRecord { .. }
+            | Self::TaskPrAbsent { .. } => OpPermission::TaskWrite,
             Self::TaskClaim { .. }
             | Self::TaskRelease { .. }
             | Self::TaskStart(_)
@@ -351,6 +352,7 @@ impl Request {
             | Self::TaskRanOnHost { uid, .. }
             | Self::ItemRm { uid, .. }
             | Self::TaskPrRecord { uid, .. }
+            | Self::TaskPrAbsent { uid, .. }
             | Self::TaskCloseMerged { uid, .. }
             | Self::WorkflowFire { uid, .. }
             | Self::WorkflowObserve { uid }

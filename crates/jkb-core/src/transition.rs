@@ -460,6 +460,7 @@ pub struct Landing {
     recorded: Option<TransitionRow>,
     resumed: Option<TransitionRow>,
     pr_number: Option<i64>,
+    pr_absent: Option<TransitionRow>,
 }
 
 impl Landing {
@@ -510,6 +511,14 @@ impl Landing {
     pub fn pr_number(&self) -> Option<i64> {
         self.pr_number
     }
+
+    /// The latest [`no_pull_request`] answer, if one was recorded: its `branch` label is the branch
+    /// asked about, its `ref_commit` the remote-tracking tip the question was asked at (`None` when
+    /// the branch had none). Whether it still holds is the client's to judge, against the tip now.
+    #[must_use]
+    pub fn pr_absent(&self) -> Option<&TransitionRow> {
+        self.pr_absent.as_ref()
+    }
 }
 
 /// Everything this task's history says about where its work went, from **one** read.
@@ -534,7 +543,47 @@ pub fn landing(conn: &Connection, task: ItemId) -> Result<Landing> {
             .cloned(),
         resumed: resumption(&rows).cloned(),
         pr_number: rows.iter().rev().find_map(|r| r.labels.pr_number),
+        pr_absent: rows
+            .iter()
+            .rev()
+            .find(|r| r.event == NO_PULL_REQUEST)
+            .cloned(),
     })
+}
+
+/// The event name of a [`no_pull_request`] row.
+pub const NO_PULL_REQUEST: &str = "no_pull_request";
+
+/// Record that `gh` was asked for a pull request headed by `branch` and answered **none**, with
+/// the remote-tracking tip of that branch the question was asked at (`None` when there was none).
+///
+/// A negative answer is not proof about the future: a pull request can be opened after it. It is
+/// recorded so that `close-merged`, which the `post-merge` hook runs over every unfinished task on
+/// every `git pull`, does not ask GitHub the same question again while nothing it depends on has
+/// moved. What it depends on is the branch **as GitHub can see it** — a pull request is opened
+/// from a pushed branch, and a push moves (or creates) the remote-tracking ref, while a merge that
+/// deletes the remote branch removes it on the next pruning fetch — so the tip is the key, and a
+/// different tip, or a different branch, is a question not yet asked.
+///
+/// Like [`note`], it changes no state and has no guard; its own event name is what lets
+/// [`Landing::pr_absent`] find it without mistaking a branch being written down for an answer.
+///
+/// # Errors
+/// Returns a database error if the write fails.
+pub fn no_pull_request(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    facts: &TaskFacts,
+    branch: &str,
+    remote_head: Option<&str>,
+) -> Result<()> {
+    let labels = Labels {
+        branch: Some(branch.to_owned()),
+        ref_commit: remote_head.map(str::to_owned),
+        ..Labels::default()
+    };
+    append(conn, meta, task, facts, NO_PULL_REQUEST, &labels)
 }
 
 /// Append a fact to a task's history without moving it.
@@ -1058,6 +1107,7 @@ mod tests {
                 recorded,
                 resumed,
                 pr_number: None,
+                pr_absent: None,
             };
             assert_eq!(l.live().is_some(), expect_live, "live");
             assert_eq!(l.superseded().is_some(), expect_spent, "superseded");

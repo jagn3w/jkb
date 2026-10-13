@@ -638,6 +638,11 @@ fn samples() -> Vec<Request> {
             uid: "u".into(),
             number: 7,
         },
+        Request::TaskPrAbsent {
+            uid: "u".into(),
+            branch: "b".into(),
+            remote_head: None,
+        },
         Request::TaskCloseMerged {
             uid: "u".into(),
             merged: super::prs::Merged::Unknown,
@@ -2383,7 +2388,7 @@ fn every_task_write_a_client_can_send_is_refused_for_a_task_filed_outside_the_ro
         assert_eq!(e.code, ErrorCode::Forbidden, "{wire}: {e:?}");
         checked += 1;
     }
-    assert_eq!(checked, 29, "every write naming an item was asked");
+    assert_eq!(checked, 30, "every write naming an item was asked");
     many_task_writes_leave_a_task_outside_the_roots_alone(&db, &inside, &outside);
     // And a verb that does git work first can ask, before it does any.
     for (uid, writable) in [(&outside, false), (&inside, true)] {
@@ -2755,6 +2760,7 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         json!({ "op": "task.claim", "uid": inside, "owner": "box:4" }),
         json!({ "op": "task.reclaim", "dead": ["box:4"] }),
         json!({ "op": "task.pr_record", "uid": inside, "number": 12 }),
+        json!({ "op": "task.pr_absent", "uid": inside, "branch": "b2", "remote_head": "abcd" }),
         json!({ "op": "task.close_merged", "uid": inside, "merged": "unknown", "dry_run": true,
                 "observed": { "live_landing": false } }),
     ];

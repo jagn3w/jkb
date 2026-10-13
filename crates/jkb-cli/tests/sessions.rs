@@ -5769,6 +5769,76 @@ fn a_discovered_merged_pull_request_closes_its_task_in_one_run() {
     assert_eq!(f.status_of(&uid), "done");
 }
 
+/// **`close-merged` does not ask `gh` again about a branch it said has no pull request until the
+/// branch moves on the remote** — through the real `jkb` and git, with a stub `gh` that logs every
+/// question. The `post-merge` hook runs this on every `git pull`.
+#[test]
+fn close_merged_asks_gh_again_only_when_the_branch_moves_on_the_remote() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Fixture::new();
+    let bin = f.home.path().join("stub-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = f.home.path().join("gh.log");
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$2\" in\n  list) printf '[]' ;;\nesac\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let uid = f.add_task("in flight, no pull request");
+    let s = f.work(&uid);
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    let asked = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.starts_with("pr list"))
+            .count()
+    };
+    let close = || {
+        let out = f
+            .jkb()
+            .env("PATH", &path)
+            .args(["--json", "task", "close-merged"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["held"][0]["uid"], uid.as_str(), "{v}");
+        v["held"][0]["reason"].as_str().unwrap().to_owned()
+    };
+    close();
+    assert_eq!(asked(), 1);
+    let why = close();
+    assert_eq!(asked(), 1, "asked again with nothing moved: {why}");
+    assert!(why.contains("when last asked"), "{why}");
+
+    // Pushed: the remote-tracking ref appears, so the question is a new one.
+    let tip = git(&f.repo, &["rev-parse", &branch]);
+    git(
+        &f.repo,
+        &[
+            "update-ref",
+            &format!("refs/remotes/origin/{branch}"),
+            tip.trim(),
+        ],
+    );
+    close();
+    assert_eq!(asked(), 2);
+    close();
+    assert_eq!(asked(), 2, "and is then answered");
+    assert_eq!(f.status_of(&uid), "in_progress");
+}
+
 /// `--no-review` asks who this client is **before** anything moves, whatever credential it presents:
 /// a terminal in the dev container holds the container credential (a coordinator), not a ticket, and
 /// keying the check on a ticket in the environment let it graft and run the gate before its waiver

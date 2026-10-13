@@ -264,3 +264,60 @@ fn the_landing_that_speaks_is_the_newest_one_still_standing() {
     }
     assert_eq!(landed(&b, &uid), None);
 }
+
+/// A *no pull request* answer is read back with the branch and remote tip it was asked at, the
+/// latest one standing; it is not a landing, and a tip that is not an object name is refused.
+#[test]
+fn a_recorded_none_is_read_back_with_what_it_was_asked_at() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = match call(
+        &b,
+        json!({ "op": "task.add", "text": "w", "managed": true }),
+    )
+    .unwrap()
+    {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    call(
+        &b,
+        json!({ "op": "task.start", "uid": uid, "take": { "owner": "box:1" },
+                "place": { "branch": "feat", "repo": "proj" } }),
+    )
+    .unwrap();
+    assert_eq!(facts(&b, &uid).pr_absent, None, "never asked");
+    call(
+        &b,
+        json!({ "op": "task.pr_absent", "uid": uid, "branch": "feat" }),
+    )
+    .unwrap();
+    let head = "0123456789abcdef0123456789abcdef01234567";
+    call(
+        &b,
+        json!({ "op": "task.pr_absent", "uid": uid, "branch": "feat", "remote_head": head }),
+    )
+    .unwrap();
+    let after = facts(&b, &uid);
+    assert_eq!(
+        after.pr_absent,
+        Some(super::PrAbsent {
+            branch: "feat".to_owned(),
+            remote_head: Some(head.to_owned()),
+        }),
+        "the latest answer stands"
+    );
+    assert_eq!(
+        (after.pr, after.branch.as_deref(), after.live_landing),
+        (None, Some("feat"), false),
+        "an answer of none is not a landing and moves no branch"
+    );
+    assert_eq!(status(&b, &uid), "in_progress");
+    for bad in ["", "not-hex", &"a".repeat(65)] {
+        let e = call(
+            &b,
+            json!({ "op": "task.pr_absent", "uid": uid, "branch": "feat", "remote_head": bad }),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{bad:?}");
+    }
+}
