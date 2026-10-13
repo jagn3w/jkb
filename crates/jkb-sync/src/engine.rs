@@ -32,7 +32,9 @@ use jkb_types::{
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::lifecycle::{FileEvent, FileState};
-use crate::serializers::{resolve, SyncBlock, SyncDoc, SyncItem, SyncSection, SyncSerializer};
+use crate::serializers::{
+    resolve, SyncBlock, SyncDoc, SyncEdge, SyncItem, SyncSection, SyncSerializer,
+};
 use crate::{Error, Result};
 
 /// What happened when reconciling one file.
@@ -579,8 +581,16 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
                 // file as failed, and the retry re-imports it and derives the mirrors again. Only
                 // when items came in: a no-op reconcile must not write, or the watcher would
                 // re-fire on its own commit and spin (the file-watch feedback loop).
+                //
+                // Only THIS file's tasks — the items bound to it, a superset of the ones this
+                // pass brought in. Not every task in the database: that was a full scan per
+                // importing file, and any unrelated task whose mirror cannot be derived rolled
+                // back every import until it was fixed.
                 if brought_items_in(outcome) {
-                    task::ensure_all_mirrors(conn, meta)?;
+                    let uris = binding::synced_uris_for_file(conn, &file_uri(&p))?;
+                    let items: Vec<ItemId> =
+                        binding::items_for_uris(conn, &uris)?.into_values().collect();
+                    task::ensure_mirrors_for(conn, meta, &items)?;
                 }
                 Ok(outcome)
             });
@@ -2168,7 +2178,7 @@ fn apply_doc(
     // the line, and the user's deletion was overwritten by the very sync that imported it.
     //
     // The removable set is exactly what the render would write — [`mirror_rows_for`], the one
-    // query both sides share — so a `tasks/…` index placement (`task::ensure_all_mirrors`) or a
+    // query both sides share — so a `tasks/…` index placement (`task::ensure_mirrors_for`) or a
     // placement inside the file's own subtree, which the file never shows and so can never
     // stop declaring, is untouched. A format that does not carry mirrors at all (`document`)
     // declares nothing by omission, so it removes nothing.
@@ -2755,29 +2765,65 @@ struct Sig {
     priority: Option<i64>,
     due: Option<String>,
     section: Option<String>,
-    /// The item's parent `local_id` (its `parent_of` incoming edge). Part of the
-    /// signature so a re-parenting/indentation change on either side is detected —
-    /// without it a nesting edit has an identical `Sig` and is silently reverted.
-    parent: Option<String>,
     tags: Vec<(String, String)>,
     mirrors: Vec<String>,
-    deps: Vec<String>,
+    /// Every edge this item OWNS ([`edge_owner`]), as `(type, the other end)`, sorted — its
+    /// `depends_on` targets and its parent (its incoming `parent_of`) among them. Part of the
+    /// signature so an edge edit on either side is detected: without its parent here a nesting
+    /// edit had an identical `Sig` and was silently reverted.
+    edges: Vec<(&'static str, String)>,
+}
+
+/// The item that OWNS an edge in a three-way merge, and the edge's other end.
+///
+/// The owner is the item whose line expresses the edge, so the edge is taken from whichever side
+/// changed that item and is part of that item's [`Sig`]. Exhaustive on purpose: the previous
+/// spelling special-cased `parent_of` and sent every other type to `src` through a wildcard, and
+/// its signature listed only `depends_on` and `parent_of` — so a new edge type would have been
+/// owned by a guess and invisible to change detection, the merge loss `parent_of` once had. A
+/// new variant does not compile until its owner is decided here.
+fn edge_owner(e: &SyncEdge) -> (&str, &str) {
+    match e.edge_type {
+        // The child's indentation declares its parent.
+        EdgeType::ParentOf => (&e.dst, &e.src),
+        // A dependent's `needs:` declares what it depends on, and every other type reads as a
+        // statement its source makes about the destination ("derived from", "supports",
+        // "fixes", …), so it is the source's line that would carry it.
+        EdgeType::DependsOn
+        | EdgeType::DerivedFrom
+        | EdgeType::References
+        | EdgeType::Supports
+        | EdgeType::Contradicts
+        | EdgeType::Refutes
+        | EdgeType::Supersedes
+        | EdgeType::RulesOut
+        | EdgeType::Narrows
+        | EdgeType::Constrains
+        | EdgeType::Confirms
+        | EdgeType::Answers
+        | EdgeType::Spawns
+        | EdgeType::DiscoveredFrom
+        | EdgeType::MemberOf
+        | EdgeType::Tests
+        | EdgeType::Verifies
+        | EdgeType::Fixes
+        | EdgeType::ReducesTo
+        | EdgeType::EquivalentInStrengthTo
+        | EdgeType::ExplainsFailure
+        | EdgeType::Informs
+        | EdgeType::Stages => (&e.src, &e.dst),
+    }
 }
 
 /// Signatures of every item in `doc`, keyed by `local_id`.
 fn sigs(doc: &SyncDoc) -> HashMap<String, Sig> {
-    let mut deps: HashMap<&str, Vec<String>> = HashMap::new();
-    // `parent_of` edges run parent(src) -> child(dst); key the child's parent by dst so
-    // a re-parenting shows up in the child's signature (the edge's authoritative form).
-    let mut parent_of: HashMap<&str, String> = HashMap::new();
+    let mut owned: HashMap<&str, Vec<(&'static str, String)>> = HashMap::new();
     for e in &doc.edges {
-        match e.edge_type {
-            EdgeType::DependsOn => deps.entry(&e.src).or_default().push(e.dst.clone()),
-            EdgeType::ParentOf => {
-                parent_of.insert(&e.dst, e.src.clone());
-            }
-            _ => {}
-        }
+        let (owner, other) = edge_owner(e);
+        owned
+            .entry(owner)
+            .or_default()
+            .push((e.edge_type.as_str(), other.to_owned()));
     }
     doc.items
         .iter()
@@ -2786,8 +2832,8 @@ fn sigs(doc: &SyncDoc) -> HashMap<String, Sig> {
             tags.sort();
             let mut mirrors = i.mirrors.clone();
             mirrors.sort();
-            let mut d = deps.get(i.local_id.as_str()).cloned().unwrap_or_default();
-            d.sort();
+            let mut edges = owned.remove(i.local_id.as_str()).unwrap_or_default();
+            edges.sort();
             (
                 i.local_id.clone(),
                 Sig {
@@ -2796,10 +2842,9 @@ fn sigs(doc: &SyncDoc) -> HashMap<String, Sig> {
                     priority: i.priority,
                     due: i.due.clone(),
                     section: i.section.clone(),
-                    parent: parent_of.get(i.local_id.as_str()).cloned(),
                     tags,
                     mirrors,
-                    deps: d,
+                    edges,
                 },
             )
         })
@@ -2866,18 +2911,13 @@ fn three_way(base: &SyncDoc, disk: &SyncDoc, kb: &SyncDoc) -> ThreeWay {
         }
     }
 
-    // Emit each edge from its *owner's* chosen side, so a per-item edit picks up its own
-    // edges: `depends_on` is owned by its `src` (the dependent), `parent_of` by its `dst`
-    // (the child — its indentation). Taking every edge by `src` alone drops a re-parented
-    // child's incoming edge when only the child changed (its parent item stays on `base`).
+    // Emit each edge from its *owner's* chosen side ([`edge_owner`]), so a per-item edit picks
+    // up its own edges. Taking every edge by `src` alone drops a re-parented child's incoming
+    // edge when only the child changed (its parent item stays on `base`).
     for id in &ids {
         let side = chosen_side(id);
         for e in &side.edges {
-            let owner = match e.edge_type {
-                EdgeType::ParentOf => &e.dst,
-                _ => &e.src,
-            };
-            if owner == id {
+            if edge_owner(e).0 == id {
                 merged.edges.push(e.clone());
             }
         }
@@ -3084,5 +3124,69 @@ fn sync_mode_of(s: &str) -> SyncMode {
         "import" => SyncMode::Import,
         "export" => SyncMode::Export,
         _ => SyncMode::Bidirectional,
+    }
+}
+
+#[cfg(test)]
+mod edge_ownership {
+    use super::{three_way, SyncDoc, SyncEdge, SyncItem, ThreeWay};
+    use jkb_types::EdgeType;
+
+    fn doc(items: &[(&str, &str)], edges: &[(&str, &str, EdgeType)]) -> SyncDoc {
+        SyncDoc {
+            items: items
+                .iter()
+                .map(|(id, text)| SyncItem::new(*id, "task", *text))
+                .collect(),
+            edges: edges
+                .iter()
+                .map(|(src, dst, edge_type)| SyncEdge {
+                    src: (*src).to_owned(),
+                    dst: (*dst).to_owned(),
+                    edge_type: *edge_type,
+                })
+                .collect(),
+            ..SyncDoc::default()
+        }
+    }
+
+    /// An edge of a type beyond `depends_on`/`parent_of`, added on one side, survives a merge
+    /// with a disjoint edit on the other.
+    ///
+    /// The owner match sent every other type to `src` by a wildcard and the signature listed only
+    /// `depends_on` and `parent_of`, so the edge's owner looked unchanged on both sides, was taken
+    /// from `base`, and the new edge was dropped without a conflict.
+    #[test]
+    fn an_edge_of_any_type_added_on_one_side_survives_a_disjoint_merge() {
+        let items = [("a", "alpha"), ("b", "beta")];
+        let base = doc(&items, &[]);
+        let disk = doc(&items, &[("a", "b", EdgeType::References)]);
+        let kb = doc(&[("a", "alpha"), ("b", "beta, edited")], &[]);
+
+        let ThreeWay::Merged(merged) = three_way(&base, &disk, &kb) else {
+            panic!("disjoint edits must merge");
+        };
+        assert!(
+            merged
+                .edges
+                .iter()
+                .any(|e| e.src == "a" && e.dst == "b" && e.edge_type == EdgeType::References),
+            "the disk side's new edge must survive: {:?}",
+            merged.edges
+        );
+        assert!(
+            merged.items.iter().any(|i| i.content == "beta, edited"),
+            "and the KB side's edit too"
+        );
+    }
+
+    /// The same edge type edited differently on both sides is a conflict, not a silent pick.
+    #[test]
+    fn an_edge_edited_on_both_sides_conflicts() {
+        let items = [("a", "alpha"), ("b", "beta"), ("c", "gamma")];
+        let base = doc(&items, &[]);
+        let disk = doc(&items, &[("a", "b", EdgeType::Supports)]);
+        let kb = doc(&items, &[("a", "c", EdgeType::Supports)]);
+        assert!(matches!(three_way(&base, &disk, &kb), ThreeWay::Conflict));
     }
 }

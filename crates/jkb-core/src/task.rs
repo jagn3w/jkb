@@ -338,25 +338,63 @@ pub fn set_primary_home(
     Ok(())
 }
 
-/// Ensure every task whose Primary home is outside `tasks/` has a `tasks/…` mirror. Backs
-/// the sync-time reconcile (file-backed tasks under `repos/<repo>/…`) and the one-shot
-/// `jkb task mirror`. Idempotent; returns the number of mirrors added.
+/// Ensure every task whose Primary home is outside `tasks/` has a `tasks/…` mirror: the global
+/// repair behind `jkb task mirror`. Idempotent; returns the number of mirrors added.
+///
+/// Sync does not call this: a file's import derives only its own tasks' mirrors
+/// ([`ensure_mirrors_for`]).
 ///
 /// # Errors
 /// Returns an error if a query or placement fails.
 pub fn ensure_all_mirrors(conn: &Connection, meta: &WriteMeta) -> Result<usize> {
-    let tasks: Vec<(ItemId, String)> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT i.id, n.path FROM items i
-             JOIN placements p ON p.item_id = i.id AND p.role = 'primary'
-             JOIN namespaces n ON n.id = p.namespace_id
-             WHERE i.kind = 'task'",
-        )?;
-        let rows = stmt.query_map([], |r| {
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.id, n.path FROM items i
+         JOIN placements p ON p.item_id = i.id AND p.role = 'primary'
+         JOIN namespaces n ON n.id = p.namespace_id
+         WHERE i.kind = 'task'",
+    )?;
+    let tasks = stmt
+        .query_map([], |r| {
             Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    mirror_each(conn, meta, tasks)
+}
+
+/// [`ensure_all_mirrors`] for the tasks among `items` only; other kinds are ignored. Backs the
+/// sync-time reconcile, which passes the items bound to the file it just imported.
+///
+/// Scoped because the reconcile runs once per importing file inside that file's transaction: the
+/// global scan cost a pass over every task in the database per file, and made the file's import
+/// fail — and roll back — on any task anywhere whose mirror cannot be derived (a home at the
+/// namespace limits), however unrelated to the file.
+///
+/// # Errors
+/// Returns an error if a query or placement fails.
+pub fn ensure_mirrors_for(conn: &Connection, meta: &WriteMeta, items: &[ItemId]) -> Result<usize> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.id, n.path FROM items i
+         JOIN placements p ON p.item_id = i.id AND p.role = 'primary'
+         JOIN namespaces n ON n.id = p.namespace_id
+         WHERE i.kind = 'task' AND i.id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let tasks = stmt
+        .query_map([crate::sql::json_ids(items.iter().map(|id| id.get()))], |r| {
+            Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    mirror_each(conn, meta, tasks)
+}
+
+/// [`ensure_task_mirror`] over `(task, home)` pairs, counting the mirrors added.
+fn mirror_each(
+    conn: &Connection,
+    meta: &WriteMeta,
+    tasks: Vec<(ItemId, String)>,
+) -> Result<usize> {
     let mut added = 0;
     for (item, home) in tasks {
         if ensure_task_mirror(conn, meta, item, &home)? {

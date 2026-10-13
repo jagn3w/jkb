@@ -3545,6 +3545,60 @@ fn the_retry_after_a_failed_mirror_derivation_mirrors_the_import() {
     );
 }
 
+/// A file's import derives only its OWN tasks' mirrors, so an unrelated task whose mirror cannot
+/// be derived does not block it — and `jkb task mirror` still repairs every task.
+///
+/// The import ran the global `ensure_all_mirrors`, a scan of every task in the database once per
+/// importing file, inside that file's transaction: one task anywhere whose mirror placement failed
+/// rolled back every import, on every pass, until someone found it.
+#[test]
+fn an_import_mirrors_only_its_own_tasks() {
+    let dir = real_tempdir();
+    let tasks = dir.path().join("tasks.md");
+    fs::write(&tasks, TASKS_MD).unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    // A task bound to no file, homed outside `tasks/`, whose mirror is missing and cannot be placed.
+    db.write_txn("t", |conn, meta| {
+        let mut new = task::NewTask::new("task:stray", "A task no file declares");
+        new.home = "elsewhere/stray".to_owned();
+        task::create(conn, meta, &new)?;
+        conn.execute_batch(
+            "DELETE FROM placements WHERE namespace_id =
+                 (SELECT id FROM namespaces WHERE path = 'tasks/elsewhere/stray');
+             CREATE TRIGGER refuse_stray_mirror BEFORE INSERT ON placements
+             WHEN (SELECT path FROM namespaces WHERE id = NEW.namespace_id) = 'tasks/elsewhere/stray'
+             BEGIN SELECT RAISE(ABORT, 'the stray task cannot be mirrored'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(mirrored_task_count(&db), 0, "the stray task starts unmirrored");
+
+    let report = sync(&db, "docs/plan").unwrap();
+    assert!(
+        report.failed().is_empty(),
+        "an unrelated task blocked the import: {:?}",
+        report.failed()
+    );
+    assert_eq!(
+        mirrored_task_count(&db),
+        3,
+        "the file's own tasks are mirrored, and only they"
+    );
+
+    // The global repair still covers every task.
+    let added = db
+        .write_txn("t", |conn, meta| {
+            conn.execute_batch("DROP TRIGGER refuse_stray_mirror")?;
+            task::ensure_all_mirrors(conn, meta)
+        })
+        .unwrap();
+    assert_eq!(added, 1, "`jkb task mirror` must still reach the stray task");
+    assert_eq!(mirrored_task_count(&db), 4);
+}
+
 // ---------------------------------------------------------------------------------------------
 // `+ns` mirrors a file stops declaring.
 // ---------------------------------------------------------------------------------------------

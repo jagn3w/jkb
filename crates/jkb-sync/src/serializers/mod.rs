@@ -132,7 +132,7 @@ pub struct SyncEdge {
     pub src: String,
     /// Destination item `local_id`.
     pub dst: String,
-    /// The edge type (`parent_of`, `depends_on`).
+    /// The edge type. Which item owns it in a three-way merge is `engine::edge_owner`.
     pub edge_type: EdgeType,
 }
 
