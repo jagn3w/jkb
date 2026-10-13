@@ -243,6 +243,34 @@ case_tag_like_base() {     # bare, the queue rebased onto the tag and the fast-f
     landed_tree "a tag named like the base" "$r"
 }
 
+# THE SUITE FLOOR IS READ FROM THE BASE BRANCH. A tag named like the base on a commit carrying
+# FEWER suites lowered the floor the gate holds the integrated tree to: here the tag has four, the
+# base branch five, and the branch deletes one, so only a floor read from the branch catches it.
+# Bare, the floor was four, the deletion passed, and the queue landed it.
+case_tag_like_base_suite_floor() {
+    local r; r="$(mkrepo tag-floor)"
+    git -C "$r" switch -qc d; git -C "$r" rm -q scripts/tests/s5.test.sh; git -C "$r" commit -qm "fewer suites"
+    git -C "$r" switch -q trunk; git -C "$r" tag trunk d; git -C "$r" branch -qD d
+    git -C "$r" switch -qc feat; git -C "$r" rm -q scripts/tests/s4.test.sh
+    echo w >"$r/work"; git -C "$r" add work; git -C "$r" commit -qm "work, one suite fewer"
+    git -C "$r" switch -q trunk 2>/dev/null     # picks the branch; the "ambiguous" warning is dropped
+    check "a tag named like the base does not lower the suite floor" "$r" 2 still 0
+}
+
+# THE MERGE BASE IS ASKED OF THE BASE BRANCH. A tag named like the base on an ORPHAN commit shares
+# no history with the work branch, so bare, `merge-base` found no common ancestor and the queue
+# refused an ordinary branch as a setup error (exit 3).
+case_tag_like_base_orphan() {
+    local r; r="$(mkrepo tag-orphan)"
+    git -C "$r" switch -q --orphan o; echo o >"$r/orphan"; git -C "$r" add orphan
+    git -C "$r" commit -qm orphan
+    # `switch` takes only branches, so it picks the branch; its "ambiguous" warning is dropped.
+    git -C "$r" tag trunk o; git -C "$r" switch -qf trunk 2>/dev/null; git -C "$r" branch -qD o
+    git -C "$r" switch -qc feat; echo w >"$r/work"; git -C "$r" add work; git -C "$r" commit -qm work
+    git -C "$r" switch -q trunk 2>/dev/null
+    check "a tag named like the base on an unrelated commit does not hide the merge base" "$r" 0 moved 1
+}
+
 echo "==> scripts/merge-queue.sh: what it exits, and whether the base moved"
 # THE STUB RECORDS. Asserting the exit code and the base ref leaves out the half of a phantom
 # landing that does the damage: `jkb task landed` is what closes every task in the group and
@@ -293,6 +321,7 @@ case_signalled() {   # killed mid-gate by any signal: never `landed`, and the ba
 
 run_cases case_signalled case_land case_red_gate case_red_suite case_nothing_ahead case_empty_work \
           case_conflict case_already_landed case_wedged case_already_merged \
-          case_tag_like_branch case_tag_like_ancestor_branch case_tag_like_base
+          case_tag_like_branch case_tag_like_ancestor_branch case_tag_like_base \
+          case_tag_like_base_suite_floor case_tag_like_base_orphan
 
 finish
