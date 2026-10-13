@@ -443,6 +443,7 @@ fn samples() -> Vec<Request> {
             repo: "jkb".into(),
             title: "t".into(),
             body: "b".into(),
+            under: Some("design:y".into()),
         },
         Request::DesignMove {
             uid: "design:x".into(),

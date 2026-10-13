@@ -1035,3 +1035,80 @@ fn a_listing_that_asks_no_counts_sends_no_review_field() {
     .unwrap();
     assert_eq!(asked["review"], json!(true));
 }
+
+fn listed(b: &LocalBackend) -> Vec<crate::designs::Design> {
+    match ok(b, json!({ "op": "design.list" })) {
+        Response::Designs { designs } => designs,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `design.create` with `under` nests the new design in the same write, and answers it naming its
+/// parent, as the listing then does.
+#[test]
+fn a_design_created_under_a_parent_is_nested_by_the_same_write() {
+    let kb = Kb::new();
+    let parent = create(&kb.op, "The parent.");
+    let child = match ok(
+        &kb.op,
+        json!({ "op": "design.create", "repo": "jkb", "title": "Child", "body": "Its words.",
+                "under": parent }),
+    ) {
+        Response::DesignCreated { design } => design,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(child.parent.as_deref(), Some(parent.as_str()));
+    assert_eq!(child.title, "Child");
+    assert_eq!(child.namespace.as_deref(), Some("designs/jkb"));
+    assert!(
+        child.seq > 0,
+        "its first text is stored, so it is announced"
+    );
+    let row = listed(&kb.op)
+        .into_iter()
+        .find(|d| d.uid == child.uid)
+        .unwrap();
+    assert_eq!(row.parent.as_deref(), Some(parent.as_str()));
+    assert_eq!(cat(&kb.op, &child.uid).text, "Its words.");
+}
+
+/// A design cannot be removed once made, so a refused parent must leave nothing behind: the
+/// creation and the nesting are one transaction.
+#[test]
+fn a_refused_parent_creates_no_design() {
+    let kb = Kb::new();
+    let elsewhere = match ok(
+        &kb.op,
+        json!({ "op": "design.create", "repo": "other", "title": "Elsewhere" }),
+    ) {
+        Response::DesignCreated { design } => design.uid,
+        other => panic!("{other:?}"),
+    };
+    let before = listed(&kb.op).len();
+    for under in ["design:no-such-design", elsewhere.as_str()] {
+        let e = call(
+            &kb.op,
+            json!({ "op": "design.create", "repo": "jkb", "title": "Orphan", "body": "x",
+                    "under": under }),
+        )
+        .unwrap_err();
+        assert_ne!(e.code, ErrorCode::Internal, "{under}: {e:?}");
+        let after = listed(&kb.op);
+        assert_eq!(after.len(), before, "{under}: a design was left behind");
+        assert!(after.iter().all(|d| d.title != "Orphan"), "{under}");
+    }
+}
+
+/// A client still creates a top-level design against a daemon that predates `under` (and refuses
+/// unknown fields): the field is never sent when absent.
+#[test]
+fn a_create_with_no_parent_sends_no_under_field() {
+    let plain = serde_json::to_value(crate::Request::DesignCreate {
+        repo: "jkb".into(),
+        title: "t".into(),
+        body: String::new(),
+        under: None,
+    })
+    .unwrap();
+    assert!(plain.get("under").is_none(), "{plain}");
+}
