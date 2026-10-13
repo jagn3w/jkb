@@ -583,6 +583,44 @@ fn abandon_caveats_a_part_way_removal_like_land_does() {
     assert_eq!(f.status_of(&uid), "in_progress", "nothing was abandoned");
 }
 
+/// A checkout git cannot read is refused apart from a dirty one: it may hold nothing to commit, so
+/// "commit them" is the wrong advice — it names `git status` to look and `--force` to proceed. Its
+/// `.git` link removed, git answers about the enclosing repository instead, which is no answer
+/// about this tree; the directory is still there, so it is not "already gone" either.
+#[test]
+fn abandon_refuses_a_checkout_git_cannot_read_apart_from_a_dirty_one() {
+    let f = Fixture::new();
+    let uid = f.add_task("unreadable task");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    commit_in(&wt, "e.txt", "work\n", "add e");
+    std::fs::remove_file(wt.join(".git")).unwrap();
+
+    f.jkb()
+        .args(["task", "abandon", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(format!(
+            "git could not read {}",
+            wt.display()
+        )))
+        .stderr(predicate::str::contains(format!(
+            "`git -C {} status`",
+            wt.display()
+        )))
+        .stderr(predicate::str::contains("pass --force"))
+        .stderr(predicate::str::contains("has uncommitted changes").not());
+    assert!(wt.exists(), "a refused abandon leaves the checkout alone");
+    assert_eq!(f.status_of(&uid), "in_progress", "nothing was abandoned");
+
+    // `--force` is the answer the refusal names, and it is accepted.
+    f.jkb()
+        .args(["task", "abandon", &uid, "--force"])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&uid), "open", "back on the frontier");
+}
+
 /// A session outlives the process that opened it: the worktree is the liveness signal, and
 /// the claim must survive the owner-existence reclaim.
 ///
@@ -4428,7 +4466,7 @@ fn abandoning_refuses_while_a_land_holds_the_land_lock() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("a `jkb task land` or `jkb task abandon` is running")
-            && stderr.contains("abandoning waits for it"),
+            && stderr.contains("abandoning refuses while one runs"),
         "{out:?}"
     );
     assert!(worktree.exists(), "the session is untouched");

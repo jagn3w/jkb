@@ -1836,9 +1836,9 @@ impl LockFor {
         match self {
             Self::Land => "landing is serial so its gate result stays meaningful",
             Self::Abandon => {
-                "abandoning waits for it, because a land in progress may be grafting this \
-                 session's commits or gating them, and removing the worktree under it would leave \
-                 them on the target with the task reopened"
+                "abandoning refuses while one runs, because a land in progress may be grafting \
+                 this session's commits or gating them, and removing the worktree under it would \
+                 leave them on the target with the task reopened"
             }
         }
     }
