@@ -2841,10 +2841,10 @@ fn edge_owner(e: &SyncEdge) -> (&str, &str) {
 
 /// Signatures of every item in `doc`, keyed by `local_id`.
 fn sigs(doc: &SyncDoc) -> HashMap<String, Sig> {
-    let mut owned: HashMap<&str, Vec<(&'static str, String)>> = HashMap::new();
+    let mut by_owner: HashMap<&str, Vec<(&'static str, String)>> = HashMap::new();
     for e in &doc.edges {
         let (owner, other) = edge_owner(e);
-        owned
+        by_owner
             .entry(owner)
             .or_default()
             .push((e.edge_type.as_str(), other.to_owned()));
@@ -2856,7 +2856,7 @@ fn sigs(doc: &SyncDoc) -> HashMap<String, Sig> {
             tags.sort();
             let mut mirrors = i.mirrors.clone();
             mirrors.sort();
-            let mut edges = owned.remove(i.local_id.as_str()).unwrap_or_default();
+            let mut edges = by_owner.remove(i.local_id.as_str()).unwrap_or_default();
             edges.sort();
             (
                 i.local_id.clone(),
