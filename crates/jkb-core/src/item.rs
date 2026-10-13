@@ -607,9 +607,11 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
                 "props": r.get::<_, String>(3)?,
                 "weight": r.get::<_, Option<f64>>(4)?,
                 "created_at": r.get::<_, String>(5)?,
-                // Restored as-is: `edges.id` is AUTOINCREMENT (V027), so the id is never
-                // reissued and an undo puts the edge back where `edge::link_weighted`'s
-                // changelog rows (keyed by it) can still find it.
+                // Restored as-is when no row holds it, which since V027 made `edges.id`
+                // AUTOINCREMENT is always: an undo then puts the edge back where
+                // `edge::link_weighted`'s changelog rows (keyed by it) can still find it. If
+                // another edge holds it — only history from before V027 can cause that — the
+                // edge is restored under a fresh id (`undo::restore_edge`).
                 "id": r.get::<_, i64>(6)?,
             }))
         })?;

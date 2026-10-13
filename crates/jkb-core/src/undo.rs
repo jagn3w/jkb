@@ -1334,8 +1334,10 @@ fn restore_item(conn: &Connection, snapshot: &Value) -> Result<usize> {
 /// with an item. Undoing the old unlink out of order puts N back, and writing the snapshot's N
 /// would then refuse the item-delete undo on `UNIQUE constraint failed: edges.id`. So
 /// [`restore_edge`] checks, in the same statement, whether a row holds the id, and if one does the
-/// edge takes a fresh id exactly as every restore did before ids were captured. An older changelog
-/// row keyed by the logged id then misses and is refused by name, as it was then. A snapshot
+/// edge takes a fresh id exactly as every restore did before ids were captured. This does **not**
+/// fix the pre-V027 reused-id hazard: an older changelog row keyed by the logged id addresses
+/// whatever row holds that id now — here the holder, not the restored edge — so undoing it acts
+/// on the holder (an old `insert` inverse deletes it and reports success). A snapshot
 /// written before the id was captured has no `id` on its edges and takes a fresh id the same way
 /// — the changelog is replayed by undo indefinitely, so those rows must stay restorable.
 ///
