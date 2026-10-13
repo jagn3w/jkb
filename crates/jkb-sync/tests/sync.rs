@@ -3076,6 +3076,75 @@ fn a_dotless_document_named_with_a_hash_syncs_as_itself() {
     assert!(!dir.path().join("issue").exists(), "no stray file `issue`");
 }
 
+/// A file whose name holds a `#` beside the file named up to it — `a#b.md` beside `a.md`, and the
+/// dotless `a#b` beside `a` — are four documents: each pass visits only the real files, each file
+/// gathers only its own binding, and an edit to one is exported to that file alone. Read by
+/// spelling, `file:///d/a#b` was the file `a` with the fragment `b`: `a`'s reconcile gathered
+/// `a#b`'s item, and a phantom `a` was exported with its hash stamped on `a#b`'s binding.
+#[test]
+fn files_named_with_a_hash_beside_their_prefix_stay_apart() {
+    let dir = real_tempdir();
+    let names = ["a.md", "a#b.md", "a", "a#b"];
+    for name in names {
+        fs::write(dir.path().join(name), format!("body of {name}")).unwrap();
+    }
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/notes",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::Created), 4);
+    let report = sync(&db, "docs/notes").unwrap();
+    assert_eq!(report.count(Outcome::UpToDate), 4, "{report:?}");
+    assert_eq!(report.results.len(), 4, "only the real files: {report:?}");
+
+    for name in names {
+        let path = dir.path().join(name);
+        let uris = {
+            let uri = uri_for(&path);
+            db.read(move |conn| binding::synced_uris_for_file(conn, &uri))
+                .unwrap()
+        };
+        assert_eq!(
+            uris,
+            [uri_for(&path)],
+            "{name} gathers only its own binding"
+        );
+        assert_eq!(
+            content_for(&db, &uri_for(&path)).as_deref(),
+            Some(format!("body of {name}").as_str())
+        );
+    }
+
+    kb_edit(&db, &uri_for(&dir.path().join("a#b")), "edited in kb");
+    let report = sync(&db, "docs/notes").unwrap();
+    assert_eq!(report.count(Outcome::Exported), 1, "{report:?}");
+    assert_eq!(report.count(Outcome::UpToDate), 3, "{report:?}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a#b")).unwrap(),
+        "edited in kb"
+    );
+    for name in ["a.md", "a#b.md", "a"] {
+        assert_eq!(
+            fs::read_to_string(dir.path().join(name)).unwrap(),
+            format!("body of {name}")
+        );
+    }
+    let mut on_disk: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    on_disk.sort();
+    assert_eq!(on_disk, ["a", "a#b", "a#b.md", "a.md"], "no phantom file");
+    assert_eq!(sync(&db, "docs/notes").unwrap().count(Outcome::UpToDate), 4);
+}
+
 /// An unbound file flagged on its first sync, whose directory is then replaced by a link, is out of
 /// scope for the sweep as it is for discovery — kept in scope, its flag could never clear.
 #[cfg(unix)]
