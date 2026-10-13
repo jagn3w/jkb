@@ -24,30 +24,40 @@ pub enum ConfigError {
 
 /// Configuration for [`chunk_text`].
 ///
-/// The fields are public for ergonomic struct-literal construction, but a
-/// `overlap_chars >= max_chars` would collapse the stride to one character and make
-/// a long text explode into ~one chunk per character. [`chunk_text`] defensively
-/// clamps the overlap below `max_chars` (see [`ChunkConfig::step`]) so that mistake
-/// cannot blow up; prefer [`ChunkConfig::new`] to have it surfaced as an error
-/// instead of silently clamped.
+/// The fields are private so the windowing invariant — `max_chars > 0` and
+/// `overlap_chars < max_chars` — holds by construction: the only ways to obtain a
+/// `ChunkConfig` are [`ChunkConfig::new`], which refuses a violating config with a
+/// [`ConfigError`], and [`Default`], which is itself built through `new` at compile
+/// time. An `overlap_chars >= max_chars` would otherwise collapse the stride toward
+/// one character and explode a long text into ~one chunk per character.
+///
+/// No struct literal can be written outside this module — not even a
+/// functional-update one, which would let a caller overwrite a field unchecked:
+///
+/// ```compile_fail,E0451
+/// use jkb_ingest::chunk::ChunkConfig;
+/// let _ = ChunkConfig { ..ChunkConfig::default() };
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct ChunkConfig {
-    /// Maximum characters per chunk.
-    pub max_chars: usize,
-    /// Characters shared between adjacent chunks. Must be `< max_chars`; a value
-    /// `>= max_chars` is clamped by [`chunk_text`] rather than honoured.
-    pub overlap_chars: usize,
+    /// Maximum characters per chunk. Always non-zero.
+    max: usize,
+    /// Characters shared between adjacent chunks. Always `< max`.
+    overlap: usize,
     /// Floor below which a lone trailing chunk is folded into a full final window.
-    pub min_chars: usize,
+    min: usize,
 }
+
+/// The default config, validated by [`ChunkConfig::new`] during constant
+/// evaluation: an invalid default is a compile error, not a runtime one.
+const DEFAULT_CONFIG: ChunkConfig = match ChunkConfig::new(1000, 100, 200) {
+    Ok(cfg) => cfg,
+    Err(_) => panic!("the default ChunkConfig violates its own invariant"),
+};
 
 impl Default for ChunkConfig {
     fn default() -> Self {
-        Self {
-            max_chars: 1000,
-            overlap_chars: 100,
-            min_chars: 200,
-        }
+        DEFAULT_CONFIG
     }
 }
 
@@ -59,7 +69,7 @@ impl ChunkConfig {
     /// Returns [`ConfigError::ZeroMax`] if `max_chars == 0`, or
     /// [`ConfigError::OverlapTooLarge`] if `overlap_chars >= max_chars` (which would
     /// collapse the stride and produce a near-quadratic number of chunks).
-    pub fn new(
+    pub const fn new(
         max_chars: usize,
         overlap_chars: usize,
         min_chars: usize,
@@ -74,31 +84,35 @@ impl ChunkConfig {
             });
         }
         Ok(Self {
-            max_chars,
-            overlap_chars,
-            min_chars,
+            max: max_chars,
+            overlap: overlap_chars,
+            min: min_chars,
         })
     }
 
-    /// The stride between window starts.
-    ///
-    /// A sane config keeps `overlap_chars < max_chars`, giving a stride of
-    /// `max_chars - overlap_chars`. A caller that built the config via the public
-    /// fields with `overlap_chars >= max_chars` would otherwise get a stride of `1`
-    /// (or, at `overlap == max`, zero before the old `max(1)`), exploding a long
-    /// text into ~one chunk per character. We defend by treating an out-of-range
-    /// overlap as *no* overlap, so the stride is the full window width — no data is
-    /// lost, only the (nonsensical) requested overlap is dropped. Prefer
-    /// [`ChunkConfig::new`] to surface the mistake as an error instead.
-    fn step(self) -> usize {
-        // `max(1)` covers a degenerate `max_chars` of 0 without panicking.
-        let max = self.max_chars.max(1);
-        let overlap = if self.overlap_chars >= max {
-            0
-        } else {
-            self.overlap_chars
-        };
-        (max - overlap).max(1)
+    /// Maximum characters per chunk (always non-zero).
+    #[must_use]
+    pub const fn max_chars(&self) -> usize {
+        self.max
+    }
+
+    /// Characters shared between adjacent chunks (always `< max_chars`).
+    #[must_use]
+    pub const fn overlap_chars(&self) -> usize {
+        self.overlap
+    }
+
+    /// Floor below which a lone trailing chunk is folded into a full final window.
+    #[must_use]
+    pub const fn min_chars(&self) -> usize {
+        self.min
+    }
+
+    /// The stride between window starts: `max_chars - overlap_chars`, which is at
+    /// least 1 because [`ChunkConfig::new`] guarantees `overlap_chars < max_chars`.
+    /// No clamp is needed — an out-of-range overlap cannot be constructed.
+    const fn step(self) -> usize {
+        self.max - self.overlap
     }
 }
 
@@ -110,7 +124,7 @@ pub fn chunk_text(text: &str, cfg: &ChunkConfig) -> Vec<String> {
     if chars.is_empty() {
         return Vec::new();
     }
-    if chars.len() <= cfg.max_chars {
+    if chars.len() <= cfg.max {
         return vec![text.to_owned()];
     }
 
@@ -118,7 +132,7 @@ pub fn chunk_text(text: &str, cfg: &ChunkConfig) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut start = 0;
     while start < chars.len() {
-        let end = (start + cfg.max_chars).min(chars.len());
+        let end = (start + cfg.max).min(chars.len());
         chunks.push(chars[start..end].iter().collect::<String>());
         if end == chars.len() {
             break;
@@ -131,9 +145,9 @@ pub fn chunk_text(text: &str, cfg: &ChunkConfig) -> Vec<String> {
     let tail_too_small = chunks.len() > 1
         && chunks
             .last()
-            .is_some_and(|last| last.chars().count() < cfg.min_chars);
+            .is_some_and(|last| last.chars().count() < cfg.min);
     if tail_too_small {
-        let start = chars.len().saturating_sub(cfg.max_chars);
+        let start = chars.len().saturating_sub(cfg.max);
         let full: String = chars[start..].iter().collect();
         if let Some(slot) = chunks.last_mut() {
             *slot = full;
@@ -147,11 +161,7 @@ mod tests {
     use super::{chunk_text, ChunkConfig, ConfigError};
 
     fn cfg(max: usize, overlap: usize, min: usize) -> ChunkConfig {
-        ChunkConfig {
-            max_chars: max,
-            overlap_chars: overlap,
-            min_chars: min,
-        }
+        ChunkConfig::new(max, overlap, min).expect("valid test config")
     }
 
     #[test]
@@ -202,33 +212,25 @@ mod tests {
     #[test]
     fn new_accepts_valid_config() {
         let c = ChunkConfig::new(10, 4, 2).expect("valid");
-        assert_eq!((c.max_chars, c.overlap_chars, c.min_chars), (10, 4, 2));
+        assert_eq!(
+            (c.max_chars(), c.overlap_chars(), c.min_chars()),
+            (10, 4, 2)
+        );
     }
 
     #[test]
-    fn overlap_at_or_above_max_does_not_explode() {
-        // Directly constructing via the public fields with overlap >= max used to
-        // yield step 1 => ~one chunk per character (memory/CPU blowup + a flood of
-        // near-identical embeddings). The out-of-range overlap is now dropped, so
-        // the stride is the full window width (max) and the chunk count stays near
-        // len/max rather than len.
-        let text: String = "a".repeat(1000);
-        for overlap in [10usize, 20, 100] {
-            let chunks = chunk_text(&text, &cfg(10, overlap, 2));
-            assert!(!chunks.is_empty());
-            // step == max == 10 over 1000 chars => ~100 windows, well under 200.
-            assert!(
-                chunks.len() <= 200,
-                "overlap {overlap} produced {} chunks",
-                chunks.len()
-            );
-        }
+    fn default_is_the_documented_valid_config() {
+        let d = ChunkConfig::default();
+        assert_eq!(
+            (d.max_chars(), d.overlap_chars(), d.min_chars()),
+            (1000, 100, 200)
+        );
+        assert_eq!(d.step(), 900);
     }
 
     #[test]
     fn overlap_below_max_still_strides_normally() {
-        // Sanity: clamping only kicks in when overlap >= max; a valid overlap is
-        // honoured exactly (step = max - overlap).
+        // A valid overlap is honoured exactly (step = max - overlap).
         let text: String = ('a'..='z').chain('0'..='9').take(30).collect();
         let chunks = chunk_text(&text, &cfg(10, 4, 1));
         // step 6 over 30 chars => starts 0,6,12,18,24 => 5 windows.

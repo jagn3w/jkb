@@ -68,11 +68,8 @@ fn open_db() -> Db {
 
 fn pipeline() -> Pipeline {
     // Small windows so ordinary test text yields several chunks.
-    Pipeline::new(FakeEmbedder::arc()).with_chunking(ChunkConfig {
-        max_chars: 40,
-        overlap_chars: 10,
-        min_chars: 10,
-    })
+    Pipeline::new(FakeEmbedder::arc())
+        .with_chunking(ChunkConfig::new(40, 10, 10).expect("valid chunk config"))
 }
 
 fn doc(text: &str) -> ParsedDocument {

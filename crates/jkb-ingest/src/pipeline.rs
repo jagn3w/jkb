@@ -106,7 +106,8 @@ impl Pipeline {
     fn strategy(&self) -> String {
         format!(
             "char:{}:{}",
-            self.chunking.max_chars, self.chunking.overlap_chars
+            self.chunking.max_chars(),
+            self.chunking.overlap_chars()
         )
     }
 
