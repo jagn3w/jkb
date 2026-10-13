@@ -4028,6 +4028,39 @@ fn a_document_import_leaves_the_items_mirrors_alone() {
     );
 }
 
+/// The converse of the sweep above: a **bound** file replaced by a directory keeps its flag. The KB
+/// still holds the file's item, so the refusal is reported rather than settled away.
+#[test]
+fn a_bound_file_replaced_by_a_directory_stays_flagged() {
+    let dir = real_tempdir();
+    let file = dir.path().join("notes.md");
+    fs::write(&file, "a note").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/repo",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert_eq!(sync(&db, "docs/repo").unwrap().count(Outcome::Created), 1);
+    fs::remove_file(&file).unwrap();
+    fs::create_dir(&file).unwrap();
+    for pass in 0..2 {
+        let report = sync(&db, "docs/repo").unwrap();
+        assert_eq!(report.count(Outcome::Failed), 1, "pass {pass}: {report:?}");
+        assert_eq!(
+            journal(&db, &uri_for(&file)).unwrap().0,
+            "needs_attention",
+            "pass {pass}"
+        );
+    }
+    assert_eq!(content_for(&db, &uri_for(&file)).as_deref(), Some("a note"));
+}
+
 /// A `+ns` mirror whose namespace differs from the internal `tasks/…` index only in case is a
 /// user's mirror, rendered into the file: the exclusion is case-exact, as `n.path != 'tasks'` is.
 #[test]

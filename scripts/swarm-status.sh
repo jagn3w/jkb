@@ -63,19 +63,19 @@ file_view() {
     # data captured into $kb, which is a wrong answer rather than a refusal.
     refuse_shared_db "$db" || exit 3
 
-    local abs uri uri_sql uri_like
+    local abs uri uri_sql uri_glob
     abs=$(cd "$(dirname "$file")" && pwd)/$(basename "$file")
     uri="file://$abs"
     # Escape single quotes for safe embedding in a SQL string literal (a path with an
     # apostrophe would otherwise close the literal early and break the query).
     uri_sql=${uri//\'/\'\'}
-    # AND THE LIKE METACHARACTERS for the prefix match below, the same three
-    # `jkb_core::sql::like_escape` escapes, paired with `ESCAPE '\'`. Quote-escaping alone left
-    # `_` and `%` live: an `_` in the path matched a one-character-different sibling directory
-    # and a `%` matched any run of characters, so the table reported another file's tasks as
-    # this file's — in the tool used exactly when someone cannot tell whose state they are
-    # looking at. scripts/tests/swarm-status.test.sh pins both.
-    uri_like=$(printf '%s' "$uri_sql" | sed 's/[\\%_]/\\&/g')
+    # AND THE GLOB METACHARACTERS for the prefix match below, as `jkb_core::sql::prefix_glob`
+    # escapes them: each of `*`, `?` and `[` wrapped in a one-character class. GLOB, not LIKE,
+    # because LIKE folds ASCII case, so `tasks.md` also listed a sibling `Tasks.md`'s tasks; and
+    # an unescaped pattern let a path's metacharacters match a different sibling. Either way the
+    # table reported another file's tasks as this file's — in the tool used exactly when someone
+    # cannot tell whose state they are looking at. scripts/tests/swarm-status.test.sh pins both.
+    uri_glob=$(printf '%s' "$uri_sql" | sed 's/[*?[]/[&]/g')
     echo "file: $abs"
     echo "db:   $db"
     echo
@@ -90,9 +90,11 @@ file_view() {
     echo
 
     local kb
-    kb=$(jkb_sqlite "$db" "SELECT substr(b.uri, instr(b.uri,'#')+1) AS frag, i.status
+    # The fragment is what follows this file's own uri and its `#`, not the first `#` in the uri:
+    # a directory with a `#` in its name would otherwise cut the fragment short.
+    kb=$(jkb_sqlite "$db" "SELECT substr(b.uri, length('$uri_sql') + 2) AS frag, i.status
          FROM bindings b JOIN items i ON i.id = b.item_id
-         WHERE b.uri LIKE '$uri_like#%' ESCAPE '\\' AND i.kind = 'task';" -separator $'\t' 2>&1 || true)
+         WHERE b.uri GLOB '$uri_glob#*' AND i.kind = 'task';" -separator $'\t' 2>&1 || true)
 
     echo "=== tasks (disk marker | kb status) ==="
     printf '%-4s  %-13s  %s\n' "DISK" "KB-STATUS" "TASK"

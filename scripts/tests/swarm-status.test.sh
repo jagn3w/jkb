@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Regression test for scripts/swarm-status.sh's FILE view (`--file <tasks.md> --db <db>`).
 #
-# The bug it exists for: the view finds a file's tasks with `b.uri LIKE '<file uri>#%'`, and the
-# path went into that pattern with only its single quotes escaped. `_` and `%` stayed live, so an
-# `_` in the path matched a one-character-different sibling directory, a `%` matched any run of
-# characters, and the "disk marker | kb status" table reported ANOTHER file's tasks as this
-# file's. The fix escapes `\`, `%` and `_` and adds `ESCAPE '\'`, as `jkb_core::sql::like_escape`
-# does on the Rust side.
+# The bug it exists for: the view finds a file's tasks by a prefix match on `<file uri>#`, and the
+# path went into that pattern with only its single quotes escaped. Its metacharacters stayed live,
+# so a path matched a different sibling directory, and the "disk marker | kb status" table reported
+# ANOTHER file's tasks as this file's. The pattern was then a LIKE, which also folds ASCII case, so
+# `repo/tasks.md` reported `Repo/tasks.md`'s tasks. The fix is a GLOB with `*`, `?` and `[`
+# escaped, as `jkb_core::sql::prefix_glob` builds on the Rust side.
 #
-# Each case below puts the file under test next to a sibling directory the unescaped pattern
-# would also match, binds a task fragment ONLY under the sibling, and asserts the file's own
-# line for that fragment still reads `(unbound)`.
+# Each case below puts the file under test next to a sibling directory an unescaped or
+# case-folding pattern would also match, binds a task fragment ONLY under the sibling, and asserts
+# the file's own line for that fragment still reads `(unbound)`.
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -25,7 +25,7 @@ mkdir -p "$work/bin"
 # THE DATABASE SHELL, or a stand-in for it. The view runs the real one through `jkb_sqlite`, and
 # it is used when present. Where it is not installed (the dev container, a bare CI image) a
 # stand-in on PATH runs the same SQL through Python's bundled SQLite — the same engine, so the
-# LIKE/ESCAPE semantics under test are SQLite's either way. It understands only what the view
+# GLOB semantics under test are SQLite's either way. It understands only what the view
 # passes: `-header`, `-column` and `-separator <s>`, then `<db> <sql>`.
 #
 # Every write below goes through `jkb_sqlite` (scripts/lib.sh), which refuses a database on a
@@ -136,6 +136,28 @@ case2() {
     check_isolated "percent" "$work/p/50%" "$work/p/50-and-more"
 }
 
+# --- 3. a path differing only in case is another file (LIKE folded ASCII case) -------------
+case3() {
+    check_isolated "case" "$work/c/repo" "$work/c/Repo"
+}
+
+# --- 4. GLOB's own metacharacters in the path are literal --------------------------------
+case4() {
+    check_isolated "star" "$work/s/a*b" "$work/s/aXb"
+    check_isolated "question" "$work/q/a?b" "$work/q/aXb"
+    check_isolated "bracket" "$work/b/a[x]b" "$work/b/axb"
+}
+
+# --- 5. LIKE's metacharacters, which GLOB takes literally, are not escaped into the path ---
+case5() {
+    check_isolated "like-chars" "$work/l/a_b%c" "$work/l/aXbYc"
+}
+
+# --- 6. a `#` in a directory name does not cut the fragment short -------------------------
+case6() {
+    check_isolated "hash-dir" "$work/h/a#b" "$work/h/a#c"
+}
+
 echo "==> scripts/swarm-status.sh --file"
-run_cases case1 case2
+run_cases case1 case2 case3 case4 case5 case6
 finish
