@@ -2211,6 +2211,10 @@ pub enum Response {
         /// Cut short at the read's budget ([`kb::Budget`]).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         truncated: bool,
+        /// Orphan vector rows the scan dropped rather than return; absent (and so zero, from a
+        /// server that predates it) when none were.
+        #[serde(default, skip_serializing_if = "kb::OrphanVectors::is_clean")]
+        orphan_vectors: kb::OrphanVectors,
     },
     /// A write that answers with nothing but its success (`task.set`, `edit`, `tag`, `depend`,
     /// `undepend`, `place`, `bind`).
@@ -3644,7 +3648,10 @@ impl LocalBackend {
                 limit,
                 context,
             } => {
-                let hits = kb::search(
+                let kb::Searched {
+                    hits,
+                    orphan_vectors,
+                } = kb::search(
                     db,
                     self.embedder.as_ref(),
                     &kb::SearchAsk {
@@ -3659,6 +3666,7 @@ impl LocalBackend {
                 Response::SearchHits {
                     hits,
                     truncated: budget.exhausted(),
+                    orphan_vectors,
                 }
             }
             Request::TaskReady {

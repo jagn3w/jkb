@@ -331,6 +331,60 @@ pub struct SearchHit {
     pub context: Vec<ContextLine>,
 }
 
+/// Orphan vector rows — rows of the vector table whose item is gone — that a `kb.search` dropped
+/// from its nearest-neighbour scan rather than return as hits (design D42.3).
+///
+/// The liveness filter that keeps them out of the hits also hides the only sign that the table
+/// needs `jkb index --sweep`, so the search carries the count out to its caller.
+/// [`Self::needs_sweep`] is the one place that decides when that is worth telling the user.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanVectors {
+    /// Rows dropped because their item is gone.
+    pub dropped: usize,
+    /// Rows the scan returned before the filter: the largest page the search read.
+    pub scanned: usize,
+}
+
+impl OrphanVectors {
+    /// [`Self::needs_sweep`] fires when at least one in this many scanned rows was an orphan.
+    ///
+    /// A database written since the vector GC trigger has none, so any orphan is a legacy store
+    /// that a sweep repairs. A quarter rather than one: a handful of stragglers costs a search
+    /// nothing visible, while a quarter or more makes every scoped search over-fetch up to its
+    /// cap, which is the latency the hint exists to explain. On the store the hint was written
+    /// for (~56k dead rows beside ~1k live) every scan is over 90% orphans.
+    pub const SWEEP_HINT_ONE_IN: usize = 4;
+
+    /// Whether nothing was dropped (and so nothing is sent on the wire).
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.dropped == 0
+    }
+
+    /// Whether enough of the scan was orphans to point the user at `jkb index --sweep`: at least
+    /// one row in [`Self::SWEEP_HINT_ONE_IN`].
+    #[must_use]
+    pub const fn needs_sweep(&self) -> bool {
+        self.dropped > 0 && self.dropped.saturating_mul(Self::SWEEP_HINT_ONE_IN) >= self.scanned
+    }
+}
+
+impl From<jkb_search::OrphanVectors> for OrphanVectors {
+    fn from(o: jkb_search::OrphanVectors) -> Self {
+        let jkb_search::OrphanVectors { dropped, scanned } = o;
+        Self { dropped, scanned }
+    }
+}
+
+/// What `kb.search` answers: the hits, and the orphan vector rows dropped to find them.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Searched {
+    /// Best first.
+    pub hits: Vec<SearchHit>,
+    /// Orphan vector rows the scan dropped.
+    pub orphan_vectors: OrphanVectors,
+}
+
 /// A tag application.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TagPair {
@@ -1069,7 +1123,8 @@ pub struct SearchAsk {
     pub context: Option<usize>,
 }
 
-/// `kb.search`: hits best-first, each resolved to its item.
+/// `kb.search`: hits best-first, each resolved to its item, and the orphan vector rows the scan
+/// dropped on the way ([`OrphanVectors`]).
 ///
 /// # Errors
 /// [`ErrorCode::Unsupported`] for a route that embeds text with no `embedder`; [`ErrorCode::Invalid`]
@@ -1079,7 +1134,7 @@ pub fn search(
     embedder: Option<&Arc<dyn Embedder + Send + Sync>>,
     ask: &SearchAsk,
     budget: &mut Budget,
-) -> Result<Vec<SearchHit>, ApiError> {
+) -> Result<Searched, ApiError> {
     if ask.limit > MAX_SEARCH_LIMIT {
         return Err(ApiError::with_code(
             ErrorCode::Invalid,
@@ -1104,7 +1159,7 @@ pub fn search(
             ))
         }
     };
-    let hits = searcher
+    let jkb_search::Searched { hits, orphans } = searcher
         .search(db, &query, ask.route.into(), ask.limit)
         .map_err(search_error)?;
     let mut out = Vec::with_capacity(hits.len());
@@ -1152,7 +1207,10 @@ pub fn search(
         }
         out.push(hit);
     }
-    Ok(out)
+    Ok(Searched {
+        hits: out,
+        orphan_vectors: orphans.into(),
+    })
 }
 
 fn search_error(e: jkb_search::Error) -> ApiError {

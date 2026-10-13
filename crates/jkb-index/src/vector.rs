@@ -115,6 +115,23 @@ impl StaleRows {
     }
 }
 
+/// One `vec0` KNN answer with its dead rows filtered out ([`VectorIndexer::knn_page`],
+/// [`VectorIndexer::knn_live`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KnnPage {
+    /// The neighbours whose item still exists, nearest-first.
+    pub live: Vec<(ItemId, f32)>,
+    /// Whether the caller has seen every live row: the index ran short of the fetch, and
+    /// nothing was withheld by a truncation.
+    pub index_exhausted: bool,
+    /// How many rows `vec0` returned for the page, before the liveness filter.
+    pub scanned: usize,
+    /// How many of those rows the liveness filter dropped because their item is gone — orphan
+    /// vectors that `jkb index --sweep` removes. `scanned - dead` is never less than
+    /// `live.len()` (more only when [`VectorIndexer::knn_live`] truncated).
+    pub dead: usize,
+}
+
 /// Find stale derived-index rows without changing anything.
 ///
 /// The detect half of the pair; [`sweep_stale`] is the clean half and uses the same
@@ -444,7 +461,7 @@ impl VectorIndexer {
     /// Returns [`crate::Error`] if `query`'s length is not the table dim, or a
     /// statement fails.
     pub fn knn(&self, conn: &Connection, query: &[f32], k: usize) -> Result<Vec<(ItemId, f32)>> {
-        Ok(self.knn_live(conn, query, k)?.0)
+        Ok(self.knn_live(conn, query, k)?.live)
     }
 
     /// The largest `k` `sqlite-vec` accepts (`SQLITE_VEC_VEC0_K_MAX`, sqlite-vec.c:7111); it
@@ -471,28 +488,24 @@ impl VectorIndexer {
     /// table whatever its `k`, an orphan-heavy database turned one scoped search into ~27 full
     /// scans where the outer loop alone does at most six.
     ///
-    /// The second return value is `true` only when the caller has seen **every** live row
-    /// (see [`Self::knn_page`]).
+    /// [`KnnPage::index_exhausted`] is `true` only when the caller has seen **every** live row
+    /// (see [`Self::knn_page`]); [`KnnPage::scanned`] and [`KnnPage::dead`] describe the last,
+    /// largest, page — each page is a prefix of the next, so it covers every earlier one.
     ///
     /// # Errors
     /// Returns an error if the query is the wrong length or a statement fails.
-    pub fn knn_live(
-        &self,
-        conn: &Connection,
-        query: &[f32],
-        k: usize,
-    ) -> Result<(Vec<(ItemId, f32)>, bool)> {
+    pub fn knn_live(&self, conn: &Connection, query: &[f32], k: usize) -> Result<KnnPage> {
         let mut fetch = k.min(Self::VEC0_K_MAX);
         loop {
-            let (live, index_exhausted) = self.knn_page(conn, query, fetch)?;
-            if live.len() >= k || index_exhausted || fetch >= Self::VEC0_K_MAX {
+            let mut page = self.knn_page(conn, query, fetch)?;
+            if page.live.len() >= k || page.index_exhausted || fetch >= Self::VEC0_K_MAX {
                 // `index_exhausted` must mean "the caller has seen every live row", not merely
                 // "the table had no more rows to give". Truncating a full page withholds live
                 // neighbours, so a truncation reports not-exhausted.
-                let mut live = live;
-                let truncated = live.len() > k;
-                live.truncate(k);
-                return Ok((live, index_exhausted && !truncated));
+                let truncated = page.live.len() > k;
+                page.live.truncate(k);
+                page.index_exhausted &= !truncated;
+                return Ok(page);
             }
             fetch = (fetch * 2).min(Self::VEC0_K_MAX);
         }
@@ -509,18 +522,23 @@ impl VectorIndexer {
     /// `live.len() < fetch`: once dead rows are filtered out that test reads a page full of
     /// orphans as exhaustion and stops growth early.
     ///
+    /// [`KnnPage::dead`] counts the rows the liveness filter removed, which is how a search learns
+    /// that the table needs `jkb index --sweep`: the filter otherwise hides the very rows that
+    /// would have told it.
+    ///
     /// # Errors
     /// Returns an error if the query is the wrong length or a statement fails.
-    pub fn knn_page(
-        &self,
-        conn: &Connection,
-        query: &[f32],
-        fetch: usize,
-    ) -> Result<(Vec<(ItemId, f32)>, bool)> {
+    pub fn knn_page(&self, conn: &Connection, query: &[f32], fetch: usize) -> Result<KnnPage> {
         let fetch = fetch.min(Self::VEC0_K_MAX);
         let raw = self.knn_raw(conn, query, fetch)?;
-        let index_exhausted = raw.len() < fetch;
-        Ok((Self::filter_live(conn, raw)?, index_exhausted))
+        let scanned = raw.len();
+        let live = Self::filter_live(conn, raw)?;
+        Ok(KnnPage {
+            index_exhausted: scanned < fetch,
+            dead: scanned - live.len(),
+            scanned,
+            live,
+        })
     }
 
     /// How many times this connection has run the `vec0` KNN statement, as `SQLite` counts it

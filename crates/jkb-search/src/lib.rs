@@ -38,7 +38,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use jkb_core::query::{Query, Scope};
 use jkb_core::Db;
-use jkb_index::{FtsIndexer, VectorIndexer};
+use jkb_index::{FtsIndexer, KnnPage, VectorIndexer};
 use jkb_types::{Embedder, ItemId};
 
 pub use error::{Error, Result};
@@ -95,6 +95,40 @@ pub struct SearchHit {
     pub source_document: Option<ItemId>,
 }
 
+/// Orphan vector rows — rows of the vector table whose item is gone — that a search's liveness
+/// filter dropped from its KNN (design D42.3).
+///
+/// The filter keeps them out of the hits, which also hides the only evidence that the table
+/// needs `jkb index --sweep`; this carries that evidence to the caller. Counted over the
+/// largest `vec0` page the search read (each page of one query is a prefix of the next, so it
+/// covers the smaller ones); zero for the FTS route and for an exactly-scored small scope,
+/// which address live items by id and never meet an orphan.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrphanVectors {
+    /// Rows the liveness filter dropped because their item is gone.
+    pub dropped: usize,
+    /// Rows the KNN returned before the filter (so `dropped <= scanned`).
+    pub scanned: usize,
+}
+
+impl OrphanVectors {
+    fn of(page: &KnnPage) -> Self {
+        Self {
+            dropped: page.dead,
+            scanned: page.scanned,
+        }
+    }
+}
+
+/// What [`Searcher::search`] answers: the hits, and what the liveness filter hid to get them.
+#[derive(Debug, Clone, Default)]
+pub struct Searched {
+    /// Best first.
+    pub hits: Vec<SearchHit>,
+    /// Orphan vector rows dropped on the way.
+    pub orphans: OrphanVectors,
+}
+
 /// One chunk in a context-expansion window around a hit.
 #[derive(Debug, Clone)]
 pub struct ContextChunk {
@@ -129,17 +163,14 @@ impl Searcher {
     /// key off the FTS term (falling back to the vector term). The structured part of
     /// `query` (scope/tags/kind/…) is applied as an in-scope filter on every route.
     ///
+    /// [`Searched::orphans`] reports the dead vector rows the vector/hybrid routes filtered out,
+    /// so a caller can point the user at `jkb index --sweep`.
+    ///
     /// # Errors
     /// Returns an error if embedding the query text fails, or a query/statement fails.
-    pub fn search(
-        &self,
-        db: &Db,
-        query: &Query,
-        route: Route,
-        limit: usize,
-    ) -> Result<Vec<SearchHit>> {
+    pub fn search(&self, db: &Db, query: &Query, route: Route, limit: usize) -> Result<Searched> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(Searched::default());
         }
 
         // Embed the query text *here*, off the writer thread — the only model call in
@@ -158,7 +189,7 @@ impl Searcher {
         let scope = scope_query(query);
         let fts_text = fts_text(query).map(str::to_owned);
 
-        db.read_with::<Vec<SearchHit>, Error, _>(move |conn| {
+        db.read_with::<Searched, Error, _>(move |conn| {
             // Resolve the structural candidate set once: `None` = unrestricted (all
             // items); `Some(ids)` = exactly the in-scope items to rank within.
             let scope_set: Option<Vec<ItemId>> = match &scope {
@@ -167,36 +198,41 @@ impl Searcher {
             };
             let scope_ref = scope_set.as_deref();
 
-            let hits = match route {
+            let (hits, orphans) = match route {
                 Route::Vector => {
-                    let ranked = vector_ranked(&vector, conn, qvec.as_deref(), scope_ref, limit)?;
-                    ranked
+                    let (ranked, orphans) =
+                        vector_ranked(&vector, conn, qvec.as_deref(), scope_ref, limit)?;
+                    let hits = ranked
                         .into_iter()
                         .map(|(id, dist)| {
                             build_hit(conn, id, Route::Vector, -f64::from(dist), Some(dist))
                         })
-                        .collect::<Result<Vec<_>>>()?
+                        .collect::<Result<Vec<_>>>()?;
+                    (hits, orphans)
                 }
                 Route::Fts => {
                     let ranked = fts_ranked(fts, conn, fts_text.as_deref(), scope_ref, limit)?;
-                    ranked
+                    let hits = ranked
                         .into_iter()
                         .map(|(id, bm25)| build_hit(conn, id, Route::Fts, -bm25, None))
-                        .collect::<Result<Vec<_>>>()?
+                        .collect::<Result<Vec<_>>>()?;
+                    (hits, OrphanVectors::default())
                 }
                 Route::Hybrid => {
                     // Fuse deeper than `limit` from each route so the two orderings
                     // have material to overlap on.
                     let depth = (limit * 2).clamp(20, OVERFETCH_CAP);
-                    let v = vector_ranked(&vector, conn, qvec.as_deref(), scope_ref, depth)?;
+                    let (v, orphans) =
+                        vector_ranked(&vector, conn, qvec.as_deref(), scope_ref, depth)?;
                     let f = fts_ranked(fts, conn, fts_text.as_deref(), scope_ref, depth)?;
-                    rrf_fuse(&v, &f, limit)
+                    let hits = rrf_fuse(&v, &f, limit)
                         .into_iter()
                         .map(|(id, score, dist)| build_hit(conn, id, Route::Hybrid, score, dist))
-                        .collect::<Result<Vec<_>>>()?
+                        .collect::<Result<Vec<_>>>()?;
+                    (hits, orphans)
                 }
             };
-            Ok(hits)
+            Ok(Searched { hits, orphans })
         })
     }
 
@@ -293,27 +329,34 @@ fn scope_query(q: &Query) -> Option<Query> {
 
 /// Rank the vector route: unrestricted KNN, exact scoring in a small scope, or
 /// adaptive over-fetch-then-filter in a large restricted scope (design D9). Returns
-/// `(item, cosine_distance)` nearest-first.
+/// `(item, cosine_distance)` nearest-first, and the orphan rows the KNN's liveness filter
+/// dropped on its largest page.
 fn vector_ranked(
     vector: &VectorIndexer,
     conn: &Connection,
     qvec: Option<&[f32]>,
     scope: Option<&[ItemId]>,
     k: usize,
-) -> Result<Vec<(ItemId, f32)>> {
+) -> Result<(Vec<(ItemId, f32)>, OrphanVectors)> {
     let Some(qv) = qvec else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), OrphanVectors::default()));
     };
     match scope {
         // Unrestricted: plain KNN over the whole table.
-        None => Ok(vector.knn(conn, qv, k)?),
-        Some([]) => Ok(Vec::new()),
+        None => {
+            let page = vector.knn_live(conn, qv, k)?;
+            let orphans = OrphanVectors::of(&page);
+            Ok((page.live, orphans))
+        }
+        Some([]) => Ok((Vec::new(), OrphanVectors::default())),
         // Small scope: exact cosine over exactly these items — recall-preserving,
         // never approximate (spec: small scope uses exact scoring).
         Some(ids) if ids.len() <= EXACT_SCORING_CAP => {
             let mut scored = vector.distances_for(conn, qv, ids)?;
             scored.truncate(k);
-            Ok(scored)
+            // Exact scoring addresses in-scope items by id, and the scope is read from
+            // `items`, so it never meets an orphan row.
+            Ok((scored, OrphanVectors::default()))
         }
         // Large restricted scope: KNN resolves globally before joins, so fetch
         // progressively more and keep the in-scope neighbours until we have `k` or hit
@@ -332,14 +375,17 @@ fn vector_ranked(
                 // `hits.len() < fetch` once it filters dead rows out for us (D42.3): a table
                 // full of orphans would otherwise read as exhausted on the first pass and this
                 // loop would stop growing and return too few in-scope hits.
-                let (hits, exhausted) = vector.knn_page(conn, qv, fetch)?;
-                let in_scope: Vec<(ItemId, f32)> = hits
+                let page = vector.knn_page(conn, qv, fetch)?;
+                let orphans = OrphanVectors::of(&page);
+                let in_scope: Vec<(ItemId, f32)> = page
+                    .live
                     .into_iter()
                     .filter(|(id, _)| set.contains(&id.get()))
                     .take(k)
                     .collect();
-                if in_scope.len() >= k || fetch >= OVERFETCH_CAP || exhausted {
-                    return Ok(in_scope);
+                if in_scope.len() >= k || fetch >= OVERFETCH_CAP || page.index_exhausted {
+                    // The last page is the largest, and a prefix-superset of every earlier one.
+                    return Ok((in_scope, orphans));
                 }
                 fetch = (fetch * 2).min(OVERFETCH_CAP);
             }
@@ -541,16 +587,24 @@ mod tests {
         let scope: Vec<ItemId> = (1..=300).map(ItemId::new).collect();
         assert!(scope.len() > EXACT_SCORING_CAP);
         let vector = VectorIndexer::new(embedder);
-        let (hits, scans) = db
+        let ((hits, orphans), scans) = db
             .read(move |conn| {
                 let before = vector.knn_scans_run(conn).unwrap();
-                let hits =
+                let ranked =
                     vector_ranked(&vector, conn, Some(&[0.25; 16]), Some(&scope), 10).unwrap();
-                Ok((hits, vector.knn_scans_run(conn).unwrap() - before))
+                Ok((ranked, vector.knn_scans_run(conn).unwrap() - before))
             })
             .unwrap();
 
         assert!(hits.is_empty(), "every vector row is an orphan: {hits:?}");
+        // The last page read 2048 rows and dropped every one: the evidence for `--sweep`.
+        assert_eq!(
+            orphans,
+            OrphanVectors {
+                dropped: OVERFETCH_CAP,
+                scanned: OVERFETCH_CAP
+            }
+        );
         // 80 → 160 → 320 → 640 → 1280 → 2048: one scan per doubling, up to the cap.
         let mut bound = 1;
         let mut fetch = 10 * OVERFETCH_MULTIPLIER;

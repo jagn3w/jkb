@@ -516,7 +516,7 @@ fn knn_live_filters_dead_rows_and_reports_exhaustion_honestly() {
     })
     .unwrap();
 
-    let (hits, exhausted) = db
+    let page = db
         .read({
             let embedder = embedder.clone();
             let probe = probe.clone();
@@ -527,6 +527,7 @@ fn knn_live_filters_dead_rows_and_reports_exhaustion_honestly() {
             }
         })
         .unwrap();
+    let (hits, exhausted) = (&page.live, page.index_exhausted);
 
     assert_eq!(hits.len(), 4, "four live hits, orphans filtered out");
     assert!(
@@ -538,6 +539,10 @@ fn knn_live_filters_dead_rows_and_reports_exhaustion_honestly() {
         "two live rows were withheld by the truncation, so the index is NOT exhausted — \
          `vector_ranked` reads this flag to decide whether to keep growing"
     );
+    // The dead count describes the last page, before truncation: every row it read is either
+    // one of the six live items or one of the six orphans.
+    assert!(page.scanned >= page.live.len() + page.dead, "{page:?}");
+    assert!(page.scanned <= 12 && page.dead <= 6, "{page:?}");
 }
 
 /// `knn_page` is exactly one `vec0` scan: it never grows, never truncates, filters dead rows, and
@@ -589,14 +594,18 @@ fn knn_page_scans_once_and_reports_index_exhaustion() {
 
     // 33 rows, 30 of them orphans: a page of 10 is full, so the index did not run out — however
     // few live rows it held — and the page is not grown to find more.
-    assert!(short_page.0.iter().all(|(id, _)| id.get() < 9000));
+    assert!(short_page.live.iter().all(|(id, _)| id.get() < 9000));
     assert!(
-        !short_page.1,
+        !short_page.index_exhausted,
         "a full page is not exhaustion: {short_page:?}"
     );
+    // Every row of the page the filter did not return is a dead one it dropped.
+    assert_eq!(short_page.scanned, 10);
+    assert_eq!(short_page.dead, 10 - short_page.live.len());
     // A page larger than the table returns every live row and says the index ran out.
-    assert_eq!(full_table.0.len(), 3);
-    assert!(full_table.1);
+    assert_eq!(full_table.live.len(), 3);
+    assert!(full_table.index_exhausted);
+    assert_eq!((full_table.scanned, full_table.dead), (33, 30));
 }
 
 /// The **repair** half of index hygiene: `count_stale` finds orphan vector rows and

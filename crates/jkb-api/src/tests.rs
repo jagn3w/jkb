@@ -1359,6 +1359,7 @@ fn a_search_score_crosses_the_wire_exactly() {
     let wire = serde_json::to_string(&Response::SearchHits {
         hits: vec![hit.clone()],
         truncated: false,
+        orphan_vectors: super::kb::OrphanVectors::default(),
     })
     .unwrap();
     let Response::SearchHits { hits, .. } = serde_json::from_str(&wire).unwrap() else {
@@ -1366,6 +1367,131 @@ fn a_search_score_crosses_the_wire_exactly() {
     };
     assert_eq!(hits[0].score.to_bits(), score.to_bits(), "{wire}");
     assert_eq!(hits[0], hit);
+}
+
+/// A constant dim-16 embedder, so a vector search runs without a model.
+struct Dim16;
+
+impl jkb_types::Embedder for Dim16 {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model(&self) -> &str {
+        "fake"
+    }
+    fn dim(&self) -> usize {
+        16
+    }
+    fn embed(&self, _text: &str) -> jkb_types::Result<Vec<f32>> {
+        Ok(vec![0.25; 16])
+    }
+    fn health_check(&self) -> jkb_types::Result<()> {
+        Ok(())
+    }
+    fn resolved_version(&self) -> jkb_types::Result<Option<String>> {
+        Ok(Some("fake:v1".to_owned()))
+    }
+}
+
+/// `kb.search` carries the orphan vector rows its scan dropped out to the client — the only way a
+/// caller can learn the table needs `jkb index --sweep`, since the dropped rows never reach the
+/// hits — and sends nothing for them on a clean table, so a client older than the field and a
+/// newer one read the same answer there.
+#[test]
+fn a_search_reports_the_orphan_vectors_it_dropped() {
+    use jkb_index::VectorIndexer;
+    let embedder: std::sync::Arc<dyn jkb_types::Embedder + Send + Sync> =
+        std::sync::Arc::new(Dim16);
+    let db = Db::open_in_memory_with(&[jkb_index::register]).unwrap();
+    let vector = VectorIndexer::new(embedder.clone());
+    db.write_txn("test", move |c, m| {
+        vector.ensure_ready(c).unwrap();
+        for n in 0..3 {
+            let id = jkb_core::item::upsert(
+                c,
+                m,
+                &jkb_core::item::NewItem {
+                    uid: format!("note:{n}"),
+                    kind: "note".into(),
+                    content: Some(format!("live note {n}")),
+                    content_hash: None,
+                    mime: None,
+                },
+            )?;
+            // Opposite the query, so the orphans planted below rank ahead of every live row.
+            vector.upsert_vector(c, id, &[-0.25; 16]).unwrap();
+        }
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db.clone()).with_embedder(embedder);
+    let search = |b: &LocalBackend| {
+        let wire = serde_json::to_value(
+            call(
+                b,
+                json!({ "op": "kb.search", "dsl": "~\"note\"", "route": "vector", "limit": 3 }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let Response::SearchHits {
+            hits,
+            orphan_vectors,
+            ..
+        } = serde_json::from_value(wire.clone()).unwrap()
+        else {
+            panic!("a search answers with hits: {wire}")
+        };
+        (hits.len(), orphan_vectors, wire)
+    };
+
+    let (found, clean, wire) = search(&b);
+    assert_eq!(found, 3);
+    assert_eq!(clean.dropped, 0, "{wire}");
+    assert!(!clean.needs_sweep());
+    assert!(
+        wire.get("orphan_vectors").is_none(),
+        "nothing on the wire for a clean table: {wire}"
+    );
+
+    // What a store ingested before the vector GC trigger and then undone carries.
+    db.write_txn("test", |c, _m| {
+        let bytes: Vec<u8> = [0.25f32; 16].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut insert =
+            c.prepare_cached("INSERT INTO vec_items_16(item_id, embedding) VALUES (?1, ?2)")?;
+        for orphan in 900_000..900_030_i64 {
+            insert.execute(rusqlite::params![orphan, bytes])?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let (found, dirty, wire) = search(&b);
+    assert_eq!(found, 3, "the live notes are still found");
+    assert_eq!(dirty.dropped, 30, "{wire}");
+    assert_eq!(dirty.scanned, 33, "{wire}");
+    assert!(dirty.needs_sweep());
+    assert_eq!(wire["orphan_vectors"]["dropped"], 30, "{wire}");
+}
+
+/// The sweep hint's threshold: at least one scanned row in four an orphan, and never on none.
+#[test]
+fn the_sweep_hint_fires_from_a_quarter_of_the_scan() {
+    use super::kb::OrphanVectors;
+    let o = |dropped, scanned| OrphanVectors { dropped, scanned };
+    assert!(!o(0, 0).needs_sweep());
+    assert!(!o(0, 100).needs_sweep());
+    assert!(!o(24, 100).needs_sweep());
+    assert!(o(25, 100).needs_sweep());
+    assert!(o(100, 100).needs_sweep());
+    // An answer from a server that predates the field reads as clean.
+    let old: Response =
+        serde_json::from_value(json!({ "result": "search_hits", "hits": [] })).unwrap();
+    assert_eq!(
+        old,
+        Response::SearchHits {
+            hits: Vec::new(),
+            truncated: false,
+            orphan_vectors: OrphanVectors::default(),
+        }
+    );
 }
 
 /// Items and namespaces for the tree guards: `new(uid)` is a document with one chunk, so it expands.

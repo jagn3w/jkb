@@ -179,7 +179,9 @@ pub fn search(tools: &Tools, args: &SearchArgs) -> Result<Answer> {
         limit: args.limit.unwrap_or(10),
         context: None,
     })? {
-        Response::SearchHits { hits, truncated } => (hits, truncated),
+        Response::SearchHits {
+            hits, truncated, ..
+        } => (hits, truncated),
         other => return Err(unexpected("kb.search", &other)),
     };
     let value = Value::Array(

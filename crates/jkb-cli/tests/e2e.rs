@@ -223,7 +223,7 @@ fn end_to_end_full_flow() {
     let searcher = Searcher::new(embedder());
     for route in [Route::Fts, Route::Vector, Route::Hybrid] {
         let query = search_query(route);
-        let hits = searcher.search(&db, &query, route, 10).unwrap();
+        let hits = searcher.search(&db, &query, route, 10).unwrap().hits;
         assert!(
             !hits.is_empty(),
             "route {} returned no hits",
