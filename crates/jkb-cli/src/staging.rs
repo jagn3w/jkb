@@ -443,18 +443,19 @@ fn stage_task(
     })
 }
 
-/// Which checkout a land onto `onto` grafts in, as [`land_dir_in`] finds it.
+/// Which checkout a land onto `onto` advances, as [`land_dir_in`] finds it. (The graft and its
+/// gate happen in `.jkb/graft`, which is always detached and so is never this.)
 pub(crate) enum LandDir {
     /// A worktree already has `onto` checked out. `git` refuses to check one branch out twice,
     /// so borrowing it is not an optimization — it is the only option there is.
     Checkout(std::path::PathBuf),
-    /// No checkout of `onto`, and jkb's scratch `.jkb/base` is registered: the graft reuses it,
+    /// No checkout of `onto`, and jkb's scratch `.jkb/base` is registered: the landing reuses it,
     /// switched to `onto`, whatever branch it holds now — or none, if it is detached.
     Base(std::path::PathBuf),
 }
 
 impl LandDir {
-    /// The directory the graft happens in.
+    /// The directory `onto` is advanced in.
     pub(crate) fn path(&self) -> &std::path::Path {
         match self {
             Self::Checkout(p) | Self::Base(p) => p,
@@ -462,7 +463,10 @@ impl LandDir {
     }
 }
 
-/// Which checkout a land onto `onto` will graft in, given the worktrees that exist.
+/// Which checkout a land onto `onto` will advance, given the worktrees that exist.
+///
+/// `.jkb/graft` is never the answer: it is matched neither by branch (it is always detached) nor
+/// by path (only `.jkb/base` is).
 ///
 /// **The one lookup.** `main::land_dir_for` asks this and then *mutates* — switching or creating
 /// `.jkb/base` — and the staging row and the land preflight ask it to decide whether that checkout
@@ -517,7 +521,7 @@ pub(crate) fn land_dir_in(
 pub(crate) fn worktree_listing_refusal(root: &std::path::Path) -> String {
     format!(
         "Git could not list this repository's worktrees, so neither this task's session checkout \
-         nor the checkout a landing would graft in can be identified, let alone established as \
+         nor the checkout a landing would advance can be identified, let alone established as \
          clean. `git -C {} worktree list` will say what it makes of the repository.",
         root.display()
     )
@@ -547,23 +551,23 @@ pub(crate) fn target_dirty_reason(
         answer
     };
     // Proven clean, or the landing is refused. A checkout git could not read is not one to
-    // graft into and roll back on a red gate.
+    // fast-forward under somebody's work.
     if is_dirty.is_no() {
         return Ok(None);
     }
     if is_dirty.is_unknown() {
         return Ok(Some(format!(
-            "{} (the checkout a land onto {onto} would graft in) could not be read by git, so \
-             it cannot be established as safe to graft into. `git -C {} status` will say what \
+            "{} (the checkout a land onto {onto} would advance) could not be read by git, so \
+             it cannot be established as safe to fast-forward. `git -C {} status` will say what \
              it makes of the directory.",
             dir.display(),
             dir.display()
         )));
     }
     Ok(Some(format!(
-        "{} (the checkout a land onto {onto} would graft in) has uncommitted changes — \
-         landing rolls it back on a red gate, which would take them with it. Commit or stash \
-         them first.",
+        "{} (the checkout a land onto {onto} would advance) has uncommitted changes — \
+         landing fast-forwards it, which would carry them onto the landed commit or be refused \
+         after the gate has run. Commit or stash them first.",
         dir.display()
     )))
 }
