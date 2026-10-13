@@ -641,7 +641,10 @@ fn credited_by(
     }
     // **Only now the historical question**, and only because the task aims nowhere — what `abandon`
     // leaves. A graft does not un-happen, so a session abandoned after its work reached this branch is
-    // still covered by a review of it.
+    // still covered by a review of it — but only when this branch holds the task's **latest**
+    // landing. `Landing::recorded` keeps no earlier one, so a task that landed here, was re-landed
+    // on another branch and was then abandoned is not covered: it falls through to
+    // `Credit::Unrelated`.
     if target.is_none() && onto_is_branch(landing.recorded()) {
         return Ok(Credit::Grafted);
     }

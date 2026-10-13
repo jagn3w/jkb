@@ -489,9 +489,11 @@ impl Landing {
 
     /// The **latest** recorded landing, spent or not — an earlier one is not kept.
     ///
-    /// For the historical question — *did jkb ever graft this work onto that branch?* — which is
-    /// what `jkb task review record` asks: a graft does not un-happen, and the reviewer read what
-    /// is in the branch whatever the task did afterwards.
+    /// For the historical question — *did jkb graft this work onto that branch?* — which is what
+    /// `jkb task review record` asks: a graft does not un-happen, and the reviewer read what is in
+    /// the branch whatever the task did afterwards. It answers that **only for the latest
+    /// landing**: a task that landed on one branch and was then re-landed on another shows only the
+    /// second, so the first graft is not seen here.
     #[must_use]
     pub fn recorded(&self) -> Option<&TransitionRow> {
         self.recorded.as_ref()
