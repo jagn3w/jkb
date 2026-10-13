@@ -108,7 +108,7 @@ pub fn remove(
 ) -> Result<()> {
     // Read the row before the delete: `undo` puts the application back from exactly the columns
     // recorded here, and one restored without its `props` is a different application — or, without
-    // its `id` (V030), the same application under an id no older entry names.
+    // its `id` (V029), the same application under an id no older entry names.
     let row: Option<(i64, String)> = conn
         .prepare_cached(
             "SELECT id, props FROM tag_applications

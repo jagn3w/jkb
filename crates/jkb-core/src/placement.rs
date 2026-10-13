@@ -99,7 +99,7 @@ pub fn set_primary(
     let stale: Vec<(i64, i64, i64, String)> = {
         // The WHOLE row, not just the key: `undo` puts a deleted placement back from exactly the
         // columns recorded here, and one restored without its `position` or `metadata` is a
-        // different placement in the same slot. That includes `id` (V030): restored under its own
+        // different placement in the same slot. That includes `id` (V029): restored under its own
         // id, the row is still the one every older entry keyed by that id names.
         let mut stmt = conn.prepare_cached(
             "SELECT id, namespace_id, position, metadata FROM placements

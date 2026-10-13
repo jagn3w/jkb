@@ -208,13 +208,13 @@ enum Reading {
 }
 
 /// The tables whose `id` column was added after deletes of them had been logged, and logged
-/// whole, without one: `placements` and `tag_applications` until V030.
+/// whole, without one: `placements` and `tag_applications` until V029.
 ///
 /// A replayed delete of either that names no `id` is put back under a fresh one, which `INSERT`
 /// assigns when the column is omitted. Refusing it instead was measured to buy nothing: the row
 /// was lost, and the refusal's own recommended escape (`jkb undo <older txn>`) then reached the
 /// same row the refusal was protecting, through the old insert's reused rowid. A fresh id is
-/// above every id the changelog names (V030 set the high-water mark there), so it collides with
+/// above every id the changelog names (V029 set the high-water mark there), so it collides with
 /// nothing. **Replay only**: a writer logging a delete of either table without its `id` is still
 /// refused at the write.
 const LATER_ID_COLUMNS: &[Entity] = &[Entity::Placements, Entity::TagApplications];
@@ -1136,7 +1136,7 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
     // transaction that has been undone; this form did not ask, so re-running `jkb undo <txn>`
     // re-executed the whole inversion — and `DeleteRow` addresses a row id, which `SQLite`
     // reissues for every table here except the `AUTOINCREMENT` ones (`items` since D40, `edges`
-    // and `namespaces` since V027, `placements` and `tag_applications` since V030). The second run
+    // and `namespaces` since V027, `placements` and `tag_applications` since V029). The second run
     // therefore unplaced, untagged or unlinked whatever now holds that id. It became reachable
     // when refusals started printing transaction ids and recommending the explicit form.
     if already_undone(conn, txn_id)? {
@@ -1389,11 +1389,11 @@ fn restore_item(conn: &Connection, snapshot: &Value) -> Result<usize> {
 /// column — `edges.id` included — before the delete and after the undo.
 ///
 /// **A cascaded placement or tag application comes back under its own id**, captured by the
-/// snapshot since V030 gave both tables an unreusable one. Before that neither id was captured,
+/// snapshot since V029 gave both tables an unreusable one. Before that neither id was captured,
 /// and both were reusable rowids: a restored row came back under a new rowid while a later row had
 /// been handed its old one, so undoing the transaction that created the original — keyed by that
 /// old rowid — deleted the later row and reported success. No other row can hold a captured id
-/// (it was never reissued), so these are plain inserts; a snapshot from before V030 names no id
+/// (it was never reissued), so these are plain inserts; a snapshot from before V029 names no id
 /// and binds NULL, which takes a fresh one.
 ///
 /// **A cascaded edge comes back under its own id when that id is free** — which, for an edge
@@ -2324,7 +2324,7 @@ mod tests {
     }
 
     /// The same for placements and tag applications, whose ids a snapshot has captured only since
-    /// V030 gave them unreusable ones: an older snapshot lacks them, and still undoes — each row
+    /// V029 gave them unreusable ones: an older snapshot lacks them, and still undoes — each row
     /// back under a fresh id.
     #[test]
     fn an_item_snapshot_without_placement_or_tag_ids_still_undoes() {
@@ -2383,11 +2383,11 @@ mod tests {
         );
     }
 
-    /// A placement or tag removal logged before V030 named no `id` — the column did not exist —
+    /// A placement or tag removal logged before V029 named no `id` — the column did not exist —
     /// and it still undoes: the row comes back whole, under a fresh id. The tolerance is for
     /// replay only; [`a_new_placement_or_tag_removal_must_log_its_id`] keeps the writer strict.
     #[test]
-    fn a_placement_and_tag_removal_logged_before_v030_still_undoes() {
+    fn a_placement_and_tag_removal_logged_before_v029_still_undoes() {
         use crate::{ns, placement, tag};
         use jkb_types::PlacementRole;
 
@@ -2409,7 +2409,7 @@ mod tests {
                 Ok((a, mirror))
             })
             .unwrap();
-        // Pre-V030 removals: each row deleted and logged with every column it had then, keyed as
+        // Pre-V029 removals: each row deleted and logged with every column it had then, keyed as
         // the old writers keyed them. Written raw because `changelog::append` refuses this shape
         // now. Test fixture only.
         let removed = db
@@ -2445,7 +2445,7 @@ mod tests {
 
         let reverted = db
             .write_txn("t", move |c, m| super::undo(c, m, removed))
-            .expect("a removal logged before V030 was refused");
+            .expect("a removal logged before V029 was refused");
         assert_eq!(reverted, 2, "both rows should have been put back");
         let rows = db
             .read(move |c| {

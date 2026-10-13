@@ -577,7 +577,7 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
                 "metadata": r.get::<_, String>(3)?,
                 // Restored as-is (`undo::restore_children`), so the changelog rows keyed by it —
                 // `placement::place`'s insert among them — still address this placement after
-                // an undo. V030 made it unreusable, so no other row can hold it by then.
+                // an undo. V029 made it unreusable, so no other row can hold it by then.
                 "id": r.get::<_, i64>(4)?,
             }))
         })?;

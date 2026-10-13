@@ -609,7 +609,7 @@ mod edges_namespaces_autoincrement_tests {
     }
 
     /// Every placement, by the columns V027 saw. Not `rows`: the harness below runs every later
-    /// migration too, and V030 gives `placements` an `id` column (its old rowid) that V027 did not
+    /// migration too, and V029 gives `placements` an `id` column (its old rowid) that V027 did not
     /// see, so `SELECT *` would differ for a reason that is not V027's.
     fn placement_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let mut stmt = conn
@@ -867,15 +867,15 @@ mod edges_namespaces_autoincrement_tests {
         );
     }
 
-    /// V030 gives `placements` and `tag_applications` an AUTOINCREMENT `id` equal to each row's old
+    /// V029 gives `placements` and `tag_applications` an AUTOINCREMENT `id` equal to each row's old
     /// rowid — so every changelog entry already keyed by one still names the same row — keeps the
     /// natural key unique and the cascades firing, and sets each high-water mark above every rowid
     /// the changelog names for the table, including ones deleted off the top of the range.
     ///
-    /// Seeded at V028 so the rowids exist and are already deleted when V030 runs.
+    /// Seeded at V028 so the rowids exist and are already deleted when V029 runs.
     #[test]
     #[allow(clippy::too_many_lines)] // one migration scenario, seeded and read back top to bottom
-    fn v030_makes_placement_and_tag_ids_unreusable_and_keeps_their_rowids() {
+    fn v029_makes_placement_and_tag_ids_unreusable_and_keeps_their_rowids() {
         let mut conn = Connection::open_in_memory().unwrap();
         // V027 rebuilds tables other rows reference, so the partial run needs the harness's
         // `foreign_keys = OFF` as well; the full run below is the harness itself.
@@ -902,7 +902,7 @@ mod edges_namespaces_autoincrement_tests {
         let placements = rows(&conn, "placements");
         let tags = rows(&conn, "tag_applications");
 
-        super::run(&mut conn).expect("V030 applied, with no dangling foreign key");
+        super::run(&mut conn).expect("V029 applied, with no dangling foreign key");
 
         // Each row's id is its old rowid, followed by the columns it had.
         let with_id = |old: Vec<Vec<Value>>, ids: &[i64]| -> Vec<Vec<Value>> {
