@@ -283,8 +283,9 @@ macro_rules! sql_terminal_list {
     };
 }
 
-/// `<col> IS NOT 'done' AND <col> IS NOT 'cancelled'`: the NULL-safe *"this status is not
+/// `(<col> IS NOT 'done' AND <col> IS NOT 'cancelled')`: the NULL-safe *"this status is not
 /// terminal"* predicate over the column `$col` (a string literal such as `"i.status"`).
+/// Parenthesised so it stays one term wherever it is spliced, beside an `OR` included.
 ///
 /// `IS NOT` rather than `NOT IN` because it is NULL-safe: a row whose `status` is NULL (every
 /// non-task item) passes, which is what the readiness and blocker anti-joins rely on. Like
@@ -293,7 +294,13 @@ macro_rules! sql_terminal_list {
 #[macro_export]
 macro_rules! sql_not_terminal {
     ($col:literal) => {
-        concat!($col, " IS NOT 'done' AND ", $col, " IS NOT 'cancelled'")
+        concat!(
+            "(",
+            $col,
+            " IS NOT 'done' AND ",
+            $col,
+            " IS NOT 'cancelled')"
+        )
     };
 }
 
@@ -542,6 +549,8 @@ mod tests {
         }
         assert_eq!(not_terminal.matches(" AND ").count() + 1, terminal.len());
         assert!(!not_terminal.contains(" OR "));
+        // One parenthesised term, so splicing it beside an `OR` cannot re-associate it.
+        assert!(not_terminal.starts_with('(') && not_terminal.ends_with(')'));
     }
 
     #[test]

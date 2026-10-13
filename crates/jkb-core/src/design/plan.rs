@@ -337,22 +337,22 @@ impl StepTasks {
 /// A database error.
 pub(crate) fn step_tasks(conn: &Connection, step: ItemId) -> Result<StepTasks> {
     Ok(conn
-        .prepare_cached(
+        .prepare_cached(concat!(
             "WITH RECURSIVE under(id) AS (
                  SELECT child_item_id FROM containment WHERE parent_item_id = ?1
                  UNION
                  SELECT c.child_item_id FROM containment c JOIN under u ON c.parent_item_id = u.id
              )
              SELECT COUNT(*), COALESCE(SUM(i.status IS ?2), 0),
-                    COALESCE(SUM(i.status IN (?2, ?3)), 0)
+                    COALESCE(SUM(i.status IN ",
+            jkb_types::sql_terminal_list!(),
+            "), 0)
                FROM under u JOIN items i ON i.id = u.id WHERE i.kind = 'task'",
-        )?
+        ))?
         .query_row(
-            params![
-                step.get(),
-                TaskStatus::Done.as_str(),
-                TaskStatus::Cancelled.as_str()
-            ],
+            // `done` is its own count (a step is IMPLEMENTED only by landed work); the
+            // terminal count comes from the shared terminal-set fragment above.
+            params![step.get(), TaskStatus::Done.as_str()],
             |r| {
                 Ok(StepTasks {
                     count: r.get(0)?,
