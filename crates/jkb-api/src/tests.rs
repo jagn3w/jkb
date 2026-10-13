@@ -1299,6 +1299,42 @@ fn a_task_shows_with_its_subtasks_and_holds_the_parent_off_the_frontier() {
     assert_eq!(children[0].reference, "task:child");
 }
 
+/// A listed item whose content is only whitespace is labelled by its uid, not served as a blank row.
+#[test]
+fn a_whitespace_only_item_is_listed_under_its_uid() {
+    use jkb_core::{item, ns, placement};
+    use jkb_types::PlacementRole;
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        let at = ns::ensure(c, m, "notes")?;
+        let id = item::upsert(
+            c,
+            m,
+            &item::NewItem {
+                uid: "note:blank".into(),
+                kind: "note".into(),
+                content: Some("  \n\t\n ".into()),
+                content_hash: None,
+                mime: None,
+            },
+        )?;
+        placement::place(c, m, id, at, PlacementRole::Primary, 0)
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    let Response::Listing { rows, .. } =
+        call(&b, json!({ "op": "kb.ls", "path": "notes" })).unwrap()
+    else {
+        panic!("kb.ls answers with a listing")
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.child.reference.as_str(), r.child.label.as_str()))
+            .collect::<Vec<_>>(),
+        [("note:blank", "note:blank")]
+    );
+}
+
 #[test]
 fn ls_and_tree_list_the_same_children() {
     let b = read_fixture();

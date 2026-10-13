@@ -1437,4 +1437,23 @@ mod tests {
             .unwrap();
         assert_eq!(db.read(move |c| unresolved_needs(c, id)).unwrap(), needs);
     }
+
+    /// An item with no readable first line is named by its uid, never by a blank: a listing row,
+    /// a staging row and a refusal all label items through `title_from`, and an empty title renders
+    /// as a blank row in every host.
+    #[test]
+    fn a_title_with_no_readable_line_falls_back_to_the_uid() {
+        for content in [None, Some(""), Some("  \n\t\n   ")] {
+            assert_eq!(
+                super::title_from("doc:x", content),
+                "doc:x",
+                "content {content:?} has no title of its own"
+            );
+        }
+        assert_eq!(
+            super::title_from("doc:x", Some("\n  Real title  \nbody")),
+            "Real title",
+            "the first non-blank line, trimmed"
+        );
+    }
 }
