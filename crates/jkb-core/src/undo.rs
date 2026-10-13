@@ -1318,14 +1318,19 @@ fn restore_item(conn: &Connection, snapshot: &Value) -> Result<usize> {
 /// — and it restored `edges.id` as a side effect. `edges.id` was then a plain `INTEGER PRIMARY
 /// KEY` with no AUTOINCREMENT, so `SQLite` reissued a freed one: a restore that wrote the logged
 /// id back collided with a live edge, and undoing the item delete became **permanently refused**.
-/// Omitting the id here is what kept that undo working, at the priced cost stated on
-/// `an_item_delete_is_undoable_after_its_edge_id_has_been_reissued`. V027 has since made
-/// `edges.id` AUTOINCREMENT, so the precondition for restoring the ids again now holds; doing so is
-/// a separate change (the snapshot taken here does not carry the id yet), and the honest fix for
-/// this whole family is still mechanical before-images (`SQLite`'s session extension), which is its
-/// own design pass, not another rule added here. Until then the lists are held to the schema by a
-/// tripwire rather than a derivation: `undoing_an_item_delete_restores_every_cascaded_row_whole`
-/// compares every cascaded row, every column, before the delete and after the undo.
+/// The honest fix for this whole family is still mechanical before-images (`SQLite`'s session
+/// extension), which is its own design pass, not another rule added here. Until then the lists are
+/// held to the schema by a tripwire rather than a derivation:
+/// `undoing_an_item_delete_restores_every_cascaded_row_whole` compares every cascaded row, every
+/// column — `edges.id` included — before the delete and after the undo.
+///
+/// **A cascaded edge comes back under its own id.** V027 made `edges.id` AUTOINCREMENT, so a
+/// freed id is never reissued and writing the logged one back cannot collide: the row that held
+/// it is the one being restored, and nothing else can have been handed it. That keeps the
+/// changelog rows keyed by the edge's id (`edge::link_weighted`, `edge::unlink`) addressing the
+/// restored row. A snapshot written before the id was captured has no `id` on its edges; it binds
+/// NULL, so the edge takes a fresh id, which is what every restore did until then — the changelog
+/// is replayed by undo indefinitely, so those rows must stay restorable.
 ///
 /// **The `WHERE EXISTS` guards are the one sanctioned way a restore in this module reports zero**,
 /// and they say exactly what they skip: a row whose *other* endpoint is not there to point at.
@@ -1389,25 +1394,7 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
             ])?;
     }
     for edge in rows("edges") {
-        // The `EXISTS` guards skip an edge whose other endpoint is gone — better than failing the
-        // whole undo on a foreign key. They, not the removed `OR IGNORE`, are what does that: an
-        // ON CONFLICT clause never applied to a FOREIGN KEY constraint.
-        put_back += conn
-            .prepare_cached(
-                "INSERT INTO edges
-                     (src_item_id, dst_item_id, type, props, weight, created_at)
-                 SELECT ?1, ?2, ?3, ?4, ?5, ?6
-                 WHERE EXISTS (SELECT 1 FROM items WHERE id = ?1)
-                   AND EXISTS (SELECT 1 FROM items WHERE id = ?2)",
-            )?
-            .execute(params![
-                edge.get("src").and_then(Value::as_i64),
-                edge.get("dst").and_then(Value::as_i64),
-                edge.get("type").and_then(Value::as_str),
-                edge.get("props").and_then(Value::as_str).unwrap_or("{}"),
-                edge.get("weight").and_then(Value::as_f64),
-                edge.get("created_at").and_then(Value::as_str),
-            ])?;
+        put_back += restore_edge(conn, edge)?;
     }
     // Containment, both directions. `child_item_id` is the PRIMARY KEY, so re-inserting the
     // row that named this item's container is one statement; the rows for the items it
@@ -1454,6 +1441,47 @@ fn restore_children(conn: &Connection, snapshot: &Value, id: i64) -> Result<usiz
             ])?;
     }
     Ok(put_back)
+}
+
+/// Re-insert one edge from a cascade snapshot, under its logged id (see [`restore_children`]).
+fn restore_edge(conn: &Connection, edge: &Value) -> Result<usize> {
+    // The `EXISTS` guards skip an edge whose other endpoint is gone — better than failing the
+    // whole undo on a foreign key. They, not the removed `OR IGNORE`, are what does that: an
+    // ON CONFLICT clause never applied to a FOREIGN KEY constraint.
+    Ok(conn
+        .prepare_cached(
+            "INSERT INTO edges
+                 (id, src_item_id, dst_item_id, type, props, weight, created_at)
+             SELECT ?7, ?1, ?2, ?3, ?4, ?5, ?6
+             WHERE EXISTS (SELECT 1 FROM items WHERE id = ?1)
+               AND EXISTS (SELECT 1 FROM items WHERE id = ?2)",
+        )?
+        .execute(params![
+            edge.get("src").and_then(Value::as_i64),
+            edge.get("dst").and_then(Value::as_i64),
+            edge.get("type").and_then(Value::as_str),
+            edge.get("props").and_then(Value::as_str).unwrap_or("{}"),
+            edge.get("weight").and_then(Value::as_f64),
+            edge.get("created_at").and_then(Value::as_str),
+            snapshot_edge_id(edge)?,
+        ])?)
+}
+
+/// The id a cascade snapshot logged for an edge, or `None` for a snapshot written before edge ids
+/// were captured — bound as NULL, which gives the restored edge a fresh id.
+///
+/// An `id` that is present but not an integer is refused rather than read as absent: binding NULL
+/// for it would restore the edge under a new id while reporting the restore whole.
+fn snapshot_edge_id(edge: &Value) -> Result<Option<i64>> {
+    match edge.get("id") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_i64().map(Some).ok_or_else(|| {
+            TypeError::Validation(format!(
+                "an edge in this item snapshot logs `id` as {v}, which is not an edge id"
+            ))
+            .into()
+        }),
+    }
 }
 
 /// Undo the most recent transaction containing **work** that has not already been undone, and
@@ -1902,15 +1930,14 @@ mod tests {
     /// wrote the *logged* id back therefore collided with a live row, and the item delete was
     /// refused with `UNIQUE constraint failed: edges.id` for as long as that row held the id: not
     /// a wrong number but a recovery path closed, and `jkb item rm` exists on the promise that it
-    /// is open. [`restore_children`] deliberately does not name `id`, so the restored edge takes a
-    /// free one.
+    /// is open. [`restore_children`] therefore did not name `id`, and the restored edge took a
+    /// free one — at the cost that undoing a *weight change* on an edge that had been through a
+    /// delete/restore addressed a row id that no longer existed, and was refused.
     ///
-    /// The cost is stated rather than hidden: `edge::link_weighted` logs `entity_id = edges.id`,
-    /// so undoing a *weight change* on an edge that has been through a delete/restore addresses a
-    /// row id that no longer exists and is refused. A refusal on a second, older undo is strictly
-    /// better than the first one being impossible, and closing both needed `edges.id` to stop being
-    /// reusable at all (the D40/V010 treatment `items` already had). V027 is that migration: the
-    /// later link below now takes a fresh id, and this test pins both that and the undo.
+    /// V027 made `edges.id` AUTOINCREMENT (the D40/V010 treatment `items` already had), so the
+    /// later link below takes a fresh id, and [`restore_children`] now writes the logged id back:
+    /// nothing can hold it. This test pins both that and the undo;
+    /// `a_weight_change_stays_undoable_after_its_edge_is_restored` pins the cost being gone.
     #[test]
     fn an_item_delete_is_undoable_after_its_edge_id_has_been_reissued() {
         use crate::edge;
@@ -1973,6 +2000,150 @@ mod tests {
             vec![d_id],
             "the live edge holding the reissued id was disturbed by the restore"
         );
+    }
+
+    /// Undoing a **weight change** still works after the edge has been through an item delete and
+    /// its undo.
+    ///
+    /// `edge::link_weighted` keys its `update` entry by `edges.id`, so this is the cost the
+    /// fresh-id restore used to carry: the restored edge had a new id, the inverse addressed the
+    /// dead one, and the older undo was refused. Restoring the cascaded edge under its logged id
+    /// is what makes this pass.
+    #[test]
+    fn a_weight_change_stays_undoable_after_its_edge_is_restored() {
+        use crate::edge;
+        use crate::item;
+        use jkb_types::EdgeType;
+
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, edge_id) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let b = upsert(c, m, &note("b"))?;
+                let e = edge::link_weighted(c, m, a, b, EdgeType::Supports, Some(1.0), None)?;
+                Ok((a, b, e.get()))
+            })
+            .unwrap();
+        let reweighed = db
+            .write_txn("t", move |c, m| {
+                edge::link_weighted(c, m, a, b, EdgeType::Supports, Some(2.0), None)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        db.write_txn("t", move |c, m| item::remove(c, m, b, true).map(|_| ()))
+            .unwrap();
+        db.write_txn("t", undo_last).unwrap();
+
+        let restored_id = db
+            .read(|c| Ok(c.query_row("SELECT id FROM edges", [], |r| r.get::<_, i64>(0))?))
+            .unwrap();
+        assert_eq!(
+            restored_id, edge_id,
+            "the cascaded edge came back under a new id"
+        );
+
+        db.write_txn("t", move |c, m| super::undo(c, m, reweighed))
+            .expect("undoing the weight change addressed an edge id the restore did not put back");
+        let weight = db
+            .read(|c| {
+                Ok(c.query_row("SELECT weight FROM edges", [], |r| {
+                    r.get::<_, Option<f64>>(0)
+                })?)
+            })
+            .unwrap();
+        assert_eq!(weight, Some(1.0), "the weight change was not undone");
+    }
+
+    /// A cascade snapshot written **before edge ids were captured** still undoes: the edge comes
+    /// back under a fresh id, as every restore did then.
+    ///
+    /// The changelog is replayed by undo for as long as it holds a row, so a snapshot in the old
+    /// shape is a live input, not a migration artefact. The fixture strips `id` from the logged
+    /// edges to make one.
+    #[test]
+    fn an_item_snapshot_without_edge_ids_still_undoes() {
+        use crate::edge;
+        use crate::item;
+        use jkb_types::EdgeType;
+
+        let db = Db::open_in_memory().unwrap();
+        let (a, b) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let b = upsert(c, m, &note("b"))?;
+                edge::link(c, m, a, b, EdgeType::References, None)?;
+                Ok((a, b))
+            })
+            .unwrap();
+        let original = db
+            .read(|c| Ok(c.query_row("SELECT id FROM edges", [], |r| r.get::<_, i64>(0))?))
+            .unwrap();
+        let removed = db
+            .write_txn("t", move |c, m| {
+                item::remove(c, m, a, true)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        // Rewrite the logged snapshot into the old shape. Test fixture only.
+        db.write_txn("t", move |c, _| {
+            let (row, before): (i64, String) = c.query_row(
+                "SELECT id, before FROM changelog
+                  WHERE txn_id = ?1 AND entity_type = 'items' AND op = 'delete'",
+                [removed],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let mut snapshot: serde_json::Value = serde_json::from_str(&before).unwrap();
+            let edges = snapshot["edges"].as_array_mut().unwrap();
+            assert!(!edges.is_empty(), "setup: the snapshot logs no edge");
+            for e in edges {
+                assert!(
+                    e.as_object_mut().unwrap().remove("id").is_some(),
+                    "setup: the snapshot did not log the edge id it is meant to lack"
+                );
+            }
+            c.execute(
+                "UPDATE changelog SET before = ?1 WHERE id = ?2",
+                rusqlite::params![snapshot.to_string(), row],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        db.write_txn("t", move |c, m| super::undo(c, m, removed))
+            .expect("an item snapshot without edge ids was refused");
+
+        assert_eq!(
+            db.read(move |c| edge::edges_from(c, a, EdgeType::References))
+                .unwrap(),
+            vec![b],
+            "the old-format snapshot's edge did not come back"
+        );
+        let restored = db
+            .read(|c| Ok(c.query_row("SELECT id FROM edges", [], |r| r.get::<_, i64>(0))?))
+            .unwrap();
+        assert_ne!(
+            restored, original,
+            "an old-format snapshot cannot name the id, so the edge takes a fresh one"
+        );
+    }
+
+    /// A snapshot edge whose `id` is present but not an integer is refused, not restored under a
+    /// fresh id as if it had been absent.
+    #[test]
+    fn a_snapshot_edge_id_that_is_not_an_integer_is_refused() {
+        assert_eq!(
+            super::snapshot_edge_id(&serde_json::json!({})).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::snapshot_edge_id(&serde_json::json!({ "id": null })).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::snapshot_edge_id(&serde_json::json!({ "id": 7 })).unwrap(),
+            Some(7)
+        );
+        assert!(super::snapshot_edge_id(&serde_json::json!({ "id": "7" })).is_err());
     }
 
     /// A restore skips an edge whose **other endpoint** is not there, rather than failing.
@@ -2525,14 +2696,14 @@ mod tests {
         "design_sources",
     ];
 
-    /// Every row of `table`, whole except for `skip`, sorted — so two dumps compare equal when
-    /// they hold the same rows whatever rowids a restore gave them. Columns come from the live
-    /// schema, so a column added later is compared without anybody listing it.
-    fn dump_rows(db: &Db, table: &'static str, skip: &'static [&'static str]) -> Vec<Vec<String>> {
+    /// Every row of `table`, every column, sorted — so two dumps compare equal when they hold the
+    /// same rows in whatever order a restore inserted them. Columns come from the live schema, so a
+    /// column added later is compared without anybody listing it. An `INTEGER PRIMARY KEY` is a
+    /// column and is compared (`edges.id`); a hidden rowid is not.
+    fn dump_rows(db: &Db, table: &'static str) -> Vec<Vec<String>> {
         db.read(move |c| {
             let columns: Vec<String> = super::table_columns(c, table)?
                 .into_iter()
-                .filter(|col| !skip.contains(&col.as_str()))
                 .map(|col| format!("\"{col}\""))
                 .collect();
             let mut stmt = c.prepare(&format!("SELECT {} FROM \"{table}\"", columns.join(", ")))?;
@@ -2645,7 +2816,7 @@ mod tests {
     }
 
     /// **The tripwire's own non-vacuity check**: every column of every [`CASCADE_RESTORED`] table
-    /// (bar `skip`) holds, in at least one of `victim`'s rows, a value that is non-NULL and outside
+    /// holds, in at least one of `victim`'s rows, a value that is non-NULL and outside
     /// `[lo, hi]` — the column's default evaluated before and after the fixture was built.
     ///
     /// Without it a column added later passes the whole-row compare untouched: the fixture never
@@ -2654,7 +2825,6 @@ mod tests {
     fn assert_every_column_is_set(
         db: &Db,
         victim: i64,
-        skip: fn(&str) -> &'static [&'static str],
         lo: &std::collections::BTreeMap<(String, String), rusqlite::types::Value>,
         hi: &std::collections::BTreeMap<(String, String), rusqlite::types::Value>,
     ) {
@@ -2665,9 +2835,6 @@ mod tests {
                 for table in CASCADE_RESTORED {
                     let refs = naming_clause(c, table)?;
                     for col in super::table_columns(c, table)? {
-                        if skip(table).contains(&col.as_str()) {
-                            continue;
-                        }
                         let key = (table.to_owned(), col.clone());
                         // A column the schema gained after `lo` was taken has only `hi`.
                         let set = match (lo.get(&key).or_else(|| hi.get(&key)), hi.get(&key)) {
@@ -2706,17 +2873,6 @@ mod tests {
         );
     }
 
-    /// The columns the whole-row compare leaves out of `table`: `edges.id` alone, which the
-    /// cascade snapshot deliberately does not carry, so a restored edge takes a fresh id (the
-    /// priced cost on `an_item_delete_is_undoable_after_its_edge_id_has_been_reissued`).
-    fn cascade_compare_skip(table: &str) -> &'static [&'static str] {
-        if table == "edges" {
-            &["id"]
-        } else {
-            &[]
-        }
-    }
-
     /// **The tripwire on the item-delete cascade's hand-written column lists.**
     ///
     /// `item::snapshot` selects, and [`restore_children`] re-inserts, the rows `ON DELETE CASCADE`
@@ -2742,7 +2898,8 @@ mod tests {
     ///   omits it. (Measured: adding `bindings.extra TEXT` or `placements.flag INTEGER NOT NULL
     ///   DEFAULT 0` passed before this check existed.)
     ///
-    /// **The one deliberate exception is `edges.id`** ([`cascade_compare_skip`]).
+    /// There is no exception: `edges.id` is compared too, so a restore that gave a cascaded edge a
+    /// fresh id fails here.
     #[test]
     fn undoing_an_item_delete_restores_every_cascaded_row_whole() {
         use crate::{binding, containment, edge, item, ns, placement, tag};
@@ -2804,9 +2961,8 @@ mod tests {
             })
             .unwrap();
 
-        let skip = cascade_compare_skip;
         let tables: Vec<&'static str> = std::iter::once("items").chain(CASCADE_RESTORED).collect();
-        let before: Vec<_> = tables.iter().map(|t| dump_rows(&db, t, skip(t))).collect();
+        let before: Vec<_> = tables.iter().map(|t| dump_rows(&db, t)).collect();
 
         // Not vacuous: every restored table holds a row the removal takes.
         for table in CASCADE_RESTORED {
@@ -2816,7 +2972,6 @@ mod tests {
         assert_every_column_is_set(
             &db,
             victim.get(),
-            skip,
             &defaults_before,
             &evaluated_defaults(&db),
         );
@@ -2829,7 +2984,7 @@ mod tests {
 
         for (table, before) in tables.iter().zip(before) {
             assert_eq!(
-                dump_rows(&db, table, skip(table)),
+                dump_rows(&db, table),
                 before,
                 "undoing an item delete did not restore `{table}` row for row, column for column"
             );

@@ -596,7 +596,7 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
     };
     let edges = {
         let mut stmt = conn.prepare_cached(
-            "SELECT src_item_id, dst_item_id, type, props, weight, created_at FROM edges
+            "SELECT src_item_id, dst_item_id, type, props, weight, created_at, id FROM edges
              WHERE src_item_id = ?1 OR dst_item_id = ?1",
         )?;
         let rows = stmt.query_map([id], |r| {
@@ -607,6 +607,10 @@ fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
                 "props": r.get::<_, String>(3)?,
                 "weight": r.get::<_, Option<f64>>(4)?,
                 "created_at": r.get::<_, String>(5)?,
+                // Restored as-is: `edges.id` is AUTOINCREMENT (V027), so the id is never
+                // reissued and an undo puts the edge back where `edge::link_weighted`'s
+                // changelog rows (keyed by it) can still find it.
+                "id": r.get::<_, i64>(6)?,
             }))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
