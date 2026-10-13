@@ -215,7 +215,7 @@ pub fn subtree_leaf_count(conn: &Connection, path: &str, include_terminal: bool)
     // no cycle is reachable here. The `depth < 256` bound is belt-and-suspenders: even if a
     // cyclic `parent_id` were ever written, the CTE terminates instead of spinning.
     let count: i64 = conn
-        .prepare_cached(
+        .prepare_cached(concat!(
             "WITH RECURSIVE sub(id, depth) AS (
                  SELECT id, 0 FROM namespaces WHERE path = ?1
                  UNION ALL
@@ -225,8 +225,9 @@ pub fn subtree_leaf_count(conn: &Connection, path: &str, include_terminal: bool)
              SELECT COUNT(DISTINCT p.item_id) FROM placements p
              JOIN sub ON sub.id = p.namespace_id
              JOIN items i ON i.id = p.item_id
-             WHERE ?2 OR i.status IS NULL OR i.status NOT IN ('done', 'cancelled')",
-        )?
+             WHERE ?2 OR i.status IS NULL OR i.status NOT IN ",
+            jkb_types::sql_terminal_list!(),
+        ))?
         .query_row(params![normalized, include_terminal], |row| row.get(0))?;
     Ok(count)
 }
@@ -256,7 +257,8 @@ pub fn subtree_leaf_counts(
     // roots) differs. Each anchored child carries its own id as `root_id` down its subtree,
     // so a single grouped COUNT(DISTINCT) yields per-child leaf totals. The `depth < 256`
     // bound mirrors `subtree_leaf_count` — belt-and-suspenders against a cyclic `parent_id`.
-    const TAIL: &str = "
+    const TAIL: &str = concat!(
+        "
              UNION ALL
              SELECT sub.root_id, n.id, sub.depth + 1
              FROM namespaces n JOIN sub ON n.parent_id = sub.id
@@ -266,8 +268,11 @@ pub fn subtree_leaf_counts(
          FROM sub
          JOIN placements p ON p.namespace_id = sub.id
          JOIN items i ON i.id = p.item_id
-         WHERE (?1 OR i.status IS NULL OR i.status NOT IN ('done', 'cancelled'))
-         GROUP BY sub.root_id, i.kind";
+         WHERE (?1 OR i.status IS NULL OR i.status NOT IN ",
+        jkb_types::sql_terminal_list!(),
+        ")
+         GROUP BY sub.root_id, i.kind"
+    );
     let mut out = std::collections::HashMap::new();
     match parent {
         None => {

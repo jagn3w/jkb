@@ -608,11 +608,12 @@ pub fn subtasks_each(
 /// Returns an error if the query fails.
 pub fn subtasks_all_terminal(conn: &Connection, parent: ItemId) -> Result<bool> {
     let open: i64 = conn
-        .prepare_cached(
+        .prepare_cached(concat!(
             "SELECT count(*) FROM containment c JOIN items i ON i.id = c.child_item_id
               WHERE c.parent_item_id = ?1
-                AND i.status IS NOT 'done' AND i.status IS NOT 'cancelled'",
-        )?
+                AND ",
+            jkb_types::sql_not_terminal!("i.status"),
+        ))?
         .query_row([parent.get()], |r| r.get(0))?;
     Ok(open == 0)
 }
@@ -759,12 +760,14 @@ pub fn observe(conn: &Connection, task: ItemId) -> Result<crate::lifecycle::Task
 /// held.
 fn has_open_subtasks(conn: &Connection, task: ItemId) -> Result<bool> {
     Ok(conn
-        .prepare_cached(
+        .prepare_cached(concat!(
             "SELECT 1 FROM containment ct JOIN items c ON c.id = ct.child_item_id
               WHERE ct.parent_item_id = ?1
-                AND c.status IS NOT 'done' AND c.status IS NOT 'cancelled'
+                AND ",
+            jkb_types::sql_not_terminal!("c.status"),
+            "
               LIMIT 1",
-        )?
+        ))?
         .query_row([task.get()], |_| Ok(()))
         .optional()?
         .is_some())
@@ -888,12 +891,14 @@ pub fn set_due(conn: &Connection, meta: &WriteMeta, task: ItemId, due: Option<&s
 /// Returns an error if the query fails.
 pub fn is_blocked(conn: &Connection, task: ItemId) -> Result<bool> {
     let hit: Option<i64> = conn
-        .prepare_cached(
+        .prepare_cached(concat!(
             "SELECT 1 FROM edges e JOIN items d ON e.dst_item_id = d.id
              WHERE e.src_item_id = ?1 AND e.type = 'depends_on'
-               AND d.status IS NOT 'done' AND d.status IS NOT 'cancelled'
+               AND ",
+            jkb_types::sql_not_terminal!("d.status"),
+            "
              LIMIT 1",
-        )?
+        ))?
         .query_row([task.get()], |row| row.get(0))
         .optional()?;
     Ok(hit.is_some())
@@ -1093,6 +1098,40 @@ fn bad(token: &str, expected: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    /// The SQL spellings of the terminal set, evaluated by `SQLite` itself, agree with
+    /// `TaskStatus::is_terminal` for every status — and `sql_not_terminal!` passes a NULL
+    /// status (a non-task item), which the readiness and blocker anti-joins rely on.
+    #[test]
+    fn sql_terminal_fragments_agree_with_is_terminal_in_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let not_terminal = |s: Option<&str>| -> bool {
+            conn.query_row(
+                concat!(
+                    "SELECT ",
+                    jkb_types::sql_not_terminal!("x"),
+                    " FROM (SELECT ?1 AS x)"
+                ),
+                [s],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let in_list = |s: &str| -> bool {
+            conn.query_row(
+                concat!("SELECT ?1 IN ", jkb_types::sql_terminal_list!()),
+                [s],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        for status in jkb_types::TaskStatus::ALL {
+            let s = status.as_str();
+            assert_eq!(in_list(s), status.is_terminal(), "{s}");
+            assert_eq!(not_terminal(Some(s)), !status.is_terminal(), "{s}");
+        }
+        assert!(not_terminal(None));
+    }
+
     /// `ready_ids` is the frontier `ready` lists, in `ready`'s order, cut by its limit — over mixed
     /// priorities, due dates and nulls, where the tie-breaks are. And `ready`'s own load takes more
     /// ids than `SQLite` has variables.

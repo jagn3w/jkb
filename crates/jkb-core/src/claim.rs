@@ -99,16 +99,18 @@ pub fn claim(conn: &Connection, meta: &WriteMeta, item: ItemId, owner: &str) -> 
         ))));
     }
     let changed = conn
-        .prepare_cached(
+        .prepare_cached(concat!(
             "UPDATE items
                 SET claimant_id = ?2,
                     claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                     status = 'in_progress',
                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
               WHERE id = ?1
-                AND status NOT IN ('done', 'cancelled')
+                AND status NOT IN ",
+            jkb_types::sql_terminal_list!(),
+            "
                 AND (claimant_id IS NULL OR claimant_id = ?2)",
-        )?
+        ))?
         .execute(params![item.get(), owner])?;
     if changed == 0 {
         // Held by a different, still-recorded owner — refuse (no state changed).

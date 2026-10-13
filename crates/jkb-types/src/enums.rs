@@ -264,6 +264,39 @@ impl PlacementRole {
     }
 }
 
+/// The terminal task statuses as an SQL value list, `('done', 'cancelled')`, for
+/// `status NOT IN` / `status IN` — the SQL spelling of [`TaskStatus::is_terminal`].
+///
+/// A macro rather than a `const` because it must expand to a **literal**: the queries that use
+/// it are `concat!`ed into the `&'static str` handed to `prepare_cached`. It is a fixed literal
+/// rather than generated from [`TaskStatus::ALL`] (a `macro_rules!` cannot read an enum), so
+/// `sql_terminal_list_names_exactly_the_terminal_statuses` holds it to `is_terminal` for every
+/// status: a change to the terminal set that misses this line fails that test rather than
+/// leaving a query disagreeing with the Rust guards.
+///
+/// `NOT IN` is not NULL-safe — `NULL NOT IN (…)` is NULL, i.e. false — so a caller filtering a
+/// nullable `status` either adds `x IS NULL OR` itself or uses [`sql_not_terminal!`].
+#[macro_export]
+macro_rules! sql_terminal_list {
+    () => {
+        "('done', 'cancelled')"
+    };
+}
+
+/// `<col> IS NOT 'done' AND <col> IS NOT 'cancelled'`: the NULL-safe *"this status is not
+/// terminal"* predicate over the column `$col` (a string literal such as `"i.status"`).
+///
+/// `IS NOT` rather than `NOT IN` because it is NULL-safe: a row whose `status` is NULL (every
+/// non-task item) passes, which is what the readiness and blocker anti-joins rely on. Like
+/// [`sql_terminal_list!`] it expands to a literal for `concat!`, and the same test holds it to
+/// [`TaskStatus::is_terminal`].
+#[macro_export]
+macro_rules! sql_not_terminal {
+    ($col:literal) => {
+        concat!($col, " IS NOT 'done' AND ", $col, " IS NOT 'cancelled'")
+    };
+}
+
 impl TaskStatus {
     /// Whether this is a terminal status (`done`/`cancelled`): no further work is
     /// expected. `needs_review` is deliberately **not** terminal — the work still needs
@@ -280,8 +313,10 @@ impl TaskStatus {
     /// written by hand at each such caller, including the guards that stop a landing, an abandon
     /// and a claim from reopening finished work — exactly the places where getting the set wrong
     /// is most expensive, and the places least likely to be revisited when the set changes.
-    /// Rust code asks this; SQL that filters on the set (`status NOT IN ('done', 'cancelled')`)
-    /// cannot call it and still spells the set out.
+    /// Rust code asks this. SQL cannot call it, so SQL spells the set through the two
+    /// fragments beside it — [`sql_terminal_list!`](crate::sql_terminal_list) and
+    /// [`sql_not_terminal!`](crate::sql_not_terminal) — which a test holds to this function for
+    /// every status. No query in the workspace writes `'done'`/`'cancelled'` itself.
     #[must_use]
     pub fn is_terminal_str(status: Option<&str>) -> bool {
         status
@@ -481,6 +516,32 @@ mod tests {
                 format!("\"{}\"", status.as_str())
             );
         }
+    }
+
+    /// Every `'quoted'` word in an SQL fragment, as a set.
+    fn quoted_words(sql: &str) -> std::collections::BTreeSet<&str> {
+        sql.split('\'').skip(1).step_by(2).collect()
+    }
+
+    /// The SQL fragments name exactly the statuses `is_terminal` calls terminal: no more, no
+    /// fewer, and nothing that is not a status at all.
+    #[test]
+    fn sql_terminal_list_names_exactly_the_terminal_statuses() {
+        let terminal: std::collections::BTreeSet<&str> = TaskStatus::ALL
+            .iter()
+            .filter(|s| s.is_terminal())
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(quoted_words(crate::sql_terminal_list!()), terminal);
+        let not_terminal = crate::sql_not_terminal!("i.status");
+        assert_eq!(quoted_words(not_terminal), terminal);
+        // Each named status is excluded through the column, and the clauses are conjoined, so
+        // the predicate is false for every terminal status and true for every other one.
+        for s in &terminal {
+            assert!(not_terminal.contains(&format!("i.status IS NOT '{s}'")));
+        }
+        assert_eq!(not_terminal.matches(" AND ").count() + 1, terminal.len());
+        assert!(!not_terminal.contains(" OR "));
     }
 
     #[test]

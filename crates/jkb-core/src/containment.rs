@@ -152,14 +152,16 @@ pub fn child_counts(
     if parents.is_empty() {
         return Ok(out);
     }
-    let mut stmt = conn.prepare_cached(
+    let mut stmt = conn.prepare_cached(concat!(
         "SELECT c.parent_item_id, COUNT(*),
-                SUM(CASE WHEN i.status IS NOT 'done' AND i.status IS NOT 'cancelled'
+                SUM(CASE WHEN ",
+        jkb_types::sql_not_terminal!("i.status"),
+        "
                          THEN 1 ELSE 0 END)
            FROM containment c JOIN items i ON i.id = c.child_item_id
           WHERE c.parent_item_id IN (SELECT value FROM json_each(?1))
           GROUP BY c.parent_item_id",
-    )?;
+    ))?;
     let ids = crate::sql::json_ids(parents.iter().map(|p| p.get()));
     let rows = stmt.query_map([ids], |r| {
         Ok((
