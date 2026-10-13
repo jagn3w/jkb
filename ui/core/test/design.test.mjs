@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   decodeDesignDoc,
   decodeDesignPrompt,
+  decodeDesignCreated,
   decodeDesigns,
   decodeDesignUpdate,
   decodeDesignWritten,
@@ -82,6 +83,18 @@ test("requests are the ops' own shapes", () => {
     op: "design.prompt",
     ask: { kind: "discuss", uid: "d", base: "1.AQ", start: 3, end: 8 },
   });
+  // `under` only when named: a daemon that predates it refuses unknown fields.
+  assert.deepEqual(designOps.create("jkb", "T"), { op: "design.create", repo: "jkb", title: "T" });
+  assert.deepEqual(designOps.create("jkb", "T", "design:p"), { op: "design.create", repo: "jkb", title: "T", under: "design:p" });
+});
+
+test("design.create's answer is the new design, and nothing else is", () => {
+  const design = { uid: "design:n", title: "N", namespace: "designs/jkb", seq: 0, topic: "design/design.n", parent: "design:p" };
+  assert.deepEqual(decodeDesignCreated(ok({ result: "design_created", design })), ok(design));
+  assert.equal(decodeDesignCreated(ok({ result: "design_meta", design })).ok, false);
+  assert.equal(decodeDesignCreated(ok({ result: "design_created", design: { ...design, uid: 1 } })).ok, false);
+  const refused = { ok: false, error: { code: "invalid", message: "no such design" } };
+  assert.equal(decodeDesignCreated(refused), refused);
 });
 
 test("a design's repo is the segment after designs/", () => {

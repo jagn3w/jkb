@@ -48,6 +48,7 @@ const { discussSpec, exclusive, repoDir } = await load(path.join(src, "renderer"
 const { SessionRegistry } = await load(path.join(src, "renderer", "src", "design", "registry.ts"));
 const { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading } = await load(path.join(src, "renderer", "src", "design", "listing.ts"));
 const { LAUNCH_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
+const { createAndOpen, createDesign, createTargets, defaultTarget } = await load(path.join(src, "renderer", "src", "design", "create.ts"));
 const Y = require("yjs");
 
 const TOPIC = "design/design.factory-1";
@@ -786,4 +787,80 @@ test("Discuss runs Claude in the design's repo with the prompt as one argument, 
   assert.equal(repoDir(ROOTS, ".."), "/home/vscode/repos", "a repo name that is not one directory stays at the root");
   assert.equal(repoDir(ROOTS, "a/b"), "/home/vscode/repos");
   assert.equal(discussSpec({ ...prompt, title: "t".repeat(400) }, "jkb", ROOTS, uuid).title.length, 200);
+});
+
+// ---- New design ----------------------------------------------------------------------------------
+
+const node = (uid, title, children = []) => ({ design: { uid, title, namespace: "designs/x", seq: 1, topic: `design/${uid}` }, children });
+const TREE = [
+  { repo: "alpha", designs: [node("design:a", "A", [node("design:a1", "A1")])] },
+  { repo: "jkb", designs: [node("design:j", "J")] },
+];
+
+test("a new design may go at a repo's top level or under any design, offered in the tree's order", () => {
+  const targets = createTargets(TREE);
+  assert.deepEqual(
+    targets.map((t) => [t.key, t.repo, t.under, t.depth]),
+    [
+      ["repo:alpha", "alpha", undefined, 0],
+      ["design:a", "alpha", "design:a", 1],
+      ["design:a1", "alpha", "design:a1", 2],
+      ["repo:jkb", "jkb", undefined, 0],
+      ["design:j", "jkb", "design:j", 1],
+    ],
+  );
+  assert.deepEqual(createTargets([]), []);
+});
+
+test("the place offered first is the open design's repo's top level, never under a design", () => {
+  const targets = createTargets(TREE);
+  // There is no un-nesting, so a parent is only ever the operator's own choice.
+  assert.equal(defaultTarget(targets, "jkb").key, "repo:jkb");
+  assert.equal(defaultTarget(targets, "alpha").under, undefined);
+  assert.equal(defaultTarget(targets, undefined).key, "repo:alpha");
+  assert.equal(defaultTarget(targets, "gone").key, "repo:alpha");
+  assert.equal(defaultTarget([], "jkb"), undefined);
+});
+
+test("a design is created by one design.create, its parent in the same op, never a following move", async () => {
+  const design = { uid: "design:new", title: "New", namespace: "designs/alpha", seq: 0, topic: "design/design.new", parent: "design:a" };
+  const d = scriptedDaemon({ "design.create": async () => ok({ result: "design_created", design }) });
+  assert.deepEqual(await createDesign(d.op, "  New  ", { repo: "alpha", under: "design:a" }), ok(design));
+  assert.deepEqual(
+    d.calls.map((c) => c.request),
+    [{ op: "design.create", repo: "alpha", title: "New", under: "design:a" }],
+  );
+  // At the top level `under` is not sent: a daemon that predates it refuses unknown fields.
+  await createDesign(d.op, "Top", { repo: "alpha", under: undefined });
+  assert.deepEqual(d.calls[1].request, { op: "design.create", repo: "alpha", title: "Top" });
+  // A blank title is refused here, before anything is written.
+  const blank = await createDesign(d.op, "   ", { repo: "alpha", under: undefined });
+  assert.equal(blank.ok, false);
+  assert.equal(d.calls.length, 2);
+  // The daemon's refusal (an unknown parent) is passed on as it is.
+  const refusing = scriptedDaemon({ "design.create": async () => err("invalid", "no design design:gone") });
+  assert.deepEqual(await createDesign(refusing.op, "X", { repo: "alpha", under: "design:gone" }), err("invalid", "no design design:gone"));
+});
+
+test("a created design is opened once the listing is read again, unless the operator opened another meanwhile", async () => {
+  const made = ok({ uid: "design:new", title: "New", namespace: "designs/alpha", seq: 0, topic: "design/design.new" });
+  const run = async (answer, moveDuring) => {
+    const log = [];
+    let current = "design:j";
+    const out = await createAndOpen({
+      create: async () => {
+        log.push("create");
+        if (moveDuring) current = "design:a";
+        return answer;
+      },
+      reload: async () => log.push("reload"),
+      current: () => current,
+      open: (uid) => log.push(`open ${uid}`),
+    });
+    return { out, log };
+  };
+  assert.deepEqual(await run(made, false), { out: made, log: ["create", "reload", "open design:new"] });
+  assert.deepEqual(await run(made, true), { out: made, log: ["create", "reload"] });
+  const refused = err("invalid", "no");
+  assert.deepEqual(await run(refused, false), { out: refused, log: ["create"] });
 });

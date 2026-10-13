@@ -14,6 +14,7 @@ import {
   type Design,
 } from "@jkb/core";
 
+import { createAndOpen, createDesign, type CreateTarget } from "../design/create";
 import { DesignSidebar } from "../design/DesignSidebar";
 import { DocumentEditor } from "../design/DocumentEditor";
 import { discussSpec, exclusive } from "../design/discuss";
@@ -489,6 +490,23 @@ export function DesignTab(): React.JSX.Element {
   const onDiscuss = useMemo(() => exclusive((from: number, to: number, shown: string) => latestDiscuss.current(from, to, shown)), []);
   const onRevealed = useCallback(() => setRevealIn(undefined), []);
 
+  // *New design*: one `design.create` (the parent in the same write), then the listing read again
+  // and the new design opened. A refusal is the tab's notice, and the sidebar keeps its form.
+  const onCreate = useCallback(
+    async (title: string, target: Pick<CreateTarget, "repo" | "under">): Promise<boolean> => {
+      setNotice(undefined);
+      const made = await createAndOpen({
+        create: () => createDesign((r) => window.jkb.op(r), title, target),
+        reload: load,
+        current: () => uidNow.current,
+        open: pickDesign,
+      });
+      if (!made.ok) setNotice(`Cannot create the design: ${made.error.message}`);
+      return made.ok;
+    },
+    [load, pickDesign],
+  );
+
   return (
     <div className="design-tab">
       <DesignSidebar
@@ -498,6 +516,8 @@ export function DesignTab(): React.JSX.Element {
         error={listing.error}
         onPick={pickDesign}
         onRefresh={() => void load()}
+        openRepo={repo}
+        onCreate={onCreate}
       />
       <div className="design-main">
         {notice !== undefined && (
@@ -535,7 +555,8 @@ export function DesignTab(): React.JSX.Element {
             <div className="design-empty">
               <p>No designs yet.</p>
               <p className="muted">
-                Create one with <code>jkb design create &lt;title&gt; --repo &lt;repo&gt;</code>, then Refresh.
+                Create one with <strong>+</strong> in the sidebar, or <code>jkb design create &lt;title&gt; --repo &lt;repo&gt;</code>{" "}
+                then Refresh.
               </p>
             </div>
           ) : (

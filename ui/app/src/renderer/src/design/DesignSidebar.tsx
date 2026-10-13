@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 
 import type { DesignNode, RepoNode, ReviewCounts } from "@jkb/core";
 
+import { createTargets, defaultTarget, type CreateTarget } from "./create";
+
 /** A thin bar of the design's span states, and how much of it is unreviewed. */
 function StateBar({ counts }: { readonly counts: ReviewCounts }): React.JSX.Element | null {
   const total = counts.proposed + counts.approved + counts.staged + counts.implemented;
@@ -122,6 +124,88 @@ function DesignRow({
 }
 
 /**
+ * *New design*: a title, and where it goes — the top level of a repo (first offered: the open
+ * design's repo) or under any design. With no designs yet there is no repo to offer, so one is typed.
+ * The form stays open, with what was typed, when the create is refused; the reason is the tab's notice.
+ */
+function NewDesignForm({
+  tree,
+  openRepo,
+  onCreate,
+  onClose,
+}: {
+  readonly tree: readonly RepoNode[];
+  readonly openRepo: string | undefined;
+  readonly onCreate: (title: string, target: Pick<CreateTarget, "repo" | "under">) => Promise<boolean>;
+  readonly onClose: () => void;
+}): React.JSX.Element {
+  const targets = createTargets(tree);
+  const [title, setTitle] = useState("");
+  const [repo, setRepo] = useState("");
+  const [key, setKey] = useState<string | undefined>(() => defaultTarget(targets, openRepo)?.key);
+  const [busy, setBusy] = useState(false);
+  // A place the listing no longer has (a refresh meanwhile) falls back to the one offered first.
+  const chosen = targets.find((t) => t.key === key) ?? defaultTarget(targets, openRepo);
+  const typed = repo.trim();
+  const target: Pick<CreateTarget, "repo" | "under"> | undefined =
+    targets.length === 0 ? (typed === "" ? undefined : { repo: typed, under: undefined }) : chosen;
+  const ready = !busy && title.trim() !== "" && target !== undefined;
+  const submit = async (): Promise<void> => {
+    if (!ready) return;
+    setBusy(true);
+    try {
+      if (await onCreate(title, target)) onClose();
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <form
+      className="design-new"
+      aria-label="New design"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void submit();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && !busy) {
+          e.preventDefault();
+          onClose();
+        }
+      }}
+    >
+      <input
+        value={title}
+        placeholder="Title"
+        autoFocus
+        disabled={busy}
+        onChange={(e) => setTitle(e.target.value)}
+        aria-label="Title"
+      />
+      {targets.length === 0 ? (
+        <input value={repo} placeholder="Repo" disabled={busy} onChange={(e) => setRepo(e.target.value)} aria-label="Repo" />
+      ) : (
+        <select value={chosen?.key ?? ""} disabled={busy} onChange={(e) => setKey(e.target.value)} aria-label="Under">
+          {targets.map((t) => (
+            <option key={t.key} value={t.key}>
+              {`${"\u00a0\u00a0".repeat(t.depth)}${t.label}`}
+            </option>
+          ))}
+        </select>
+      )}
+      <div className="design-new-actions">
+        <button type="button" className="bar-button" disabled={busy} onClick={onClose}>
+          Cancel
+        </button>
+        <button type="submit" className="bar-button" disabled={!ready}>
+          {busy ? "Creating…" : "Create"}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/**
  * The design list (operator feedback, 2026-10-11): a collapsible tree on the left, like Notion's —
  * repos at the top level, their designs under them, a child design under its parent. Replaces the
  * repo and design dropdowns. What is folded is the window's own convenience.
@@ -133,6 +217,8 @@ export function DesignSidebar({
   error,
   onPick,
   onRefresh,
+  openRepo,
+  onCreate,
 }: {
   readonly tree: readonly RepoNode[] | undefined;
   readonly active: string | undefined;
@@ -140,8 +226,13 @@ export function DesignSidebar({
   readonly error: string | undefined;
   readonly onPick: (uid: string) => void;
   readonly onRefresh: () => void;
+  /** The open design's repo: where *New design* offers to put one first. */
+  readonly openRepo: string | undefined;
+  /** Make a design and open it; `false` (refused) keeps the form open. */
+  readonly onCreate: (title: string, target: Pick<CreateTarget, "repo" | "under">) => Promise<boolean>;
 }): React.JSX.Element {
   const [folded, setFolded] = useState<ReadonlySet<string>>(readFolded);
+  const [creating, setCreating] = useState(false);
   // The open design is always visible: its repo and every design above it unfold when it opens,
   // however it was opened (*Next*, *Jump to context*), or no row would say which design it is. Once
   // per design opened, not on every reload of the listing, so a fold the reader makes stays put.
@@ -173,10 +264,24 @@ export function DesignSidebar({
       <header className="sidebar-bar">
         <h1>Design</h1>
         <span className="spacer" />
+        <button
+          type="button"
+          className="bar-button"
+          onClick={() => setCreating((c) => !c)}
+          disabled={tree === undefined}
+          aria-label="New design"
+          aria-expanded={creating}
+          title="New design"
+        >
+          +
+        </button>
         <button type="button" className="bar-button" onClick={onRefresh} disabled={loading} aria-label="Refresh designs">
           ↻
         </button>
       </header>
+      {creating && tree !== undefined && (
+        <NewDesignForm tree={tree} openRepo={openRepo} onCreate={onCreate} onClose={() => setCreating(false)} />
+      )}
       {tree === undefined ? (
         <p className="sidebar-hint muted">{error !== undefined ? `Cannot list designs: ${error}` : "Loading designs…"}</p>
       ) : tree.length === 0 ? (
