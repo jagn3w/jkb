@@ -74,9 +74,11 @@ pub fn health(conn: &Connection) -> Result<Health, ApiError> {
     let stale_vectors = if vector_tables == 0 {
         0
     } else {
-        jkb_index::count_stale(conn)
-            .map_err(|e| index_error(&e))?
-            .vectors
+        // Destructured exhaustively, so a new derived index is a compile error here rather
+        // than stale rows this report never mentions.
+        let jkb_index::StaleRows { vectors } =
+            jkb_index::count_stale(conn).map_err(|e| index_error(&e))?;
+        vectors
     };
     let unguarded_vector_tables =
         jkb_index::vector_tables_without_gc_trigger(conn).map_err(|e| index_error(&e))?;

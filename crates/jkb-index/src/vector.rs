@@ -90,10 +90,10 @@ pub(crate) fn count_orphan_vectors(conn: &Connection) -> Result<i64> {
 /// index that grows monotonically, so it is worth finding and removing on demand.
 ///
 /// A struct rather than a bare count because the set of derived indexes is open: FTS is
-/// trigger-maintained today and a second vector backend is plausible. [`StaleRows::total`] and
-/// [`StaleRows::is_empty`] cover every field, so a caller asking "is anything stale?" stays
-/// right when one is added; a caller reading a named field such as `vectors` reports only that
-/// index, and nothing will flag it when another appears.
+/// trigger-maintained today and a second vector backend is plausible. Every reader of a field
+/// destructures it exhaustively (`let StaleRows { vectors } = …;`, no `..`), so adding a field is
+/// a compile error at each of them rather than a silently unreported total. [`StaleRows::total`]
+/// and [`StaleRows::is_empty`] cover every index.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct StaleRows {
     /// Rows across every `vec_items_<dim>` table whose item is gone.
@@ -104,7 +104,8 @@ impl StaleRows {
     /// Every stale row, across all derived indexes.
     #[must_use]
     pub fn total(self) -> usize {
-        self.vectors
+        let Self { vectors } = self;
+        vectors
     }
 
     /// Whether the derived indexes are clean.

@@ -4627,11 +4627,13 @@ fn cmd_index(db: &Db, sweep: bool) -> Result<()> {
     // clean without running the whole of `doctor`. Deliberately its own flag rather than
     // something `index` always does: embedding needs a live embedder and this must not.
     if sweep {
-        let removed = sweep_stale(db)?;
-        if removed.is_empty() {
+        // Destructured exhaustively: a new derived index is a compile error here, not a
+        // sweep this message silently under-reports.
+        let jkb_index::StaleRows { vectors } = sweep_stale(db)?;
+        if vectors == 0 {
             println!("index: no stale rows");
         } else {
-            println!("index: removed {} stale vector row(s)", removed.vectors);
+            println!("index: removed {vectors} stale vector row(s)");
         }
         return Ok(());
     }

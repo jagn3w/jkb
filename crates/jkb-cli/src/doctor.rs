@@ -284,7 +284,11 @@ pub(crate) fn run(
     report_claims(kb, fix)?;
 
     let swept = match (host, fix) {
-        (Some(h), true) if health.vector_tables > 0 => Some(crate::sweep_stale(h.db)?.vectors),
+        (Some(h), true) if health.vector_tables > 0 => {
+            // Destructured exhaustively: a new derived index is a compile error here.
+            let jkb_index::StaleRows { vectors } = crate::sweep_stale(h.db)?;
+            Some(vectors)
+        }
         _ => None,
     };
     for line in vector_report(&health, swept) {
