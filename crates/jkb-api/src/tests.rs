@@ -1458,7 +1458,7 @@ fn a_search_reports_the_orphan_vectors_it_dropped() {
                 },
             )?;
             // Opposite the query, so the orphans planted below rank ahead of every live row.
-            vector.upsert_vector(c, id, &[-0.25; 16]).unwrap();
+            vector.upsert_vector(c, id, 0, &[-0.25; 16]).unwrap();
         }
         Ok(())
     })

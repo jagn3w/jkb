@@ -241,7 +241,7 @@ fn selective_large_scope_returns_results_via_overfetch() {
                 },
             )?;
             placement::place(conn, meta, id, out_ns, PlacementRole::Primary, 0)?;
-            vector.upsert_vector(conn, id, &q_vec)?;
+            vector.upsert_vector(conn, id, 0, &q_vec)?;
         }
         // 300 in-scope items (> 256) at a farther, uniform distance.
         for i in 0..300 {
@@ -257,7 +257,7 @@ fn selective_large_scope_returns_results_via_overfetch() {
                 },
             )?;
             placement::place(conn, meta, id, in_ns, PlacementRole::Primary, 0)?;
-            vector.upsert_vector(conn, id, &in_vec)?;
+            vector.upsert_vector(conn, id, 0, &in_vec)?;
         }
         Ok(())
     })

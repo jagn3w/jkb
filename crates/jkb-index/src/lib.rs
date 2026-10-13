@@ -28,8 +28,8 @@ use jkb_types::ItemId;
 pub use error::{Error, Result};
 pub use fts::FtsIndexer;
 pub use vector::{
-    count_stale, register, sweep_stale, vector_tables, vector_tables_without_gc_trigger, KnnPage,
-    StaleRows, VectorIndexer,
+    count_stale, forget_sources, pending_predicate, register, sweep_stale, vector_tables,
+    vector_tables_without_gc_trigger, KnnPage, StaleRows, VectorIndexer,
 };
 
 /// The item fields an [`Indexer`] needs to (re)index a single item.
@@ -48,6 +48,9 @@ pub struct IndexItem<'a> {
     pub mime: Option<&'a str>,
     /// The item's text content, if any.
     pub content: Option<&'a str>,
+    /// The item's `content_rev` when `content` was read. An `embedding` is stored only if the item
+    /// is still at this revision, so one computed from text an edit has since replaced is dropped.
+    pub content_rev: i64,
     /// A precomputed embedding, if the caller already has one.
     pub embedding: Option<&'a [f32]>,
 }

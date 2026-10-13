@@ -115,6 +115,7 @@ fn dispatcher_indexes_and_knn_returns_item_ids_without_a_join() {
                                 kind: "note",
                                 mime: None,
                                 content: Some(content),
+                                content_rev: 0,
                                 embedding: Some(&embedding),
                             },
                         )
@@ -201,7 +202,7 @@ fn drop_and_rebuild_reproduces_vector_results() {
                 ] {
                     let id = add_item(conn, meta, uid, content);
                     let e = embedder.embed(content).unwrap();
-                    vector.upsert_vector(conn, id, &e).unwrap();
+                    vector.upsert_vector(conn, id, 0, &e).unwrap();
                 }
                 let q = embedder.embed(query_text).unwrap();
                 Ok(vector.knn(conn, &q, 3).unwrap())
@@ -244,7 +245,7 @@ fn catalog_refuses_a_different_model_at_the_same_dim() {
             .embed("hello world")
             .unwrap();
         vector.ensure_ready(conn).unwrap();
-        vector.upsert_vector(conn, id, &e).unwrap();
+        vector.upsert_vector(conn, id, 0, &e).unwrap();
         Ok(())
     })
     .unwrap();
@@ -309,7 +310,7 @@ fn a_deleted_items_vector_is_swept_and_a_successor_gets_a_fresh_id() {
                 vector.ensure_ready(conn).unwrap();
                 let id = add_item(conn, meta, "n:doomed", "doomed content");
                 vector
-                    .upsert_vector(conn, id, &embedder.embed("doomed content").unwrap())
+                    .upsert_vector(conn, id, 0, &embedder.embed("doomed content").unwrap())
                     .unwrap();
                 Ok(id)
             }
@@ -321,7 +322,7 @@ fn a_deleted_items_vector_is_swept_and_a_successor_gets_a_fresh_id() {
         let embedder = embedder.clone();
         move |conn, _meta| {
             VectorIndexer::new(embedder.clone())
-                .upsert_vector(conn, id, &embedder.embed("second pass").unwrap())
+                .upsert_vector(conn, id, 0, &embedder.embed("second pass").unwrap())
                 .unwrap();
             Ok(())
         }
@@ -360,7 +361,12 @@ fn a_deleted_items_vector_is_swept_and_a_successor_gets_a_fresh_id() {
                 id.get()
             );
             VectorIndexer::new(embedder.clone())
-                .upsert_vector(conn, new_id, &embedder.embed("successor content").unwrap())
+                .upsert_vector(
+                    conn,
+                    new_id,
+                    0,
+                    &embedder.embed("successor content").unwrap(),
+                )
                 .unwrap();
             Ok(())
         }
@@ -383,7 +389,7 @@ fn a_delete_trigger_can_reach_a_vec0_virtual_table() {
                 vector.ensure_ready(conn).unwrap();
                 let id = add_item(conn, meta, "n:trig", "body");
                 vector
-                    .upsert_vector(conn, id, &embedder.embed("body").unwrap())
+                    .upsert_vector(conn, id, 0, &embedder.embed("body").unwrap())
                     .unwrap();
                 // No trigger created here: `ensure_ready` above installs it (D42.2). This test
                 // exists to prove a trigger can reach a vec0 **virtual** table at all, which is
@@ -430,7 +436,7 @@ fn a_deleted_items_text_does_not_retrieve_its_successor() {
                 let vector = VectorIndexer::new(embedder.clone());
                 vector.ensure_ready(conn).unwrap();
                 let id = add_item(conn, meta, "n:doomed", "the doomed document about badgers");
-                vector.upsert_vector(conn, id, &v).unwrap();
+                vector.upsert_vector(conn, id, 0, &v).unwrap();
                 Ok(id)
             }
         })
@@ -502,7 +508,7 @@ fn knn_live_filters_dead_rows_and_reports_exhaustion_honestly() {
             // Six live items with vectors...
             for i in 0..6 {
                 let id = add_item(conn, meta, &format!("n:live{i}"), "probe text");
-                vector.upsert_vector(conn, id, &probe).unwrap();
+                vector.upsert_vector(conn, id, 0, &probe).unwrap();
             }
             // ...and six orphan rows on ids no item has (what a pre-trigger store carries).
             for fake in 9000..9006 {
@@ -562,7 +568,7 @@ fn knn_page_scans_once_and_reports_index_exhaustion() {
             vector.ensure_ready(conn).unwrap();
             for i in 0..3 {
                 let id = add_item(conn, meta, &format!("n:live{i}"), "probe text");
-                vector.upsert_vector(conn, id, &probe).unwrap();
+                vector.upsert_vector(conn, id, 0, &probe).unwrap();
             }
             for fake in 9000..9030 {
                 conn.execute(
@@ -631,7 +637,7 @@ fn the_sweep_finds_and_removes_orphan_vector_rows() {
         indexer.ensure_ready(conn).unwrap();
         let id = add_item(conn, meta, "n:live", "live content");
         indexer
-            .upsert_vector(conn, id, &embedder.embed("live content").unwrap())
+            .upsert_vector(conn, id, 0, &embedder.embed("live content").unwrap())
             .unwrap();
 
         // An orphan of the kind a pre-trigger database holds: a vector whose item never
@@ -708,7 +714,7 @@ fn a_repair_installs_the_trigger_on_a_legacy_database() {
                 conn.execute_batch("DROP TRIGGER IF EXISTS vec_items_16_gc;")?;
                 let id = add_item(conn, meta, "n:legacy", "legacy content");
                 vector
-                    .upsert_vector(conn, id, &embedder.embed("legacy content").unwrap())
+                    .upsert_vector(conn, id, 0, &embedder.embed("legacy content").unwrap())
                     .unwrap();
                 Ok(id)
             }
@@ -755,7 +761,7 @@ fn a_repair_installs_the_trigger_on_a_legacy_database() {
             move |conn, meta| {
                 let id2 = add_item(conn, meta, "n:after", "after content");
                 VectorIndexer::new(embedder.clone())
-                    .upsert_vector(conn, id2, &embedder.embed("after content").unwrap())
+                    .upsert_vector(conn, id2, 0, &embedder.embed("after content").unwrap())
                     .unwrap();
                 Ok(id2)
             }
@@ -789,11 +795,11 @@ fn upsert_vector_writes_nothing_for_a_missing_item() {
             let id = add_item(conn, meta, "n:gone", "gone content");
             conn.execute("DELETE FROM items WHERE id = ?1", [id.get()])?;
             let gone = vector
-                .upsert_vector(conn, id, &embedder.embed("gone content").unwrap())
+                .upsert_vector(conn, id, 0, &embedder.embed("gone content").unwrap())
                 .unwrap();
             let id = add_item(conn, meta, "n:live", "live content");
             let live = vector
-                .upsert_vector(conn, id, &embedder.embed("live content").unwrap())
+                .upsert_vector(conn, id, 0, &embedder.embed("live content").unwrap())
                 .unwrap();
             Ok((live, gone))
         })
@@ -829,7 +835,7 @@ fn vectors_for_answers_more_ids_than_one_statement_can_bind() {
                 .collect::<rusqlite::Result<_>>()?;
             assert_eq!(ids.len(), usize::try_from(n).unwrap());
             for &id in &ids {
-                assert!(vector.upsert_vector(conn, id, &[1.0, 0.5]).unwrap());
+                assert!(vector.upsert_vector(conn, id, 0, &[1.0, 0.5]).unwrap());
             }
             Ok(vector.vectors_for(conn, &ids).unwrap().len())
         })
@@ -860,4 +866,228 @@ fn fts_search_words_are_never_fts5_syntax() {
     assert_eq!(or.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![id]);
     assert_eq!(dash.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![id]);
     assert!(quote.is_empty());
+}
+
+/// The ids `pending_predicate` names, in id order.
+fn pending_ids(db: &Db, embedder: &Arc<dyn Embedder + Send + Sync>) -> Vec<ItemId> {
+    let vector = VectorIndexer::new(embedder.clone());
+    db.read(move |conn| {
+        let sql = format!(
+            "SELECT i.id FROM items i WHERE {} ORDER BY i.id",
+            jkb_index::pending_predicate(conn, &vector, "i").unwrap()
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let ids = stmt
+            .query_map([], |r| r.get(0).map(ItemId::new))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    })
+    .unwrap()
+}
+
+/// An item's content revision.
+fn rev_of(db: &Db, id: ItemId) -> i64 {
+    db.read(move |conn| {
+        Ok(conn.query_row(
+            "SELECT content_rev FROM items WHERE id = ?1",
+            [id.get()],
+            |r| r.get(0),
+        )?)
+    })
+    .unwrap()
+}
+
+/// Freshness is derived from what `upsert_vector` recorded: an item is pending until a vector of its
+/// current revision is stored, pending again once its text changes, and a vector computed from the
+/// text it held before an edit is refused rather than stored under the new revision — which would
+/// make the edit look embedded for good.
+#[test]
+fn pending_follows_the_content_revision_and_a_stale_vector_is_refused() {
+    let db = open_db();
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let (edited, untouched) = db
+        .write_txn("test", |conn, meta| {
+            Ok((
+                add_item(conn, meta, "n:edited", "first words"),
+                add_item(conn, meta, "n:untouched", "steady words"),
+            ))
+        })
+        .unwrap();
+    assert_eq!(pending_ids(&db, &embedder), [edited, untouched]);
+
+    let e = embedder.clone();
+    db.write_txn("test", move |conn, _| {
+        let vector = VectorIndexer::new(e.clone());
+        vector.ensure_ready(conn).unwrap();
+        for (id, text) in [(edited, "first words"), (untouched, "steady words")] {
+            assert!(vector
+                .upsert_vector(conn, id, 0, &e.embed(text).unwrap())
+                .unwrap());
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(pending_ids(&db, &embedder).is_empty());
+
+    // An edit bumps the revision (the V030 trigger), which is all it takes to be pending again.
+    db.write_txn("test", move |conn, meta| {
+        jkb_core::item::set_content(conn, meta, edited, "second words", None)
+    })
+    .unwrap();
+    assert_eq!(rev_of(&db, edited), 1);
+    assert_eq!(pending_ids(&db, &embedder), [edited]);
+
+    // A vector computed before the edit is refused, and the item stays pending.
+    let e = embedder.clone();
+    let (stale, fresh) = db
+        .write_txn("test", move |conn, _| {
+            let vector = VectorIndexer::new(e.clone());
+            let stale = vector
+                .upsert_vector(conn, edited, 0, &e.embed("first words").unwrap())
+                .unwrap();
+            let pending_after_stale = {
+                let sql = format!(
+                    "SELECT count(*) FROM items i WHERE {}",
+                    jkb_index::pending_predicate(conn, &vector, "i").unwrap()
+                );
+                conn.query_row(&sql, [], |r| r.get::<_, i64>(0))?
+            };
+            assert_eq!(pending_after_stale, 1, "the stale vector cleared the item");
+            let fresh = vector
+                .upsert_vector(conn, edited, 1, &e.embed("second words").unwrap())
+                .unwrap();
+            Ok((stale, fresh))
+        })
+        .unwrap();
+    assert!(!stale, "a vector of the replaced text was stored");
+    assert!(fresh);
+    assert!(pending_ids(&db, &embedder).is_empty());
+
+    // Identical text is no change.
+    db.write_txn("test", move |conn, meta| {
+        jkb_core::item::set_content(conn, meta, edited, "second words", None)
+    })
+    .unwrap();
+    assert_eq!(rev_of(&db, edited), 1);
+    assert!(pending_ids(&db, &embedder).is_empty());
+}
+
+/// `forget_sources` (`jkb index --all`) makes every item pending and deletes no vector: the old ones
+/// serve until replaced. `clear` (`jkb index --rebuild`) deletes them as well.
+#[test]
+fn forgetting_provenance_keeps_vectors_and_clearing_drops_them() {
+    let db = open_db();
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let e = embedder.clone();
+    let id = db
+        .write_txn("test", move |conn, meta| {
+            let id = add_item(conn, meta, "n:kept", "kept words");
+            let vector = VectorIndexer::new(e.clone());
+            vector.ensure_ready(conn).unwrap();
+            vector
+                .upsert_vector(conn, id, 0, &e.embed("kept words").unwrap())
+                .unwrap();
+            Ok(id)
+        })
+        .unwrap();
+    assert!(pending_ids(&db, &embedder).is_empty());
+
+    let forgotten = db
+        .write_txn("test", |conn, _| {
+            Ok(jkb_index::forget_sources(conn).unwrap())
+        })
+        .unwrap();
+    assert_eq!(forgotten, 1);
+    assert_eq!(pending_ids(&db, &embedder), [id]);
+    let e = embedder.clone();
+    let kept = db
+        .read(move |conn| {
+            Ok(VectorIndexer::new(e)
+                .vectors_for(conn, &[id])
+                .unwrap()
+                .len())
+        })
+        .unwrap();
+    assert_eq!(kept, 1, "forgetting provenance deleted a vector");
+
+    let e = embedder.clone();
+    let left = db
+        .write_txn("test", move |conn, _| {
+            let vector = VectorIndexer::new(e);
+            vector.clear(conn).unwrap();
+            Ok(vector.vectors_for(conn, &[id]).unwrap().len())
+        })
+        .unwrap();
+    assert_eq!(left, 0, "clear left a vector");
+    assert_eq!(pending_ids(&db, &embedder), [id]);
+}
+
+/// `Indexer::rebuild` re-embeds items from their own text but not documents: a document's vector is
+/// its chunks' centroid, which `jkb-ingest` derives, and embedding its whole text gave it a vector of
+/// a truncated prefix. The document is left pending for that pass.
+#[test]
+fn rebuild_leaves_documents_to_their_chunks() {
+    let db = open_db();
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let (note, document) = db
+        .write_txn("test", |conn, meta| {
+            let note = add_item(conn, meta, "n:note", "a plain note");
+            let document = upsert(
+                conn,
+                meta,
+                &NewItem {
+                    uid: "b3:doc".to_owned(),
+                    kind: "document".to_owned(),
+                    content: Some("a long document".to_owned()),
+                    content_hash: None,
+                    mime: None,
+                },
+            )
+            .unwrap();
+            Ok((note, document))
+        })
+        .unwrap();
+    let e = embedder.clone();
+    let stored = db
+        .write_txn("test", move |conn, _| {
+            let vector = VectorIndexer::new(e);
+            vector.rebuild(conn).unwrap();
+            Ok(vector.vectors_for(conn, &[note, document]).unwrap())
+        })
+        .unwrap();
+    assert!(stored.contains_key(&note));
+    assert!(
+        !stored.contains_key(&document),
+        "rebuild embedded a document from its own text"
+    );
+    assert_eq!(pending_ids(&db, &embedder), [document]);
+}
+
+/// A store whose model changed holds sidecar rows describing another table's vectors; an item with
+/// no vector in this model's table is pending whatever its sidecar says.
+#[test]
+fn an_item_with_no_vector_in_this_models_table_is_pending() {
+    let db = open_db();
+    let first = FakeEmbedder::arc("first", 16);
+    let second = FakeEmbedder::arc("second", 8);
+    let e = first.clone();
+    let id = db
+        .write_txn("test", move |conn, meta| {
+            let id = add_item(conn, meta, "n:x", "some words");
+            let vector = VectorIndexer::new(e.clone());
+            vector.ensure_ready(conn).unwrap();
+            vector
+                .upsert_vector(conn, id, 0, &e.embed("some words").unwrap())
+                .unwrap();
+            Ok(id)
+        })
+        .unwrap();
+    assert!(pending_ids(&db, &first).is_empty());
+    let e = second.clone();
+    db.write_txn("test", move |conn, _| {
+        VectorIndexer::new(e).ensure_ready(conn).unwrap();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(pending_ids(&db, &second), [id]);
 }
