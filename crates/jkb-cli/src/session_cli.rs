@@ -1375,10 +1375,14 @@ pub(crate) fn abandon(
     // session whose worktree still exists (so `is_alive` says Yes) and therefore reclaimable by
     // nothing. Re-running failed identically. The decision is already in the record's `Plan`, and
     // `delete_branch_if_any` applies it once the tree is out of the way.
-    // `is_yes()`: delete only a branch proven to be there. An unestablished answer leaves it
-    // alone, which costs a `git branch -D` and never an unrecoverable one.
-    if delete_branch && deferred.is_none() && gitrepo::has_branch(&ctx.root, &branch)?.is_yes() {
-        gitrepo::delete_branch(&ctx.root, &branch, true)?;
+    // Through the disposal's own compare-and-delete, at the tip read just before: a branch git
+    // cannot speak for, one checked out elsewhere, or one that moves in between is kept and said
+    // so — never a bail here, which would land before the claim is released (the wedge above).
+    if delete_branch && deferred.is_none() {
+        let read = archive::branch_tip(&ctx.root, &branch);
+        if let Some(note) = delete_abandoned_branch(&ctx.root, &branch, read) {
+            eprintln!("note: {note}");
+        }
     }
     // Read from git rather than from what this function did: `dispose` deletes the branch itself
     // when it archived the tree, so a flag set here would report `false` for a branch that is
@@ -1433,6 +1437,13 @@ pub(crate) fn abandon(
         json,
     );
     Ok(())
+}
+
+/// `abandon --delete-branch`'s own deletion, when nothing was deferred: at the tip `read` found,
+/// and only while the branch is still there. The line to print when it was not deleted, if any.
+fn delete_abandoned_branch(root: &Path, branch: &str, read: archive::Tip) -> Option<String> {
+    let at = read.oid().map(str::to_owned);
+    archive::delete_branch_planned(root, branch, at.as_deref(), read).note(root, branch)
 }
 
 /// Dispose of an abandoned session, if there is one, and say why not when it could not be moved.
@@ -1969,6 +1980,65 @@ mod tests {
     use super::{batch_is_spent, open_worktree, task_on, Kb, Landed};
     use jkb_api::sessions::BranchTask;
     use std::collections::BTreeMap;
+
+    /// `abandon --delete-branch` deletes at the tip it read. A commit landing between that read
+    /// and the delete — simulated by moving the branch after reading it — is kept with its branch
+    /// and reported. `git branch -D` deleted it, and the abandoned branch is the only copy.
+    #[test]
+    fn an_abandoned_branch_that_moves_after_it_was_read_is_kept() {
+        use crate::archive::{self, tests::git};
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        let (wt, branch, _) = archive::tests::session(&repo, "sess");
+        // Nothing has it checked out, as after the disposal archived the session.
+        git(&wt, &["checkout", "-q", "--detach"]);
+        let read = archive::branch_tip(&repo, &branch);
+        std::fs::write(wt.join("late.txt"), "in the window").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "late work"]);
+        let now = git(&wt, &["rev-parse", "HEAD"]);
+        git(&repo, &["branch", "-f", &branch, &now]);
+
+        let note = super::delete_abandoned_branch(&repo, &branch, read).expect("reported");
+
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/heads/{branch}")]),
+            now,
+            "the branch survives, with the commit that landed in the window"
+        );
+        assert!(note.contains(&now) && note.contains(&branch), "{note}");
+
+        // And with nothing in the window, it is deleted, silently.
+        let read = archive::branch_tip(&repo, &branch);
+        assert_eq!(super::delete_abandoned_branch(&repo, &branch, read), None);
+        assert!(git(&repo, &["branch", "--list", &branch]).is_empty());
+    }
+
+    /// A branch another worktree has checked out is kept and reported. `git branch -D` refused
+    /// it too, but through a `?` that bailed before the claim was released; `update-ref` would
+    /// delete it out from under that checkout.
+    #[test]
+    fn an_abandoned_branch_checked_out_elsewhere_is_kept() {
+        use crate::archive::{self, tests::git};
+        let t = tempfile::tempdir().unwrap();
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = archive::tests::session(&repo, "sess");
+
+        let read = archive::branch_tip(&repo, &branch);
+        let note = super::delete_abandoned_branch(&repo, &branch, read).expect("reported");
+
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/heads/{branch}")]),
+            head,
+            "the checked-out branch is kept"
+        );
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]),
+            head,
+            "and its checkout intact"
+        );
+        assert!(note.contains("checked out"), "{note}");
+    }
 
     /// One refused task on a branch the merge queue records answers as a refusal of that task, not an
     /// error: the caller records the branch's other tasks and reports the refused one held.

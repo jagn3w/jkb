@@ -1748,20 +1748,12 @@ fn create_branch_between(
     anyhow::bail!("git {}: {text}", args.join(" "))
 }
 
-/// Delete branch `branch`, discarding unmerged commits when `force`.
-///
-/// # Errors
-/// Returns an error if `git` cannot be executed or refuses to delete the branch.
-pub fn delete_branch(dir: &Path, branch: &str, force: bool) -> Result<()> {
-    valid_ref(branch)?;
-    git_must(dir, &["branch", if force { "-D" } else { "-d" }, branch])?;
-    Ok(())
-}
-
 /// Delete branch `branch` **only if it still points at `expected`** — git's own compare-and-delete
 /// (`update-ref -d <ref> <old>`), so a commit that lands on the branch after the caller read it is
-/// never discarded with it. [`delete_branch`]'s `git branch -D` takes no old value: a caller that
-/// read the tip, compared it, then deleted, lost whatever arrived in between.
+/// never discarded with it. `git branch -D` takes no old value: a caller that read the tip,
+/// compared it, then deleted, lost whatever arrived in between — which is why there is no
+/// `delete_branch` beside this one any more, and why a disposal deletes only through
+/// `archive::delete_branch_planned`.
 ///
 /// `Ok(true)` when git deleted it, `Ok(false)` when git refused — the ref moved, is gone, or is
 /// locked. Which of those is the caller's to establish by asking again, never by parsing git's
