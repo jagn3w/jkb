@@ -2583,22 +2583,26 @@ mod tests {
         );
     }
 
+    /// The `WHERE` clause matching a row of `table` that references item `?1` through any of its
+    /// foreign keys onto `items`.
+    fn naming_clause(c: &rusqlite::Connection, table: &str) -> crate::Result<String> {
+        let mut stmt = c.prepare(
+            "SELECT \"from\" FROM pragma_foreign_key_list(?1) WHERE \"table\" = 'items'",
+        )?;
+        let fks = stmt
+            .query_map([table], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(fks
+            .iter()
+            .map(|col| format!("\"{col}\" = ?1"))
+            .collect::<Vec<_>>()
+            .join(" OR "))
+    }
+
     /// How many rows of `table` reference item `id` through any of its foreign keys onto `items`.
     fn rows_naming(db: &Db, table: &'static str, id: i64) -> i64 {
         db.read(move |c| {
-            let fks: Vec<String> = {
-                let mut stmt = c.prepare(
-                    "SELECT \"from\" FROM pragma_foreign_key_list(?1)
-                      WHERE \"table\" = 'items'",
-                )?;
-                let rows = stmt.query_map([table], |r| r.get::<_, String>(0))?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            let refs = fks
-                .iter()
-                .map(|col| format!("\"{col}\" = ?1"))
-                .collect::<Vec<_>>()
-                .join(" OR ");
+            let refs = naming_clause(c, table)?;
             Ok(c.query_row(
                 &format!("SELECT count(*) FROM \"{table}\" WHERE {refs}"),
                 [id],
@@ -2606,6 +2610,111 @@ mod tests {
             )?)
         })
         .unwrap()
+    }
+
+    /// Each column's declared default, **evaluated now**, for every column of [`CASCADE_RESTORED`]
+    /// that has one. Evaluated rather than compared as text because a default is an expression
+    /// (`'{}'`, `0`, `strftime(… 'now')`); taken once before the fixture and once after, the two
+    /// bound every value an unset column can have received — a time default included.
+    fn evaluated_defaults(
+        db: &Db,
+    ) -> std::collections::BTreeMap<(String, String), rusqlite::types::Value> {
+        db.read(|c| {
+            let mut out = std::collections::BTreeMap::new();
+            for table in CASCADE_RESTORED {
+                let mut stmt = c.prepare(
+                    "SELECT name, dflt_value FROM pragma_table_info(?1)
+                      WHERE dflt_value IS NOT NULL",
+                )?;
+                let cols = stmt
+                    .query_map([table], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (col, dflt) in cols {
+                    // Schema text, not a value: a test reading its own fixture's DDL.
+                    let value = c.query_row(&format!("SELECT {dflt}"), [], |r| {
+                        r.get::<_, rusqlite::types::Value>(0)
+                    })?;
+                    out.insert((table.to_owned(), col), value);
+                }
+            }
+            Ok(out)
+        })
+        .unwrap()
+    }
+
+    /// **The tripwire's own non-vacuity check**: every column of every [`CASCADE_RESTORED`] table
+    /// (bar `skip`) holds, in at least one of `victim`'s rows, a value that is non-NULL and outside
+    /// `[lo, hi]` — the column's default evaluated before and after the fixture was built.
+    ///
+    /// Without it a column added later passes the whole-row compare untouched: the fixture never
+    /// sets it, so it holds NULL or its default before the delete, and a snapshot that omits it
+    /// puts the same default back. V005 and V007 added exactly such columns.
+    fn assert_every_column_is_set(
+        db: &Db,
+        victim: i64,
+        skip: fn(&str) -> &'static [&'static str],
+        lo: &std::collections::BTreeMap<(String, String), rusqlite::types::Value>,
+        hi: &std::collections::BTreeMap<(String, String), rusqlite::types::Value>,
+    ) {
+        let (lo, hi) = (lo.clone(), hi.clone());
+        let uncovered = db
+            .read(move |c| {
+                let mut uncovered = Vec::new();
+                for table in CASCADE_RESTORED {
+                    let refs = naming_clause(c, table)?;
+                    for col in super::table_columns(c, table)? {
+                        if skip(table).contains(&col.as_str()) {
+                            continue;
+                        }
+                        let key = (table.to_owned(), col.clone());
+                        // A column the schema gained after `lo` was taken has only `hi`.
+                        let set = match (lo.get(&key).or_else(|| hi.get(&key)), hi.get(&key)) {
+                            (Some(lo), Some(hi)) => c.query_row(
+                                &format!(
+                                    "SELECT count(*) FROM \"{table}\" WHERE ({refs})
+                                       AND \"{col}\" IS NOT NULL
+                                       AND NOT (\"{col}\" BETWEEN ?2 AND ?3)"
+                                ),
+                                rusqlite::params![victim, lo, hi],
+                                |r| r.get::<_, i64>(0),
+                            )?,
+                            _ => c.query_row(
+                                &format!(
+                                    "SELECT count(*) FROM \"{table}\" WHERE ({refs})
+                                       AND \"{col}\" IS NOT NULL"
+                                ),
+                                [victim],
+                                |r| r.get::<_, i64>(0),
+                            )?,
+                        };
+                        if set == 0 {
+                            uncovered.push(format!("{table}.{col}"));
+                        }
+                    }
+                }
+                Ok(uncovered)
+            })
+            .unwrap();
+        assert!(
+            uncovered.is_empty(),
+            "a new column must be set to a non-default value in this fixture: {} holds only NULL \
+             or its default in every row of the victim's, so the whole-row compare cannot tell a \
+             restore that dropped it from one that kept it",
+            uncovered.join(", ")
+        );
+    }
+
+    /// The columns the whole-row compare leaves out of `table`: `edges.id` alone, which the
+    /// cascade snapshot deliberately does not carry, so a restored edge takes a fresh id (the
+    /// priced cost on `an_item_delete_is_undoable_after_its_edge_id_has_been_reissued`).
+    fn cascade_compare_skip(table: &str) -> &'static [&'static str] {
+        if table == "edges" {
+            &["id"]
+        } else {
+            &[]
+        }
     }
 
     /// **The tripwire on the item-delete cascade's hand-written column lists.**
@@ -2619,25 +2728,31 @@ mod tests {
     ///
     /// So this compares **whole rows** — every column the live schema has, the same shape as
     /// `undoing_a_delete_restores_the_whole_row_for_every_deleter` — before the removal and after
-    /// the undo, with every column given a non-default value so an omission cannot restore it by
-    /// luck. It also derives the set of cascading tables from the schema, so a table added later
-    /// with an `ON DELETE CASCADE` onto `items` fails here until somebody decides whether undo
-    /// restores it.
+    /// the undo. Three checks make that compare mean something for columns nobody has added yet:
     ///
-    /// **The one deliberate exception is `edges.id`**: the snapshot does not carry it, so a
-    /// restored edge takes a fresh id (the priced cost on
-    /// `an_item_delete_is_undoable_after_its_edge_id_has_been_reissued`).
+    /// - the set of cascading tables is read from the schema, so a table added later with an
+    ///   `ON DELETE CASCADE` onto `items` fails until somebody decides whether undo restores it
+    ///   ([`assert_every_cascade_table_is_accounted_for`]);
+    /// - every restored table must hold a row naming the victim;
+    /// - every column of every restored table must be set, in at least one of the victim's rows,
+    ///   to a value that is neither NULL nor its default ([`assert_every_column_is_set`]). A
+    ///   compare alone cannot catch a new column: unset, it holds its default before the delete
+    ///   and a snapshot that drops it restores the same default. With this check the new column
+    ///   fails here until the fixture sets it — and then the compare catches a snapshot that
+    ///   omits it. (Measured: adding `bindings.extra TEXT` or `placements.flag INTEGER NOT NULL
+    ///   DEFAULT 0` passed before this check existed.)
+    ///
+    /// **The one deliberate exception is `edges.id`** ([`cascade_compare_skip`]).
     #[test]
     fn undoing_an_item_delete_restores_every_cascaded_row_whole() {
         use crate::{binding, containment, edge, item, ns, placement, tag};
         use jkb_types::{EdgeType, PlacementRole, SyncMode};
         use serde_json::json;
 
-        const EDGE_ID_EXCEPTION: &[&str] = &["id"];
-
         assert_every_cascade_table_is_accounted_for();
 
         let db = Db::open_in_memory().unwrap();
+        let defaults_before = evaluated_defaults(&db);
         let victim = db
             .write_txn("t", |c, m| {
                 let victim = upsert(c, m, &note("victim"))?;
@@ -2689,13 +2804,7 @@ mod tests {
             })
             .unwrap();
 
-        let skip = |table: &str| -> &'static [&'static str] {
-            if table == "edges" {
-                EDGE_ID_EXCEPTION
-            } else {
-                &[]
-            }
-        };
+        let skip = cascade_compare_skip;
         let tables: Vec<&'static str> = std::iter::once("items").chain(CASCADE_RESTORED).collect();
         let before: Vec<_> = tables.iter().map(|t| dump_rows(&db, t, skip(t))).collect();
 
@@ -2704,6 +2813,13 @@ mod tests {
             let held = rows_naming(&db, table, victim.get());
             assert!(held > 0, "setup: the victim has no row in `{table}`");
         }
+        assert_every_column_is_set(
+            &db,
+            victim.get(),
+            skip,
+            &defaults_before,
+            &evaluated_defaults(&db),
+        );
 
         db.write_txn("t", move |c, m| {
             item::remove(c, m, victim, true).map(|_| ())
