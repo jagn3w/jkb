@@ -4161,7 +4161,12 @@ fn dispose_session(
                 accept_dirty: false,
             },
         )? {
-            archive::Disposed::Archived(dest) => disposal = Disposal::Archived(dest),
+            archive::Disposed::Archived { dest, branch_note } => {
+                if let Some(note) = branch_note {
+                    eprintln!("note: {note}");
+                }
+                disposal = Disposal::Archived(dest);
+            }
             archive::Disposed::Deferred(d) => disposal = Disposal::Deferred(d),
         }
     }

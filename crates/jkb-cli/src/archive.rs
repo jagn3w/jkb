@@ -249,7 +249,7 @@ impl<'a> Stores<'a> {
 
     /// Confine records to `root` rather than this process's `~/repos`.
     #[cfg(test)]
-    const fn with_shared_root(mut self, root: &'a Path) -> Self {
+    pub(crate) const fn with_shared_root(mut self, root: &'a Path) -> Self {
         self.shared_root = Some(root);
         self
     }
@@ -854,7 +854,15 @@ impl Deferral {
 /// What became of a worktree this process tried to dispose of.
 pub enum Disposed {
     /// Moved into the repo's archive.
-    Archived(PathBuf),
+    Archived {
+        /// Where the tree went.
+        dest: PathBuf,
+        /// When the plan asked for the branch to go and it did not — it moved past the head
+        /// read from the tree, a worktree has it checked out, or git would not say — why, for
+        /// the caller to print. Returned rather than printed here so a caller can tell that
+        /// this disposal's verdict on the branch was reached, and must not be re-decided.
+        branch_note: Option<String>,
+    },
     /// Nothing moved — this process may not unlink the tree — and a record was left for the
     /// reaper. Carries the refusal, because "it did not work" without the reason is what makes an
     /// operator go looking in the wrong place.
@@ -927,13 +935,12 @@ pub fn dispose(
                 );
             }
             let _ = gitrepo::forget_worktree(repo_root, worktree);
-            if plan.delete_branch {
-                if let Some(note) = delete_disposed_branch(repo_root, branch, entry.head.as_deref())
-                {
-                    eprintln!("note: {note}");
-                }
-            }
-            Ok(Disposed::Archived(dest))
+            let branch_note = if plan.delete_branch {
+                delete_disposed_branch(repo_root, branch, entry.head.as_deref())
+            } else {
+                None
+            };
+            Ok(Disposed::Archived { dest, branch_note })
         }
         // A SESSION CANNOT ARCHIVE ITSELF, and that is the ordinary case rather than an error:
         // the refusal covers the session's own working directories, and every other process — the
@@ -3154,18 +3161,17 @@ pub(crate) mod tests {
             },
         )
         .expect("disposed");
-        assert!(
-            matches!(out, Disposed::Archived(_)),
-            "the premise: archived"
-        );
+        let Disposed::Archived { branch_note, .. } = out else {
+            panic!("the premise: archived")
+        };
 
         assert_eq!(
             git(&repo, &["rev-parse", &format!("refs/heads/{branch}")]),
             moved,
             "the branch survives, with the commit past the head that was read"
         );
-        // What `dispose` printed, asked again of the same function: kept, and naming where.
-        let note = delete_disposed_branch(&repo, &branch, Some(&head)).expect("reported");
+        // Kept, and said so — naming where it is.
+        let note = branch_note.expect("reported");
         assert!(note.contains(&moved) && note.contains(&branch), "{note}");
     }
 
@@ -3201,10 +3207,9 @@ pub(crate) mod tests {
             },
         )
         .expect("disposed");
-        assert!(
-            matches!(out, Disposed::Archived(_)),
-            "the premise: archived"
-        );
+        let Disposed::Archived { branch_note, .. } = out else {
+            panic!("the premise: archived")
+        };
 
         assert_eq!(
             git(&repo, &["rev-parse", &format!("refs/heads/{branch}")]),
@@ -3216,7 +3221,7 @@ pub(crate) mod tests {
             head,
             "and the checkout holding it still has its commit"
         );
-        let note = delete_disposed_branch(&repo, &branch, Some(&head)).expect("reported");
+        let note = branch_note.expect("reported");
         assert!(note.contains("checked out"), "{note}");
     }
 
@@ -3289,7 +3294,7 @@ pub(crate) mod tests {
             },
         )
         .expect("an archivable session is archived, not refused");
-        let Disposed::Archived(dest) = out else {
+        let Disposed::Archived { dest, .. } = out else {
             panic!("stow can succeed here, so it must have")
         };
         assert!(dest.exists(), "the tree really moved");

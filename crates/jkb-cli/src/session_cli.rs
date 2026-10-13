@@ -1355,7 +1355,7 @@ pub(crate) fn abandon(
         }
     }
 
-    let deferred = abandon_session(
+    let disposal = abandon_session(
         stores,
         &ctx,
         sess.as_ref(),
@@ -1364,44 +1364,11 @@ pub(crate) fn abandon(
         delete_branch,
         force,
     )?;
-    // Deleting the branch leaves the history alone, and that is correct: an entry says what
-    // happened at a moment, and a branch deleted afterwards does not make it untrue. Nothing is
-    // keyed by the name, so the next `jkb task work` cutting a **new** branch under the same
-    // name cannot inherit anything from the old one — which is what the cut point this used to
-    // have to forget was for.
-    // NOT while the worktree still holds it. When the disposal deferred, the checkout is still
-    // there with this branch checked out, and `git branch -D` refuses outright — which `?` turned
-    // into a bail BEFORE the claim was released, leaving the task `in_progress`, claimed by a
-    // session whose worktree still exists (so `is_alive` says Yes) and therefore reclaimable by
-    // nothing. Re-running failed identically. The decision is already in the record's `Plan`, and
-    // `delete_branch_if_any` applies it once the tree is out of the way.
-    // Through the disposal's own compare-and-delete, at the tip read just before: a branch git
-    // cannot speak for, one checked out elsewhere, or one that moves in between is kept and said
-    // so — never a bail here, which would land before the claim is released (the wedge above).
-    if delete_branch && deferred.is_none() {
-        let read = archive::branch_tip(&ctx.root, &branch);
-        if let Some(note) = delete_abandoned_branch(&ctx.root, &branch, read) {
-            eprintln!("note: {note}");
-        }
+    let deferred = disposal.deferral();
+    let (branch_fate, notes) = abandoned_branch(&ctx.root, &branch, delete_branch, &disposal)?;
+    for note in notes {
+        eprintln!("note: {note}");
     }
-    // Read from git rather than from what this function did: `dispose` deletes the branch itself
-    // when it archived the tree, so a flag set here would report `false` for a branch that is
-    // gone. Asked once, after everything that could have removed it.
-    // Read from git rather than from what this function did — `dispose` deletes the branch itself
-    // when it archived the tree — and folded into ONE value, so no two lines can disagree.
-    // Three-valued, and an unestablished answer is reported as still there rather than as gone:
-    // saying a branch was deleted when git could not say is what stops somebody looking for it.
-    // `deferred.is_some()` is passed because "the reaper will delete it" is a claim about the
-    // RECORD, not about the branch: with the tree archived (or already gone) there is no record,
-    // so nothing will ever apply the plan and the operator has to do it themselves.
-    let still_there = gitrepo::has_branch(&ctx.root, &branch)?;
-    let branch_fate = branch_fate(
-        delete_branch,
-        still_there,
-        deferred
-            .as_ref()
-            .is_some_and(archive::Deferral::will_be_swept),
-    );
 
     // Release, and reopen unless the task is already finished (`task.abandon`).
     //
@@ -1431,7 +1398,7 @@ pub(crate) fn abandon(
             reopened,
             final_status: &final_status,
             worktree_removed: sess.is_some() && deferred.is_none(),
-            deferred: deferred.as_ref(),
+            deferred,
             branch: branch_fate,
         },
         json,
@@ -1439,8 +1406,87 @@ pub(crate) fn abandon(
     Ok(())
 }
 
-/// `abandon --delete-branch`'s own deletion, when nothing was deferred: at the tip `read` found,
-/// and only while the branch is still there. The line to print when it was not deleted, if any.
+/// What [`abandon_session`] did with the session's checkout — which decides who carries out
+/// `--delete-branch`.
+enum SessionDisposal {
+    /// No disposal ran: there was no session, or its checkout was proven gone. Nothing has decided
+    /// the branch, so `--delete-branch` is `abandon`'s own to carry out.
+    NotRun,
+    /// `dispose` archived the checkout and applied `--delete-branch` itself, at the head it read
+    /// from the tree. Its verdict stands: re-deciding it here at the CURRENT tip, which always
+    /// matches, deleted the very branch `dispose` had just kept and said so.
+    Archived {
+        /// Why `dispose` did not delete the branch it was asked to, if it did not.
+        branch_note: Option<String>,
+    },
+    /// Not moved; the record's plan carries the decision to the sweep.
+    Deferred(archive::Deferral),
+}
+
+impl SessionDisposal {
+    const fn deferral(&self) -> Option<&archive::Deferral> {
+        match self {
+            Self::Deferred(d) => Some(d),
+            Self::NotRun | Self::Archived { .. } => None,
+        }
+    }
+}
+
+/// The branch half of `abandon`, once the checkout is dealt with: what became of the branch, and
+/// the lines to print about a deletion asked for and not carried out.
+///
+/// Deleting the branch leaves the history alone, and that is correct: an entry says what happened
+/// at a moment, and a branch deleted afterwards does not make it untrue. Nothing is keyed by the
+/// name, so the next `jkb task work` cutting a **new** branch under the same name cannot inherit
+/// anything from the old one.
+///
+/// # Errors
+/// Returns an error only if `git` cannot be executed to ask whether the branch is still there.
+fn abandoned_branch(
+    root: &Path,
+    branch: &str,
+    delete_branch: bool,
+    disposal: &SessionDisposal,
+) -> Result<(BranchFate, Vec<String>)> {
+    let mut notes = Vec::new();
+    match disposal {
+        // ONLY when no disposal ran. Not while a deferred worktree still holds the branch: the
+        // decision is already in the record's `Plan`, and `delete_branch_if_any` applies it once
+        // the tree is out of the way (a `git branch -D` here once bailed through `?` before the
+        // claim was released, wedging the task). And not after an archive: `dispose` deleted, or
+        // kept and reported, already. Through the disposal's own compare-and-delete at the tip
+        // read just before, so a branch git cannot speak for, one checked out elsewhere, or one
+        // that moves in between is kept and said so — never a bail ahead of the claim release.
+        SessionDisposal::NotRun if delete_branch => notes.extend(delete_abandoned_branch(
+            root,
+            branch,
+            archive::branch_tip(root, branch),
+        )),
+        SessionDisposal::Archived {
+            branch_note: Some(note),
+        } => notes.push(note.clone()),
+        SessionDisposal::NotRun
+        | SessionDisposal::Archived { branch_note: None }
+        | SessionDisposal::Deferred(_) => {}
+    }
+    // Read from git rather than from what this function did, asked once after everything that
+    // could have removed it, and folded into ONE value so no two lines can disagree. Three-valued:
+    // an unestablished answer is reported as still there, since saying a branch was deleted when
+    // git could not say is what stops somebody looking for it. "The reaper will delete it" is a
+    // claim about the RECORD, not the branch: with the tree archived (or already gone) there is
+    // no record, so nothing will ever apply the plan and the operator has to do it themselves.
+    let fate = branch_fate(
+        delete_branch,
+        gitrepo::has_branch(root, branch)?,
+        disposal
+            .deferral()
+            .is_some_and(archive::Deferral::will_be_swept),
+    );
+    Ok((fate, notes))
+}
+
+/// `abandon --delete-branch`'s own deletion, when no disposal ran: at the tip `read` found, and
+/// only while the branch is still there. The line to print when it was not deleted, if any.
 fn delete_abandoned_branch(root: &Path, branch: &str, read: archive::Tip) -> Option<String> {
     let at = read.oid().map(str::to_owned);
     archive::delete_branch_planned(root, branch, at.as_deref(), read).note(root, branch)
@@ -1458,8 +1504,10 @@ fn abandon_session(
     uid: &str,
     delete_branch: bool,
     force: bool,
-) -> Result<Option<archive::Deferral>> {
-    let Some(sess) = sess else { return Ok(None) };
+) -> Result<SessionDisposal> {
+    let Some(sess) = sess else {
+        return Ok(SessionDisposal::NotRun);
+    };
     // ALREADY GONE is its own outcome, not a deferral. Without this arm `dispose` reported that
     // the tree "could not be archived from in here" — true, but because there was nothing to
     // archive — and handed `--delete-branch` to a sweep with nothing to do, so the branch was
@@ -1476,7 +1524,7 @@ fn abandon_session(
         .is_no()
     {
         let _ = gitrepo::forget_worktree(&ctx.root, &sess.worktree);
-        return Ok(None);
+        return Ok(SessionDisposal::NotRun);
     }
     {
         if !force {
@@ -1514,10 +1562,9 @@ fn abandon_session(
         // also the verb an operator naturally reaches for to clear the directory a deferred
         // landing leaves behind, which made it the likeliest route to that state.
         //
-        // The branch is deleted only below, and only when asked: an abandoned branch holds the
-        // only copy of real work, which is why `--force` here discards a dirty tree but never
-        // the commits.
-        if let archive::Disposed::Deferred(d) = archive::dispose(
+        // The branch is deleted only when asked: an abandoned branch holds the only copy of real
+        // work, which is why `--force` here discards a dirty tree but never the commits.
+        match archive::dispose(
             stores,
             &ctx.root,
             &sess.worktree,
@@ -1535,10 +1582,12 @@ fn abandon_session(
                 accept_dirty: force,
             },
         )? {
-            return Ok(Some(d));
+            archive::Disposed::Archived { branch_note, .. } => {
+                Ok(SessionDisposal::Archived { branch_note })
+            }
+            archive::Disposed::Deferred(d) => Ok(SessionDisposal::Deferred(d)),
         }
     }
-    Ok(None)
 }
 
 /// What `abandon` actually did, so the report is built from outcomes rather than from the flags
@@ -2012,6 +2061,56 @@ mod tests {
         let read = archive::branch_tip(&repo, &branch);
         assert_eq!(super::delete_abandoned_branch(&repo, &branch, read), None);
         assert!(git(&repo, &["branch", "--list", &branch]).is_empty());
+    }
+
+    /// The composed path: `dispose` archives the session and keeps its branch, because the branch
+    /// moved past the head read from the tree. `abandon` used to follow that with its own delete at
+    /// the CURRENT tip — which always matches — so the branch `dispose` had just kept, and said it
+    /// kept, was deleted silently. `dispose`'s verdict stands: kept, one note, reported as kept.
+    #[test]
+    fn abandon_does_not_redecide_a_branch_its_disposal_kept() {
+        use crate::archive::{self, tests::git};
+        use jkb_api::LocalBackend;
+        let t = tempfile::tempdir().unwrap();
+        let db = t.path().join("jkb.db");
+        let b = LocalBackend::new(jkb_core::Db::open(&db).unwrap()).with_actor("cli");
+        let stores = archive::Stores::new(Kb::new(&b), Some(&db)).with_shared_root(t.path());
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = archive::tests::session(&repo, "sess");
+        // The checkout is left detached one commit behind its branch.
+        std::fs::write(wt.join("late.txt"), "past the read").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "late work"]);
+        let moved = git(&wt, &["rev-parse", "HEAD"]);
+        git(&wt, &["checkout", "-q", "--detach", &head]);
+        let ctx = crate::repo::RepoCtx {
+            root: repo.clone(),
+            key: "repo".to_owned(),
+            trunk: None,
+        };
+        let sess = crate::session::Session {
+            name: "sess".to_owned(),
+            worktree: wt.clone(),
+            branch: branch.clone(),
+        };
+
+        let disposal =
+            super::abandon_session(&stores, &ctx, Some(&sess), &branch, "task:t", true, false)
+                .unwrap();
+        assert!(
+            matches!(disposal, super::SessionDisposal::Archived { .. }),
+            "the premise: archived"
+        );
+        let (fate, notes) = super::abandoned_branch(&repo, &branch, true, &disposal).unwrap();
+
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/heads/{branch}")]),
+            moved,
+            "the branch dispose kept survives, with `late work`"
+        );
+        assert_eq!(notes.len(), 1, "exactly one note, dispose's: {notes:?}");
+        assert!(notes[0].contains(&moved), "{notes:?}");
+        assert!(fate == crate::BranchFate::Kept, "reported as kept");
     }
 
     /// A branch another worktree has checked out is kept and reported. `git branch -D` refused
