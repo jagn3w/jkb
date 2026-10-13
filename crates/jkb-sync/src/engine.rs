@@ -2581,14 +2581,19 @@ fn set_task_columns(conn: &Connection, meta: &WriteMeta, id: ItemId, it: &SyncIt
 /// because it would close a cycle, as `(dependent, dependency)` local ids, for [`apply_doc`] to
 /// park.
 ///
-/// **The file owns an edge between two of its tasks, at least one of them still in it**
-/// ([`FileEdges::owns`]): both ends in `doc` or bound to the file until this import (`existing`, a
-/// line just removed), and not both removed. Those are the edges a line can express or has just
-/// stopped expressing. An edge to a task that was never in the file (a `jkb task depend` from a
-/// filed task to a task in no file, or in another file) is left alone: this used to reset each
-/// filed task's outgoing edges to the in-file ones, so the next import of the file silently
-/// dropped every such dependency and put the task back on the frontier. An edge between two
-/// removed tasks is left alone too: they are cancelled and detached, and keep their history.
+/// **The file owns an edge between two of its tasks** — tasks in `doc`, or bound to the file until
+/// this import (`existing`, a line just removed) — as [`FileEdges::owns`] decides per type. Those
+/// are the edges a line can express or has just stopped expressing. An edge to a task that was
+/// never in the file (a `jkb task depend` from a filed task to a task in no file, or in another
+/// file) is left alone: this used to reset each filed task's outgoing edges to the in-file ones, so
+/// the next import of the file silently dropped every such dependency and put the task back on the
+/// frontier.
+///
+/// A removed task is cancelled and detached and keeps its edges and history (D25), so a
+/// `depends_on` FROM it is never touched: reopened, it still waits on what it waited on. The one
+/// exception is a `parent_of` from a removed parent to a task still in the file, which goes with
+/// its containment row — left in place, it kept the open child inside a cancelled parent that
+/// every listing hides, so the child was reachable nowhere.
 ///
 /// An edge the file does not own can close a cycle with one it declares: `^ghost` depends, through
 /// a task outside the file, on `^fix`, and the file says `^fix needs:^ghost`. `edge::link` refuses
@@ -2634,7 +2639,7 @@ fn reconcile_edges(
         let mut gone: Vec<(ItemId, ItemId)> = Vec::new();
         let mut have: HashSet<(ItemId, ItemId)> = HashSet::new();
         for (src, dsts) in edge::edges_from_many(conn, &srcs, kind)? {
-            for dst in dsts.into_iter().filter(|&d| file.owns(src, d)) {
+            for dst in dsts.into_iter().filter(|&d| file.owns(kind, src, d)) {
                 have.insert((src, dst));
                 if !want.contains(&(src, dst)) {
                     gone.push((src, dst));
@@ -2674,11 +2679,20 @@ struct FileEdges {
 }
 
 impl FileEdges {
-    /// Whether the edge `src -> dst` (or the containment row of `dst` in `src`) is the file's:
-    /// both ends are its tasks and at least one is still in it.
-    fn owns(&self, src: ItemId, dst: ItemId) -> bool {
+    /// Whether the `kind` edge `src -> dst` is the file's. Both ends must be its tasks; then
+    /// a `depends_on` is owned only from a task still in the file, and a `parent_of` (and the
+    /// containment row of `dst` in `src`, which stands beside it) whenever either end still is.
+    /// No other type is reconciled by a file.
+    fn owns(&self, kind: EdgeType, src: ItemId, dst: ItemId) -> bool {
         let mine = |id: ItemId| self.in_doc.contains(&id) || self.removed.contains(&id);
-        mine(src) && mine(dst) && (self.in_doc.contains(&src) || self.in_doc.contains(&dst))
+        if !(mine(src) && mine(dst)) {
+            return false;
+        }
+        match kind {
+            EdgeType::DependsOn => self.in_doc.contains(&src),
+            EdgeType::ParentOf => self.in_doc.contains(&src) || self.in_doc.contains(&dst),
+            _ => false,
+        }
     }
 }
 
@@ -2723,7 +2737,7 @@ fn reconcile_containment(
     children.sort_unstable();
     for child in children {
         if let Some(cur) = containment::parent(conn, child)? {
-            if file.owns(cur, child) && declared.get(&child) != Some(&cur) {
+            if file.owns(EdgeType::ParentOf, cur, child) && declared.get(&child) != Some(&cur) {
                 containment::uncontain(conn, meta, child)?;
             }
         }

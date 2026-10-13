@@ -3982,6 +3982,36 @@ fn a_deleted_parent_line_releases_its_open_subtask() {
     assert_eq!(container_of(&db, &write), Some(ship_id));
 }
 
+/// A task whose line is deleted keeps its dependencies (D25): reopened, it still waits on the task
+/// it needed, rather than landing on the frontier ahead of it.
+#[test]
+fn a_deleted_dependents_line_keeps_its_dependency() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n- [ ] Write it needs:^ship ^write\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let (ship, write) = (format!("{uri}#ship"), format!("{uri}#write"));
+    let write_id = item_of(&db, &write);
+
+    fs::write(&file, "## Work\n- [ ] Ship it ^ship\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(kb_status(&db, &write).as_deref(), Some("cancelled"));
+    db.write_txn("t", move |conn, meta| {
+        task::set_status(conn, meta, write_id, jkb_types::TaskStatus::Open)
+    })
+    .unwrap();
+    let ready = ready_uids(&db);
+    assert!(ready.contains(&ship), "{ready:?}");
+    assert!(!ready.contains(&write), "still waits on ^ship: {ready:?}");
+}
+
 /// An import that changes nothing about a task's parent journals no containment write, so a sync
 /// of an unrelated edit does not grow the changelog by a row per subtask.
 #[test]
