@@ -2210,13 +2210,22 @@ pub fn prepare_graft_tree(root: &Path, path: &Path, onto: &str) -> Result<()> {
             root.display()
         )
     })?;
-    let here = physical(path);
-    let registered = listed.iter().any(|w| physical(&w.path) == here);
     let present = match fs::symlink_metadata(path) {
+        // A SYMLINK IS REFUSED BEFORE ANY GIT COMMAND RUNS THROUGH IT. Canonicalized, a link to the
+        // main checkout or to a session equals that registered worktree, and the reset and clean
+        // below would then run in the user's own tree — deleting untracked files git has no copy
+        // of. Only a real directory at this exact path is known to be jkb's.
+        Ok(m) if m.file_type().is_symlink() => anyhow::bail!(
+            "{} is a symlink, so it is not used as jkb's graft checkout — look at it, then move it \
+             out of the way and land again",
+            path.display()
+        ),
         Ok(_) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => return Err(e).with_context(|| format!("examining {}", path.display())),
     };
+    let here = physical(path);
+    let registered = listed.iter().any(|w| physical(&w.path) == here);
     match (registered, present) {
         (false, true) => anyhow::bail!(
             "{} exists but git does not know it as a worktree, so it is not reused as jkb's graft \
@@ -3660,6 +3669,39 @@ mod tests {
             std::fs::read_to_string(at.join("keep.txt")).unwrap(),
             "someone's"
         );
+    }
+
+    /// **A symlink at the graft path is refused before any git command runs through it.** Linked to
+    /// the main checkout, it canonicalizes to a registered worktree, and the reset and clean would
+    /// otherwise discard the user's own tracked edit and delete their untracked file.
+    #[test]
+    fn a_symlink_at_the_graft_path_is_refused_before_git_runs_through_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        grafting_fixture(dir);
+        std::fs::create_dir_all(dir.join(".jkb")).unwrap();
+        let at = dir.join(".jkb").join("graft");
+        std::os::unix::fs::symlink(dir, &at).unwrap();
+        std::fs::write(dir.join("only-copy.txt"), "untracked\n").unwrap();
+        std::fs::write(dir.join("base.txt"), "edited").unwrap();
+
+        let err = super::prepare_graft_tree(dir, &at, "main").expect_err("used through the link");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("is a symlink") && msg.contains("move it out of the way"),
+            "{msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("only-copy.txt")).unwrap(),
+            "untracked\n",
+            "the user's untracked file was deleted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("base.txt")).unwrap(),
+            "edited",
+            "the user's tracked edit was discarded"
+        );
+        assert_eq!(current_branch(dir).unwrap().as_deref(), Some("main"));
     }
 
     /// A conflict aborts the rebase and leaves the target and its checkout untouched; the graft
