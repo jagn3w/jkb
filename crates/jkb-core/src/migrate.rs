@@ -1012,7 +1012,9 @@ mod edges_namespaces_autoincrement_tests {
 
     /// V030 adds each item's content revision and the provenance table, and changes nothing
     /// else a reader sees: every item starts at revision 0, documents that already have chunks
-    /// record they were cut at 0 (so they are not re-cut), nothing else is marked as cut, and no
+    /// record they were cut at 0 (so they are not re-cut) — or at -1 when their `content_hash` no
+    /// longer matches their `b3:` uid, the mark of an edit since capture, so they are re-cut —
+    /// nothing else is marked as cut, and no
     /// vector has a provenance row — so every vector written before the upgrade reads as pending
     /// until it is replaced. Then the trigger: a content change bumps the revision, an identical
     /// write does not, the count cannot be lowered, and FTS stays consistent through the bump.
@@ -1026,14 +1028,22 @@ mod edges_namespaces_autoincrement_tests {
             .unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         conn.execute_batch(
-            "INSERT INTO items (id, uid, kind, content) VALUES
-                 (1, 'b3:cut', 'document', 'a chunked document'),
-                 (2, 'b3:cut:0', 'chunk', 'a chunked document'),
-                 (3, 'doc:synced', 'document', 'a synced document'),
-                 (4, 'n:note', 'note', 'a note'),
-                 (5, 'b3:other', 'document', 'linked to a note, not a chunk');
+            "INSERT INTO items (id, uid, kind, content, content_hash) VALUES
+                 (1, 'b3:cut', 'document', 'a chunked document', 'cut'),
+                 (2, 'b3:cut:0', 'chunk', 'a chunked document', NULL),
+                 (3, 'doc:synced', 'document', 'a synced document', NULL),
+                 (4, 'n:note', 'note', 'a note', NULL),
+                 (5, 'b3:other', 'document', 'linked to a note, not a chunk', 'other'),
+                 -- Ingested, then edited before the upgrade: `set_content` cleared its hash, and
+                 -- its chunk still holds the captured text.
+                 (6, 'b3:edited', 'document', 'what it says now', NULL),
+                 (7, 'b3:edited:0', 'chunk', 'what it said when captured', NULL),
+                 -- Ingested, then re-synced with another hash.
+                 (8, 'b3:synced', 'document', 'resynced text', 'f00d'),
+                 (9, 'b3:synced:0', 'chunk', 'the captured text', NULL);
              INSERT INTO edges (src_item_id, dst_item_id, type) VALUES
-                 (2, 1, 'derived_from'), (4, 5, 'derived_from');",
+                 (2, 1, 'derived_from'), (4, 5, 'derived_from'), (7, 6, 'derived_from'),
+                 (9, 8, 'derived_from');",
         )
         .unwrap();
 
@@ -1053,7 +1063,11 @@ mod edges_namespaces_autoincrement_tests {
                 (2, 0, None),
                 (3, 0, None),
                 (4, 0, None),
-                (5, 0, None)
+                (5, 0, None),
+                (6, 0, Some(-1)),
+                (7, 0, None),
+                (8, 0, Some(-1)),
+                (9, 0, None)
             ]
         );
         let sources: i64 = conn

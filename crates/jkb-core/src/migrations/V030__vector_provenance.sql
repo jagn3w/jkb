@@ -13,8 +13,9 @@
 --   items.chunked_rev   the content_rev the item's chunks were cut from. Written only by the
 --                       chunker (`jkb-ingest`), beside the chunks it cuts. NULL for an item the
 --                       chunker never cut — a synced document, a note — which is embedded from its
---                       own text. Backfilled to 0 for the documents that already have chunks:
---                       those chunks were cut from the text the document holds at rev 0.
+--                       own text. Backfilled for the documents that already have chunks: 0, as
+--                       they were cut from the text it holds at rev 0 — or -1 if it was edited
+--                       since its capture (below), so it is re-cut.
 --   vector_sources      the content_rev each stored vector was computed from, and `seq`, a
 --                       store-wide write counter. Written only by the one vector writer,
 --                       `jkb_index::VectorIndexer::upsert_vector`, beside the vector and only if
@@ -33,7 +34,13 @@
 ALTER TABLE items ADD COLUMN content_rev INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE items ADD COLUMN chunked_rev INTEGER;
 
-UPDATE items SET chunked_rev = 0
+-- A chunked document whose text was edited before this migration still holds the chunks of its
+-- captured text, and nothing counted the edit. Ingest stores a document as uid `b3:<hash>` with
+-- `content_hash` `<hash>` (for source bytes and for text alike); an edit through the content repo
+-- clears or replaces `content_hash`, so one that no longer matches its uid was edited. It is recorded
+-- as cut at -1, a revision no text ever has, so the first embed pass re-cuts it from what it says now
+-- rather than storing its old chunks' centroid under its new text for ever.
+UPDATE items SET chunked_rev = CASE WHEN content_hash IS NOT substr(uid, 4) THEN -1 ELSE 0 END
  WHERE kind = 'document'
    AND EXISTS (SELECT 1 FROM edges e JOIN items c ON c.id = e.src_item_id
                 WHERE e.dst_item_id = items.id AND e.type = 'derived_from' AND c.kind = 'chunk');
