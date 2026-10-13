@@ -337,6 +337,97 @@ fn task_edit_appends_a_body_to_a_file_backed_task_but_refuses_a_blank_line() {
         .stdout(predicate::str::contains("appended"));
 }
 
+/// A `needs:^id` word in a file-backed task's text is refused: the one-task probe keeps it as words,
+/// but the file defines the id and reads the line back as a dependency the knowledge base does not
+/// have — a disagreement no later sync would report. A task whose dangling `needs:` the file itself
+/// put in its title (kept as words, reported by the sync) still takes every other write.
+#[test]
+fn a_needs_word_in_a_file_backed_tasks_text_is_refused_but_an_imported_one_blocks_nothing() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = dir.path().canonicalize().unwrap().join("proj");
+    std::fs::create_dir_all(&repo).unwrap();
+    let file = repo.join("tasks.md");
+    let text = "## Backend\n- [ ] Set up CI ^setup\n- [ ] Fix flaky test needs:^ghost ^fix\n\
+                - [ ] Ship button ^ship\n";
+    std::fs::write(&file, text).unwrap();
+    jkb(&db)
+        .args([
+            "mount",
+            "create",
+            "work",
+            repo.to_str().unwrap(),
+            "--serializer",
+            "tasks",
+        ])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["sync", "work"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("needs:^ghost"));
+    let uid = |id: &str| format!("file://{}#{id}", file.display());
+    let content = |id: &str| {
+        let out = jkb(&db)
+            .args(["--json", "task", "show", &uid(id)])
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["content"].as_str().unwrap().to_owned()
+    };
+    assert_eq!(content("fix"), "Fix flaky test needs:^ghost");
+
+    // The edit that would leave the file and the knowledge base disagreeing is refused.
+    jkb(&db)
+        .args(["task", "edit", &uid("ship"), "Ship button needs:^setup"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("`needs:^setup`"))
+        .stderr(predicate::str::contains("jkb task depend"));
+    assert_eq!(content("ship"), "Ship button");
+    jkb(&db).args(["sync", "work"]).assert().success();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+
+    // The imported token does not hold the task hostage: an append, a status and a priority land.
+    jkb(&db)
+        .args(["task", "edit", &uid("fix"), "--append", "seen in CI"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args([
+            "task",
+            "set",
+            &uid("fix"),
+            "--status",
+            "in_progress",
+            "--priority",
+            "1",
+        ])
+        .assert()
+        .success();
+    assert_eq!(content("fix"), "Fix flaky test needs:^ghost\nseen in CI");
+    jkb(&db).args(["sync", "work"]).assert().success();
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("- [~] Fix flaky test needs:^ghost !p1 ^fix\n  seen in CI\n"),
+        "{}",
+        std::fs::read_to_string(&file).unwrap()
+    );
+    // But an edit cannot add a second one.
+    jkb(&db)
+        .args([
+            "task",
+            "edit",
+            &uid("fix"),
+            "Fix flaky test needs:^ghost needs:^ship",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("`needs:^ship`"));
+}
+
 #[test]
 fn ns_ls_shows_created_namespaces() {
     let dir = TempDir::new().unwrap();

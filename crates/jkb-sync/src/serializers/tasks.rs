@@ -566,7 +566,7 @@ pub fn task_content_problem(content: &str) -> Option<String> {
     let Ok(bytes) = TasksSerializer.render(&doc) else {
         return Some("it cannot be written as a task line".to_owned());
     };
-    let Ok(back) = TasksSerializer.parse(&bytes) else {
+    let Ok((back, warnings)) = TasksSerializer.parse_with_warnings(&bytes) else {
         return Some("the task line it makes does not parse".to_owned());
     };
     if back.items.len() > 1 {
@@ -606,19 +606,52 @@ pub fn task_content_problem(content: &str) -> Option<String> {
             trailing.join(", ")
         ));
     }
-    (task.content != content).then(|| {
+    if task.content != content {
         const SHOWN: usize = 200;
         let mut shown: String = task.content.chars().take(SHOWN).collect();
         if task.content.chars().nth(SHOWN).is_some() {
             shown.push('…');
         }
-        format!(
+        return Some(format!(
             "it would be read back as {shown:?} (quotes are dropped, runs of spaces and tabs close \
              up, spaces are taken off the ends of the title and the start of every body line, and a \
              trailing `^id` becomes the task's identity) — `task edit` with the text as it should \
              read replaces it"
+        ));
+    }
+    // Last, so any other problem is named first. A `needs:^id` naming no task is kept as words —
+    // but only because the one-task probe defines no id. In the real file the id may well exist,
+    // and then the line is read back as a dependency the knowledge base does not have: the two
+    // disagree, permanently and without a word. The probe's warning is exactly that case.
+    (!warnings.is_empty()).then(|| {
+        let mut tokens: Vec<&str> = trailing_modifier_words(content)
+            .filter(|w| matches!(classify(w), Some(Modifier::Dep(_))))
+            .collect();
+        tokens.sort_unstable();
+        tokens.dedup();
+        format!(
+            "its title has {}, which the tasks.md reads as a dependency as soon as the file has a task \
+             with that id, while the knowledge base keeps it as words — record a dependency with \
+             `jkb task depend` instead",
+            tokens
+                .iter()
+                .map(|t| format!("`{t}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     })
+}
+
+/// The trailing run of modifier-shaped words on `content`'s first line (its title): the words a
+/// task line reads as modifiers rather than title (see [`parse_task_tokens`]).
+fn trailing_modifier_words(content: &str) -> impl Iterator<Item = &str> {
+    content
+        .split('\n')
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .rev()
+        .take_while(|w| classify(w).is_some())
 }
 
 /// Why `item`'s line in a `tasks.md` would not come back as `item` — `None` when it would. `deps` are the
@@ -1361,10 +1394,33 @@ Some description.
     }
 
     #[test]
-    fn a_content_probe_with_a_needs_naming_nothing_round_trips() {
-        // `task_content_problem` renders the content as a one-task file. A `needs:^x` in a title
-        // names no task there, so it is read back as the same title text.
-        assert_eq!(super::task_content_problem("Ship it needs:^x"), None);
+    fn task_text_with_a_needs_word_is_named_as_a_dependency_problem() {
+        // The one-task probe defines no id, so it reads `needs:^x` back as title words; the real
+        // file may define `x` and read it as a dependency the knowledge base does not have.
+        for text in [
+            "Ship it needs:^x",
+            "Ship it needs:^x\nbody",
+            "Ship needs:^y needs:^x",
+        ] {
+            let problem = super::task_content_problem(text);
+            assert!(
+                problem
+                    .as_deref()
+                    .is_some_and(|p| p.contains("`needs:^x`") && p.contains("jkb task depend")),
+                "{text:?}: {problem:?}"
+            );
+        }
+        // Only a well-formed `needs:^…` word is one; text that merely mentions needs is fine.
+        assert_eq!(
+            super::task_content_problem("Find what it needs: ^ caret"),
+            None
+        );
+        // Mid-title it is never read as a modifier, in the probe or in the file.
+        assert_eq!(super::task_content_problem("Ship needs:^x now"), None);
+        assert_eq!(
+            super::task_content_problem("Ship it\nbody says needs:^x"),
+            None
+        );
     }
 
     #[test]

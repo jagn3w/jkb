@@ -265,7 +265,8 @@ pub enum ContentEdit<'a> {
 /// refuses a result `tasks_problem` names — the tasks serializer's own round trip
 /// (`jkb_sync::task_content_problem`), handed in because core does not depend on it: a blank line
 /// ending the body, an indented checkbox becoming a child task, a trailing `^x` or `@x` becoming an
-/// identity or a due date. The *result* is judged, not the text sent. Any other item appends after a
+/// identity or a due date. The *result* is judged, not the text sent, and a result whose problem is the
+/// one the item's text already had, named identically, is let through. Any other item appends after a
 /// blank line. With `max_bytes`, a result longer than that is refused. A replace with an `expected`
 /// base is refused with [`Error::Stale`] unless the item's content is still exactly that base, so an
 /// editor whose draft started before someone else's write cannot erase it. Answers whether the item
@@ -316,7 +317,20 @@ pub fn edit_content(
         }
     }
     if tasks_file {
-        if let Some(problem) = tasks_problem(&content) {
+        // A problem the text already had, exactly as named, is not this edit's: the file itself can
+        // put one there (a `needs:^id` naming no task is imported as title words), and refusing every
+        // later edit — an append beneath it, say — would hold the task hostage to a line only the
+        // file can fix. The same rule `jkb_api::tasks::check_line` applies to the whole line. A
+        // different problem, or the same kind with more in it, is named differently and refused.
+        let problem = match tasks_problem(&content) {
+            Some(problem) => {
+                let before = get_content(conn, item)?;
+                let had = before.as_deref().and_then(tasks_problem);
+                (had.as_ref() != Some(&problem)).then_some(problem)
+            }
+            None => None,
+        };
+        if let Some(problem) = problem {
             return Err(TypeError::Validation(format!(
                 "this task is written into a tasks.md, and its text would not come back from the file \
                  as written: {problem}"
