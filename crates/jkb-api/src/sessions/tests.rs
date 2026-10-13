@@ -903,3 +903,122 @@ fn the_staging_read_lists_the_repo_s_landing_tasks() {
     assert!(targets(true).contains("old-batch"));
     assert!(targets(false).contains("batch"), "a live batch is listed");
 }
+
+fn why(b: &LocalBackend, uid: &str) -> Vec<crate::tasks::HistoryEntry> {
+    match call(b, json!({ "op": "task.why", "uid": uid })).unwrap() {
+        Response::History { entries, .. } => entries,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// One `task.start` is one entry in the task's history: the `start` row carries the branch and land
+/// target, so no `note` repeats them. A `note` is still the record when no transition row was written
+/// — a kept claim — since then nothing else carries where the work now is.
+#[test]
+fn a_start_is_one_entry_in_the_history() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = add(&b, "one action, one row +tasks/x");
+    assert!(start_on(&b, &uid, "host:1", None, "feat", "batch").unwrap());
+    let rows = why(&b, &uid);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(
+        (
+            row.event.as_str(),
+            row.from.as_deref(),
+            row.to.as_str(),
+            row.agent.as_deref(),
+            row.branch.as_deref(),
+            row.onto.as_deref(),
+        ),
+        (
+            "start",
+            Some("open"),
+            "in_progress",
+            Some("host:1"),
+            Some("feat"),
+            Some("batch")
+        ),
+        "{rows:?}"
+    );
+
+    // The same owner starting it again somewhere else: the declared `in_progress` self-loop, so
+    // again one `start` row carrying the new place, and no note beside it.
+    assert!(start_on(&b, &uid, "host:1", None, "feat2", "batch2").unwrap());
+    let rows = why(&b, &uid);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(
+        (
+            rows[1].event.as_str(),
+            rows[1].agent.as_deref(),
+            rows[1].branch.as_deref(),
+            rows[1].onto.as_deref()
+        ),
+        ("start", Some("host:1"), Some("feat2"), Some("batch2")),
+        "{rows:?}"
+    );
+
+    // A kept claim produces no transition, so the note is its only record.
+    assert!(call(
+        &b,
+        json!({ "op": "task.start", "uid": uid, "keep": "host:1",
+                "place": { "branch": "feat3", "repo": "proj", "onto": "batch3" } }),
+    )
+    .map(taken)
+    .unwrap());
+    let rows = why(&b, &uid);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(
+        (rows[2].event.as_str(), rows[2].branch.as_deref()),
+        ("note", Some("feat3")),
+        "{rows:?}"
+    );
+}
+
+/// `task.facts`' `start_refusal` is the machine's refusal from the task's state and nothing else: for
+/// every status, `Some` exactly when the lifecycle has no `start` edge out of it, and `None` for a
+/// task somebody else holds — the guard's refusal depends on who asks, which only the write knows.
+#[test]
+fn the_start_refusal_is_the_machines_verdict_on_the_state() {
+    use jkb_core::lifecycle::{self, TaskEvent, TaskFacts};
+    use jkb_types::TaskStatus;
+
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    for status in [
+        TaskStatus::Open,
+        TaskStatus::InProgress,
+        TaskStatus::NeedsReview,
+        TaskStatus::Done,
+        TaskStatus::Cancelled,
+    ] {
+        let uid = add(&b, &format!("in {} +tasks/x", status.as_str()));
+        if status != TaskStatus::Open {
+            call(
+                &b,
+                json!({ "op": "task.set", "uid": uid, "status": status.as_str() }),
+            )
+            .unwrap();
+        }
+        let f = facts(&b, &uid);
+        assert_eq!(f.status, status.as_str());
+        let undefined = matches!(
+            lifecycle::apply(
+                &TaskFacts {
+                    status,
+                    ..TaskFacts::default()
+                },
+                TaskEvent::Start
+            ),
+            jkb_fsm::Outcome::Undefined { .. }
+        );
+        assert_eq!(f.start_refusal.is_some(), undefined, "{status:?}: {f:?}");
+    }
+
+    let held = add(&b, "held by another +tasks/x");
+    assert!(start(&b, &held, "host:1", None).unwrap());
+    assert_eq!(
+        facts(&b, &held).start_refusal,
+        None,
+        "another owner's claim is the guard's to judge at the write"
+    );
+}

@@ -2790,6 +2790,70 @@ fn a_landing_recorded_while_a_task_was_held_closes_it_once_the_hold_lifts() {
     );
 }
 
+/// A task closed by the landing jkb recorded is reported **without** a pull request number, even when
+/// one is recorded in its history: that number was never asked about, so crediting it would report a
+/// close the pull request had no part in — "reported from what actually happened, never from what
+/// was intended" (`settle_landing`).
+#[test]
+fn a_close_by_a_recorded_landing_reports_no_pull_request() {
+    let f = Fixture::new();
+    let parent = f.add_task("parent task");
+    let s = f.work(&parent);
+    let worktree = std::path::PathBuf::from(s["worktree"].as_str().unwrap());
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    let branch = s["branch"].as_str().unwrap().to_owned();
+    commit_in(&worktree, "p.txt", "parent work\n", "parent work");
+    let out = f
+        .jkb()
+        .args([
+            "--global",
+            "task",
+            "add",
+            "child task",
+            "--under",
+            &parent,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "task add --under: {out:?}");
+    let child = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The queue grafts the branch while the parent is held for its open subtask.
+    git(&f.repo, &["merge", "-q", "--ff-only", &branch]);
+    f.jkb()
+        .args(["task", "landed", &branch, "--onto", &onto])
+        .assert()
+        .success();
+    // A pull request number arrives in the history — one that had no part in the graft.
+    f.jkb()
+        .args(["task", "pr", &parent, "31"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "set", &child, "--status", "done"])
+        .assert()
+        .success();
+
+    let out = f
+        .jkb()
+        .args(["--json", "task", "close-merged"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "close-merged: {out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let closed = v["closed"].as_array().unwrap();
+    assert_eq!(closed.len(), 1, "{v}");
+    assert_eq!(closed[0]["uid"], parent.as_str(), "{v}");
+    assert!(
+        closed[0]["pr"].is_null(),
+        "credited a pull request it never read: {v}"
+    );
+    assert_eq!(f.status_of(&parent), "done");
+}
+
 /// A landing is spent once the task is put back to work — and **still closes it when it is not**.
 ///
 /// Both directions, because either alone passes with the rule broken the other way: refusing
@@ -3758,6 +3822,10 @@ fn a_branch_name_cannot_smuggle_a_git_option() {
 /// The rule was stated twice before: once here and once in the table. Two copies of a rule read
 /// as protection while diverging from the one that actually decides, which is how one click came
 /// to reopen a task that had already merged.
+///
+/// And it refuses **before any git side effect**: no `.git/info/exclude` entry, no branch, no
+/// session directory. A refusal the verb already had in hand and raised only after the git work
+/// left all three behind for a task that was never going to be worked.
 #[test]
 fn a_finished_task_cannot_be_worked() {
     let f = Fixture::new();
@@ -3766,12 +3834,29 @@ fn a_finished_task_cannot_be_worked() {
         .args(["--global", "task", "set", &uid, "--status", "done"])
         .assert()
         .success();
+    let exclude = f.repo.join(".git/info/exclude");
+    let exclude_before = std::fs::read(&exclude).ok();
+    let branches_before = git(&f.repo, &["branch", "--format=%(refname:short)"]);
     f.jkb()
         .args(["task", "work", &uid])
         .assert()
         .failure()
         .stderr(predicate::str::contains("is not something that can happen"));
     assert_eq!(f.status_of(&uid), "done", "the refusal changed the task");
+    assert_eq!(
+        std::fs::read(&exclude).ok(),
+        exclude_before,
+        "the refusal came after `.git/info/exclude` was written"
+    );
+    assert_eq!(
+        git(&f.repo, &["branch", "--format=%(refname:short)"]),
+        branches_before,
+        "the refusal came after a branch was cut"
+    );
+    assert!(
+        !f.repo.join(".jkb").exists(),
+        "the refusal came after the session directory was made"
+    );
 }
 
 /// An owner whose liveness cannot be established keeps its claim, and is **reported** rather

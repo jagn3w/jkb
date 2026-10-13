@@ -741,6 +741,16 @@ struct Land {
     dropped_trunk: bool,
 }
 
+/// `task work`'s pre-check: the lifecycle's refusal to start, as `task.facts` reported it. Not
+/// filtered by status — a second notion here of which refusals count is how one was once discarded
+/// and only re-raised after the worktree work had run.
+fn refuse_unstartable(uid: &str, facts: &TaskState) -> Result<()> {
+    match &facts.start_refusal {
+        Some(why) => anyhow::bail!("{uid}: {why}"),
+        None => Ok(()),
+    }
+}
+
 /// `task work` — open (or return) an isolated session for a task (design D36.2).
 ///
 /// Idempotent by construction: the task's own `branch=` tag names its session, so a second
@@ -756,16 +766,11 @@ pub(crate) fn work(
     let cwd = std::env::current_dir()?;
     let facts = kb.facts(uid)?;
 
-    // Asked of the lifecycle rather than re-stated here: `start` has no transition out of a
-    // terminal status, so this is the same refusal `jkb task start` and the In Flight row give.
-    // Only the *state* half is checked now — everything a session needs is established below,
-    // and asking about it before the worktree exists would be asking about facts that are not
-    // yet true.
-    if let Some(why) = &facts.start_refusal {
-        if facts.terminal {
-            anyhow::bail!("{uid}: {why}");
-        }
-    }
+    // Asked of the lifecycle rather than re-stated here, and honoured whole: every refusal the
+    // facts carry stops the verb before any git side effect. `task.facts` reports only the
+    // machine's refusal from the task's *state* (no `start` edge out of it); the guard's half
+    // depends on who asks and is decided by the write, after everything a session needs exists.
+    refuse_unstartable(uid, &facts)?;
 
     // Session worktrees live inside the repo, so the first one must not make it dirty.
     session::ensure_excluded(&ctx.root)?;
@@ -2029,6 +2034,32 @@ mod tests {
     use super::{batch_is_spent, open_worktree, task_on, Kb, Landed};
     use jkb_api::sessions::BranchTask;
     use std::collections::BTreeMap;
+
+    /// `task work`'s pre-check honours whatever refusal `task.facts` reports, whatever the status.
+    /// It used to re-state `is_terminal` beside the machine's answer and drop any refusal of a task
+    /// that was not terminal — which then came back from the write, after the git work had run.
+    #[test]
+    fn the_work_pre_check_honours_every_reported_refusal() {
+        let state =
+            |status: &str, terminal: bool, refusal: Option<&str>| jkb_api::sessions::TaskState {
+                uid: "task:t".to_owned(),
+                status: status.to_owned(),
+                tags: BTreeMap::new(),
+                review: jkb_core::reviews::ReviewState::default(),
+                claim: None,
+                land_target: None,
+                start_refusal: refusal.map(str::to_owned),
+                terminal,
+                open_subtasks: false,
+                writable: true,
+                landed: None,
+            };
+        let e = super::refuse_unstartable("task:t", &state("needs_review", false, Some("no")))
+            .unwrap_err();
+        assert_eq!(e.to_string(), "task:t: no");
+        assert!(super::refuse_unstartable("task:t", &state("done", true, Some("no"))).is_err());
+        assert!(super::refuse_unstartable("task:t", &state("open", false, None)).is_ok());
+    }
 
     /// `abandon --delete-branch` deletes at the tip it read. A commit landing between that read
     /// and the delete — simulated by moving the branch after reading it — is kept with its branch
