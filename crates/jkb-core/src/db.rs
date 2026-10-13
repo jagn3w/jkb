@@ -137,8 +137,9 @@ mod tests {
         // design_sources),
         // V027 edges.id and namespaces.id AUTOINCREMENT (a freed id is never reissued),
         // V028 drops the unread task_transitions branch index; V029 gives placements and tag
-        // applications unreusable ids.
-        assert_eq!(user_version, 29);
+        // applications unreusable ids; V030 records each vector's provenance (content_rev,
+        // chunked_rev, vector_sources).
+        assert_eq!(user_version, 30);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -303,8 +304,9 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         // V028 drops the unread task_transitions branch index; V029 gives placements and tag
-        // applications unreusable ids.
-        assert_eq!(user_version, 29);
+        // applications unreusable ids; V030 records each vector's provenance (content_rev,
+        // chunked_rev, vector_sources).
+        assert_eq!(user_version, 30);
         assert_eq!(
             crate::supported_schema_version(),
             user_version,

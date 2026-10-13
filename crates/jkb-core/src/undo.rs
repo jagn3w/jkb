@@ -219,6 +219,14 @@ enum Reading {
 /// refused at the write.
 const LATER_ID_COLUMNS: &[Entity] = &[Entity::Placements, Entity::TagApplications];
 
+/// The `items` columns added after item deletes had been logged, whole, without them: V030's
+/// vector provenance. A replayed delete that names neither puts the item back at `content_rev` 0
+/// and `chunked_rev` NULL, which loses nothing a restore needs. Its vector and `vector_sources` row
+/// went with the delete, so it is pending whatever its rev, and a NULL `chunked_rev` only means its
+/// chunks — restored or not — are not re-cut: it still takes their centroid if it has any.
+/// **Replay only**, like [`LATER_ID_COLUMNS`]: `item::remove` logs both.
+const LATER_ITEM_COLUMNS: &[&str] = &["content_rev", "chunked_rev"];
+
 /// The columns a before-state may leave out of a whole-row delete when read for `reading`.
 fn tolerated_missing(op: &str, table: &str, reading: Reading) -> &'static [&'static str] {
     let later = reading == Reading::Replay
@@ -258,7 +266,19 @@ fn check_restorable_as(
     // and this module's restore) and the next column added to the table would have been dropped
     // by both, silently, on every restore.
     if is_cascade_snapshot(op, table) {
-        return check_columns(conn, op, table, column_map(op, table, before), true, &[]);
+        let may_omit = if reading == Reading::Replay {
+            LATER_ITEM_COLUMNS
+        } else {
+            &[]
+        };
+        return check_columns(
+            conn,
+            op,
+            table,
+            column_map(op, table, before),
+            true,
+            may_omit,
+        );
     }
     let Some(inverse) = row_shaped(op, table) else {
         return Ok(());
@@ -2425,6 +2445,85 @@ mod tests {
         );
     }
 
+    /// An item delete logged before V030 names neither `content_rev` nor `chunked_rev` — the
+    /// columns did not exist — and still undoes, the item back at revision 0 and never cut. A
+    /// writer logging one without them is still refused: the tolerance is replay's alone.
+    #[test]
+    fn an_item_snapshot_without_its_v030_revisions_still_undoes_and_a_writer_must_log_them() {
+        use crate::item;
+
+        let db = Db::open_in_memory().unwrap();
+        let a = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                item::set_content(c, m, a, "edited once", None)?;
+                Ok(a)
+            })
+            .unwrap();
+        let removed = db
+            .write_txn("t", move |c, m| {
+                item::remove(c, m, a, true)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        let old_shape = db
+            .write_txn("t", move |c, _| {
+                let (row, before): (i64, String) = c.query_row(
+                    "SELECT id, before FROM changelog
+                      WHERE txn_id = ?1 AND entity_type = 'items' AND op = 'delete'",
+                    [removed],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let mut snapshot: serde_json::Value = serde_json::from_str(&before).unwrap();
+                let fields = snapshot["item"].as_object_mut().unwrap();
+                assert_eq!(
+                    fields.remove("content_rev"),
+                    Some(serde_json::json!(1)),
+                    "setup: rev not logged"
+                );
+                assert!(
+                    fields.remove("chunked_rev").is_some(),
+                    "setup: chunked_rev not logged"
+                );
+                c.execute(
+                    "UPDATE changelog SET before = ?1 WHERE id = ?2",
+                    rusqlite::params![snapshot.to_string(), row],
+                )?;
+                Ok(snapshot)
+            })
+            .unwrap();
+
+        let refused = db
+            .read(move |c| {
+                Ok(
+                    super::check_restorable(c, "delete", "items", Some(&old_shape))
+                        .expect_err("a writer may log an item delete without its revisions")
+                        .to_string(),
+                )
+            })
+            .unwrap();
+        assert!(refused.contains("content_rev"), "{refused}");
+
+        db.write_txn("t", move |c, m| super::undo(c, m, removed))
+            .expect("an item snapshot logged before V030 was refused");
+        let revs = db
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT content, content_rev, chunked_rev FROM items WHERE id = ?1",
+                    [a.get()],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap();
+        assert_eq!(revs, ("edited once".to_owned(), 0, None));
+    }
+
     /// A placement or tag removal logged before V029 named no `id` — the column did not exist —
     /// and it still undoes: the row comes back whole, under a fresh id. The tolerance is for
     /// replay only; [`a_new_placement_or_tag_removal_must_log_its_id`] keeps the writer strict.
@@ -3160,9 +3259,12 @@ mod tests {
     /// The tables an item delete cascades through that undo does **not** put back, each for a
     /// stated reason. `task_transitions`: an item's history is not restored (the cost V015
     /// states). The `design_*` tables: they belong to a design, which `item::remove` refuses to
-    /// delete, so no undo of an item delete ever needs them.
-    const CASCADE_NOT_RESTORED: [&str; 5] = [
+    /// delete, so no undo of an item delete ever needs them. `vector_sources`: derived index state
+    /// (V030), like the vector it describes — the GC trigger deletes that vector with the item, so
+    /// a restored item has neither and is pending.
+    const CASCADE_NOT_RESTORED: [&str; 6] = [
         "task_transitions",
+        "vector_sources",
         "design_updates",
         "design_snapshots",
         "design_doc_targets",

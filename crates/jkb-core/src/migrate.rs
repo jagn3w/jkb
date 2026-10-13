@@ -719,6 +719,9 @@ mod edges_namespaces_autoincrement_tests {
         // The harness, so its `foreign_key_check` runs over the rebuild.
         super::run(&mut conn).expect("V027 applied, with no dangling foreign key");
 
+        // The harness runs every later migration too, and one that adds a table of its own adds
+        // that table's foreign keys (V030's `vector_sources`); only the keys of tables that were
+        // already there are V027's.
         let after = (
             rows(&conn, "edges"),
             rows(&conn, "namespaces"),
@@ -726,7 +729,10 @@ mod edges_namespaces_autoincrement_tests {
             placement_rows(&conn),
             indexes(&conn, "edges"),
             indexes(&conn, "namespaces"),
-            foreign_keys(&conn),
+            foreign_keys(&conn)
+                .into_iter()
+                .filter(|fk| before.6.iter().any(|b| b.0 == fk.0))
+                .collect::<Vec<_>>(),
         );
         assert_eq!(
             after, before,
@@ -1002,5 +1008,104 @@ mod edges_namespaces_autoincrement_tests {
             left, 0,
             "placements or tags did not cascade with their item"
         );
+    }
+
+    /// V030 adds each item's content revision and the provenance table, and changes nothing
+    /// else a reader sees: every item starts at revision 0, documents that already have chunks
+    /// record they were cut at 0 (so they are not re-cut), nothing else is marked as cut, and no
+    /// vector has a provenance row — so every vector written before the upgrade reads as pending
+    /// until it is replaced. Then the trigger: a content change bumps the revision, an identical
+    /// write does not, the count cannot be lowered, and FTS stays consistent through the bump.
+    #[test]
+    fn v030_starts_every_item_at_rev_zero_and_records_only_existing_chunk_cuts() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(29))
+            .run(&mut conn)
+            .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO items (id, uid, kind, content) VALUES
+                 (1, 'b3:cut', 'document', 'a chunked document'),
+                 (2, 'b3:cut:0', 'chunk', 'a chunked document'),
+                 (3, 'doc:synced', 'document', 'a synced document'),
+                 (4, 'n:note', 'note', 'a note'),
+                 (5, 'b3:other', 'document', 'linked to a note, not a chunk');
+             INSERT INTO edges (src_item_id, dst_item_id, type) VALUES
+                 (2, 1, 'derived_from'), (4, 5, 'derived_from');",
+        )
+        .unwrap();
+
+        super::run(&mut conn).expect("V030 applied, with no dangling foreign key");
+
+        let revs: Vec<(i64, i64, Option<i64>)> = conn
+            .prepare("SELECT id, content_rev, chunked_rev FROM items ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            revs,
+            [
+                (1, 0, Some(0)),
+                (2, 0, None),
+                (3, 0, None),
+                (4, 0, None),
+                (5, 0, None)
+            ]
+        );
+        let sources: i64 = conn
+            .query_row("SELECT count(*) FROM vector_sources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sources, 0, "a pre-upgrade vector must not read as current");
+
+        let rev = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT content_rev FROM items WHERE id = 4", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        conn.execute(
+            "UPDATE items SET content = 'a changed note' WHERE id = 4",
+            [],
+        )
+        .unwrap();
+        assert_eq!(rev(&conn), 1);
+        conn.execute(
+            "UPDATE items SET content = 'a changed note' WHERE id = 4",
+            [],
+        )
+        .unwrap();
+        assert_eq!(rev(&conn), 1, "an identical write bumped the revision");
+        conn.execute("UPDATE items SET content = NULL WHERE id = 4", [])
+            .unwrap();
+        assert_eq!(rev(&conn), 2, "text to NULL is a change");
+        conn.execute(
+            "UPDATE items SET metadata = '{\"k\":1}', priority = 2 WHERE id = 4",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            rev(&conn),
+            2,
+            "a write of another column bumped the revision"
+        );
+        let lowered = conn
+            .execute("UPDATE items SET content_rev = 0 WHERE id = 4", [])
+            .expect_err("the revision was lowered")
+            .to_string();
+        assert!(lowered.contains("never decreases"), "{lowered}");
+        conn.execute_batch("INSERT INTO fts_items(fts_items) VALUES('integrity-check')")
+            .expect("FTS is consistent after content edits through the revision trigger");
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM fts_items WHERE fts_items MATCH 'changed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 0, "FTS still indexes the note's old text");
     }
 }
