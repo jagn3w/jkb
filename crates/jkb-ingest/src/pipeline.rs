@@ -55,8 +55,9 @@ pub struct Outcome {
     pub document: ItemId,
     /// The number of chunks derived from the document.
     pub chunk_count: usize,
-    /// Whether the source's items are vector-embedded (false if the embedder was
-    /// down — the source is still captured and keyword-searchable).
+    /// Whether the source's items are vector-embedded and current (false if the embedder was
+    /// down, or the document was edited during the run — the source is still captured and
+    /// keyword-searchable, and `jkb index` finishes it).
     pub embedded: bool,
     /// True if an earlier run captured this source, so this call wrote no items — it may still have
     /// written vectors, or marked a capture embedded since complete.
