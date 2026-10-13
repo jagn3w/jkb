@@ -335,9 +335,12 @@ impl TaskStatus {
     /// its work is not yet landed on the feature branch and may bounce back, so a
     /// dependent must not start against it. Dependents unblock only once the dependency
     /// reaches `done` (its work is landed) or `cancelled` (it will never complete).
+    ///
+    /// Derived from [`Self::is_terminal`] rather than spelled again, so the two sets cannot
+    /// drift: a status that unblocks a dependent is exactly one with no further work expected.
     #[must_use]
     pub fn unblocks_dependents(self) -> bool {
-        matches!(self, Self::Done | Self::Cancelled)
+        self.is_terminal()
     }
 
     /// Parse a *manually settable* status string into a [`TaskStatus`].
