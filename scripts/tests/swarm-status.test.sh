@@ -14,6 +14,8 @@
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck source=scripts/lib.sh
+. "$repo_root/scripts/lib.sh"
 # shellcheck source=scripts/tests/harness.sh
 . "$(dirname "$0")/harness.sh"
 
@@ -26,8 +28,10 @@ mkdir -p "$work/bin"
 # LIKE/ESCAPE semantics under test are SQLite's either way. It understands only what the view
 # passes: `-header`, `-column` and `-separator <s>`, then `<db> <sql>`.
 #
-# The name is assembled from pieces so this file never contains the bare call dev-scripts.test.sh
-# case 11 scans for.
+# Every write below goes through `jkb_sqlite` (scripts/lib.sh), which refuses a database on a
+# shared filesystem before it opens one — the rule dev-scripts.test.sh case 11 enforces. The
+# assembled name is used only to probe for the shell and to name the stand-in file, as case 11's
+# own shim does (`"$work/shim/sqli""te3"`).
 db_shell="sqli""te3"
 if ! command -v "$db_shell" >/dev/null 2>&1; then
     if ! command -v python3 >/dev/null 2>&1; then
@@ -70,7 +74,7 @@ STUB
 fi
 
 db="$work/jkb.db"
-"$db_shell" "$db" "CREATE TABLE items (id INTEGER PRIMARY KEY, kind TEXT, status TEXT);
+jkb_sqlite "$db" "CREATE TABLE items (id INTEGER PRIMARY KEY, kind TEXT, status TEXT);
     CREATE TABLE bindings (uri TEXT, item_id INTEGER);" \
     || { echo "cannot create the fixture database" >&2; exit 1; }
 
@@ -81,7 +85,7 @@ bind() {
     next_id=$((next_id + 1))
     uri="file://$1#$2"
     uri="${uri//\'/\'\'}"
-    "$db_shell" "$db" "INSERT INTO items (id, kind, status) VALUES ($next_id, 'task', '$3');
+    jkb_sqlite "$db" "INSERT INTO items (id, kind, status) VALUES ($next_id, 'task', '$3');
         INSERT INTO bindings (uri, item_id) VALUES ('$uri', $next_id);" \
         || { echo "cannot write the fixture database" >&2; exit 1; }
 }
