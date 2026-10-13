@@ -741,23 +741,26 @@ fn document_id(conn: &Connection, hash: &str) -> Result<ItemId> {
     Ok(ItemId::new(id))
 }
 
-/// The `LIKE … ESCAPE '\'` pattern matching every chunk uid of `hash` (`b3:<hash>:<idx>`).
+/// The `LIKE` pattern matching every chunk uid of `hash` (`b3:<hash>:<idx>`); bind it with
+/// [`jkb_core::like_escape_clause!`] after the `LIKE ?`.
 ///
 /// `hash` is blake3 hex today (`blob::hash_bytes` or [`text_address`]), which holds no `LIKE`
 /// metacharacter, so the escape is a no-op for every value ingest produces. It is escaped anyway,
-/// through the same [`jkb_core::sql::like_escape`] every other prefix match uses, so that safety
+/// through the same [`jkb_core::sql::prefix_like`] every other prefix match uses, so that safety
 /// is a property of this one function rather than of what each caller happens to pass, and these
 /// sites read like their siblings instead of like the unescaped patterns that were bugs.
 fn chunk_uid_like(hash: &str) -> String {
-    format!("b3:{}:%", jkb_core::sql::like_escape(hash))
+    jkb_core::sql::prefix_like(&format!("b3:{hash}"), ':')
 }
 
 /// Items left over from a previous ingestion of `hash` — its chunks, and the document if it
 /// is somehow still there — so a re-capture can start from nothing.
 fn surviving_fragments(conn: &Connection, hash: &str) -> Result<Vec<ItemId>> {
-    let mut stmt = conn.prepare_cached(
-        r"SELECT id FROM items WHERE uid = ?1 OR uid LIKE ?2 ESCAPE '\' ORDER BY id DESC",
-    )?;
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT id FROM items WHERE uid = ?1 OR uid LIKE ?2 ",
+        jkb_core::like_escape_clause!(),
+        " ORDER BY id DESC"
+    ))?;
     let rows = stmt.query_map(
         rusqlite::params![format!("b3:{hash}"), chunk_uid_like(hash)],
         |r| r.get::<_, i64>(0),
@@ -772,7 +775,10 @@ fn surviving_fragments(conn: &Connection, hash: &str) -> Result<Vec<ItemId>> {
 /// The number of chunk items for `hash` (uid `b3:<hash>:<idx>`).
 fn count_chunks(conn: &Connection, hash: &str) -> Result<usize> {
     let n: i64 = conn
-        .prepare_cached(r"SELECT count(*) FROM items WHERE uid LIKE ?1 ESCAPE '\'")?
+        .prepare_cached(concat!(
+            "SELECT count(*) FROM items WHERE uid LIKE ?1 ",
+            jkb_core::like_escape_clause!()
+        ))?
         .query_row([chunk_uid_like(hash)], |r| r.get(0))?;
     Ok(usize::try_from(n).unwrap_or(0))
 }
@@ -785,10 +791,11 @@ fn load_items(conn: &Connection, hash: &str) -> Result<(ItemId, Vec<(ItemId, Str
         .query_row([document.get()], |r| r.get(0))?;
     let mut items = vec![(document, doc_content)];
 
-    let mut stmt = conn.prepare_cached(
-        r"SELECT id, content FROM items WHERE uid LIKE ?1 ESCAPE '\' AND content IS NOT NULL
-           ORDER BY id",
-    )?;
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT id, content FROM items WHERE uid LIKE ?1 ",
+        jkb_core::like_escape_clause!(),
+        " AND content IS NOT NULL ORDER BY id"
+    ))?;
     let chunks = stmt
         .query_map([chunk_uid_like(hash)], |r| {
             Ok((ItemId::new(r.get(0)?), r.get::<_, String>(1)?))

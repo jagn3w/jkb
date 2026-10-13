@@ -8,7 +8,7 @@ use serde_json::json;
 use jkb_types::{Error as TypeError, ItemId, Resolution};
 
 use crate::changelog::{Entity, Op};
-use crate::sql::like_escape;
+use crate::sql::subtree_like;
 use crate::store::WriteMeta;
 use crate::{changelog, Error, Result};
 
@@ -163,12 +163,14 @@ pub fn grep_each(
         params.push(Value::Text(pattern.to_owned()));
     }
     if let Some(s) = scope {
-        sql.push_str(
+        sql.push_str(concat!(
             " AND EXISTS (SELECT 1 FROM placements p JOIN namespaces n ON n.id = p.namespace_id
-                          WHERE p.item_id = i.id AND (n.path = ? OR n.path LIKE ? ESCAPE '\\'))",
-        );
+                          WHERE p.item_id = i.id AND (n.path = ? OR n.path LIKE ? ",
+            crate::like_escape_clause!(),
+            "))"
+        ));
         params.push(Value::Text(s.to_owned()));
-        params.push(Value::Text(format!("{}/%", like_escape(s))));
+        params.push(Value::Text(subtree_like(s)));
     }
     sql.push_str(" ORDER BY i.uid");
 

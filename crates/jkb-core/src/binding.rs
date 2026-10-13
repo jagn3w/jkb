@@ -11,7 +11,7 @@ use serde_json::json;
 use jkb_types::{ItemId, SyncMode};
 
 use crate::changelog::{Entity, Op};
-use crate::sql::like_escape;
+use crate::sql::{prefix_like, subtree_like};
 use crate::store::WriteMeta;
 use crate::{changelog, Result};
 
@@ -119,16 +119,17 @@ pub fn items_for_uris(conn: &Connection, uris: &[String]) -> Result<HashMap<Stri
 /// # Errors
 /// Returns an error if the query fails.
 pub fn synced_uris_under(conn: &Connection, ns_path: &str) -> Result<Vec<String>> {
-    // Escape LIKE metacharacters in the path (`_sys`, `jkb-v1-foundation` all contain `_`),
-    // else the subtree prefix would match sibling namespaces.
-    let like = format!("{}/%", like_escape(ns_path));
-    let mut stmt = conn.prepare_cached(
+    let mut stmt = conn.prepare_cached(concat!(
         "SELECT DISTINCT b.uri FROM bindings b
          JOIN placements p ON p.item_id = b.item_id
          JOIN namespaces n ON n.id = p.namespace_id
-         WHERE b.uri LIKE 'file://%' AND (n.path = ?1 OR n.path LIKE ?2 ESCAPE '\\')",
-    )?;
-    let rows = stmt.query_map(params![ns_path, like], |row| row.get::<_, String>(0))?;
+         WHERE b.uri LIKE 'file://%' AND (n.path = ?1 OR n.path LIKE ?2 ",
+        crate::like_escape_clause!(),
+        ")"
+    ))?;
+    let rows = stmt.query_map(params![ns_path, subtree_like(ns_path)], |row| {
+        row.get::<_, String>(0)
+    })?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -145,13 +146,14 @@ pub fn synced_uris_under(conn: &Connection, ns_path: &str) -> Result<Vec<String>
 /// # Errors
 /// Returns an error if the query fails.
 pub fn synced_uris_for_file(conn: &Connection, bare_uri: &str) -> Result<Vec<String>> {
-    // Escape LIKE metacharacters — file uris commonly contain `_` (a wildcard), so an
-    // unescaped `<uri>#%` could gather a *different* file's item bindings.
-    let fragment_like = format!("{}#%", like_escape(bare_uri));
-    let mut stmt = conn.prepare_cached(
-        "SELECT uri FROM bindings WHERE uri = ?1 OR uri LIKE ?2 ESCAPE '\\' ORDER BY uri",
-    )?;
-    let rows = stmt.query_map(params![bare_uri, fragment_like], |row| {
+    // File uris commonly contain `_` (`my_file.md`); `prefix_like` escapes it, so the `<uri>#%`
+    // pattern cannot gather a *different* file's item bindings.
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT uri FROM bindings WHERE uri = ?1 OR uri LIKE ?2 ",
+        crate::like_escape_clause!(),
+        " ORDER BY uri"
+    ))?;
+    let rows = stmt.query_map(params![bare_uri, prefix_like(bare_uri, '#')], |row| {
         row.get::<_, String>(0)
     })?;
     let file = bare_uri.strip_prefix("file://");
