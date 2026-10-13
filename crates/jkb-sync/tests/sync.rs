@@ -3574,7 +3574,11 @@ fn an_import_mirrors_only_its_own_tasks() {
         Ok(())
     })
     .unwrap();
-    assert_eq!(mirrored_task_count(&db), 0, "the stray task starts unmirrored");
+    assert_eq!(
+        mirrored_task_count(&db),
+        0,
+        "the stray task starts unmirrored"
+    );
 
     let report = sync(&db, "docs/plan").unwrap();
     assert!(
@@ -3595,7 +3599,10 @@ fn an_import_mirrors_only_its_own_tasks() {
             task::ensure_all_mirrors(conn, meta)
         })
         .unwrap();
-    assert_eq!(added, 1, "`jkb task mirror` must still reach the stray task");
+    assert_eq!(
+        added, 1,
+        "`jkb task mirror` must still reach the stray task"
+    );
     assert_eq!(mirrored_task_count(&db), 4);
 }
 

@@ -382,19 +382,16 @@ pub fn ensure_mirrors_for(conn: &Connection, meta: &WriteMeta, items: &[ItemId])
          WHERE i.kind = 'task' AND i.id IN (SELECT value FROM json_each(?1))",
     )?;
     let tasks = stmt
-        .query_map([crate::sql::json_ids(items.iter().map(|id| id.get()))], |r| {
-            Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?))
-        })?
+        .query_map(
+            [crate::sql::json_ids(items.iter().map(|id| id.get()))],
+            |r| Ok((ItemId::new(r.get::<_, i64>(0)?), r.get::<_, String>(1)?)),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     mirror_each(conn, meta, tasks)
 }
 
 /// [`ensure_task_mirror`] over `(task, home)` pairs, counting the mirrors added.
-fn mirror_each(
-    conn: &Connection,
-    meta: &WriteMeta,
-    tasks: Vec<(ItemId, String)>,
-) -> Result<usize> {
+fn mirror_each(conn: &Connection, meta: &WriteMeta, tasks: Vec<(ItemId, String)>) -> Result<usize> {
     let mut added = 0;
     for (item, home) in tasks {
         if ensure_task_mirror(conn, meta, item, &home)? {

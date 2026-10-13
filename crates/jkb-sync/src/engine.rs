@@ -588,8 +588,9 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
                 // back every import until it was fixed.
                 if brought_items_in(outcome) {
                     let uris = binding::synced_uris_for_file(conn, &file_uri(&p))?;
-                    let items: Vec<ItemId> =
-                        binding::items_for_uris(conn, &uris)?.into_values().collect();
+                    let items: Vec<ItemId> = binding::items_for_uris(conn, &uris)?
+                        .into_values()
+                        .collect();
                     task::ensure_mirrors_for(conn, meta, &items)?;
                 }
                 Ok(outcome)
@@ -3227,7 +3228,9 @@ mod archive_skip {
 
     fn archived(db: &Db, bytes: &[u8]) -> bool {
         let hash = blob::hash_bytes(bytes);
-        db.read(move |conn| blob::load(conn, &hash)).unwrap().is_some()
+        db.read(move |conn| blob::load(conn, &hash))
+            .unwrap()
+            .is_some()
     }
 
     /// A pass over a settled file opens no archive write, and every byte a pass overwrites is
@@ -3262,7 +3265,11 @@ mod archive_skip {
         // Unchanged on both sides: no archive write at all.
         let before = archive_writes();
         sync(&db, "docs/plan").unwrap();
-        assert_eq!(archive_writes(), before, "a settled pass must not open an archive write");
+        assert_eq!(
+            archive_writes(),
+            before,
+            "a settled pass must not open an archive write"
+        );
 
         // Only the KB changed: the export overwrites bytes the skip found already archived.
         let settled = std::fs::read(&path).unwrap();
@@ -3273,13 +3280,24 @@ mod archive_skip {
         .unwrap();
         let before = archive_writes();
         sync(&db, "docs/plan").unwrap();
-        assert_eq!(archive_writes(), before, "the disk bytes were the archived base");
-        assert_ne!(std::fs::read(&path).unwrap(), settled, "the export overwrote the file");
-        assert!(archived(&db, &settled), "the overwritten bytes are in the archive");
+        assert_eq!(
+            archive_writes(),
+            before,
+            "the disk bytes were the archived base"
+        );
+        assert_ne!(
+            std::fs::read(&path).unwrap(),
+            settled,
+            "the export overwrote the file"
+        );
+        assert!(
+            archived(&db, &settled),
+            "the overwritten bytes are in the archive"
+        );
 
         // Disk changed: bytes the archive has never seen are stored before anything else.
-        let edited = String::from_utf8(std::fs::read(&path).unwrap()).unwrap()
-            + "- [ ] and another !p2\n";
+        let edited =
+            String::from_utf8(std::fs::read(&path).unwrap()).unwrap() + "- [ ] and another !p2\n";
         std::fs::write(&path, &edited).unwrap();
         let before = archive_writes();
         sync(&db, "docs/plan").unwrap();
