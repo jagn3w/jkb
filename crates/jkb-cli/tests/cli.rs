@@ -5216,7 +5216,7 @@ fn ingest_through_the_daemon_sends_text_and_the_host_stores_it() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["embedded"], false, "{v}");
-    assert!(v["warnings"].to_string().contains("index --pending"), "{v}");
+    assert!(v["warnings"].to_string().contains("`jkb index`"), "{v}");
 
     let found = remote(&["search", "--route", "fts", "zanzibar"]);
     assert!(

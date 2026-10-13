@@ -3139,7 +3139,7 @@ fn an_edit_or_add_filed_in_a_tasks_md_must_read_back_as_written() {
 }
 
 /// A client's text is captured without a model: the daemon's backend has no embedder, so the document
-/// is keyword-searchable at once and left for the host's `jkb index --pending`. Addressed by its text,
+/// is keyword-searchable at once and left for the host's `jkb index`. Addressed by its text,
 /// with no blob, and the same text again is the same document.
 #[test]
 fn ingest_text_captures_a_client_s_text_without_calling_a_model() {
@@ -3153,10 +3153,7 @@ fn ingest_text_captures_a_client_s_text_without_calling_a_model() {
     assert!(!ingested.embedded);
     assert!(ingested.chunk_count > 1, "{ingested:?}");
     assert!(
-        ingested
-            .warnings
-            .iter()
-            .any(|w| w.contains("index --pending")),
+        ingested.warnings.iter().any(|w| w.contains("`jkb index`")),
         "{ingested:?}"
     );
     let Response::Ingested { ingested: again } = call(&daemon, ask).unwrap() else {
