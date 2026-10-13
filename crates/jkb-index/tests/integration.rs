@@ -540,6 +540,65 @@ fn knn_live_filters_dead_rows_and_reports_exhaustion_honestly() {
     );
 }
 
+/// `knn_page` is exactly one `vec0` scan: it never grows, never truncates, filters dead rows, and
+/// reports exhaustion only when the index itself ran short — the contract `jkb-search`'s growth
+/// loop relies on to be the only loop.
+#[test]
+fn knn_page_scans_once_and_reports_index_exhaustion() {
+    let db = open_db();
+    let embedder = FakeEmbedder::arc("fake", 16);
+    let probe = embedder.embed("probe text").unwrap();
+
+    db.write_txn("test", {
+        let embedder = embedder.clone();
+        let probe = probe.clone();
+        move |conn, meta| {
+            let vector = VectorIndexer::new(embedder.clone());
+            vector.ensure_ready(conn).unwrap();
+            for i in 0..3 {
+                let id = add_item(conn, meta, &format!("n:live{i}"), "probe text");
+                vector.upsert_vector(conn, id, &probe).unwrap();
+            }
+            for fake in 9000..9030 {
+                conn.execute(
+                    "INSERT INTO vec_items_16(item_id, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![fake, embedding_bytes(&probe)],
+                )?;
+            }
+            Ok(())
+        }
+    })
+    .unwrap();
+
+    let (short_page, full_table) = db
+        .read(move |conn| {
+            let vector = VectorIndexer::new(embedder.clone());
+            let page = |fetch| {
+                let before = vector.knn_scans_run(conn).unwrap();
+                let got = vector.knn_page(conn, &probe, fetch).unwrap();
+                assert_eq!(
+                    vector.knn_scans_run(conn).unwrap() - before,
+                    1,
+                    "fetch {fetch}"
+                );
+                got
+            };
+            Ok((page(10), page(100)))
+        })
+        .unwrap();
+
+    // 33 rows, 30 of them orphans: a page of 10 is full, so the index did not run out — however
+    // few live rows it held — and the page is not grown to find more.
+    assert!(short_page.0.iter().all(|(id, _)| id.get() < 9000));
+    assert!(
+        !short_page.1,
+        "a full page is not exhaustion: {short_page:?}"
+    );
+    // A page larger than the table returns every live row and says the index ran out.
+    assert_eq!(full_table.0.len(), 3);
+    assert!(full_table.1);
+}
+
 /// The **repair** half of index hygiene: `count_stale` finds orphan vector rows and
 /// `sweep_stale` removes them, returning what it removed.
 ///

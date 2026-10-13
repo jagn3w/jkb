@@ -447,6 +447,11 @@ impl VectorIndexer {
         Ok(self.knn_live(conn, query, k)?.0)
     }
 
+    /// The largest `k` `sqlite-vec` accepts (`SQLITE_VEC_VEC0_K_MAX`, sqlite-vec.c:7111); it
+    /// hard-errors above it, so a caller that already over-fetches must not be multiplied into
+    /// a raw extension error on the flagship read.
+    const VEC0_K_MAX: usize = 4096;
+
     /// KNN, with the neighbours whose item no longer exists removed — and a flag saying whether
     /// the **index itself** ran out (design D42.3).
     ///
@@ -459,10 +464,15 @@ impl VectorIndexer {
     /// `LIMIT`/`k` constraint and rejects `ORDER BY` on anything but `distance`, and with `items`
     /// chosen as the outer loop a join would re-run the KNN once per item row.
     ///
-    /// The second return value distinguishes "the index has no more rows" from "live rows ran out
-    /// inside our budget". `jkb-search`'s growth loop tests `hits.len() < fetch` to decide it is
-    /// exhausted; once filtering happens in here that test is wrong, and the loop would stop
-    /// growing and return too few hits.
+    /// This **grows** its fetch (doubling up to `sqlite-vec`'s `k` limit) until it has `k` live
+    /// neighbours, so it is for a caller with no growth loop of its own — the unrestricted
+    /// search. A caller that already grows its own over-fetch must call [`Self::knn_page`]
+    /// instead: two nested growth loops multiply, and since every `vec0` KNN scans the whole
+    /// table whatever its `k`, an orphan-heavy database turned one scoped search into ~27 full
+    /// scans where the outer loop alone does at most six.
+    ///
+    /// The second return value is `true` only when the caller has seen **every** live row
+    /// (see [`Self::knn_page`]).
     ///
     /// # Errors
     /// Returns an error if the query is the wrong length or a statement fails.
@@ -472,28 +482,72 @@ impl VectorIndexer {
         query: &[f32],
         k: usize,
     ) -> Result<(Vec<(ItemId, f32)>, bool)> {
-        // `sqlite-vec` hard-errors above this (`SQLITE_VEC_VEC0_K_MAX`, sqlite-vec.c:7111), so a
-        // caller that already over-fetches must not be multiplied into a raw extension error on
-        // the flagship read.
-        const VEC0_K_MAX: usize = 4096;
-        let mut fetch = k.min(VEC0_K_MAX);
+        let mut fetch = k.min(Self::VEC0_K_MAX);
         loop {
-            let raw = self.knn_raw(conn, query, fetch)?;
-            let index_exhausted = raw.len() < fetch;
-            let live = Self::filter_live(conn, raw)?;
-            if live.len() >= k || index_exhausted || fetch >= VEC0_K_MAX {
+            let (live, index_exhausted) = self.knn_page(conn, query, fetch)?;
+            if live.len() >= k || index_exhausted || fetch >= Self::VEC0_K_MAX {
                 // `index_exhausted` must mean "the caller has seen every live row", not merely
                 // "the table had no more rows to give". Truncating a full page withholds live
-                // neighbours, and `vector_ranked` reads this flag to decide whether to grow its
-                // own over-fetch — so reporting exhaustion after a truncation made a scoped
-                // search stop early and return fewer, often zero, in-scope hits.
+                // neighbours, so a truncation reports not-exhausted.
                 let mut live = live;
                 let truncated = live.len() > k;
                 live.truncate(k);
                 return Ok((live, index_exhausted && !truncated));
             }
-            fetch = (fetch * 2).min(VEC0_K_MAX);
+            fetch = (fetch * 2).min(Self::VEC0_K_MAX);
         }
+    }
+
+    /// **Exactly one** `vec0` KNN scan at `fetch` (clamped to `sqlite-vec`'s `k` limit), with
+    /// the neighbours whose item no longer exists removed, nearest-first.
+    ///
+    /// The building block for a caller that owns its own growth loop (`jkb-search`'s scoped
+    /// over-fetch): it never re-queries, so the caller's loop is the only thing that decides how
+    /// many scans one search costs. Nothing is truncated — every live row of the page is
+    /// returned — so the flag is simply whether the **index** ran out (`vec0` returned fewer
+    /// rows than asked for), which then means the caller has seen every live row. It is not
+    /// `live.len() < fetch`: once dead rows are filtered out that test reads a page full of
+    /// orphans as exhaustion and stops growth early.
+    ///
+    /// # Errors
+    /// Returns an error if the query is the wrong length or a statement fails.
+    pub fn knn_page(
+        &self,
+        conn: &Connection,
+        query: &[f32],
+        fetch: usize,
+    ) -> Result<(Vec<(ItemId, f32)>, bool)> {
+        let fetch = fetch.min(Self::VEC0_K_MAX);
+        let raw = self.knn_raw(conn, query, fetch)?;
+        let index_exhausted = raw.len() < fetch;
+        Ok((Self::filter_live(conn, raw)?, index_exhausted))
+    }
+
+    /// How many times this connection has run the `vec0` KNN statement, as `SQLite` counts it
+    /// (`SQLITE_STMTSTATUS_RUN` on the cached statement) — `0` when no KNN has run or the
+    /// statement has been evicted from the connection's cache.
+    ///
+    /// Every run is a full scan of the vector table whatever its `k`, so this is the cost
+    /// measure for a search. A test seam: it lets a test bound the number of scans one search
+    /// makes without timing anything.
+    ///
+    /// # Errors
+    /// Returns an error if the statement cannot be prepared.
+    #[doc(hidden)]
+    pub fn knn_scans_run(&self, conn: &Connection) -> Result<i32> {
+        let stmt = conn.prepare_cached(&self.knn_sql())?;
+        Ok(stmt.get_status(rusqlite::StatementStatus::Run))
+    }
+
+    /// The `vec0` KNN statement — one spelling, shared by [`Self::knn_raw`] and
+    /// [`Self::knn_scans_run`] so the counter reads the statement the search actually ran.
+    fn knn_sql(&self) -> String {
+        format!(
+            "SELECT item_id, distance FROM {}
+             WHERE embedding MATCH ?1 AND k = ?2
+             ORDER BY distance",
+            self.table
+        )
     }
 
     /// Drop neighbours whose item row is gone, preserving distance order.
@@ -531,12 +585,7 @@ impl VectorIndexer {
         }
         let k = i64::try_from(k).map_err(|_| TypesError::Validation(format!("k {k} too large")))?;
         let bytes = embedding_to_bytes(query);
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT item_id, distance FROM {}
-             WHERE embedding MATCH ?1 AND k = ?2
-             ORDER BY distance",
-            self.table
-        ))?;
+        let mut stmt = conn.prepare_cached(&self.knn_sql())?;
         let rows = stmt
             .query_map(params![bytes, k], |row| {
                 Ok((ItemId::new(row.get(0)?), row.get::<_, f32>(1)?))

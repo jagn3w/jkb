@@ -318,15 +318,21 @@ fn vector_ranked(
         // Large restricted scope: KNN resolves globally before joins, so fetch
         // progressively more and keep the in-scope neighbours until we have `k` or hit
         // the cap (spec: selective scope still returns results via over-fetch).
+        //
+        // This loop is the ONLY growth: each pass is exactly one `vec0` scan
+        // (`knn_page`), so one search costs at most one scan per doubling from
+        // `k * OVERFETCH_MULTIPLIER` to `OVERFETCH_CAP` — six for k=10. Calling the
+        // self-growing `knn_live` here nested its loop inside this one, and on an
+        // orphan-heavy table that was ~27 full scans for one search.
         Some(ids) => {
             let set: HashSet<i64> = ids.iter().map(|id| id.get()).collect();
             let mut fetch = (k * OVERFETCH_MULTIPLIER).min(OVERFETCH_CAP);
             loop {
-                // `knn_live` reports whether the INDEX ran out, which is not the same as
+                // `knn_page` reports whether the INDEX ran out, which is not the same as
                 // `hits.len() < fetch` once it filters dead rows out for us (D42.3): a table
                 // full of orphans would otherwise read as exhausted on the first pass and this
                 // loop would stop growing and return too few in-scope hits.
-                let (hits, exhausted) = vector.knn_live(conn, qv, fetch)?;
+                let (hits, exhausted) = vector.knn_page(conn, qv, fetch)?;
                 let in_scope: Vec<(ItemId, f32)> = hits
                     .into_iter()
                     .filter(|(id, _)| set.contains(&id.get()))
@@ -472,5 +478,90 @@ fn single_item_context(conn: &Connection, item: ItemId) -> Result<Vec<ContextChu
             is_hit: true,
         }]),
         None => Ok(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A constant dim-16 embedder: the vector table only needs its identity and dim here.
+    struct Dim16;
+
+    impl Embedder for Dim16 {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model(&self) -> &str {
+            "fake"
+        }
+        fn dim(&self) -> usize {
+            16
+        }
+        fn embed(&self, _text: &str) -> jkb_types::Result<Vec<f32>> {
+            Ok(vec![0.25; 16])
+        }
+        fn health_check(&self) -> jkb_types::Result<()> {
+            Ok(())
+        }
+        fn resolved_version(&self) -> jkb_types::Result<Option<String>> {
+            Ok(Some("fake:v1".to_owned()))
+        }
+    }
+
+    /// One scoped vector search over an orphan-heavy table makes at most one `vec0` scan per
+    /// over-fetch doubling — six for k=10 (80, 160, …, 1280, 2048) — not one growth loop nested
+    /// inside another.
+    ///
+    /// The table is what a database ingested before the vector GC trigger existed and then
+    /// undone looks like: thousands of vector rows whose items are gone, more than `vec0`'s
+    /// `k` limit, so no page is ever short and every page filters to nothing. The nested loops
+    /// made 7 + 6 + 5 + 4 + 3 + 2 = 27 scans here. Counted from `SQLite`'s own statement run
+    /// counter, not timed.
+    #[test]
+    fn a_scoped_search_on_an_orphan_heavy_table_scans_once_per_doubling() {
+        let embedder: Arc<dyn Embedder + Send + Sync> = Arc::new(Dim16);
+        let db = Db::open_in_memory_with(&[jkb_index::register]).unwrap();
+        db.write_txn("test", {
+            let vector = VectorIndexer::new(embedder.clone());
+            move |conn, _meta| {
+                vector.ensure_ready(conn).unwrap();
+                let bytes: Vec<u8> = [0.25f32; 16].iter().flat_map(|f| f.to_le_bytes()).collect();
+                let mut insert = conn.prepare_cached(
+                    "INSERT INTO vec_items_16(item_id, embedding) VALUES (?1, ?2)",
+                )?;
+                for orphan in 100_000..104_200_i64 {
+                    insert.execute(params![orphan, bytes])?;
+                }
+                Ok(())
+            }
+        })
+        .unwrap();
+
+        // A scope larger than the exact-scoring cap, so the over-fetch branch runs. None of
+        // these items has a vector, so no page ever satisfies the search.
+        let scope: Vec<ItemId> = (1..=300).map(ItemId::new).collect();
+        assert!(scope.len() > EXACT_SCORING_CAP);
+        let vector = VectorIndexer::new(embedder);
+        let (hits, scans) = db
+            .read(move |conn| {
+                let before = vector.knn_scans_run(conn).unwrap();
+                let hits =
+                    vector_ranked(&vector, conn, Some(&[0.25; 16]), Some(&scope), 10).unwrap();
+                Ok((hits, vector.knn_scans_run(conn).unwrap() - before))
+            })
+            .unwrap();
+
+        assert!(hits.is_empty(), "every vector row is an orphan: {hits:?}");
+        // 80 → 160 → 320 → 640 → 1280 → 2048: one scan per doubling, up to the cap.
+        let mut bound = 1;
+        let mut fetch = 10 * OVERFETCH_MULTIPLIER;
+        while fetch < OVERFETCH_CAP {
+            fetch = (fetch * 2).min(OVERFETCH_CAP);
+            bound += 1;
+        }
+        assert_eq!(bound, 6);
+        assert_eq!(
+            scans, bound,
+            "one scoped search must scan the vector table once per over-fetch doubling"
+        );
     }
 }
