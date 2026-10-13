@@ -196,12 +196,23 @@ enum Command {
         /// The transaction id to undo (default: the most recent).
         txn: Option<i64>,
     },
-    /// Embed content-bearing items not yet in the vector index (needs the embedder).
+    /// Embed content-bearing items whose vector is missing or out of date (needs the embedder).
+    ///
+    /// An item is out of date when its text changed after its vector was written; an edited
+    /// document is re-chunked and its vector re-derived from its new chunks.
     Index {
         /// Remove derived-index rows whose item is gone, instead of embedding. Needs no
         /// embedder, so it works offline.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["all", "rebuild"])]
         sweep: bool,
+        /// Re-embed every content item, replacing each vector in place. Old vectors serve until
+        /// replaced, and an interrupted run is finished by a plain `jkb index`.
+        #[arg(long, conflicts_with = "rebuild")]
+        all: bool,
+        /// Delete this model's vectors, then re-embed every content item. Vector search finds
+        /// nothing until each is replaced; an interrupted run is finished by a plain `jkb index`.
+        #[arg(long)]
+        rebuild: bool,
     },
     /// Health checks, integrity, and backup.
     Doctor {
@@ -1815,7 +1826,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Task { cmd } => cmd_task(&db, &db_path, cmd, json),
         Command::View { cmd } => cmd_view(&db, cmd, json),
         Command::Undo { txn } => cmd_undo(&db, txn),
-        Command::Index { sweep } => cmd_index(&db, sweep),
+        Command::Index {
+            sweep,
+            all,
+            rebuild,
+        } => cmd_index(&db, sweep, all, rebuild),
         Command::Doctor { backup, fix } => {
             let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
             doctor::run(
@@ -4650,7 +4665,7 @@ fn sweep_stale(db: &Db) -> Result<jkb_index::StaleRows> {
     db.write_txn_with::<_, anyhow::Error, _>("cli", |conn, _meta| Ok(jkb_index::sweep_stale(conn)?))
 }
 
-fn cmd_index(db: &Db, sweep: bool) -> Result<()> {
+fn cmd_index(db: &Db, sweep: bool, all: bool, rebuild: bool) -> Result<()> {
     // The on-demand half of the derived-index hygiene pair (design D40). `AUTOINCREMENT`
     // makes a leftover vector row harmless — its id is never reissued, so nothing can inherit
     // its embedding — but not absent, and an index that only grows is worth being able to
@@ -4667,12 +4682,27 @@ fn cmd_index(db: &Db, sweep: bool) -> Result<()> {
         }
         return Ok(());
     }
-    // Embed every content-bearing item not yet in the vector index (D21): this covers
-    // items created by file sync, not just the ingest pipeline. Needs a live embedder.
-    let pipeline = Pipeline::new(embedder()?);
+    // Embed every content-bearing item whose vector is missing or out of date (D21): this
+    // covers items created and edited by file sync, not just the ingest pipeline. Needs a live
+    // embedder. What is out of date is derived from each vector's recorded provenance (V030),
+    // so `--all` and `--rebuild` only forget that provenance and the ordinary pass does the rest
+    // — committed per batch, so an interrupted run is finished by a plain `jkb index`.
+    let embedder = embedder()?;
+    if rebuild {
+        let vector = jkb_index::VectorIndexer::new(embedder.clone());
+        db.write_txn_with::<_, anyhow::Error, _>(
+            "cli",
+            move |conn, _meta| Ok(vector.clear(conn)?),
+        )?;
+    } else if all {
+        db.write_txn_with::<_, anyhow::Error, _>("cli", |conn, _meta| {
+            Ok(jkb_index::forget_sources(conn)?)
+        })?;
+    }
+    let pipeline = Pipeline::new(embedder);
     let pending = pipeline.unembedded_count(db)?;
     if pending == 0 {
-        println!("index: nothing to embed (all content items are indexed)");
+        println!("index: nothing to embed (every content item's vector is current)");
         return Ok(());
     }
     println!("index: embedding {pending} pending item(s)…");
@@ -4704,8 +4734,8 @@ fn report_embedder(db: &Db) {
     };
     println!("embedder: {embed_status}");
     match embedder().and_then(|e| Ok(Pipeline::new(e).unembedded_count(db)?)) {
-        Ok(pending) => println!("un-embedded items: {pending}"),
-        Err(e) => println!("un-embedded items: unknown ({e})"),
+        Ok(pending) => println!("items awaiting a vector (missing or stale): {pending}"),
+        Err(e) => println!("items awaiting a vector (missing or stale): unknown ({e})"),
     }
 }
 
