@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:foundation-18dcdeed0ab4d7709fd734, edit there (version 96.X4LfyqDozfwPAYLqkPH_p0UBhO2vnI20zgcBgvvZ1Mnb6Q0Bhu3u9vOuwQkBiefImrSgjgUBidepvMKL7AEBi-7vkr7UzwIBi4v13NKE4A0BjYWn0daWdwGQh6fnuO31DwGR4vys_rxrAZL-t5Wzl7ICAZSF453X3fYEAZXKovzQiI0NAZaB3JHjhKcNAZXZobTRvY8BAZi63c-qh70EAZmJ45HLrq0FAZXg2b340Z4KAZSTl_SJ7oQFAZ2Mx8bk4tkPAZ6VgO30xcYDAZ_PkrepqIABAZ-1w8KT-x0BosCV7pXhvg4BpfzbiJXP4AYBqY3Z4duPywYBqprvqf_k7gEBq7u0h9q0nwUBrcmgvui4_wgBreSM8OOM2gkBree0z5aL5Q4BsdCT8faJigQBtZjXif6wiwrfigS3l83i_4DFDwG46drXpriLDAG5hZyS-ojYDwG5wtCE2tavCgG72ZXjnJ-SCwG3kt3Iv43oAwG9x6qT5dr8CAG-9pjn9d3dBQG7npCdiY76CQHAwa2RrfHpBwHCkYvEusHvBAHEtOjXn4XQDgHGlI6whPnXCgHH3YKwwavqCAHIma7i1oOPBQHJ2JD6kb3dBQHKnpvM_br_DwHHlqzaquDIAQHMifX37fX2BgHNh9aKpqLsDQHJkYme__L_BAHPj-2Nzu2ZAwHP0onzzJWFCwHQ3-Lz5JSaCAHS5JfUxey_CgHQgOOmwqabCAHP8rD1vuNbAdWdgLio6tkIAdbDh5TWtcsPAdG3oL6mwcgIAdmW_t3a-ZELAdrm6Y-sraINAdvzrNjN48QKAdvs6rbhh7oPAduVj4GcpKMOAd6KqrX5jeMJAd62u72N-u4IAeDB0Pji9bcEAeHIyrDgov4LAeGGtb_I-v4OAeOTuJeas8gEAeT-nOrLy70IAeX8mPaHz6QEAebo062N5XoB5LHZ1qPBvQIB6OOByP2wgAMB6Jnf1O2t0QgB6KTkp5qUtgsB6O7o0pLooAUB4K_Th6zmqgcB6JOdntPMtwcB7pjK-piqhgcB8JSB9sq66g0B8ZCj_YuxuAQB8q_6gYm9lQQB8Prj56_kzgoB9vaf2vzcpA8B-dnGtKGi-A8B_PG7hYj2wgYB_6Px-ICjmg0B, blake3 9dd7c15a518fb9adc5bf1dbcc3b77edeab0c8d7c50d4d05276cdc75d0905da88) -->
+<!-- generated from jkb design design:foundation-18dcdeed0ab4d7709fd734, edit there (version 97.X4LfyqDozfwPAYLqkPH_p0UBhO2vnI20zgcBgvvZ1Mnb6Q0Bhu3u9vOuwQkBiefImrSgjgUBidepvMKL7AEBi-7vkr7UzwIBi4v13NKE4A0BjYWn0daWdwGQh6fnuO31DwGR4vys_rxrAZL-t5Wzl7ICAZSF453X3fYEAZXKovzQiI0NAZaB3JHjhKcNAZXZobTRvY8BAZi63c-qh70EAZmJ45HLrq0FAZXg2b340Z4KAZSTl_SJ7oQFAZ2Mx8bk4tkPAZ6VgO30xcYDAZ_PkrepqIABAZ-1w8KT-x0BosCV7pXhvg4BpfzbiJXP4AYBqY3Z4duPywYBqprvqf_k7gEBq7u0h9q0nwUBrcmgvui4_wgBreSM8OOM2gkBree0z5aL5Q4BsdCT8faJigQBtZjXif6wiwrfigS3l83i_4DFDwG46drXpriLDAG5hZyS-ojYDwG5wtCE2tavCgG72ZXjnJ-SCwG3kt3Iv43oAwG9x6qT5dr8CAG-9pjn9d3dBQG7npCdiY76CQHAwa2RrfHpBwHCkYvEusHvBAHEtOjXn4XQDgHGlI6whPnXCgHH3YKwwavqCAHIma7i1oOPBQHJ2JD6kb3dBQHKnpvM_br_DwHHlqzaquDIAQHMifX37fX2BgHNh9aKpqLsDQHJkYme__L_BAHPj-2Nzu2ZAwHP0onzzJWFCwHQ3-Lz5JSaCAHS5JfUxey_CgHQgOOmwqabCAHP8rD1vuNbAdWdgLio6tkIAdbDh5TWtcsPAdG3oL6mwcgIAdmW_t3a-ZELAdrm6Y-sraINAdvzrNjN48QKAdvs6rbhh7oPAduVj4GcpKMOAd6KqrX5jeMJAd62u72N-u4IAeDB0Pji9bcEAeHIyrDgov4LAeGGtb_I-v4OAeOTuJeas8gEAeT-nOrLy70IAeX8mPaHz6QEAebo062N5XoB5LHZ1qPBvQIB6OOByP2wgAMB6Jnf1O2t0QgB6KTkp5qUtgsB6O7o0pLooAUB4K_Th6zmqgcB6JOdntPMtwcB7pjK-piqhgcB8JSB9sq66g0B8ZCj_YuxuAQB8q_6gYm9lQQB8Prj56_kzgoB9vaf2vzcpA8B-dnGtKGi-A8B_PG7hYj2wgYB_6Px-ICjmg0B, blake3 8d7ce00cd7f20ab2fb59b68fda3bef88d124eb889127630bd37ad7e7927dc19c) -->
 # Foundation
 
 jkb is a local-first, agent-native knowledge base. It replaced two rigid tools: the arch-helper
@@ -282,9 +282,55 @@ JSON records; in the database, idempotency and provenance are transactional and 
 Capture must never fail or stall because the embedder is down. An item is written and
 FTS-indexed at once by triggers, so it is keyword-searchable immediately. Embedding is its own
 resumable stage that can run inline, in a background pass, or at the next `jkb index` or
-`jkb doctor`; until then the item is simply not vector-searchable. `Pipeline::index_pending`
-embeds what is missing and `Pipeline::unembedded_count` reports it. Embeddings are computed off
+`jkb doctor`; until then the item is not vector-searchable, or after an edit is found by its previous text.
+`Pipeline::index_pending` embeds what is missing or stale and `Pipeline::unembedded_count`
+reports it; staleness is derived, below. Embeddings are computed off
 the writer thread, so no database lock is held during network I/O.
+
+### Vector freshness is derived from recorded provenance, never marked
+
+A vector is a function of one text; a document's vector is a function of its chunks' vectors; the
+chunks are a function of the document's text. Each link records its input, and nothing is ever
+flagged. `items.content_rev` (V030) counts content changes, bumped by an `AFTER UPDATE OF content
+… WHEN old.content IS NOT new.content` trigger, so `undo`'s generic column restore and every future
+writer count without remembering to. `vector_sources(item_id PK → items ON DELETE CASCADE,
+content_rev, seq)` is written by the one vector writer, `VectorIndexer::upsert_vector(conn, id,
+rev, embedding)`, beside the vector and only if `items.content_rev` is still `rev`, so an edit
+racing a backfill leaves the item stale rather than losing the edit. `seq` is a store-wide write
+counter. `items.chunked_rev` is written only by the chunker, beside the chunks it cuts.
+
+Pending is one predicate, in `jkb-index` beside the table it owns: no sidecar row, or a sidecar rev
+other than the content rev. `jkb-ingest` adds the document rule on top, in one function that both
+the resumed-ingest path and `index_pending` call. A document whose `chunked_rev` is not its
+`content_rev` is re-chunked first: the old chunk items are removed and new ones cut from the
+current text, uids from its blake3, in one write transaction with no model call. Then stale chunks
+are embedded. Then the document is pending if its own row is stale or any chunk's `seq` exceeds
+its own, and it gets the centroid of its current chunks, or its own text only when it has none. An
+edited task re-embeds; an edited document re-chunks and re-centres; a document never embeds a
+truncated copy of itself.
+
+`jkb index` embeds what the predicate names. `jkb index --all` empties `vector_sources`: provenance
+is forgotten, so everything is pending, old vectors serve until replaced, and an interrupted run
+resumes under plain `jkb index`. `jkb index --rebuild` also empties the vector table, and
+`Indexer::rebuild` no longer embeds documents from their own text. A pre-upgrade vector has no
+sidecar row, so the upgrade reports the whole store pending and the next `jkb index` re-embeds it
+once, resumably. That was chosen over counting old vectors fresh, which would keep every edited
+pre-upgrade item wrong for ever, silently, and that is the defect being fixed.
+
+What it cost to learn: the shelved `swarm-task/reembed-on-edit` spent three review rounds on one
+`vector_stale` mark that meant both "own text changed" and "re-embed me". For a document those
+differ, since its vector derives from its chunks and not its text. The mark made `jkb index --all`
+replace every document centroid with a truncated self-embedding (round 3), the resumed-ingest path
+bypassed the edited-document rule (round 2), and an edited document averaged stale chunks (round
+1). Each fix was a rule another writer had to remember.
+
+Rejected: a stored blake3 of the embedded text, which is correct but means reading and hashing
+every item's content on every `jkb index` and `jkb doctor`, and `items.content_hash` cannot carry
+it because it is the global dedup key. A metadata column on the `vec0` table: pre-upgrade tables
+lack it, and a populated virtual table is never altered, so the upgrade would drop every vector
+rather than serve old ones until replaced. Re-chunking inside `item::set_content`: `jkb-sync` and
+`jkb-core` cannot depend on `jkb-ingest`'s chunker, and `undo` bypasses `set_content` anyway. Two
+marks: still set-and-clear, still a rule per writer.
 
 ### URL ingestion is one-way and rendered by a headless browser
 
