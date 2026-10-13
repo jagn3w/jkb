@@ -390,6 +390,53 @@ fn an_abandon_releases_only_the_judged_claim() {
     );
 }
 
+/// Claim `uid` for `owner` through `task.claim`, as a SCHEDULER pass would, and say it was acquired.
+fn claim_for(b: &LocalBackend, uid: &str, owner: &str) {
+    match call(b, json!({ "op": "task.claim", "uid": uid, "owner": owner })).unwrap() {
+        Response::Claimed { claimed } => assert!(claimed.acquired, "{claimed:?}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A task that was **unclaimed** when `jkb task abandon` looked, and claimed while it was removing the
+/// session, is left to its new holder: not reopened, its land target kept, the claim untouched.
+///
+/// The CLI states "nothing was held" as `observed: None`. Guarding the reopen only when a claim had
+/// been observed skipped the check for exactly this case, and the reopen then wrote `open` under a live
+/// claim — the claimed-but-open state the claim model forbids — and cleared the land target the new
+/// worker's `jkb task land` needs. The decision is taken in the op's transaction, against the claim as
+/// it is then.
+#[test]
+fn an_abandon_that_saw_no_claim_leaves_one_taken_meanwhile() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = add(&b, "claimed during the abandon +tasks/x");
+    assert!(start(&b, &uid, "host:1", None).unwrap());
+    // `doctor --fix` or `task release` freed it: in a session, in progress, held by nobody.
+    call(
+        &b,
+        json!({ "op": "task.release", "uid": uid, "owner": "host:1" }),
+    )
+    .unwrap();
+    let observed = facts(&b, &uid).claim;
+    assert_eq!(observed, None);
+
+    // ...and while the abandon runs its git subprocesses, the SCHEDULER claims it.
+    claim_for(&b, &uid, "host:7");
+
+    let a = abandon(&b, &uid, observed.as_deref());
+    assert_eq!(
+        (a.released, a.reopened, a.status.as_str()),
+        (false, false, "in_progress")
+    );
+    let f = facts(&b, &uid);
+    assert_eq!(f.claim.as_deref(), Some("host:7"), "the new claim stands");
+    assert_eq!(
+        f.land_target.as_deref(),
+        Some("batch"),
+        "and the land target its worker will land on"
+    );
+}
+
 /// The gate is read through the daemon and never written: there is no op that stores one.
 #[test]
 fn the_gate_is_read_only() {
@@ -701,6 +748,38 @@ fn a_land_finishes_the_task_unless_it_was_cancelled_meanwhile() {
     let l = land(&other, None).unwrap();
     assert!(!l.moved && l.refusal.is_some(), "{l:?}");
     assert_eq!(l.status, "cancelled");
+}
+
+/// A landing releases the task's claim **whoever holds it by then**: the claim goes with the terminal
+/// status, decided in one place — the lifecycle's plan for every terminal move — and not by a guard in
+/// the landing command.
+///
+/// The case: `jkb task land` removes the session's worktree before it records, so the session owner
+/// reads as gone, a `task reclaim` frees the claim and the next SCHEDULER pass claims the task for
+/// someone else — all before this op runs. The commits are already on the target, so the task is
+/// done; a terminal task holding a claim is a state the claim model forbids, and a worker left holding
+/// a landed task would only redo landed work. `settle_landing` once carried an owner-scoped clear meant
+/// to spare that claim; it never could, because the status write freed it anyway.
+#[test]
+fn a_land_releases_a_claim_taken_while_it_ran() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = add(&b, "reclaimed during the gate +tasks/x");
+    assert!(start(&b, &uid, "host:1", None).unwrap());
+    call(
+        &b,
+        json!({ "op": "task.release", "uid": uid, "owner": "host:1" }),
+    )
+    .unwrap();
+    claim_for(&b, &uid, "host:7");
+
+    let l = landing(call(
+        &b,
+        json!({ "op": "task.land", "uid": uid,
+                "landed": { "branch": "feat", "onto": "batch", "head": "abcd1234" } }),
+    ))
+    .unwrap();
+    assert_eq!((l.moved, l.status.as_str()), (true, "done"), "{l:?}");
+    assert_eq!(facts(&b, &uid).claim, None, "no claim outlives the landing");
 }
 
 /// `task.landed` records the queue's graft: it finishes a task in progress, records a landing a guard

@@ -1738,6 +1738,198 @@ fn abandon_frees_a_dead_owners_claim() {
     assert_eq!(f.status_of(&uid), "open");
 }
 
+/// A `git` on `PATH` that runs `hook` (a shell fragment) once, the first time jkb asks git to remove a
+/// worktree, then hands every call to the real git — the window between a verb's read of the task and
+/// its record, opened deterministically. Returns the `PATH` to run `jkb` under, and the marker the hook
+/// leaves once it has run.
+fn git_shim_on_worktree_remove(f: &Fixture, hook: &str) -> (String, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    // Found by walking `PATH` rather than by asking a shell, so the shim adds no spawn of its own.
+    let real = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("git"))
+        .find(|g| g.is_file())
+        .expect("git on PATH")
+        .display()
+        .to_string();
+    let bin = f.home.path().join("shim-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let ran = f.home.path().join("shim-ran");
+    let shim = bin.join("git");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" worktree remove \"*)\n    if [ ! -e '{ran}' ]; then\n      \
+             : > '{ran}'\n      {hook}\n    fi ;;\nesac\nexec '{real}' \"$@\"\n",
+            ran = ran.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (path, ran)
+}
+
+/// A task **nobody held** when `jkb task abandon` read it, claimed while abandon removed the session,
+/// stays with its new holder: in progress, claimed, and still landing where it was going.
+///
+/// The reopen was guarded only when a claim had been read beforehand, so this case — a session whose
+/// claim `doctor --fix` or `task release` had freed, picked up by the SCHEDULER during the git work —
+/// was reopened under the new worker's claim and its land target cleared, and that worker's `task land`
+/// then failed for want of one. The race is opened by a `git` shim that claims the task from inside
+/// abandon's worktree removal.
+#[test]
+fn a_task_claimed_while_abandon_removes_its_session_is_left_to_its_new_holder() {
+    let f = Fixture::new();
+    let uid = f.add_task("claimed mid-abandon");
+    let s = f.work(&uid);
+    let wt = PathBuf::from(s["worktree"].as_str().unwrap());
+    let onto = s["onto"].as_str().unwrap().to_owned();
+    let session_owner = claim_of(&f.db, &uid).expect("task work claims");
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "release",
+            &uid,
+            "--owner",
+            &session_owner,
+        ])
+        .assert()
+        .success();
+    assert_eq!(claim_of(&f.db, &uid), None);
+
+    let live = format!("swarm:{}", std::process::id());
+    let jkb_bin = Path::new(env!("CARGO_BIN_EXE_jkb"));
+    let hook = format!(
+        "'{}' --db '{}' --global task claim '{uid}' --owner '{live}' >/dev/null 2>&1 || \
+         : > '{}'",
+        jkb_bin.display(),
+        f.db.display(),
+        f.home.path().join("shim-claim-failed").display(),
+    );
+    let (path, ran) = git_shim_on_worktree_remove(&f, &hook);
+
+    let out = f
+        .jkb()
+        .env("PATH", &path)
+        .args(["--json", "task", "abandon", &uid])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        ran.exists(),
+        "the shim never saw a worktree removal: {out:?}"
+    );
+    assert!(
+        !f.home.path().join("shim-claim-failed").exists(),
+        "the mid-abandon claim did not take, so nothing was raced"
+    );
+    assert!(!wt.exists(), "the session itself is still disposed of");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["claim_released"], serde_json::json!(false), "{v}");
+
+    assert_eq!(
+        f.status_of(&uid),
+        "in_progress",
+        "not reopened under a live claim"
+    );
+    assert_eq!(claim_of(&f.db, &uid).as_deref(), Some(live.as_str()));
+    let rows = f.staging(&["--all"]);
+    assert_eq!(
+        rows[0]["branch"],
+        serde_json::json!(onto),
+        "the land target is kept for the worker that holds the task: {rows}"
+    );
+}
+
+/// A landing frees the claim **whoever holds it by the time it records**, and the task is done.
+///
+/// The gate runs for minutes, and the session's owner can lose the claim in that time — `land` removes
+/// the worktree before it records, so the owner reads as gone and a `task reclaim` plus a SCHEDULER
+/// pass hand the task to someone else. `settle_landing` once carried an owner-scoped clear to spare
+/// that claim, and it was inert: the status write released it anyway. The decision is the lifecycle's,
+/// in one place — a terminal status takes its claim with it — because the commits are already on the
+/// target: a worker left holding a landed task could only redo landed work. The gate here moves the
+/// claim, which opens the same window deterministically.
+#[test]
+fn a_landing_frees_a_claim_taken_while_it_ran() {
+    let f = Fixture::new();
+    let uid = f.add_task("reclaimed mid-land");
+    let s = f.work(&uid);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    let session_owner = claim_of(&f.db, &uid).expect("task work claims");
+    let live = format!("swarm:{}", std::process::id());
+    let jkb_bin = Path::new(env!("CARGO_BIN_EXE_jkb"));
+    let jkb_sh = format!("'{}' --db '{}' --global", jkb_bin.display(), f.db.display());
+    let gate = format!(
+        "{jkb_sh} task release '{uid}' --owner '{session_owner}' && \
+         {jkb_sh} task claim '{uid}' --owner '{live}'"
+    );
+
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", &gate, "--no-review"])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&uid), "done");
+    assert_eq!(
+        claim_of(&f.db, &uid),
+        None,
+        "a terminal task holds no claim, whoever took it during the gate"
+    );
+}
+
+/// A start the record refuses leaves the repository exactly as it found it.
+///
+/// `task start` and `task work` once ran their whole git measurement — and two local `git config`
+/// writes retaining a branch's reflog — inside the write transaction, so a refusal rolled back the
+/// record and left the config entry behind, residue `jkb doctor` reported for a branch with no record.
+/// The record is now one op whose transaction runs no git; what git is asked happens first, and reads.
+/// Pinned by the refusal that comes from inside that transaction: the lifecycle's, for a finished task.
+#[test]
+fn a_start_refused_by_its_record_leaves_git_untouched() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "batch"]);
+    git(&f.repo, &["checkout", "-q", "-b", "feat"]);
+    let uid = f.add_task("already finished");
+    f.jkb()
+        .args(["--global", "task", "set", &uid, "--status", "done"])
+        .assert()
+        .success();
+    let git_dir = f.repo.join(".git");
+    let snapshot = || {
+        (
+            std::fs::read(git_dir.join("config")).unwrap(),
+            std::fs::read(git_dir.join("info/exclude")).ok(),
+            git(
+                &f.repo,
+                &["for-each-ref", "--format=%(refname) %(objectname)"],
+            ),
+            git(&f.repo, &["worktree", "list", "--porcelain"]),
+        )
+    };
+    let before = snapshot();
+
+    f.jkb()
+        .args(["task", "start", &uid, "--onto", "batch"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "`start` is not something that can happen",
+        ));
+
+    assert_eq!(snapshot(), before, "a refused start wrote into git");
+    assert_eq!(f.status_of(&uid), "done");
+}
+
 /// A finished task must not be **reopened** by either verb that could.
 ///
 /// `land` removes the worktree and marks the task done, but the row stays in the In Flight
