@@ -91,6 +91,11 @@ const SAFE_SUBCOMMANDS: &[&str] = &[
     "merge",
     "rebase",
     "reset",
+    // Ref plumbing only: it reads and writes `refs/`, never an index or a work tree. Measured on
+    // git 2.51.1 by `jkb_s_git_does_not_run_a_submodule_s_config` — and by hand without jkb's
+    // settings at all, where a bare superproject `git status` ran the planted filter and a bare
+    // `git update-ref -d` did not.
+    "update-ref",
 ];
 
 /// Where the subcommand is in `args`: past any leading `-c <key>=<value>` pairs, the one global
@@ -1751,6 +1756,35 @@ pub fn delete_branch(dir: &Path, branch: &str, force: bool) -> Result<()> {
     valid_ref(branch)?;
     git_must(dir, &["branch", if force { "-D" } else { "-d" }, branch])?;
     Ok(())
+}
+
+/// Delete branch `branch` **only if it still points at `expected`** — git's own compare-and-delete
+/// (`update-ref -d <ref> <old>`), so a commit that lands on the branch after the caller read it is
+/// never discarded with it. [`delete_branch`]'s `git branch -D` takes no old value: a caller that
+/// read the tip, compared it, then deleted, lost whatever arrived in between.
+///
+/// `Ok(true)` when git deleted it, `Ok(false)` when git refused — the ref moved, is gone, or is
+/// locked. Which of those is the caller's to establish by asking again, never by parsing git's
+/// English.
+///
+/// **Not `git branch -D`'s checks.** `update-ref` is plumbing: it deletes a branch another
+/// worktree has checked out (measured on git 2.51.1: that worktree then reads `No commits yet`),
+/// which `branch -D` refuses. A caller that may meet one must ask [`worktrees`] first.
+///
+/// # Errors
+/// Returns an error if `branch` or `expected` cannot be passed to git (`expected` must be a full
+/// object id: anything else would be resolved as a revision), or `git` cannot be executed.
+pub fn delete_branch_at(dir: &Path, branch: &str, expected: &str) -> Result<bool> {
+    valid_ref(branch)?;
+    anyhow::ensure!(
+        matches!(expected.len(), 40 | 64) && expected.bytes().all(|b| b.is_ascii_hexdigit()),
+        "`{expected}` is not a full object id, so it cannot say which commit `{branch}` must be \
+         at to be deleted"
+    );
+    let full = format!("refs/heads/{branch}");
+    // `--no-deref`: delete the ref itself, as `branch -D` does, never a symbolic ref's target.
+    let (ok, _) = git_run(dir, &["update-ref", "--no-deref", "-d", &full, expected])?;
+    Ok(ok)
 }
 
 /// Whether the working tree at `dir` has uncommitted changes (staged, unstaged, or
@@ -4164,8 +4198,45 @@ mod tests {
         let _ = super::git_run(&sup, &["checkout", "--detach", "other"]);
         let _ = super::git_run(&sup, &["switch", "other"]);
         assert!(!marker.exists(), "checkout or switch entered the submodule");
+        // The compare-and-delete the disposal sweep tidies a branch with is ref plumbing alone.
+        run(&sup, &["branch", "tidied"]);
+        let tip = super::rev(&sup, "refs/heads/tidied").unwrap().unwrap();
+        std::fs::write(sup.join("sub/f"), "eeee\n").unwrap();
+        assert!(super::delete_branch_at(&sup, "tidied", &tip).unwrap());
+        assert!(!marker.exists(), "update-ref entered the submodule");
         let e = super::git_run(&sup, &["stash"]).unwrap_err().to_string();
         assert!(e.contains("does not run `git stash`"), "{e}");
+    }
+
+    /// The delete is conditional on the tip the caller read: a branch that moved since is kept,
+    /// with the commit that moved it, and one still at that tip is deleted.
+    #[test]
+    fn delete_branch_at_keeps_a_branch_that_moved_since_it_was_read() {
+        let t = tempfile::tempdir().unwrap();
+        fixture(t.path());
+        let read = super::rev(t.path(), "refs/heads/unmerged")
+            .unwrap()
+            .unwrap();
+        let moved = super::rev(t.path(), "refs/heads/mergecommit")
+            .unwrap()
+            .unwrap();
+        assert_ne!(read, moved, "the premise: two different commits");
+        let ok = fixture_git(t.path(), &["update-ref", "refs/heads/unmerged", &moved])
+            .output()
+            .unwrap();
+        assert!(ok.status.success(), "{ok:?}");
+
+        assert!(!super::delete_branch_at(t.path(), "unmerged", &read).unwrap());
+        assert_eq!(
+            super::rev(t.path(), "refs/heads/unmerged").unwrap(),
+            Some(moved.clone()),
+            "the moved branch survives, where it moved to"
+        );
+        assert!(super::delete_branch_at(t.path(), "unmerged", &moved).unwrap());
+        assert!(super::has_branch(t.path(), "unmerged").unwrap().is_no());
+        // Never resolved as a revision: `HEAD` would match whatever the branch is at.
+        let e = super::delete_branch_at(t.path(), "deep/er", "HEAD").unwrap_err();
+        assert!(e.to_string().contains("not a full object id"), "{e}");
     }
 
     /// A submodule checked out inside a session worktree has a git directory of its own, under the

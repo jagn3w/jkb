@@ -2167,23 +2167,85 @@ fn delete_branch_if_any(entry: &Entry, report: &mut Report) {
             .flatten(),
         Ok(Fact::Unknown) | Err(_) => None,
     };
-    let why = match (tip, &entry.head) {
+    match (tip, &entry.head) {
         (Some(now), Some(planned)) if &now == planned => {
-            // A branch somebody checked out elsewhere is not an error worth stopping an
-            // unattended sweep for.
-            let _ = gitrepo::delete_branch(root, branch, true);
-            return;
+            delete_branch_at_plan(entry, planned, report);
         }
-        (Some(now), planned) => format!(
+        (Some(now), planned) => report_moved(entry, planned.as_deref(), &now, report),
+        (None, _) => report_unanswered(entry, report),
+    }
+}
+
+/// Delete the entry's branch **only while it is still at `planned`** — git's compare-and-delete, so
+/// a commit landing between [`delete_branch_if_any`]'s read and this delete is kept, never lost
+/// with the branch. That window was real: the read was a `rev`, the delete a `git branch -D` that
+/// takes no old value.
+fn delete_branch_at_plan(entry: &Entry, planned: &str, report: &mut Report) {
+    let root = &entry.repo_root;
+    let branch = &entry.branch;
+    // `update-ref` does not refuse a branch another worktree has checked out, as `git branch -D`
+    // did — so that refusal is asked for here. Kept silently, as before: a branch somebody checked
+    // out elsewhere is not an error worth stopping an unattended sweep for. (`branch -D` also
+    // refused a branch mid-rebase or mid-bisect elsewhere, where HEAD is detached; at the planned
+    // head that loses no commit, since the rebase still holds them.)
+    match gitrepo::worktrees(root) {
+        Ok(Some(trees)) => {
+            if trees
+                .iter()
+                .any(|w| w.branch.as_deref() == Some(branch.as_str()))
+            {
+                return;
+            }
+        }
+        Ok(None) | Err(_) => return report_unanswered(entry, report),
+    }
+    if let Ok(true) = gitrepo::delete_branch_at(root, branch, planned) {
+        return;
+    }
+    // Git refused, or could not be asked. Which, is read from git again — never from its message.
+    match gitrepo::has_branch(root, branch) {
+        // Gone: somebody else deleted it, which is what the plan wanted.
+        Ok(Fact::No) => {}
+        Ok(Fact::Yes) => match gitrepo::rev(root, &format!("refs/heads/{branch}")) {
+            Ok(Some(now)) if now != planned => report_moved(entry, Some(planned), &now, report),
+            // Still at the planned head and not deleted: a held lock, or a git that would not run.
+            Ok(Some(_)) => report.kept_branches.push((
+                entry.uid.clone(),
+                format!(
+                    "{branch} was not deleted: it is still at {planned}, where the disposal planned \
+                     to delete it, but git refused to — `git -C {} branch -D {branch}` deletes it, \
+                     and says why if it cannot.",
+                    root.display(),
+                ),
+            )),
+            _ => report_unanswered(entry, report),
+        },
+        Ok(Fact::Unknown) | Err(_) => report_unanswered(entry, report),
+    }
+}
+
+/// The branch is not where the disposal planned to delete it, so it is kept and said so.
+fn report_moved(entry: &Entry, planned: Option<&str>, now: &str, report: &mut Report) {
+    let branch = &entry.branch;
+    report.kept_branches.push((
+        entry.uid.clone(),
+        format!(
             "{branch} was kept: the disposal planned to delete it at {}, and it is now at {now} — \
              whether anything since reached a target is not something this can establish, and a \
              forced `git branch -D` on the wrong side of that is the only copy's last reader. \
              Delete it yourself once you have looked.",
-            planned
-                .as_deref()
-                .unwrap_or("a commit the record could not observe"),
+            planned.unwrap_or("a commit the record could not observe"),
         ),
-        (None, _) => format!(
+    ));
+}
+
+/// Git did not answer, so the planned deletion could not be checked — reported, never skipped.
+fn report_unanswered(entry: &Entry, report: &mut Report) {
+    let root = &entry.repo_root;
+    let branch = &entry.branch;
+    report.kept_branches.push((
+        entry.uid.clone(),
+        format!(
             "{branch} was not deleted: git did not answer in {} about whether it still exists, so \
              the planned deletion could not be checked — `git -C {} branch --list {branch}` shows \
              whether it is there; delete it yourself if it is still at {}.",
@@ -2194,8 +2256,7 @@ fn delete_branch_if_any(entry: &Entry, report: &mut Report) {
                 .as_deref()
                 .unwrap_or("the commit the disposal recorded"),
         ),
-    };
-    report.kept_branches.push((entry.uid.clone(), why));
+    ));
 }
 
 /// `YYYYmmddTHHMMSSZ`, so an archive directory says when it was made without anything having to
@@ -2944,6 +3005,74 @@ mod tests {
             1,
             "and the refusal is reported: {r:?}"
         );
+    }
+
+    /// The delete is conditional on the tip that was read. A commit landing between the read and
+    /// the delete — simulated by moving the branch, then deleting at the head read before it moved
+    /// — is kept with its branch, and the refusal reported. `git branch -D` deleted it.
+    #[test]
+    fn a_branch_that_moves_after_it_was_read_is_kept() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let (repo, e, head) = moved_branch(t.path());
+        // The tree is out of the way by the time the sweep deletes, as in the sweep itself.
+        git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &e.worktree.to_string_lossy(),
+            ],
+        );
+        let now = git(&repo, &["rev-parse", &format!("refs/heads/{}", e.branch)]);
+        assert_ne!(
+            now, head,
+            "the premise: the branch moved after `head` was read"
+        );
+
+        let mut r = Report::default();
+        delete_branch_at_plan(&e, &head, &mut r);
+
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/heads/{}", e.branch)]),
+            now,
+            "the branch survives, with the commit that landed in the window"
+        );
+        assert_eq!(
+            r.kept_branches.len(),
+            1,
+            "and the refusal is reported: {r:?}"
+        );
+        assert!(
+            r.kept_branches[0].1.contains(&now),
+            "naming where it is: {r:?}"
+        );
+    }
+
+    /// `update-ref` deletes a branch another worktree has checked out, which `git branch -D`
+    /// refused; that refusal is the sweep's to make now, and it keeps such a branch silently.
+    #[test]
+    fn a_branch_checked_out_elsewhere_is_not_deleted() {
+        let t = tempfile::tempdir().expect("tempdir");
+        let repo = t.path().join("repo");
+        let (wt, branch, head) = session(&repo, "sess");
+        let e = Entry {
+            plan: Plan {
+                delete_branch: true,
+                accept_dirty: false,
+            },
+            ..session_entry(&repo, &wt, &branch, &head)
+        };
+
+        let mut r = Report::default();
+        delete_branch_if_any(&e, &mut r);
+
+        assert_eq!(
+            git(&repo, &["rev-parse", &format!("refs/heads/{branch}")]),
+            head,
+            "the checked-out branch is kept"
+        );
+        assert!(r.kept_branches.is_empty(), "silently, as before: {r:?}");
     }
 
     /// Git not answering is not "the branch is gone". Before, it read as absent: the plan was
