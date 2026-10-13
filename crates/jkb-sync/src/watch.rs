@@ -838,6 +838,21 @@ mod tests {
             .all(|(_, s)| s.stopped.get() && s.joined.get()));
     }
 
+    /// A pass that fails outright is turned into a retry the watcher owes, never an error that
+    /// leaves the loop: `run_pass` has no way to return one, and its answer must be "owed".
+    #[test]
+    fn a_pass_that_fails_outright_owes_a_retry() {
+        let owed = super::run_pass("docs/a", || {
+            Err(crate::Error::Types(jkb_types::Error::Validation(
+                "unknown serializer".to_owned(),
+            )))
+        });
+        assert!(
+            owed,
+            "a failed pass owed no retry; that mount would never be re-scanned"
+        );
+    }
+
     /// A debt nothing owes is never due, however long the watcher idles.
     #[test]
     fn no_debt_is_never_due() {

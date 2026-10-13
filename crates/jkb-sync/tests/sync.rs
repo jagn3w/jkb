@@ -428,6 +428,79 @@ fn watch_runs_an_initial_reconcile_then_stops() {
     );
 }
 
+/// A pass that fails outright — not one bad file, but `sync` itself returning `Err`, here for an
+/// unknown serializer — is reported and owed a retry; it does not end the watcher. It used to
+/// propagate with `?`, which exited that mount's thread for good while `watch_all` sat joining the
+/// others, so the service looked healthy and the mount never synced again.
+///
+/// `stop` is preset, so `watch` runs exactly its initial pass and then returns: the result is the
+/// loop's own verdict on that pass, with no timing involved.
+#[test]
+fn watch_survives_a_pass_that_fails_outright() {
+    let dir = real_tempdir();
+    fs::write(dir.path().join("a.md"), "x").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/broken",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "spec",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    assert!(
+        sync(&db, "docs/broken").is_err(),
+        "precondition: this mount's pass must fail outright, or the test proves nothing"
+    );
+
+    let stop = Arc::new(AtomicBool::new(true));
+    jkb_sync::watch(&db, "docs/broken", Duration::from_millis(20), &stop)
+        .expect("a failed reconcile pass must not end the watcher");
+}
+
+/// `watch_all`'s own result does not carry one watcher's failure, and a healthy mount beside a
+/// mount whose every pass fails outright still gets its initial reconcile.
+///
+/// This does **not** guard against a watcher thread dying on a failed pass: with `stop` preset,
+/// `Watchers::shutdown` only reports a watcher's `Err`, so this passes even when `watch` propagates
+/// the pass error again. That defect is pinned by `watch_survives_a_pass_that_fails_outright`
+/// (the loop survives) and the `Watchers` unit tests in `watch.rs`, e.g.
+/// `a_watcher_that_exited_is_re_armed_after_a_backoff` (an exited watcher is reported and re-armed).
+#[test]
+fn watch_all_keeps_syncing_beside_a_mount_whose_pass_fails() {
+    let db = Db::open_in_memory().unwrap();
+    let broken = real_tempdir();
+    let good = real_tempdir();
+    fs::write(broken.path().join("a.md"), "x").unwrap();
+    fs::write(good.path().join("b.md"), "beta").unwrap();
+    for (path, dir, serializer) in [
+        ("docs/broken", broken.path(), "spec"),
+        ("docs/good", good.path(), "document"),
+    ] {
+        mount_dir(
+            &db,
+            path,
+            dir,
+            SyncMode::Bidirectional,
+            serializer,
+            Some("**/*.md"),
+            None,
+            ConflictPolicy::Manual,
+        );
+    }
+    assert!(sync(&db, "docs/broken").is_err(), "precondition");
+
+    let stop = Arc::new(AtomicBool::new(true));
+    jkb_sync::watch_all(&db, Duration::from_millis(20), &stop)
+        .expect("one mount's failed pass must not fail the others");
+    assert_eq!(
+        content_for(&db, &uri_for(&good.path().join("b.md"))).as_deref(),
+        Some("beta")
+    );
+}
+
 #[test]
 fn watch_all_reconciles_every_mount_then_stops() {
     let db = Db::open_in_memory().unwrap();
