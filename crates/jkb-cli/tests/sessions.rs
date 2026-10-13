@@ -613,6 +613,75 @@ fn a_gate_that_dirties_the_graft_tree_does_not_stop_the_next_landing() {
     assert_eq!(f.status_of(&uid), "done");
 }
 
+/// **An untracked file a gate leaves in `.jkb/graft` does not stop a later landing that adds it,
+/// and ignored build output there stays warm.** `reset --hard` keeps untracked files, so without
+/// the `clean -fd` a branch adding `new.txt` failed `checkout --detach` on every landing until
+/// somebody deleted the file by hand — and the gate would not have seen exactly what the target
+/// becomes. Ignored files are deliberately kept (`clean` without `-x`), so a gate's build directory
+/// is not rebuilt from cold every landing.
+#[test]
+fn a_gate_s_untracked_file_does_not_block_a_branch_that_adds_it() {
+    let f = Fixture::new();
+    let a = f.add_task("leaves a stray file");
+    let b = f.add_task("adds the same file");
+    let sa = f.work(&a);
+    let sb = f.work(&b);
+    let onto = sa["onto"].as_str().unwrap().to_owned();
+    assert_eq!(sb["onto"].as_str().unwrap(), onto, "the premise: one batch");
+    commit_in(
+        Path::new(sa["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a\n",
+        "add a",
+    );
+    commit_in(
+        Path::new(sb["worktree"].as_str().unwrap()),
+        "new.txt",
+        "from b\n",
+        "add new",
+    );
+    // `warm/` is ignored, as a build directory would be.
+    let exclude = f.repo.join(".git/info/exclude");
+    let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
+    text.push_str("warm/\n");
+    std::fs::write(&exclude, text).unwrap();
+
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &a,
+            "--gate",
+            "echo stray > new.txt; mkdir -p warm; echo built > warm/out; false",
+            "--no-review",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("gate failed"));
+    let graft = f.repo.join(".jkb").join("graft");
+    assert!(
+        graft.join("new.txt").exists() && graft.join("warm/out").exists(),
+        "the premise: the gate left an untracked and an ignored file in the graft tree"
+    );
+
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &b,
+            "--gate",
+            "test \"$(cat new.txt)\" = 'from b' && test -f warm/out",
+            "--no-review",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        git(&f.repo, &["show", &format!("refs/heads/{onto}:new.txt")]),
+        "from b"
+    );
+    assert_eq!(f.status_of(&b), "done");
+}
+
 /// **A reviewer's detached checkout of a task branch never blocks a landing.** `git worktree add
 /// --detach <path> <branch>` is how a reviewer reads a branch; a guard keyed on detached
 /// checkouts above the target refused every landing while one existed. Nothing here inspects

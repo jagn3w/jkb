@@ -96,6 +96,11 @@ const SAFE_SUBCOMMANDS: &[&str] = &[
     // settings at all, where a bare superproject `git status` ran the planted filter and a bare
     // `git update-ref -d` did not.
     "update-ref",
+    // Only as `clean -fd` (one `-f`, no `-x`), which `prepare_graft_tree` runs: it deletes untracked
+    // files and does not descend into a nested repository or submodule. Measured on git 2.51.1 by
+    // `jkb_s_git_does_not_run_a_submodule_s_config`: the planted filter did not run, and an
+    // untracked file inside the submodule survived while the superproject's own was removed.
+    "clean",
 ];
 
 /// Where the subcommand is in `args`: past any leading `-c <key>=<value>` pairs, the one global
@@ -2180,10 +2185,10 @@ fn physical(path: &Path) -> PathBuf {
 ///
 /// THE RESET IS UNCONDITIONAL. Nothing but a landing ever works in this tree, and nothing reads
 /// it, so what a landing interrupted mid-rebase or mid-gate left there (a rebase in progress, a
-/// detached ungated graft, tracked files the gate modified) is harmless and is simply discarded:
-/// `rebase --abort` (its failure, when no rebase is in progress, is the ordinary case), `reset
-/// --hard`, then `checkout --detach`. Untracked and ignored files are kept, so a gate's build
-/// directory stays warm from one landing to the next.
+/// detached ungated graft, tracked files the gate modified, untracked files it wrote) is harmless
+/// and is simply discarded: `rebase --abort` (its failure, when no rebase is in progress, is the
+/// ordinary case), `reset --hard`, `clean -fd`, then `checkout --detach`. Ignored files are kept,
+/// so a gate's build directory stays warm from one landing to the next.
 ///
 /// A path that exists but git does not register is **refused**, never reused or removed: it is
 /// not known to be jkb's, the same rule [`forget_worktree`] keeps and `.jkb/base` follows. A
@@ -2222,6 +2227,11 @@ pub fn prepare_graft_tree(root: &Path, path: &Path, onto: &str) -> Result<()> {
         (true, true) => {
             let _ = git_run(path, &["rebase", "--abort"])?;
             git_must(path, &["reset", "--hard"])?;
+            // Untracked files a gate left would survive the reset, and a later branch adding one of
+            // those paths would then fail `checkout --detach` on every landing — and the gate would
+            // not see exactly what `onto` becomes. `-fd` only: not `-x`, so ignored build output
+            // stays warm; not `-ff`, so a nested repository is not descended into.
+            git_must(path, &["clean", "-fd"])?;
             git_must(path, &["checkout", "--detach", &onto_ref])?;
         }
         (registered, false) => {
@@ -4709,6 +4719,18 @@ mod tests {
         std::fs::write(sup.join("sub/f"), "eeee\n").unwrap();
         assert!(super::delete_branch_at(&sup, "tidied", &tip).unwrap());
         assert!(!marker.exists(), "update-ref entered the submodule");
+        // The graft tree's `clean -fd` removes the superproject's untracked file and neither enters
+        // the submodule nor deletes inside it.
+        std::fs::write(sup.join("stray.txt"), "x").unwrap();
+        std::fs::write(sup.join("sub/inside.txt"), "x").unwrap();
+        std::fs::write(sup.join("sub/f"), "ffff\n").unwrap();
+        assert!(super::git_run(&sup, &["clean", "-fd"]).unwrap().0);
+        assert!(!sup.join("stray.txt").exists(), "clean removed nothing");
+        assert!(
+            sup.join("sub/inside.txt").exists(),
+            "clean descended into the submodule"
+        );
+        assert!(!marker.exists(), "clean entered the submodule");
         let e = super::git_run(&sup, &["stash"]).unwrap_err().to_string();
         assert!(e.contains("does not run `git stash`"), "{e}");
     }
