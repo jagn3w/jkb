@@ -945,6 +945,117 @@ fn malformed_file_is_quarantined_then_recovers() {
     assert_eq!(journal(&db, &uri).unwrap().0, "ok");
 }
 
+#[test]
+fn a_needs_naming_a_deleted_task_drops_one_edge_not_the_file() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    assert!(is_blocked(&db, &format!("{uri}#fix")));
+
+    // Delete `setup`'s line, leaving `fix`'s `needs:^setup` naming nothing, and in the same edit
+    // reopen `ship` and add a task that depends on `fix`. Every one of those must land.
+    let edited = "<!-- notes -->\n## Backend\n- [ ] Fix flaky test !p1 needs:^setup ^fix\n\
+                  ## Frontend\n- [ ] Ship button ^ship\n- [ ] Release needs:^fix ^release\n";
+    fs::write(&file, edited).unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(report.count(Outcome::Quarantined), 0);
+    assert_eq!(report.count(Outcome::Imported), 1, "{:?}", report.results);
+    assert_eq!(journal(&db, &uri).unwrap().0, "ok");
+    assert_eq!(
+        status_of(&db, &format!("{uri}#ship")).as_deref(),
+        Some("open")
+    );
+    assert!(is_blocked(&db, &format!("{uri}#release")));
+    // Only the dangling edge went: `fix` no longer waits on the removed task…
+    assert!(!is_blocked(&db, &format!("{uri}#fix")));
+    assert_eq!(
+        status_of(&db, &format!("{uri}#setup")).as_deref(),
+        Some("cancelled")
+    );
+    // …and that is said, not swallowed.
+    let warnings = report.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].0, file.as_path());
+    assert!(warnings[0].1.contains("needs:^setup"), "{}", warnings[0].1);
+
+    // The token stays in the file where the author can see it, the file settles, and the warning
+    // is repeated on every sync until the file stops saying it.
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(
+        text.contains("- [ ] Fix flaky test needs:^setup !p1 ^fix"),
+        "{text}"
+    );
+    let again = sync(&db, "docs/plan").unwrap();
+    assert_eq!(again.count(Outcome::UpToDate), 1);
+    assert_eq!(again.warnings().len(), 1);
+    assert_eq!(fs::read_to_string(&file).unwrap(), text);
+
+    // Re-adding the target's line brings the dependency back.
+    fs::write(
+        &file,
+        text.replace("## Frontend", "- [ ] Set up CI ^setup\n## Frontend"),
+    )
+    .unwrap();
+    let back = sync(&db, "docs/plan").unwrap();
+    assert!(back.warnings().is_empty());
+    assert!(is_blocked(&db, &format!("{uri}#fix")));
+}
+
+#[test]
+fn ambiguous_mixed_indentation_quarantines_with_the_line_named() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, TASKS_MD).unwrap();
+    let uri = uri_for(&file);
+
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+
+    // A tab-indented line under a four-space-indented task: child or sibling depends on the tab
+    // width. Neither reading is imported; the file is quarantined and left as written.
+    let ambiguous = "<!-- notes -->\n## Backend\n- [ ] Set up CI ^setup\n    - [ ] Fix flaky test !p1 needs:^setup ^fix\n\
+                     \t- [ ] Ship button ^ship\n";
+    fs::write(&file, ambiguous).unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(report.count(Outcome::Quarantined), 1);
+    assert_eq!(journal(&db, &uri).unwrap().0, "needs_attention");
+    assert!(!has_parent_edge(
+        &db,
+        &format!("{uri}#fix"),
+        &format!("{uri}#ship")
+    ));
+    assert_eq!(fs::read_to_string(&file).unwrap(), ambiguous);
+    let reason = db
+        .read({
+            let uri = uri.clone();
+            move |conn| jkb_core::sync_state::get(conn, &uri)
+        })
+        .unwrap()
+        .and_then(|j| j.parse_error)
+        .unwrap();
+    assert!(reason.contains("line 5:"), "{reason}");
+
+    // Indenting it the way its parent is indented clears the quarantine with the tree it shows.
+    fs::write(
+        &file,
+        ambiguous.replace("\t- [ ] Ship", "        - [ ] Ship"),
+    )
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(journal(&db, &uri).unwrap().0, "ok");
+    assert!(has_parent_edge(
+        &db,
+        &format!("{uri}#fix"),
+        &format!("{uri}#ship")
+    ));
+}
+
 /// Whether a `parent_of` edge runs from `parent_uri` to `child_uri`.
 fn has_parent_edge(db: &Db, parent_uri: &str, child_uri: &str) -> bool {
     let parent_uri = parent_uri.to_owned();

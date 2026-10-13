@@ -350,6 +350,9 @@ fn report_notable(mount_ns: &str, report: &engine::SyncReport) {
             path.display()
         );
     }
+    for (path, warning) in report.warnings() {
+        eprintln!("sync {mount_ns}: warning {}: {warning}", path.display());
+    }
 }
 
 /// Watch **every** configured mount concurrently (one thread each), reconciling each

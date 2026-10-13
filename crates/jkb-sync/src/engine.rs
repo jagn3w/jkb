@@ -103,6 +103,10 @@ pub struct FileResult {
     /// than restating the rule — a printer that restates it drifts from the engine, which is
     /// how a refused file came to be told to exclude a sibling that did not exist.
     pub reason: Option<String>,
+    /// What the serializer read in the file without taking it at face value (see
+    /// [`SyncSerializer::parse_with_warnings`]) — reported on every outcome, every time the file
+    /// is read, until the file no longer says it.
+    pub warnings: Vec<String>,
 }
 
 /// The outcome of a one-shot [`sync`] over a mount.
@@ -123,6 +127,15 @@ impl SyncReport {
     #[must_use]
     pub fn quarantined(&self) -> Vec<&Path> {
         self.paths_with(Outcome::Quarantined)
+    }
+
+    /// Every warning a file's parse raised, as `(path, warning)`, in file order.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<(&Path, &str)> {
+        self.results
+            .iter()
+            .flat_map(|r| r.warnings.iter().map(|w| (r.path.as_path(), w.as_str())))
+            .collect()
     }
 
     /// The paths that were three-way [`Outcome::Merged`].
@@ -577,9 +590,11 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
         // mount, whose serializer does not quarantine — returned `Err` out of the watcher
         // thread. `watch_all` then blocked joining the other threads until stop, launchd never
         // restarted the still-alive process, and that mount silently stopped syncing forever.
-        let outcome =
-            db.write_txn_with::<Outcome, Error, _>(sync_state::SYNC_ACTOR, move |conn, meta| {
-                let outcome = reconcile(conn, meta, &txn_ctx, &p, archived)?;
+        let outcome = db.write_txn_with::<(Outcome, Vec<String>), Error, _>(
+            sync_state::SYNC_ACTOR,
+            move |conn, meta| {
+                let mut warnings = Vec::new();
+                let outcome = reconcile(conn, meta, &txn_ctx, &p, archived, &mut warnings)?;
                 // Tasks this file just brought in from `repos/<repo>/…/tasks.md` get their
                 // `tasks/…` mirror IN THE SAME TRANSACTION, so `tasks/**` stays the complete task
                 // index. Atomic with the import, a failure rolls the import back and journals the
@@ -598,13 +613,15 @@ fn reconcile_all(db: &Db, ctx: &Ctx, paths: Vec<PathBuf>) -> Result<SyncReport> 
                         .collect();
                     task::ensure_mirrors_for(conn, meta, &items)?;
                 }
-                Ok(outcome)
-            });
+                Ok((outcome, warnings))
+            },
+        );
         match outcome {
-            Ok(outcome) => results.push(FileResult {
+            Ok((outcome, warnings)) => results.push(FileResult {
                 reason: outcome_reason(db, &path)?,
                 path,
                 outcome,
+                warnings,
             }),
             Err(e) => results.push(failed_file(db, ctx, path, e.to_string())),
         }
@@ -630,6 +647,7 @@ fn failed_file(db: &Db, ctx: &Ctx, path: PathBuf, reason: String) -> FileResult 
         path,
         outcome: Outcome::Failed,
         reason: Some(reason),
+        warnings: Vec::new(),
     }
 }
 
@@ -1153,6 +1171,8 @@ fn reconcile(
     // version preserved. Reading the file again here left a window in which a save could land
     // between the two reads and be overwritten with only the older bytes archived.
     disk_bytes: Option<Vec<u8>>,
+    // Filled with the disk parse's warnings, for the file's `FileResult`.
+    warnings: &mut Vec<String>,
 ) -> Result<Outcome> {
     let bare_uri = file_uri(path);
     let (ser_name, serializer) = resolve_serializer(conn, ctx, &bare_uri)?;
@@ -1170,8 +1190,11 @@ fn reconcile(
     // Parse the disk side (if the file exists). A quarantining serializer turns a parse
     // failure into a journal flag instead of a hard error, protecting last-good items.
     let disk = if let Some(bytes) = disk_bytes {
-        match serializer.parse(&bytes) {
-            Ok(doc) => Some((bytes, doc)),
+        match serializer.parse_with_warnings(&bytes) {
+            Ok((doc, raised)) => {
+                *warnings = raised;
+                Some((bytes, doc))
+            }
             Err(e) => {
                 if serializer.quarantine_on_parse_error() {
                     return quarantine(

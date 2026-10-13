@@ -2549,6 +2549,11 @@ fn report_sync(db: &Db, ns_path: &str, conflict: Option<ConflictPolicy>) -> Resu
     for path in report.quarantined() {
         println!("  needs attention (parse failed): {}", path.display());
     }
+    // A warning changed nothing that needs undoing, but the file says something the sync did not
+    // record — a `needs:^id` naming no task — so it is said on every sync until the file is fixed.
+    for (path, warning) in report.warnings() {
+        println!("  warning {}: {warning}", path.display());
+    }
     // A refusal wrote nothing, so it must be visible or the file silently stops syncing.
     for (path, reason) in report.refused() {
         println!("  REFUSED {}: {reason}", path.display());

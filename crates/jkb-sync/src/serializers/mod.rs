@@ -149,6 +149,18 @@ pub trait SyncSerializer: Send + Sync {
     /// Returns a validation error if the bytes cannot be parsed for this format.
     fn parse(&self, bytes: &[u8]) -> Result<SyncDoc>;
 
+    /// [`parse`](Self::parse), plus one warning for each thing in the bytes the parse accepted
+    /// without taking it at face value — for `tasks`, a `needs:^id` naming no task in the file,
+    /// kept as title text instead of becoming an edge. The engine reports these on the file's
+    /// [`FileResult`](crate::FileResult) every time it reads the file, so a reference that
+    /// records nothing is never silent. The default has nothing to warn about.
+    ///
+    /// # Errors
+    /// As [`parse`](Self::parse).
+    fn parse_with_warnings(&self, bytes: &[u8]) -> Result<(SyncDoc, Vec<String>)> {
+        Ok((self.parse(bytes)?, Vec::new()))
+    }
+
     /// Render a [`SyncDoc`] back into file bytes. Must be idempotent:
     /// `render(parse(render(doc)))` equals `render(doc)`.
     ///

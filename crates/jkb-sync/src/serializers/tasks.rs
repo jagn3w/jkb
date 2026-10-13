@@ -35,6 +35,10 @@ impl SyncSerializer for TasksSerializer {
     }
 
     fn parse(&self, bytes: &[u8]) -> Result<SyncDoc> {
+        self.parse_with_warnings(bytes).map(|(doc, _)| doc)
+    }
+
+    fn parse_with_warnings(&self, bytes: &[u8]) -> Result<(SyncDoc, Vec<String>)> {
         let text = std::str::from_utf8(bytes).map_err(|_| {
             bad("file is not valid UTF-8; the `tasks` serializer handles text files")
         })?;
@@ -54,20 +58,21 @@ impl SyncSerializer for TasksSerializer {
     }
 }
 
-/// Parse the whole file into a [`SyncDoc`]. A single trailing newline is normalized
-/// away (and re-added on render) so the round-trip is stable.
-fn parse_text(text: &str) -> Result<SyncDoc> {
+/// Parse the whole file into a [`SyncDoc`], with a warning for each thing the parse accepted
+/// but did not take at face value (see [`keep_dangling_dependencies_as_text`]). A single
+/// trailing newline is normalized away (and re-added on render) so the round-trip is stable.
+fn parse_text(text: &str) -> Result<(SyncDoc, Vec<String>)> {
     // A truly empty file yields an empty doc; a lone "\n" is a preserved blank line.
     if text.is_empty() {
-        return Ok(SyncDoc::default());
+        return Ok((SyncDoc::default(), Vec::new()));
     }
     let body = text.strip_suffix('\n').unwrap_or(text);
     let mut st = ParseState::default();
-    for line in body.split('\n') {
+    for (index, line) in body.split('\n').enumerate() {
         if let Some((level, header_text)) = header(line) {
             st.on_header(line, level, header_text);
         } else if let Some((indent, status, rest)) = task_line(line) {
-            st.on_task(indent, status, rest)?;
+            st.on_task(index + 1, indent, status, rest)?;
         } else if st.take_continuation(line) {
             // An indented, non-blank line under an open task is that task's own body.
         } else {
@@ -76,15 +81,11 @@ fn parse_text(text: &str) -> Result<SyncDoc> {
         }
     }
     st.flush_text();
-    if let Some(missing) = dangling_dependency(&st.doc) {
-        return Err(bad(&format!(
-            "task dependency `needs:^{missing}` names an id that is not defined in this file"
-        )));
-    }
+    let warnings = keep_dangling_dependencies_as_text(&mut st.doc);
     if has_dependency_cycle(&st.doc) {
         return Err(bad("task dependencies (`needs:^…`) form a cycle"));
     }
-    Ok(st.doc)
+    Ok((st.doc, warnings))
 }
 
 /// Mutable state accumulated while parsing a tasks file line by line.
@@ -99,20 +100,23 @@ struct ParseState {
     sec_stack: Vec<(usize, String)>,
     /// The current section's slug path (`None` before the first header).
     current_section: Option<String>,
-    /// `(indent, local_id)` of the open task ancestry, for `parent_of`.
-    task_stack: Vec<(usize, String)>,
+    /// `(leading whitespace, local_id)` of the open task ancestry, for `parent_of` (see
+    /// [`ParseState::on_task`] for how indentation is compared).
+    task_stack: Vec<(String, String)>,
     /// Accumulated prose/blank lines awaiting a boundary.
     text_run: Vec<String>,
-    /// `(index into doc.items, own indent)` of the task whose body is still open, so an
-    /// indented line beneath it is appended to *it* rather than floating in the section.
-    open_task: Option<(usize, usize)>,
+    /// `(index into doc.items, own leading whitespace)` of the task whose body is still open,
+    /// so an indented line beneath it is appended to *it* rather than floating in the section.
+    open_task: Option<(usize, String)>,
 }
 
 impl ParseState {
     /// If `line` continues the open task's body, append it to that task's content and
     /// report `true`.
     ///
-    /// A continuation is a **non-blank line indented deeper than its task** that is not
+    /// A continuation is a **non-blank line indented deeper than its task** — its leading
+    /// whitespace strictly extends the task's, the same rule nesting uses (see
+    /// [`ParseState::on_task`]) — that is not
     /// itself a task line — the shape every multi-line entry in a tasks file already uses
     /// (a finding's failure scenario, a decision's rationale). It belongs to the *item*, not
     /// to the section: stored on the section it drifts away from the task it explains and can
@@ -121,11 +125,12 @@ impl ParseState {
     /// A blank line closes the body, so a second paragraph becomes ordinary section prose —
     /// predictable, and it still round-trips byte-for-byte.
     fn take_continuation(&mut self, line: &str) -> bool {
-        let Some((index, task_indent)) = self.open_task else {
+        let Some((index, task_indent)) = &self.open_task else {
             return false;
         };
-        let indent = line.len() - line.trim_start().len();
-        if jkb_core::item::ends_task_body(line) || indent <= task_indent {
+        let index = *index;
+        let indent = &line[..line.len() - line.trim_start().len()];
+        if jkb_core::item::ends_task_body(line) || !strictly_extends(indent, task_indent) {
             self.open_task = None;
             return false;
         }
@@ -173,8 +178,23 @@ impl ParseState {
         });
     }
 
-    /// Handle a `- [ ]` task line: create the item, its hierarchy, and its edges.
-    fn on_task(&mut self, indent: usize, status: &str, rest: &str) -> Result<()> {
+    /// Handle a `- [ ]` task line (1-based `line_no`): create the item, its hierarchy, and
+    /// its edges.
+    ///
+    /// **Nesting compares leading whitespace as strings, never as columns.** A task is a child
+    /// of the nearest open task whose indentation its own *strictly extends* (same characters,
+    /// then more); one whose indentation equals or extends its own is closed (a sibling or a
+    /// shallower line). A file indented with spaces throughout, or with tabs throughout,
+    /// nests exactly as it reads.
+    ///
+    /// Two indentations neither of which extends the other — four spaces against a tab — have
+    /// no single reading: how deep a tab sits depends on the viewer's tab width, so the same
+    /// bytes show a child in one editor and a sibling in another. Converting a tab to a column
+    /// count picked one of those readings silently (a tab and four spaces both landed on
+    /// column 4, so a tab-indented child under a four-space parent became its sibling and lost
+    /// its `parent_of`). Such a line is a parse error instead, which quarantines the file with
+    /// the line named: the tree is never one the author did not see.
+    fn on_task(&mut self, line_no: usize, indent: &str, status: &str, rest: &str) -> Result<()> {
         self.flush_text();
         let parsed = parse_task_tokens(rest);
         let local_id = match parsed.own_id {
@@ -188,15 +208,22 @@ impl ParseState {
             }
             None => mint_id(&parsed.title, &mut self.used_ids),
         };
-        while self
-            .task_stack
-            .last()
-            .is_some_and(|(ind, _)| *ind >= indent)
-        {
+        while let Some((open, _)) = self.task_stack.last() {
+            if strictly_extends(indent, open) {
+                break;
+            }
+            if !open.starts_with(indent) {
+                return Err(bad(&format!(
+                    "line {line_no}: its indentation {indent:?} and the indentation {open:?} of the \
+                     task above it mix tabs and spaces so that neither extends the other, and how \
+                     deep it sits depends on the tab width; indent a nested task by extending its \
+                     parent's indentation with the same characters"
+                )));
+            }
             self.task_stack.pop();
         }
         let parent = self.task_stack.last().map(|(_, id)| id.clone());
-        self.task_stack.push((indent, local_id.clone()));
+        self.task_stack.push((indent.to_owned(), local_id.clone()));
 
         let mut item = SyncItem::new(local_id.clone(), "task", parsed.title);
         item.section.clone_from(&self.current_section);
@@ -210,7 +237,7 @@ impl ParseState {
         // block index; document order itself lives in `layout`.
         item.position = i64::try_from(self.doc.layout.len()).unwrap_or(i64::MAX);
         self.doc.layout.push(SyncBlock::Item(local_id.clone()));
-        self.open_task = Some((self.doc.items.len(), indent));
+        self.open_task = Some((self.doc.items.len(), indent.to_owned()));
         self.doc.items.push(item);
 
         if let Some(p) = parent {
@@ -231,19 +258,57 @@ impl ParseState {
     }
 }
 
-/// The `dst` of the first `depends_on` edge whose target is not defined in the file, if
-/// any. A `needs:^id` whose `^id` names no task (a typo, or the target line was deleted)
-/// would otherwise be silently dropped by the engine's `reconcile_edges` (which skips any
-/// edge endpoint that doesn't resolve to an item id), losing the user-declared dependency
-/// permanently and invisibly. Surfacing it as a parse error routes the file to quarantine
-/// so the mistake is flagged instead of swallowed.
-fn dangling_dependency(doc: &SyncDoc) -> Option<String> {
-    let defined: HashSet<&str> = doc.items.iter().map(|i| i.local_id.as_str()).collect();
-    doc.edges
-        .iter()
-        .filter(|e| e.edge_type == EdgeType::DependsOn)
-        .find(|e| !defined.contains(e.dst.as_str()))
-        .map(|e| e.dst.clone())
+/// Turn each `needs:^id` whose `^id` names no task in this file back into words of its task's
+/// title, returning one warning per token so turned.
+///
+/// A dangling reference — a typo, or a target line since deleted — is not a malformed file:
+/// every other line still says exactly what it means. It used to be a parse error, so one stale
+/// `needs:` quarantined the whole file and froze every other task in it until someone found the
+/// line. Dropping only the edge, though, would let the import's write-back erase the token from
+/// the file with nothing on any surface saying so. Kept as text, the token stays where the author
+/// wrote it, the line round-trips (the KB title holds it, so its render agrees with the file's),
+/// the sync reports it every time it reads the file, and the dependency forms by itself once a
+/// task with that `^id` exists.
+fn keep_dangling_dependencies_as_text(doc: &mut SyncDoc) -> Vec<String> {
+    let defined: HashSet<String> = doc.items.iter().map(|i| i.local_id.clone()).collect();
+    let mut dangling: HashMap<String, Vec<String>> = HashMap::new();
+    let mut warnings = Vec::new();
+    doc.edges.retain(|e| {
+        if e.edge_type != EdgeType::DependsOn || defined.contains(&e.dst) {
+            return true;
+        }
+        warnings.push(format!(
+            "task `^{}`: `needs:^{}` names no task in this file, so no dependency was recorded; \
+             it is kept as text in the title until a task with that id exists",
+            e.src, e.dst
+        ));
+        dangling
+            .entry(e.src.clone())
+            .or_default()
+            .push(format!("needs:^{}", e.dst));
+        false
+    });
+    for item in &mut doc.items {
+        let Some(tokens) = dangling.remove(&item.local_id) else {
+            continue;
+        };
+        let (title, body) = match item.content.split_once('\n') {
+            Some((title, body)) => (title, Some(body)),
+            None => (item.content.as_str(), None),
+        };
+        let mut words: Vec<&str> = Vec::new();
+        if !title.is_empty() {
+            words.push(title);
+        }
+        words.extend(tokens.iter().map(String::as_str));
+        let mut content = words.join(" ");
+        if let Some(body) = body {
+            content.push('\n');
+            content.push_str(body);
+        }
+        item.content = content;
+    }
+    warnings
 }
 
 /// Whether the `depends_on` edges among the file's tasks contain a cycle. Detecting it
@@ -801,35 +866,20 @@ fn header(line: &str) -> Option<(usize, &str)> {
     }
 }
 
-/// Tab stop width used to expand a leading `\t` into a visual column count when
-/// measuring task indentation (see `task_line`).
-const TAB_WIDTH: usize = 4;
-
-/// Visual indentation width of a run of leading whitespace: a space is one
-/// column, a tab advances to the next `TAB_WIDTH` stop. Used only for *relative*
-/// nesting comparison, so the exact width is immaterial as long as deeper
-/// (more-indented) lines yield strictly larger widths.
-fn indent_width(ws: &str) -> usize {
-    let mut col = 0;
-    for c in ws.chars() {
-        if c == '\t' {
-            col = (col / TAB_WIDTH + 1) * TAB_WIDTH;
-        } else {
-            col += 1;
-        }
-    }
-    col
+/// Whether indentation `inner` is `outer` followed by more: the only way one line is nested
+/// under another (see [`ParseState::on_task`]).
+fn strictly_extends(inner: &str, outer: &str) -> bool {
+    inner.len() > outer.len() && inner.starts_with(outer)
 }
 
-/// Parse a task line, returning `(indent_width, status, rest_after_checkbox)`.
+/// Parse a task line, returning `(leading whitespace, status, rest_after_checkbox)`.
 ///
-/// `indent_width` is a visual column count (see `indent_width`) used only for the
-/// *relative* nesting comparison in `on_task`; tabs count as indentation so a
-/// Tab-nested subtask (`"\t- [ ] child"`) still parents under a preceding
-/// less-indented task instead of collapsing to depth 0.
-fn task_line(line: &str) -> Option<(usize, &'static str, &str)> {
+/// The leading run of spaces and tabs is returned as written, for the nesting comparison in
+/// [`ParseState::on_task`]; tabs count as indentation, so a tab-nested subtask
+/// (`"\t- [ ] child"`) still parents under a preceding less-indented task.
+fn task_line(line: &str) -> Option<(&str, &'static str, &str)> {
     let ws_bytes = line.len() - line.trim_start_matches([' ', '\t']).len();
-    let indent = indent_width(&line[..ws_bytes]);
+    let indent = &line[..ws_bytes];
     let trimmed = &line[ws_bytes..];
     let after = trimmed.strip_prefix("- [")?;
     let mark = after.chars().next()?;
@@ -943,7 +993,7 @@ mod tests {
         const N: usize = 4096;
         let text = format!("## S\n{}## S\n## S\n", "- [ ] x\n".repeat(N));
         PROBES.set(0);
-        let doc = super::parse_text(&text).expect("parses");
+        let (doc, _) = super::parse_text(&text).expect("parses");
         let mut ids: Vec<&str> = doc.items.iter().map(|i| i.local_id.as_str()).collect();
         assert_eq!(ids.len(), N);
         ids.sort_unstable();
@@ -1233,22 +1283,88 @@ Some description.
             .is_err());
     }
 
+    /// The ids of the `depends_on` targets of `src` in `doc`.
+    fn deps_of<'a>(doc: &'a SyncDoc, src: &str) -> Vec<&'a str> {
+        doc.edges
+            .iter()
+            .filter(|e| e.edge_type == jkb_types::EdgeType::DependsOn && e.src == src)
+            .map(|e| e.dst.as_str())
+            .collect()
+    }
+
+    /// The `parent` of the task `id` in `doc`.
+    fn parent_of<'a>(doc: &'a SyncDoc, id: &str) -> Option<&'a str> {
+        doc.items
+            .iter()
+            .find(|i| i.local_id == id)
+            .and_then(|i| i.parent.as_deref())
+    }
+
     #[test]
-    fn dangling_needs_id_errors() {
-        // `needs:^missing` names an id no task in the file defines. Rather than silently
-        // drop the dependency (the engine's reconcile_edges would skip the unresolved
-        // endpoint), parsing errors so the file is quarantined for the user to fix.
-        let err = TasksSerializer
-            .parse(b"- [ ] a needs:^ghost ^a\n")
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("ghost"),
-            "error should name the missing id: {err}"
+    fn a_dangling_needs_drops_only_its_edge_keeps_its_text_and_is_reported() {
+        // `needs:^ghost` names no task in the file (a typo, or its line was deleted). It is not a
+        // parse failure: every other task and edge parses, and only that one reference records
+        // nothing — kept as title text, and reported.
+        let text = "## A\n- [ ] setup ^setup\n- [ ] a !p1 needs:^ghost needs:^setup ^a\n  why a\n- [ ] b needs:^a ^b\n";
+        let (doc, warnings) = super::parse_text(text).expect("a dangling needs does not fail");
+        assert_eq!(deps_of(&doc, "a"), ["setup"]);
+        assert_eq!(deps_of(&doc, "b"), ["a"]);
+        let a = doc.items.iter().find(|i| i.local_id == "a").unwrap();
+        assert_eq!(
+            a.content, "a needs:^ghost\nwhy a",
+            "the token stays, on the title line"
         );
-        // A dependency on a real id still parses cleanly.
-        assert!(TasksSerializer
-            .parse(b"- [ ] a needs:^b ^a\n- [ ] b ^b\n")
-            .is_ok());
+        assert_eq!(a.priority, Some(1));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`^a`") && warnings[0].contains("needs:^ghost"));
+
+        // The line renders with the token in it, and from there render is a fixed point.
+        let s = TasksSerializer;
+        let once = String::from_utf8(s.render(&doc).unwrap()).unwrap();
+        assert!(
+            once.contains("- [ ] a needs:^ghost !p1 needs:^setup ^a\n  why a"),
+            "{once}"
+        );
+        let (again, still) = super::parse_text(&once).unwrap();
+        assert_eq!(again, doc);
+        assert_eq!(still, warnings, "reported every time the file is read");
+        assert_eq!(String::from_utf8(s.render(&again).unwrap()).unwrap(), once);
+
+        // The reference comes alive once a task with that id exists.
+        let (alive, none) = super::parse_text(&format!("{once}- [ ] ghost ^ghost\n")).unwrap();
+        assert!(none.is_empty());
+        assert_eq!(deps_of(&alive, "a"), ["ghost", "setup"]);
+        assert_eq!(
+            alive
+                .items
+                .iter()
+                .find(|i| i.local_id == "a")
+                .unwrap()
+                .content,
+            "a\nwhy a"
+        );
+
+        // A dependency on a real id parses with nothing to report.
+        let (_, none) = super::parse_text("- [ ] a needs:^b ^a\n- [ ] b ^b\n").unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn a_needs_naming_a_minted_id_is_a_dependency() {
+        // A caret-less line's id is minted; a `needs:` naming that id resolves like any other.
+        let (doc, _) = super::parse_text("- [ ] Set up CI\n").unwrap();
+        let minted = doc.items[0].local_id.clone();
+        let text = format!("- [ ] Set up CI\n- [ ] deploy needs:^{minted} ^deploy\n");
+        let (doc, warnings) = super::parse_text(&text).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(deps_of(&doc, "deploy"), [minted.as_str()]);
+    }
+
+    #[test]
+    fn a_content_probe_with_a_needs_naming_nothing_round_trips() {
+        // `task_content_problem` renders the content as a one-task file. A `needs:^x` in a title
+        // names no task there, so it is read back as the same title text.
+        assert_eq!(super::task_content_problem("Ship it needs:^x"), None);
     }
 
     #[test]
@@ -1273,6 +1389,96 @@ Some description.
             .edges
             .iter()
             .any(|e| e.src == "p" && e.dst == "c" && e.edge_type == jkb_types::EdgeType::ParentOf));
+    }
+
+    #[test]
+    fn indentation_nests_by_extending_the_parents_whitespace() {
+        // Tabs under tabs and spaces under spaces nest as they read, at every depth, and a
+        // shallower line closes the deeper ones.
+        for text in [
+            "- [ ] p ^p\n\t- [ ] c ^c\n\t\t- [ ] g ^g\n\t- [ ] s ^s\n- [ ] t ^t\n",
+            "- [ ] p ^p\n    - [ ] c ^c\n        - [ ] g ^g\n    - [ ] s ^s\n- [ ] t ^t\n",
+            "- [ ] p ^p\n  - [ ] c ^c\n    - [ ] g ^g\n  - [ ] s ^s\n- [ ] t ^t\n",
+            // Mixed, but every nested line extends its parent's own characters: unambiguous.
+            "- [ ] p ^p\n\t- [ ] c ^c\n\t  - [ ] g ^g\n\t- [ ] s ^s\n- [ ] t ^t\n",
+        ] {
+            let doc = TasksSerializer.parse(text.as_bytes()).unwrap();
+            assert_eq!(parent_of(&doc, "p"), None, "{text:?}");
+            assert_eq!(parent_of(&doc, "c"), Some("p"), "{text:?}");
+            assert_eq!(parent_of(&doc, "g"), Some("c"), "{text:?}");
+            assert_eq!(parent_of(&doc, "s"), Some("p"), "{text:?}");
+            assert_eq!(parent_of(&doc, "t"), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn indentation_with_no_single_reading_is_a_parse_error_naming_the_line() {
+        // A tab against four spaces: whether the tab line is the four-space task's child or its
+        // sibling depends on the reader's tab width. Reading it either way would hand the KB a
+        // tree the author may not have seen, so the file does not parse (and is quarantined).
+        for (text, line) in [
+            ("- [ ] p ^p\n    - [ ] c ^c\n\t- [ ] d ^d\n", 3),
+            ("- [ ] p ^p\n  - [ ] c ^c\n\t- [ ] d ^d\n", 3),
+            ("- [ ] p ^p\n\t- [ ] c ^c\n    - [ ] d ^d\n", 3),
+            ("## S\n- [ ] p ^p\n\t- [ ] c ^c\n \t- [ ] d ^d\n", 4),
+        ] {
+            let err = TasksSerializer
+                .parse(text.as_bytes())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("line {line}:")) && err.contains("tab"),
+                "{text:?}: {err}"
+            );
+        }
+        // A header resets nesting, so the same indentations under a new section are fine.
+        assert!(TasksSerializer
+            .parse(b"- [ ] p ^p\n    - [ ] c ^c\n## S\n\t- [ ] d ^d\n")
+            .is_ok());
+    }
+
+    #[test]
+    fn a_tab_indented_file_renders_canonically_with_the_same_tree() {
+        // Render re-indents canonically (two spaces a level) so it stays idempotent; what it must
+        // keep is the tree, and the canonical file is a fixed point.
+        let s = TasksSerializer;
+        let text = "- [ ] p ^p\n\t- [ ] c ^c\n\t\tbody of c\n\t\t- [ ] g ^g\n- [ ] t ^t\n";
+        let doc = s.parse(text.as_bytes()).unwrap();
+        assert_eq!(
+            doc.items
+                .iter()
+                .find(|i| i.local_id == "c")
+                .unwrap()
+                .content,
+            "c\nbody of c"
+        );
+        let rendered = s.render(&doc).unwrap();
+        assert_eq!(
+            String::from_utf8(rendered.clone()).unwrap(),
+            "- [ ] p ^p\n  - [ ] c ^c\n    body of c\n    - [ ] g ^g\n- [ ] t ^t\n"
+        );
+        let back = s.parse(&rendered).unwrap();
+        assert_eq!(back, doc, "the tree survives the re-indent");
+        assert_eq!(s.render(&back).unwrap(), rendered);
+    }
+
+    #[test]
+    fn a_body_line_must_extend_its_tasks_indentation() {
+        // The body rule is the nesting rule: a line whose whitespace extends the task's is its
+        // body; one that does not (spaces under a tab-indented task) is section prose, kept
+        // verbatim — never silently attached to a task it may not belong to.
+        let doc = TasksSerializer
+            .parse(b"- [ ] p ^p\n\t- [ ] c ^c\n\t\tc body\n  not c's\n")
+            .unwrap();
+        assert_eq!(
+            doc.items
+                .iter()
+                .find(|i| i.local_id == "c")
+                .unwrap()
+                .content,
+            "c\nc body"
+        );
+        assert!(prose_blocks(&doc).iter().any(|p| p.contains("not c's")));
     }
 
     #[test]
