@@ -311,7 +311,12 @@ fn settle_out_of_scope(db: &Db, ctx: &Ctx, filter: &Filter) -> Result<usize> {
             } else {
                 filter.accepts(&ctx.dir, &path) && !through_link(&ctx.dir, &path)
             };
-            !in_scope || (!path.exists() && !bound.contains(&path))
+            //
+            // A third: an unbound path that is a directory. `discover` yields only files, so no
+            // reconcile revisits it — a row a watch event once journalled for a `mkdir` (before
+            // `sync_paths` skipped directories) was otherwise flagged for good, in `jkb doctor` but
+            // never in `jkb sync`'s report. A bound one stays: its reconcile owns the refusal.
+            !in_scope || (!bound.contains(&path) && (!path.exists() || is_dir_nofollow(&path)))
         })
         .map(|row| row.uri)
         .collect();

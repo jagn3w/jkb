@@ -399,6 +399,58 @@ fn sync_paths_ignores_directories_the_globs_accept() {
     assert_eq!(report.count(Outcome::Failed), 0, "{:?}", report.results);
 }
 
+/// A directory row journalled before `sync_paths` skipped directories (a `mkdir` under a watched
+/// mount, refused as `Is a directory`) is cleared by the next full sync, since no reconcile will
+/// ever revisit it.
+#[test]
+fn a_full_sync_settles_a_flag_journalled_for_a_directory() {
+    let dir = real_tempdir();
+    let folder = dir.path().join("notes.md");
+    fs::create_dir(&folder).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "docs/repo",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "document",
+        None,
+        None,
+        ConflictPolicy::Manual,
+    );
+    let uri = uri_for(&folder);
+    let seeded = uri.clone();
+    db.write_txn("sync", move |conn, meta| {
+        jkb_core::sync_state::upsert(
+            conn,
+            meta,
+            &jkb_core::sync_state::SyncStateWrite {
+                uri: &seeded,
+                serializer: "document",
+                status: "needs_attention",
+                last_synced_hash: None,
+                base_blob_hash: None,
+                parse_error: Some("could not archive: Is a directory (os error 21)"),
+                quarantine_blob_hash: None,
+                document: None,
+            },
+        )
+    })
+    .unwrap();
+    assert_eq!(journal(&db, &uri).unwrap().0, "needs_attention");
+
+    sync(&db, "docs/repo").unwrap();
+    assert_eq!(
+        journal(&db, &uri).unwrap().0,
+        "ok",
+        "the directory's flag is settled"
+    );
+    assert!(db
+        .read(jkb_core::sync_state::needs_attention)
+        .unwrap()
+        .is_empty());
+}
+
 #[test]
 fn watch_runs_an_initial_reconcile_then_stops() {
     let dir = real_tempdir();
