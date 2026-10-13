@@ -593,6 +593,24 @@ fn an_agent_owner_with_a_colon_keeps_its_claim() {
     assert_eq!(facts(&b, &uid).claim, None, "the release cleared it");
 }
 
+/// **A fresh claim by an agent id with an inner colon is stored as sent.** `jkb task start --owner
+/// agent:run:7` must write the row the caller named: when `AgentId::parse` rejoined the tail with
+/// `-`, the canonical-spelling check refused the owner outright, and a row written from the parsed
+/// owner would read `agent:run-7` — which the same owner's re-run then failed to recognize.
+#[test]
+fn a_fresh_start_by_an_agent_with_a_colon_stores_the_owner_as_sent() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let uid = add(&b, "fresh colon agent +tasks/x");
+    let owner = "agent:run:7";
+    assert!(start(&b, &uid, owner, None).unwrap(), "the claim is taken");
+    assert_eq!(facts(&b, &uid).claim.as_deref(), Some(owner));
+    assert!(
+        start(&b, &uid, owner, None).unwrap(),
+        "the same owner's re-run recognizes its own claim"
+    );
+    assert_eq!(facts(&b, &uid).claim.as_deref(), Some(owner));
+}
+
 /// **A claim held in an older spelling is refused with the way out, not reported as a race.** Its holder,
 /// sending the spelling it is now required to, would otherwise pass the lifecycle (which compares parsed
 /// owners) and fail the claim's byte compare-and-set.

@@ -212,7 +212,13 @@ impl AgentId {
         }
     }
 
-    /// The stored spelling. Inverse of [`AgentId::parse`].
+    /// The stored spelling.
+    ///
+    /// `AgentId::parse(s).as_str() == s` for every string already in this spelling — including an
+    /// `agent:` id whose tail carries a colon — but not for a non-canonical one: `host:007` reads
+    /// back as `host:7`. A claim is therefore taken only by an owner already in this spelling
+    /// (`jkb-api`'s `check_new_owner`), so the stored row, every comparison and the printed owner
+    /// are the same bytes.
     #[must_use]
     pub fn as_str(&self) -> String {
         match self {
