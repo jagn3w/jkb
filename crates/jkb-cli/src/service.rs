@@ -55,15 +55,47 @@ fn manager() -> Result<Manager> {
 /// One installable unit: its label, where it goes, and what goes in it.
 type Unit = (&'static str, PathBuf, String);
 
-/// Print the service units for this platform to stdout (a dry run of `install`).
+/// Print the service units for this platform to stdout (a dry run of `install`), each under a
+/// comment naming the path `install` writes it to.
 ///
 /// # Errors
 /// Returns an error if the current executable or working directory can't be resolved.
 pub fn print(db: &Path) -> Result<()> {
-    for (_, _, unit) in units_for_platform(db)? {
-        print!("{unit}");
-    }
+    print!("{}", render_print(manager()?, &units_for_platform(db)?));
     Ok(())
+}
+
+/// Every unit, separated by a blank line, each carrying a comment that names its install path in
+/// that unit type's own comment syntax — so each section can be copied into its file verbatim.
+/// Concatenated bare, two plists were two XML documents in one stream (which `plutil` and launchd
+/// reject) and nothing said which file either belonged in.
+///
+/// A systemd unit takes a leading `#` line. A plist cannot: the XML declaration must be the
+/// document's first bytes, so the `<!-- … -->` comment goes on the line after it, in the prolog,
+/// where XML allows one. `--` may not appear inside an XML comment, so a path containing it is
+/// spelled `- -` there.
+fn render_print(manager: Manager, units: &[Unit]) -> String {
+    let mut sections = Vec::with_capacity(units.len());
+    for (_, path, unit) in units {
+        let path = path.display().to_string();
+        let mut section = match manager {
+            Manager::Systemd => format!("# {path}\n{unit}"),
+            Manager::Launchd => {
+                let comment = format!("<!-- {} -->\n", path.replace("--", "- -"));
+                match unit.split_once('\n') {
+                    Some((decl, rest)) if decl.starts_with("<?xml") => {
+                        format!("{decl}\n{comment}{rest}")
+                    }
+                    _ => format!("{comment}{unit}"),
+                }
+            }
+        };
+        if !section.ends_with('\n') {
+            section.push('\n');
+        }
+        sections.push(section);
+    }
+    sections.join("\n")
 }
 
 /// Write the service units to their platform locations and print the activation commands.
@@ -561,10 +593,83 @@ fn xml_escape(s: &str) -> String {
 mod tests {
     use super::{
         install_units, launchd_log, launchd_plist, launchd_reap_plist, launchd_serve_plist,
-        systemd_quote, systemd_reap_unit, systemd_serve_unit, systemd_unit, xml_escape, Manager,
-        Word, LABEL, REAP_LABEL, SERVE_LABEL,
+        render_print, systemd_quote, systemd_reap_unit, systemd_serve_unit, systemd_unit,
+        xml_escape, Manager, Word, LABEL, REAP_LABEL, SERVE_LABEL,
     };
     use std::path::Path;
+
+    /// `service print` is a dry run of `install`: each unit is announced by a comment naming its
+    /// install path, in a syntax its file accepts, so every section copies into its file verbatim.
+    #[test]
+    fn print_names_each_systemd_unit_by_its_install_path() {
+        let exe = Path::new("/usr/local/bin/jkb");
+        let db = Path::new("/home/u/.jkb/jkb.db");
+        let dir = Path::new("/home/u/.config/systemd/user");
+        let units = vec![
+            (
+                LABEL,
+                dir.join(format!("{LABEL}.service")),
+                systemd_unit(exe, db),
+            ),
+            (
+                REAP_LABEL,
+                dir.join(format!("{REAP_LABEL}.service")),
+                systemd_reap_unit(exe, db, None),
+            ),
+        ];
+        let out = render_print(Manager::Systemd, &units);
+        let want = format!(
+            "# /home/u/.config/systemd/user/{LABEL}.service\n{}\n\
+             # /home/u/.config/systemd/user/{REAP_LABEL}.service\n{}",
+            units[0].2, units[1].2
+        );
+        assert_eq!(out, want);
+        // Each section is a whole unit: the header line is a systemd comment, and the next
+        // section begins only after the previous unit's last line.
+        for (_, path, unit) in &units {
+            let header = format!("# {}\n", path.display());
+            let at = out.find(&header).expect("every unit has a header");
+            assert!(out[at + header.len()..].starts_with(unit.as_str()));
+        }
+    }
+
+    #[test]
+    fn print_names_each_plist_by_its_install_path_after_the_xml_declaration() {
+        let exe = Path::new("/usr/local/bin/jkb");
+        let db = Path::new("/Users/u/.jkb/jkb.db");
+        let dir = Path::new("/Users/u/Library/LaunchAgents");
+        let units = vec![
+            (
+                LABEL,
+                dir.join(format!("{LABEL}.plist")),
+                launchd_plist(exe, db),
+            ),
+            (
+                SERVE_LABEL,
+                Path::new("/Users/a--b").join(format!("{SERVE_LABEL}.plist")),
+                launchd_serve_plist(exe, db),
+            ),
+        ];
+        let out = render_print(Manager::Launchd, &units);
+        // The XML declaration must be a document's first bytes, so every section starts with it
+        // and names its path on the very next line.
+        let docs: Vec<&str> = out.split("<?xml ").filter(|d| !d.is_empty()).collect();
+        assert_eq!(docs.len(), 2, "{out}");
+        assert!(out.starts_with("<?xml "));
+        let comments = [
+            format!("<!-- /Users/u/Library/LaunchAgents/{LABEL}.plist -->"),
+            format!("<!-- /Users/a- -b/{SERVE_LABEL}.plist -->"),
+        ];
+        for ((doc, comment), (_, _, unit)) in docs.iter().zip(&comments).zip(&units) {
+            let mut lines = doc.lines();
+            lines.next();
+            assert_eq!(lines.next(), Some(comment.as_str()));
+            // Taking the comment line back out leaves exactly the unit `install` writes.
+            let restored = format!("<?xml {}", doc.replacen(&format!("{comment}\n"), "", 1));
+            assert_eq!(restored.trim_end(), unit.trim_end());
+            assert!(!comment[4..comment.len() - 3].contains("--"));
+        }
+    }
 
     #[test]
     fn launchd_plist_runs_the_watcher() {

@@ -1509,7 +1509,8 @@ enum TaskTagCmd {
 
 #[derive(Subcommand)]
 enum ServiceCmd {
-    /// Print the service unit for this platform (a dry run of `install`).
+    /// Print the service units for this platform (a dry run of `install`), each under a comment
+    /// naming the file `install` writes it to.
     Print,
     /// Write the service unit and print the command to activate it.
     Install,
@@ -3319,9 +3320,9 @@ fn settle_landing(
     // land (the land lease only excludes a second land, or an abandon). Writing `Done` over a cancellation made
     // this the one transition the guard exists to prevent. Same reasoning as `review::record`.
     // Whether the status was left as somebody else set it during the gate. Reported, not
-    // returned as an error: the session HAS been disposed of by this point, so bailing left
-    // the claim held on a worktree that no longer exists — freed only by `doctor --fix` — and
-    // said nothing about what had just been removed.
+    // returned as an error: the session's disposal has already RUN by this point (archived, or
+    // deferred to the reaper), so bailing left the claim held on a worktree that may no longer
+    // exist — freed only by `doctor --fix` — and said nothing about what had just been done to it.
     // THE PLAN IS APPLIED LAST, after every fallible git step above has succeeded. That is the
     // rule that makes a git failure survivable: a landing whose session could not be disposed of
     // leaves the task where it was, and the verb is simply re-runnable. The incident this
@@ -3351,9 +3352,8 @@ fn settle_landing(
     let kept_status = outcome.refusal.map(|why| (outcome.status, why));
     if let Some((status, why)) = &kept_status {
         eprintln!(
-            "note: {} was left `{status}` — {why} Its commits are on {}, and its session has been \
-             disposed of.",
-            landed.uid, landed.onto
+            "{}",
+            kept_status_note(landed.uid, landed.onto, status, why, &disposal)
         );
     }
 
@@ -3390,6 +3390,22 @@ fn settle_landing(
         json,
     );
     Ok(())
+}
+
+/// The note for a landing whose `land` transition was refused (the task was cancelled during the
+/// gate), saying what became of the session on the arm that actually ran. It once said "its
+/// session has been disposed of" on every arm, which the deferred arm — a session landing itself,
+/// whose tree is still where it was — contradicts.
+fn kept_status_note(uid: &str, onto: &str, status: &str, why: &str, disposal: &Disposal) -> String {
+    let session = match disposal {
+        Disposal::AlreadyGone => "its session was already gone",
+        Disposal::Archived(_) => "its session has been archived",
+        Disposal::Deferred(_) => {
+            "its session could not be archived from in here and is still where it was"
+        }
+        Disposal::Kept => "its session was kept, as asked",
+    };
+    format!("note: {uid} was left `{status}` — {why} Its commits are on {onto}, and {session}.")
 }
 
 /// Say what happened, never what was intended. Two claims here were once simply false:
@@ -4312,12 +4328,6 @@ fn branch_fate(asked_to_delete: bool, present: Fact, reaper_will_act: bool) -> B
     }
 }
 
-/// The `doctor` line for this repo's task sessions. Best-effort: `doctor` is often run
-/// outside a git repo entirely, and that is not a fault to report.
-///
-/// Every session is listed, not just some subset flagged as neglected — nothing here can tell
-/// a session you are working in from one you walked away from (design D36.6), and a report
-/// that guesses would tell you to abandon the work you are doing.
 /// Worktrees a landing disposed of, or could not (design D49).
 ///
 /// Reported by `doctor` because both halves are otherwise invisible: a deferred removal is a
@@ -4465,6 +4475,13 @@ fn fix_worktree_removals(stores: &archive::Stores<'_>) {
     }
 }
 
+/// The `doctor` lines for this repo's task sessions: each one, with the task it carries and how
+/// to resume, land or drop it. Best-effort: `doctor` is often run outside a git repo entirely,
+/// and that is not a fault to report.
+///
+/// Every session is listed, not just some subset flagged as neglected — nothing here can tell
+/// a session you are working in from one you walked away from (design D36.6), and a report
+/// that guesses would tell you to abandon the work you are doing.
 fn report_sessions(kb: &session_cli::Kb<'_>) {
     let Ok(ctx) = repo::repo_ctx() else { return };
     let Ok(sessions) = session::discover(&ctx.root) else {
@@ -4800,6 +4817,41 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The refused-land note says what became of the session on the arm that ran. On the deferred
+    /// arm — a session landing itself — the tree is still where it was, and the note used to say
+    /// it "has been disposed of".
+    #[test]
+    fn a_refused_land_note_says_what_became_of_the_session() {
+        use super::{kept_status_note, Disposal};
+        use crate::archive::{Deferral, Verdict};
+        let deferred = Disposal::Deferred(Deferral {
+            why: "permission denied".to_owned(),
+            verdict: Verdict::Stow,
+            unrecorded: None,
+        });
+        let note = kept_status_note("task:t", "main", "cancelled", "Cancelled.", &deferred);
+        assert!(
+            note.contains("is still where it was"),
+            "deferred arm must say the session is still in place: {note}"
+        );
+        assert!(!note.contains("disposed of"), "{note}");
+        assert!(note
+            .starts_with("note: task:t was left `cancelled` — Cancelled. Its commits are on main"));
+
+        let archived = kept_status_note(
+            "task:t",
+            "main",
+            "cancelled",
+            "Cancelled.",
+            &Disposal::Archived(std::path::PathBuf::from("/a")),
+        );
+        assert!(archived.contains("has been archived"), "{archived}");
+        let gone = kept_status_note("task:t", "main", "cancelled", "x", &Disposal::AlreadyGone);
+        assert!(gone.contains("already gone"), "{gone}");
+        let kept = kept_status_note("task:t", "main", "cancelled", "x", &Disposal::Kept);
+        assert!(kept.contains("was kept"), "{kept}");
+    }
 
     /// THE REPORTING RULE, driven for every outcome. Nothing executed it before: the seam stopped
     /// one level lower, at `sweep_with`, so the loop's own discipline — say what CHANGED — was
