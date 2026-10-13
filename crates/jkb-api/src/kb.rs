@@ -473,6 +473,11 @@ pub struct TaskDetail {
     /// from an older daemon's answer, which decodes as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub place: Option<TaskPlacement>,
+    /// The `^id`s its tasks.md line `needs:` that no task in that file defines yet
+    /// (`jkb_core::item::UNRESOLVED_NEEDS`): dependencies the file declares but cannot record.
+    /// Absent when there are none, and from an older daemon's answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_needs: Vec<String>,
 }
 
 fn not_found(what: impl Into<String>) -> ApiError {
@@ -1302,6 +1307,7 @@ pub fn task_show(
         subtasks: Vec::new(),
         review: jkb_core::reviews::state(conn, id)?,
         place: design::plan::ancestry_of(conn, id)?.map(TaskPlacement::from),
+        unresolved_needs: item::unresolved_needs(conn, id)?,
     };
     // The task itself is not charged: it is what was asked for, and charging a large body marked the
     // answer cut when no subtask had been dropped at all.
@@ -1366,6 +1372,7 @@ mod tests {
             subtasks: Vec::new(),
             review: jkb_core::reviews::ReviewState::default(),
             place: None,
+            unresolved_needs: Vec::new(),
         };
         let sent = serde_json::to_value(&detail).unwrap();
         assert!(sent.get("place").is_none(), "{sent}");

@@ -1034,6 +1034,8 @@ fn task_json(task: &TaskDetail) -> serde_json::Value {
         // Additive: the step, plan and design it sits under (null under none), so an implementer
         // finds the design that governs it.
         "place": task.place,
+        // Additive: the `needs:^id`s its tasks.md line declares that name no task in the file yet.
+        "unresolved_needs": task.unresolved_needs,
     })
 }
 
@@ -1091,6 +1093,17 @@ fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
             .map(|t| format!("{}={}", t.facet, t.value))
             .collect();
         println!("tags:      {}", pairs.join(", "));
+    }
+    if !task.unresolved_needs.is_empty() {
+        let ids: Vec<String> = task
+            .unresolved_needs
+            .iter()
+            .map(|id| format!("^{id}"))
+            .collect();
+        println!(
+            "needs:     {} (named in its tasks.md, but no task there has that id yet)",
+            ids.join(", ")
+        );
     }
     if let Some(line) = review_line(&task.review) {
         println!("review:    {line}");
@@ -1254,6 +1267,7 @@ mod tests {
                         transitions: Vec::new(),
                         subtasks: Vec::new(),
                         place: None,
+                        unresolved_needs: Vec::new(),
                     }),
                     truncated: true,
                 },

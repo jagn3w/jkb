@@ -983,13 +983,16 @@ fn a_needs_naming_a_deleted_task_drops_one_edge_not_the_file() {
     assert_eq!(warnings[0].0, file.as_path());
     assert!(warnings[0].1.contains("needs:^setup"), "{}", warnings[0].1);
 
-    // The token stays in the file where the author can see it, the file settles, and the warning
-    // is repeated on every sync until the file stops saying it.
+    // The token stays in the file, on its line exactly as written, while the task's text stays
+    // clean and the reference is parked on the item; the file settles, and the warning is
+    // repeated on every sync until the file stops saying it.
     let text = fs::read_to_string(&file).unwrap();
-    assert!(
-        text.contains("- [ ] Fix flaky test needs:^setup !p1 ^fix"),
-        "{text}"
+    assert_eq!(text, edited);
+    assert_eq!(
+        content_for(&db, &format!("{uri}#fix")).as_deref(),
+        Some("Fix flaky test")
     );
+    assert_eq!(unresolved_needs(&db, &format!("{uri}#fix")), ["setup"]);
     let again = sync(&db, "docs/plan").unwrap();
     assert_eq!(again.count(Outcome::UpToDate), 1);
     assert_eq!(again.warnings().len(), 1);
@@ -1004,6 +1007,47 @@ fn a_needs_naming_a_deleted_task_drops_one_edge_not_the_file() {
     let back = sync(&db, "docs/plan").unwrap();
     assert!(back.warnings().is_empty());
     assert!(is_blocked(&db, &format!("{uri}#fix")));
+    assert!(unresolved_needs(&db, &format!("{uri}#fix")).is_empty());
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        text.replace("## Frontend", "- [ ] Set up CI ^setup\n## Frontend")
+    );
+}
+
+/// The parked `needs:` of the bound task `uid`.
+fn unresolved_needs(db: &Db, uid: &str) -> Vec<String> {
+    let uid = uid.to_owned();
+    db.read(move |conn| {
+        let id = item::id_for_uid(conn, &uid)?.expect("task");
+        item::unresolved_needs(conn, id)
+    })
+    .unwrap()
+}
+
+#[test]
+fn a_parked_needs_edited_on_disk_is_seen_by_a_three_way_merge() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, "## A\n- [ ] a needs:^ghost ^a\n- [ ] b ^b\n").unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(unresolved_needs(&db, &format!("{uri}#a")), ["ghost"]);
+
+    // Disk changes only `a`'s parked reference while the KB changes `b`: the merge must take the
+    // disk's `a`, so its signature has to see the parked reference change.
+    kb_set_status(&db, &format!("{uri}#b"), "in_progress");
+    fs::write(&file, "## A\n- [ ] a needs:^phantom ^a\n- [ ] b ^b\n").unwrap();
+    let report = sync(&db, "docs/plan").unwrap();
+    assert_eq!(report.count(Outcome::Merged), 1, "{:?}", report.results);
+    assert_eq!(unresolved_needs(&db, &format!("{uri}#a")), ["phantom"]);
+    assert_eq!(
+        status_of(&db, &format!("{uri}#b")).as_deref(),
+        Some("in_progress")
+    );
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.contains("- [ ] a needs:^phantom ^a"), "{text}");
 }
 
 #[test]

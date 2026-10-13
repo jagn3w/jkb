@@ -103,6 +103,12 @@ pub struct SyncItem {
     pub mirrors: Vec<String>,
     /// The `local_id` of this item's parent (indentation → `parent_of`); `None` if top.
     pub parent: Option<String>,
+    /// The `^id`s this task's `needs:` modifiers name that no item in the file defines, in file
+    /// order: a dependency the file declares but cannot yet record. Never an edge and never words
+    /// of the content; rendered back as `needs:^id` so the line survives, and stored on the item
+    /// (`jkb_core::item::UNRESOLVED_NEEDS`). The parse resolves one into a `depends_on` edge as
+    /// soon as the file defines its id.
+    pub unresolved_needs: Vec<String>,
 }
 
 impl SyncItem {
@@ -121,6 +127,7 @@ impl SyncItem {
             tags: Vec::new(),
             mirrors: Vec::new(),
             parent: None,
+            unresolved_needs: Vec::new(),
         }
     }
 }
@@ -151,7 +158,7 @@ pub trait SyncSerializer: Send + Sync {
 
     /// [`parse`](Self::parse), plus one warning for each thing in the bytes the parse accepted
     /// without taking it at face value — for `tasks`, a `needs:^id` naming no task in the file,
-    /// kept as title text instead of becoming an edge. The engine reports these on the file's
+    /// parked on its task ([`SyncItem::unresolved_needs`]) instead of becoming an edge. The engine reports these on the file's
     /// [`FileResult`](crate::FileResult) every time it reads the file, so a reference that
     /// records nothing is never silent. The default has nothing to warn about.
     ///

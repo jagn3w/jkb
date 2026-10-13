@@ -265,8 +265,7 @@ pub enum ContentEdit<'a> {
 /// refuses a result `tasks_problem` names — the tasks serializer's own round trip
 /// (`jkb_sync::task_content_problem`), handed in because core does not depend on it: a blank line
 /// ending the body, an indented checkbox becoming a child task, a trailing `^x` or `@x` becoming an
-/// identity or a due date. The *result* is judged, not the text sent, and a result whose problem is the
-/// one the item's text already had, named identically, is let through. Any other item appends after a
+/// identity or a due date. The *result* is judged, not the text sent. Any other item appends after a
 /// blank line. With `max_bytes`, a result longer than that is refused. A replace with an `expected`
 /// base is refused with [`Error::Stale`] unless the item's content is still exactly that base, so an
 /// editor whose draft started before someone else's write cannot erase it. Answers whether the item
@@ -317,20 +316,7 @@ pub fn edit_content(
         }
     }
     if tasks_file {
-        // A problem the text already had, exactly as named, is not this edit's: the file itself can
-        // put one there (a `needs:^id` naming no task is imported as title words), and refusing every
-        // later edit — an append beneath it, say — would hold the task hostage to a line only the
-        // file can fix. The same rule `jkb_api::tasks::check_line` applies to the whole line. A
-        // different problem, or the same kind with more in it, is named differently and refused.
-        let problem = match tasks_problem(&content) {
-            Some(problem) => {
-                let before = get_content(conn, item)?;
-                let had = before.as_deref().and_then(tasks_problem);
-                (had.as_ref() != Some(&problem)).then_some(problem)
-            }
-            None => None,
-        };
-        if let Some(problem) = problem {
+        if let Some(problem) = tasks_problem(&content) {
             return Err(TypeError::Validation(format!(
                 "this task is written into a tasks.md, and its text would not come back from the file \
                  as written: {problem}"
@@ -1036,9 +1022,96 @@ pub fn set_content(
     Ok(())
 }
 
+/// The `metadata` key holding a file-backed task's **unresolved needs**: the `^id`s its line's
+/// `needs:` modifiers name that no task in its file defines, in file order. Kept so the file's
+/// text survives a round trip without the reference becoming either an edge to nothing or
+/// words of the title; the `tasks` serializer turns one into a `depends_on` edge as soon as the
+/// file defines its id.
+pub const UNRESOLVED_NEEDS: &str = "unresolved_needs";
+
+/// The item's [`UNRESOLVED_NEEDS`], in order; empty when it has none.
+///
+/// # Errors
+/// [`jkb_types::Error::NotFound`] for an unknown item, unreadable `metadata`, or a failed read.
+pub fn unresolved_needs(conn: &Connection, item: ItemId) -> Result<Vec<String>> {
+    let md = metadata_of(conn, item)?;
+    Ok(md
+        .get(UNRESOLVED_NEEDS)
+        .and_then(serde_json::Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Set the item's [`UNRESOLVED_NEEDS`] (removing the key when `needs` is empty), leaving every
+/// other `metadata` key as it was. Writes nothing when the value is unchanged; a write is logged so
+/// `jkb undo` restores the previous `metadata`.
+///
+/// # Errors
+/// [`jkb_types::Error::NotFound`] for an unknown item, unreadable `metadata`, or a failed write.
+pub fn set_unresolved_needs(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    needs: &[String],
+) -> Result<()> {
+    if unresolved_needs(conn, item)? == needs {
+        return Ok(());
+    }
+    let before = metadata_of(conn, item)?;
+    let mut after = before.clone();
+    if let Some(map) = after.as_object_mut() {
+        if needs.is_empty() {
+            map.remove(UNRESOLVED_NEEDS);
+        } else {
+            map.insert(UNRESOLVED_NEEDS.to_owned(), json!(needs));
+        }
+    }
+    let (before, after) = (before.to_string(), after.to_string());
+    conn.prepare_cached(
+        "UPDATE items SET metadata = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+          WHERE id = ?1",
+    )?
+    .execute(params![item.get(), after])?;
+    changelog::append(
+        conn,
+        meta,
+        Op::Update,
+        Entity::Items,
+        &item.get().to_string(),
+        Some(&json!({ "metadata": before })),
+        Some(&json!({ "metadata": after })),
+    )?;
+    Ok(())
+}
+
+/// The item's `metadata` object.
+fn metadata_of(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
+    let raw: String = conn
+        .prepare_cached("SELECT metadata FROM items WHERE id = ?1")?
+        .query_row([item.get()], |r| r.get(0))
+        .optional()?
+        .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        Error::Types(TypeError::Validation(format!(
+            "item {item} has unreadable metadata: {e}"
+        )))
+    })?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(Error::Types(TypeError::Validation(format!(
+            "item {item} has metadata that is not an object"
+        ))))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{grep, remove, upsert, NewItem};
+    use super::{grep, remove, set_unresolved_needs, unresolved_needs, upsert, NewItem};
     use crate::{ns, placement, Db};
     use jkb_types::PlacementRole;
     use proptest::prelude::*;
@@ -1314,5 +1387,54 @@ mod tests {
                 .unwrap();
             prop_assert_eq!(n, 1);
         }
+    }
+
+    /// Unresolved needs live under one `metadata` key: set and read back in order, cleared by an
+    /// empty list without touching any other key, and restored by `jkb undo`.
+    #[test]
+    fn unresolved_needs_round_trip_keep_other_metadata_and_undo() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |c, m| {
+                let id = upsert(
+                    c,
+                    m,
+                    &NewItem {
+                        uid: "task:n".into(),
+                        kind: "task".into(),
+                        content: Some("n".into()),
+                        content_hash: None,
+                        mime: None,
+                    },
+                )?;
+                c.execute(
+                    "UPDATE items SET metadata = '{\"keep\":1}' WHERE id = ?1",
+                    [id.get()],
+                )?;
+                Ok(id)
+            })
+            .unwrap();
+        let needs = vec!["b".to_owned(), "a".to_owned()];
+        db.write_txn("t", {
+            let needs = needs.clone();
+            move |c, m| set_unresolved_needs(c, m, id, &needs)
+        })
+        .unwrap();
+        assert_eq!(db.read(move |c| unresolved_needs(c, id)).unwrap(), needs);
+        db.write_txn("t", move |c, m| set_unresolved_needs(c, m, id, &[]))
+            .unwrap();
+        let md: String = db
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT metadata FROM items WHERE id = ?1",
+                    [id.get()],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(md, r#"{"keep":1}"#);
+        db.write_txn("t", |c, m| crate::undo::undo_last(c, m).map(|_| ()))
+            .unwrap();
+        assert_eq!(db.read(move |c| unresolved_needs(c, id)).unwrap(), needs);
     }
 }

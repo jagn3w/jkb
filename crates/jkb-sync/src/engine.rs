@@ -2482,6 +2482,9 @@ fn set_task_columns(conn: &Connection, meta: &WriteMeta, id: ItemId, it: &SyncIt
     if it.due != due {
         task::set_due(conn, meta, id, it.due.as_deref())?;
     }
+    // Writes nothing when unchanged. Stored with the task's columns because it is read back with
+    // them (`assemble_kb_doc`), so the KB render carries the `needs:^id` the file does.
+    item::set_unresolved_needs(conn, meta, id, &it.unresolved_needs)?;
     Ok(())
 }
 
@@ -2584,6 +2587,9 @@ fn assemble_kb_doc(
             continue;
         };
         let mut item = build_sync_item(local_id, &file_ns_path, row, placement);
+        if item.kind == "task" {
+            item.unresolved_needs = item::unresolved_needs(conn, *id)?;
+        }
         item.tags = tags.remove(id).unwrap_or_default();
         item.mirrors = mirrors.remove(id).unwrap_or_default();
         doc.items.push(item);
@@ -2823,6 +2829,9 @@ struct Sig {
     /// signature so an edge edit on either side is detected: without its parent here a nesting
     /// edit had an identical `Sig` and was silently reverted.
     edges: Vec<(&'static str, String)>,
+    /// Its parked `needs:^id`s ([`SyncItem::unresolved_needs`]), in order: a dependency the line
+    /// declares as much as an edge is, so a disk or KB edit to one is a change to this item.
+    unresolved_needs: Vec<String>,
 }
 
 /// The item that OWNS an edge in a three-way merge, and the edge's other end.
@@ -2896,6 +2905,7 @@ fn sigs(doc: &SyncDoc) -> HashMap<String, Sig> {
                     tags,
                     mirrors,
                     edges,
+                    unresolved_needs: i.unresolved_needs.clone(),
                 },
             )
         })

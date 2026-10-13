@@ -59,7 +59,7 @@ impl SyncSerializer for TasksSerializer {
 }
 
 /// Parse the whole file into a [`SyncDoc`], with a warning for each thing the parse accepted
-/// but did not take at face value (see [`keep_dangling_dependencies_as_text`]). A single
+/// but did not take at face value (see [`park_dangling_dependencies`]). A single
 /// trailing newline is normalized away (and re-added on render) so the round-trip is stable.
 fn parse_text(text: &str) -> Result<(SyncDoc, Vec<String>)> {
     // A truly empty file yields an empty doc; a lone "\n" is a preserved blank line.
@@ -81,7 +81,7 @@ fn parse_text(text: &str) -> Result<(SyncDoc, Vec<String>)> {
         }
     }
     st.flush_text();
-    let warnings = keep_dangling_dependencies_as_text(&mut st.doc);
+    let warnings = park_dangling_dependencies(&mut st.doc);
     if has_dependency_cycle(&st.doc) {
         return Err(bad("task dependencies (`needs:^…`) form a cycle"));
     }
@@ -258,18 +258,20 @@ impl ParseState {
     }
 }
 
-/// Turn each `needs:^id` whose `^id` names no task in this file back into words of its task's
-/// title, returning one warning per token so turned.
+/// Park each `needs:^id` whose `^id` names no task in this file on its task
+/// ([`SyncItem::unresolved_needs`]) instead of leaving it an edge, returning one warning per
+/// reference so parked.
 ///
 /// A dangling reference — a typo, or a target line since deleted — is not a malformed file:
 /// every other line still says exactly what it means. It used to be a parse error, so one stale
 /// `needs:` quarantined the whole file and froze every other task in it until someone found the
-/// line. Dropping only the edge, though, would let the import's write-back erase the token from
-/// the file with nothing on any surface saying so. Kept as text, the token stays where the author
-/// wrote it, the line round-trips (the KB title holds it, so its render agrees with the file's),
-/// the sync reports it every time it reads the file, and the dependency forms by itself once a
-/// task with that `^id` exists.
-fn keep_dangling_dependencies_as_text(doc: &mut SyncDoc) -> Vec<String> {
+/// line. Dropping only the edge would let the import's write-back erase the token from the file
+/// with nothing on any surface saying so; keeping it as words of the title made the title carry
+/// a token the file reads as a dependency whenever the id exists, a disagreement no later sync
+/// would see. Parked, the task's text stays clean, the token renders back where the modifiers
+/// go, the sync reports it every time it reads the file, and the dependency forms by itself once
+/// a task with that `^id` exists.
+fn park_dangling_dependencies(doc: &mut SyncDoc) -> Vec<String> {
     let defined: HashSet<String> = doc.items.iter().map(|i| i.local_id.clone()).collect();
     let mut dangling: HashMap<String, Vec<String>> = HashMap::new();
     let mut warnings = Vec::new();
@@ -279,34 +281,19 @@ fn keep_dangling_dependencies_as_text(doc: &mut SyncDoc) -> Vec<String> {
         }
         warnings.push(format!(
             "task `^{}`: `needs:^{}` names no task in this file, so no dependency was recorded; \
-             it is kept as text in the title until a task with that id exists",
+             the line keeps it until a task with that id exists",
             e.src, e.dst
         ));
         dangling
             .entry(e.src.clone())
             .or_default()
-            .push(format!("needs:^{}", e.dst));
+            .push(e.dst.clone());
         false
     });
     for item in &mut doc.items {
-        let Some(tokens) = dangling.remove(&item.local_id) else {
-            continue;
-        };
-        let (title, body) = match item.content.split_once('\n') {
-            Some((title, body)) => (title, Some(body)),
-            None => (item.content.as_str(), None),
-        };
-        let mut words: Vec<&str> = Vec::new();
-        if !title.is_empty() {
-            words.push(title);
+        if let Some(needs) = dangling.remove(&item.local_id) {
+            item.unresolved_needs = needs;
         }
-        words.extend(tokens.iter().map(String::as_str));
-        let mut content = words.join(" ");
-        if let Some(body) = body {
-            content.push('\n');
-            content.push_str(body);
-        }
-        item.content = content;
     }
     warnings
 }
@@ -470,6 +457,9 @@ fn render_task(
             parts.push(format!("needs:^{dep}"));
         }
     }
+    for dep in &item.unresolved_needs {
+        parts.push(format!("needs:^{dep}"));
+    }
     parts.push(format!("^{}", item.local_id));
     let mut out = format!("{indent}- [{checkbox}] {}", parts.join(" "));
     if let Some(body) = body {
@@ -566,7 +556,7 @@ pub fn task_content_problem(content: &str) -> Option<String> {
     let Ok(bytes) = TasksSerializer.render(&doc) else {
         return Some("it cannot be written as a task line".to_owned());
     };
-    let Ok((back, warnings)) = TasksSerializer.parse_with_warnings(&bytes) else {
+    let Ok(back) = TasksSerializer.parse(&bytes) else {
         return Some("the task line it makes does not parse".to_owned());
     };
     if back.items.len() > 1 {
@@ -597,8 +587,10 @@ pub fn task_content_problem(content: &str) -> Option<String> {
     if !task.mirrors.is_empty() {
         trailing.push("`+ns` placement");
     }
-    if !back.edges.is_empty() {
-        trailing.push("`needs:^id` dependency");
+    // A `needs:^id` naming no task is parked rather than made an edge — in this one-task probe,
+    // every one is — but in the real file the id may exist, so it is a dependency either way.
+    if !back.edges.is_empty() || !task.unresolved_needs.is_empty() {
+        trailing.push("`needs:^id` dependency (record one with `jkb task depend`)");
     }
     if !trailing.is_empty() {
         return Some(format!(
@@ -606,52 +598,19 @@ pub fn task_content_problem(content: &str) -> Option<String> {
             trailing.join(", ")
         ));
     }
-    if task.content != content {
+    (task.content != content).then(|| {
         const SHOWN: usize = 200;
         let mut shown: String = task.content.chars().take(SHOWN).collect();
         if task.content.chars().nth(SHOWN).is_some() {
             shown.push('…');
         }
-        return Some(format!(
+        format!(
             "it would be read back as {shown:?} (quotes are dropped, runs of spaces and tabs close \
              up, spaces are taken off the ends of the title and the start of every body line, and a \
              trailing `^id` becomes the task's identity) — `task edit` with the text as it should \
              read replaces it"
-        ));
-    }
-    // Last, so any other problem is named first. A `needs:^id` naming no task is kept as words —
-    // but only because the one-task probe defines no id. In the real file the id may well exist,
-    // and then the line is read back as a dependency the knowledge base does not have: the two
-    // disagree, permanently and without a word. The probe's warning is exactly that case.
-    (!warnings.is_empty()).then(|| {
-        let mut tokens: Vec<&str> = trailing_modifier_words(content)
-            .filter(|w| matches!(classify(w), Some(Modifier::Dep(_))))
-            .collect();
-        tokens.sort_unstable();
-        tokens.dedup();
-        format!(
-            "its title has {}, which the tasks.md reads as a dependency as soon as the file has a task \
-             with that id, while the knowledge base keeps it as words — record a dependency with \
-             `jkb task depend` instead",
-            tokens
-                .iter()
-                .map(|t| format!("`{t}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
         )
     })
-}
-
-/// The trailing run of modifier-shaped words on `content`'s first line (its title): the words a
-/// task line reads as modifiers rather than title (see [`parse_task_tokens`]).
-fn trailing_modifier_words(content: &str) -> impl Iterator<Item = &str> {
-    content
-        .split('\n')
-        .next()
-        .unwrap_or_default()
-        .split_whitespace()
-        .rev()
-        .take_while(|w| classify(w).is_some())
 }
 
 /// Why `item`'s line in a `tasks.md` would not come back as `item` — `None` when it would. `deps` are the
@@ -772,11 +731,11 @@ fn line_difference(item: &SyncItem, deps: &[String]) -> Option<(&'static str, St
             show(&sorted(&item.mirrors)),
             show(&sorted(&got.mirrors)),
         ))
-    } else if sorted(&got_deps) != sorted(deps) {
+    } else if sorted(&got_deps) != sorted(deps) || got.unresolved_needs != item.unresolved_needs {
         Some((
             "dependencies",
-            show(&sorted(deps)),
-            show(&sorted(&got_deps)),
+            show(&(sorted(deps), &item.unresolved_needs)),
+            show(&(sorted(&got_deps), &got.unresolved_needs)),
         ))
     } else if got.status != item.status {
         Some(("status", show(&item.status), show(&got.status)))
@@ -1334,28 +1293,27 @@ Some description.
     }
 
     #[test]
-    fn a_dangling_needs_drops_only_its_edge_keeps_its_text_and_is_reported() {
+    fn a_dangling_needs_is_parked_on_its_task_not_an_edge_and_is_reported() {
         // `needs:^ghost` names no task in the file (a typo, or its line was deleted). It is not a
         // parse failure: every other task and edge parses, and only that one reference records
-        // nothing — kept as title text, and reported.
+        // nothing — parked on its task, out of its text, and reported.
         let text = "## A\n- [ ] setup ^setup\n- [ ] a !p1 needs:^ghost needs:^setup ^a\n  why a\n- [ ] b needs:^a ^b\n";
         let (doc, warnings) = super::parse_text(text).expect("a dangling needs does not fail");
         assert_eq!(deps_of(&doc, "a"), ["setup"]);
         assert_eq!(deps_of(&doc, "b"), ["a"]);
         let a = doc.items.iter().find(|i| i.local_id == "a").unwrap();
-        assert_eq!(
-            a.content, "a needs:^ghost\nwhy a",
-            "the token stays, on the title line"
-        );
+        assert_eq!(a.content, "a\nwhy a", "the text stays clean");
+        assert_eq!(a.unresolved_needs, ["ghost"]);
         assert_eq!(a.priority, Some(1));
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("`^a`") && warnings[0].contains("needs:^ghost"));
 
-        // The line renders with the token in it, and from there render is a fixed point.
+        // The line renders with the token among its modifiers (after the resolved ones), and from
+        // there render is a fixed point.
         let s = TasksSerializer;
         let once = String::from_utf8(s.render(&doc).unwrap()).unwrap();
         assert!(
-            once.contains("- [ ] a needs:^ghost !p1 needs:^setup ^a\n  why a"),
+            once.contains("- [ ] a !p1 needs:^setup needs:^ghost ^a\n  why a"),
             "{once}"
         );
         let (again, still) = super::parse_text(&once).unwrap();
@@ -1363,19 +1321,13 @@ Some description.
         assert_eq!(still, warnings, "reported every time the file is read");
         assert_eq!(String::from_utf8(s.render(&again).unwrap()).unwrap(), once);
 
-        // The reference comes alive once a task with that id exists.
+        // The reference becomes an edge once a task with that id exists, and is no longer parked.
         let (alive, none) = super::parse_text(&format!("{once}- [ ] ghost ^ghost\n")).unwrap();
         assert!(none.is_empty());
-        assert_eq!(deps_of(&alive, "a"), ["ghost", "setup"]);
-        assert_eq!(
-            alive
-                .items
-                .iter()
-                .find(|i| i.local_id == "a")
-                .unwrap()
-                .content,
-            "a\nwhy a"
-        );
+        assert_eq!(deps_of(&alive, "a"), ["setup", "ghost"]);
+        let a = alive.items.iter().find(|i| i.local_id == "a").unwrap();
+        assert!(a.unresolved_needs.is_empty());
+        assert_eq!(a.content, "a\nwhy a");
 
         // A dependency on a real id parses with nothing to report.
         let (_, none) = super::parse_text("- [ ] a needs:^b ^a\n- [ ] b ^b\n").unwrap();
@@ -1395,8 +1347,8 @@ Some description.
 
     #[test]
     fn task_text_with_a_needs_word_is_named_as_a_dependency_problem() {
-        // The one-task probe defines no id, so it reads `needs:^x` back as title words; the real
-        // file may define `x` and read it as a dependency the knowledge base does not have.
+        // The one-task probe defines no id, so a trailing `needs:^x` is parked there; the real file
+        // may define `x` and read it as a dependency the knowledge base does not have.
         for text in [
             "Ship it needs:^x",
             "Ship it needs:^x\nbody",
@@ -1404,22 +1356,39 @@ Some description.
         ] {
             let problem = super::task_content_problem(text);
             assert!(
-                problem
-                    .as_deref()
-                    .is_some_and(|p| p.contains("`needs:^x`") && p.contains("jkb task depend")),
+                problem.as_deref().is_some_and(
+                    |p| p.contains("`needs:^id` dependency") && p.contains("jkb task depend")
+                ),
                 "{text:?}: {problem:?}"
             );
         }
-        // Only a well-formed `needs:^…` word is one; text that merely mentions needs is fine.
+        // Only a well-formed trailing `needs:^…` word is one; mid-title, in the body, or merely
+        // mentioning needs, it is never read as a modifier, in the probe or in the file.
         assert_eq!(
             super::task_content_problem("Find what it needs: ^ caret"),
             None
         );
-        // Mid-title it is never read as a modifier, in the probe or in the file.
         assert_eq!(super::task_content_problem("Ship needs:^x now"), None);
         assert_eq!(
             super::task_content_problem("Ship it\nbody says needs:^x"),
             None
+        );
+    }
+
+    #[test]
+    fn a_line_with_parked_needs_comes_back_whole_and_a_changed_one_is_named() {
+        let mut item = super::SyncItem::new("fix", "task", "Fix flaky test");
+        item.status = Some("open".to_owned());
+        item.unresolved_needs = vec!["ghost".to_owned()];
+        assert_eq!(super::task_line_problem(&item, &[]), None);
+        // A parked id the line could not carry is named as the dependencies it would lose.
+        item.unresolved_needs = vec!["Not An Id".to_owned()];
+        let problem = super::task_line_problem(&item, &[]);
+        assert!(
+            problem
+                .as_deref()
+                .is_some_and(|p| p.contains("dependencies")),
+            "{problem:?}"
         );
     }
 
