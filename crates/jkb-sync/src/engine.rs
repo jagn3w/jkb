@@ -23,7 +23,8 @@ use walkdir::WalkDir;
 
 use jkb_core::item::NewItem;
 use jkb_core::{
-    binding, blob, edge, item, mount, ns, placement, sync_state, tag, task, Db, WriteMeta,
+    binding, blob, containment, edge, item, mount, ns, placement, sync_state, tag, task, Db,
+    WriteMeta,
 };
 use jkb_types::{
     ConflictPolicy, EdgeType, Error as TypeError, ItemId, NamespaceId, PlacementRole, SyncMode,
@@ -1168,9 +1169,11 @@ fn reconcile(
     let mut cycles = Vec::new();
     let outcome = reconcile_sides(conn, meta, ctx, path, disk_bytes, warnings, &mut cycles)?;
     // A parked need left parked because it would close a cycle is judged on the store the pass
-    // starts from, and an import can drop it (the disk edit that breaks the cycle), so the warning
-    // is judged again on the store the import left. Only then: the common pass reads nothing more.
-    if !cycles.is_empty() && brought_items_in(outcome) {
+    // starts from, and an import can drop it (the disk edit that breaks the cycle) or park one
+    // (`apply_doc`, for a `needs:` the disk declares that closes a cycle through an edge the file
+    // does not own), so the warning is judged again on the store the import left. Only then: the
+    // common pass reads nothing more.
+    if brought_items_in(outcome) {
         let bare_uri = file_uri(path);
         let journal = sync_state::get(conn, &bare_uri)?;
         cycles = assemble_kb_doc_parts(conn, ctx, path, &bare_uri, journal.as_ref())?
@@ -1542,8 +1545,8 @@ fn finish_import(
     if !ctx.imports() {
         return Ok(Outcome::Skipped);
     }
-    let resolved = apply_doc(conn, meta, f, doc)?;
-    let rendered = serializer.render(doc)?;
+    let Applied { items, doc } = apply_doc(conn, meta, f, doc)?;
+    let rendered = serializer.render(&doc)?;
     // Persist identity / normalization back to disk (the rendered form is authoritative).
     if rendered != disk_bytes {
         // `snapshot`, not `Some(disk_bytes)`: they differ exactly when the file was absent,
@@ -1559,8 +1562,8 @@ fn finish_import(
         bare_uri,
         ser_name,
         &rendered,
-        &resolved,
-        Some(&document_json(doc)),
+        &items,
+        Some(&document_json(&doc)),
     )?;
     Ok(outcome)
 }
@@ -1988,7 +1991,7 @@ fn three_way_resolve(
                 )?;
                 return Ok(Outcome::Refused);
             }
-            let resolved = apply_doc(conn, meta, f, &merged)?;
+            let Applied { items, doc: merged } = apply_doc(conn, meta, f, &merged)?;
             let rendered = serializer.render(&merged)?;
             if ctx.exports() {
                 write_file(path, &rendered, snapshot)?;
@@ -1999,7 +2002,7 @@ fn three_way_resolve(
                 bare_uri,
                 ser_name,
                 &rendered,
-                &resolved,
+                &items,
                 Some(&document_json(&merged)),
             )?;
             Ok(Outcome::Merged)
@@ -2167,7 +2170,8 @@ struct FileCtx<'a> {
 
 /// Apply `doc` to the KB (create/update items, place them under their section
 /// namespaces, reconcile tags and edges, cancel removed tasks). Two passes so edges
-/// resolve after every item exists. Returns the item ids the doc now maps to.
+/// resolve after every item exists. Returns the item ids the doc now maps to, and the doc as
+/// recorded ([`Applied`]).
 ///
 /// **This is the only path by which the disk side reaches the KB**, so the "does this mount
 /// import?" rule lives here rather than at each caller. `finish_import` had it and the
@@ -2181,7 +2185,7 @@ fn apply_doc(
     meta: &WriteMeta,
     f: &FileCtx<'_>,
     doc: &SyncDoc,
-) -> Result<Vec<ItemId>> {
+) -> Result<Applied> {
     let FileCtx {
         ctx,
         path,
@@ -2293,9 +2297,58 @@ fn apply_doc(
     }
 
     // Pass 2 — reconcile edges now that every local_id resolves to an item.
-    reconcile_edges(conn, meta, doc, &resolved)?;
+    let parked = reconcile_edges(conn, meta, doc, &resolved, &existing)?;
+    let mut doc = doc.clone();
+    park_cycle_closing_needs(conn, meta, &mut doc, &resolved, &parked)?;
 
-    Ok(resolved.into_values().collect())
+    Ok(Applied {
+        items: resolved.into_values().collect(),
+        doc,
+    })
+}
+
+/// What [`apply_doc`] recorded: the items the doc maps to, and the doc as the store now holds it.
+struct Applied {
+    items: Vec<ItemId>,
+    /// The doc applied, with each `needs:^id` that would have closed a cycle parked on its task
+    /// rather than an edge. What the caller renders and settles, so the base and the file say
+    /// what the store says and the next pass does not read the parking as a KB edit.
+    doc: SyncDoc,
+}
+
+/// Park each declared `depends_on` that [`reconcile_edges`] could not record because it closes a
+/// cycle: drop it from `doc`'s edges and put its `^id` on its task's parked needs, ahead of the
+/// needs the parse parked (an edge's `needs:` renders before them), in the store and in `doc`.
+fn park_cycle_closing_needs(
+    conn: &Connection,
+    meta: &WriteMeta,
+    doc: &mut SyncDoc,
+    resolved: &HashMap<String, ItemId>,
+    parked: &[(String, String)],
+) -> Result<()> {
+    if parked.is_empty() {
+        return Ok(());
+    }
+    doc.edges.retain(|e| {
+        e.edge_type != EdgeType::DependsOn
+            || !parked.iter().any(|(s, d)| *s == e.src && *d == e.dst)
+    });
+    for item in &mut doc.items {
+        let mut needs: Vec<String> = parked
+            .iter()
+            .filter(|(s, _)| *s == item.local_id)
+            .map(|(_, d)| d.clone())
+            .collect();
+        if needs.is_empty() {
+            continue;
+        }
+        needs.append(&mut item.unresolved_needs);
+        item.unresolved_needs = needs;
+        if let Some(&id) = resolved.get(&item.local_id) {
+            item::set_unresolved_needs(conn, meta, id, &item.unresolved_needs)?;
+        }
+    }
+    Ok(())
 }
 
 /// A file's document **structure** — block order and section headers — as the JSON stored on its
@@ -2523,45 +2576,139 @@ fn set_task_columns(conn: &Connection, meta: &WriteMeta, id: ItemId, it: &SyncIt
     Ok(())
 }
 
-/// Reconcile `parent_of` and `depends_on` edges to exactly what `doc` declares.
+/// Reconcile the `parent_of` and `depends_on` edges this file owns, and its tasks' containment
+/// rows, to exactly what `doc` declares. Returns each declared `depends_on` that was NOT recorded
+/// because it would close a cycle, as `(dependent, dependency)` local ids, for [`apply_doc`] to
+/// park.
+///
+/// **The file owns an edge from one of its tasks to a task of this file** — one in `doc`, or one
+/// bound to the file until this import (`existing`), whose line was just removed. Those are the
+/// edges a line can express. An edge to a task that was never in the file (a `jkb task depend`
+/// from a filed task to a task in no file, or in another file) is left alone: this used to reset
+/// each filed task's outgoing edges to the in-file ones, so the next import of the file silently
+/// dropped every such dependency and put the task back on the frontier. An edge FROM a task whose
+/// line was removed is left alone too: that task is cancelled and detached, and keeps its edges.
+///
+/// An edge the file does not own can close a cycle with one it declares: `^ghost` depends, through
+/// a task outside the file, on `^fix`, and the file says `^fix needs:^ghost`. `edge::link` refuses
+/// that, and refusing it here failed the file on every pass with nothing in the file to edit away.
+/// The need is kept parked instead, as [`resolve_parked_needs`] keeps one it cannot resolve, and
+/// the pass after the import warns about it from there.
 fn reconcile_edges(
     conn: &Connection,
     meta: &WriteMeta,
     doc: &SyncDoc,
     resolved: &HashMap<String, ItemId>,
-) -> Result<()> {
-    let srcs: Vec<ItemId> = resolved.values().copied().collect();
+    existing: &HashMap<String, ItemId>,
+) -> Result<Vec<(String, String)>> {
+    // The file's items in file order, so which of two cycle-closing needs is parked does not
+    // depend on a hash map's order.
+    let ids: Vec<ItemId> = doc
+        .items
+        .iter()
+        .filter_map(|i| resolved.get(&i.local_id).copied())
+        .collect();
+    let in_doc: HashSet<ItemId> = ids.iter().copied().collect();
+    let owned: HashSet<ItemId> = in_doc.iter().chain(existing.values()).copied().collect();
+    let local: HashMap<ItemId, &str> = resolved.iter().map(|(l, &id)| (id, l.as_str())).collect();
+    let mut parked = Vec::new();
     for kind in [EdgeType::ParentOf, EdgeType::DependsOn] {
-        // desired src -> set(dst) from the doc, mapped to item ids.
-        let mut desired: HashMap<ItemId, HashSet<ItemId>> = HashMap::new();
+        let mut want: HashSet<(ItemId, ItemId)> = HashSet::new();
+        let mut adds = Vec::new();
         for e in doc.edges.iter().filter(|e| e.edge_type == kind) {
             if let (Some(&s), Some(&d)) = (resolved.get(&e.src), resolved.get(&e.dst)) {
-                if s != d {
-                    desired.entry(s).or_default().insert(d);
+                if s != d && want.insert((s, d)) {
+                    adds.push((s, d));
                 }
             }
         }
-        // Current edges for all sources in one query, indexed by source.
-        let mut current = edge::edges_from_many(conn, &srcs, kind)?;
-        let mut adds = Vec::new();
-        for &src in &srcs {
-            let want = desired.get(&src).cloned().unwrap_or_default();
-            let have: HashSet<ItemId> = current
-                .remove(&src)
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            for &dst in have.difference(&want) {
-                edge::unlink(conn, meta, src, dst, kind)?;
+        let mut gone: Vec<(ItemId, ItemId)> = Vec::new();
+        let mut have: HashSet<(ItemId, ItemId)> = HashSet::new();
+        for (src, dsts) in edge::edges_from_many(conn, &ids, kind)? {
+            for dst in dsts.into_iter().filter(|d| owned.contains(d)) {
+                have.insert((src, dst));
+                if !want.contains(&(src, dst)) {
+                    gone.push((src, dst));
+                }
             }
-            adds.extend(want.difference(&have).map(|&dst| (src, dst)));
+        }
+        gone.sort_unstable();
+        for (src, dst) in gone {
+            edge::unlink(conn, meta, src, dst, kind)?;
         }
         // Every removal before any addition: `edge::link` refuses an edge that closes a cycle
         // with the edges present, so a file that swaps a parent and its child (or reverses a
         // dependency) would be refused against the old edge it is about to drop.
         for (src, dst) in adds {
+            if have.contains(&(src, dst)) {
+                continue;
+            }
+            // A `parent_of` cycle cannot come from edges the file does not own (a filed parent
+            // takes no child from outside its file, `task::add_subtask`), so only a need parks.
+            if kind == EdgeType::DependsOn && edge::closes_cycle(conn, src, dst, kind)? {
+                parked.push((local[&src].to_owned(), local[&dst].to_owned()));
+                continue;
+            }
             edge::link(conn, meta, src, dst, kind, None)?;
         }
+    }
+    reconcile_containment(conn, meta, doc, resolved, &ids, &in_doc, &owned)?;
+    Ok(parked)
+}
+
+/// Set each of the file's tasks' container to the parent its indentation declares, at its position
+/// among that parent's children in the file.
+///
+/// The frontier holds a parent back by its CONTAINMENT row (`SUBTASK_CLAUSE`), not by its
+/// `parent_of` edge, so writing only the edge left every parent in a tasks file pickable beside
+/// its own open subtasks, and a re-indent left the old container in place. The rows are derived
+/// from the same declared edges [`reconcile_edges`] just wrote, in the same transaction, and
+/// journalled, so `jkb undo` takes both back together.
+///
+/// Owned exactly as the `parent_of` edge it stands beside ([`reconcile_edges`]): a row whose
+/// container is in `doc` and whose child is a task of the file (`owned`) is removed when the file
+/// no longer declares it. A container outside the file is left alone unless the file now declares
+/// a parent for that task, since a task has one container.
+fn reconcile_containment(
+    conn: &Connection,
+    meta: &WriteMeta,
+    doc: &SyncDoc,
+    resolved: &HashMap<String, ItemId>,
+    ids: &[ItemId],
+    in_doc: &HashSet<ItemId>,
+    owned: &HashSet<ItemId>,
+) -> Result<()> {
+    let order: HashMap<ItemId, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let mut declared: HashMap<ItemId, ItemId> = HashMap::new();
+    for e in doc
+        .edges
+        .iter()
+        .filter(|e| e.edge_type == EdgeType::ParentOf)
+    {
+        if let (Some(&p), Some(&c)) = (resolved.get(&e.src), resolved.get(&e.dst)) {
+            if p != c {
+                declared.entry(c).or_insert(p);
+            }
+        }
+    }
+    // Every row that is about to change goes first, so `containment::contain`'s cycle guard never
+    // meets a row this pass is replacing (a parent and child swapped by a re-indent).
+    let mut children: Vec<ItemId> = owned.iter().copied().collect();
+    children.sort_unstable();
+    for child in children {
+        if let Some(cur) = containment::parent(conn, child)? {
+            if in_doc.contains(&cur) && declared.get(&child) != Some(&cur) {
+                containment::uncontain(conn, meta, child)?;
+            }
+        }
+    }
+    let mut children: Vec<(ItemId, ItemId)> = declared.into_iter().collect();
+    children.sort_unstable_by_key(|&(c, _)| order.get(&c).copied());
+    let mut next_position: HashMap<ItemId, i64> = HashMap::new();
+    for (child, parent) in children {
+        let position = next_position.entry(parent).or_insert(0);
+        containment::contain(conn, meta, child, parent, *position)?;
+        *position += 1;
     }
     Ok(())
 }

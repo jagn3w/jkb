@@ -581,6 +581,9 @@ const INVERSES: &[(Op, Option<Entity>, Inverse)] = &[
         Inverse::ReinsertRow,
     ),
     (Op::Delete, Some(Entity::Edges), Inverse::ReinsertRow),
+    // `containment::uncontain`: the `tasks` file sync drops a filed task's container when its
+    // line is out-dented.
+    (Op::Delete, Some(Entity::Containment), Inverse::ReinsertRow),
     (Op::Delete, Some(Entity::Namespaces), Inverse::ReinsertRow),
     // A design update is reverted by a newer update, never by deleting the row (D53.4).
     (

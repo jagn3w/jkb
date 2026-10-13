@@ -784,16 +784,57 @@ fn a_parked_needs_closing_a_cycle_through_another_file_stays_parked() {
     let again = sync_ok(&db, "oth");
     assert!(again.contains("1 up-to-date"), "{again}");
 
-    // An edit elsewhere in the file imports without failing.
+    // An edit elsewhere in the file imports without failing. The import reads `needs:^ghost` off
+    // the line as a dependency between two of the file's tasks, and recording it would close the
+    // cycle through `^ghost`'s dependency on `Between`, which the import does not own and keeps:
+    // so the need stays parked, with the same warning, rather than failing the file.
     let text = std::fs::read_to_string(&ofile).unwrap();
     std::fs::write(&ofile, text.replace("- [ ] Ghost", "- [ ] Ghost town")).unwrap();
     let edited = sync_ok(&db, "oth");
     assert!(edited.contains("1 imported"), "{edited}");
+    assert!(
+        edited.contains("`^fix`: `needs:^ghost` would close a dependency cycle"),
+        "{edited}"
+    );
     assert_eq!(
         task_json(&db, &fix)["unresolved_needs"],
-        serde_json::json!(["phantom"])
+        serde_json::json!(["ghost", "phantom"])
     );
-    assert!(!ready_tasks(&db).contains("#fix"), "{}", ready_tasks(&db));
+    let ready = ready_tasks(&db);
+    assert!(
+        ready.contains("#fix") && !ready.contains("#ghost"),
+        "`^ghost` still waits on `Between`: {ready}"
+    );
+    let settled = sync_ok(&db, "oth");
+    assert!(settled.contains("1 up-to-date"), "{settled}");
+}
+
+/// A dependency recorded with `jkb task depend` from a filed task to a task outside its file is
+/// not one the file can express, so importing the file keeps it. The import used to reset each
+/// filed task's dependencies to the in-file ones, dropping it on any unrelated edit to the file and
+/// putting the task back on the frontier.
+#[test]
+fn an_import_keeps_a_filed_tasks_dependency_on_a_task_outside_its_file() {
+    let dir = TempDir::new().unwrap();
+    let (db, _pfile, ofile) = two_tasks_files(&dir);
+    let ghost = format!("file://{}#ghost", ofile.display());
+    let between = add_task(&db, "Between");
+    assert!(ready_tasks(&db).contains("#ghost"), "{}", ready_tasks(&db));
+    jkb(&db)
+        .args(["task", "depend", &ghost, &between])
+        .assert()
+        .success();
+    assert!(!ready_tasks(&db).contains("#ghost"), "{}", ready_tasks(&db));
+
+    let text = std::fs::read_to_string(&ofile).unwrap();
+    std::fs::write(&ofile, text.replace("- [ ] Ghost", "- [ ] Ghost town")).unwrap();
+    let edited = sync_ok(&db, "oth");
+    assert!(edited.contains("1 imported"), "{edited}");
+    assert!(
+        !ready_tasks(&db).contains("#ghost"),
+        "the dependency survived the import: {}",
+        ready_tasks(&db)
+    );
 }
 
 #[test]

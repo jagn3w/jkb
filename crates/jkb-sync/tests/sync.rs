@@ -3775,7 +3775,188 @@ fn a_disk_reindent_that_swaps_parent_and_child_is_applied() {
             !has_parent_edge(&db, child.2, parent.2),
             "round {round}: the old edge is gone"
         );
+        // The containment row follows the edge: the frontier, `jkb tree` and `jkb ls` read it.
+        assert_eq!(
+            container_of(&db, child.2),
+            Some(item_of(&db, parent.2)),
+            "round {round}: the child is contained by its new parent"
+        );
+        assert_eq!(
+            container_of(&db, parent.2),
+            None,
+            "round {round}: the old container is gone"
+        );
     }
+}
+
+/// The item bound to `uri`.
+fn item_of(db: &Db, uri: &str) -> jkb_types::ItemId {
+    let uri = uri.to_owned();
+    db.read(move |conn| binding::item_for_uri(conn, &uri))
+        .unwrap()
+        .expect("a bound item")
+}
+
+/// The item containing the item bound to `uri`, from its containment row.
+fn container_of(db: &Db, uri: &str) -> Option<jkb_types::ItemId> {
+    let id = item_of(db, uri);
+    db.read(move |conn| jkb_core::containment::parent(conn, id))
+        .unwrap()
+}
+
+/// The uids `jkb task next` would offer, across every namespace.
+fn ready_uids(db: &Db) -> Vec<String> {
+    db.read(|conn| task::ready(conn, jkb_core::query::Query::default()))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.uid)
+        .collect()
+}
+
+/// A subtask written by indentation holds its parent off the frontier until it is done, like one
+/// made with `jkb task add --under`: the frontier reads the containment row, and the import used to
+/// write only the `parent_of` edge.
+#[test]
+fn a_file_subtask_holds_its_parent_off_the_frontier_until_done() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n  - [ ] Test it ^test\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let (ship, write, test) = (
+        format!("{uri}#ship"),
+        format!("{uri}#write"),
+        format!("{uri}#test"),
+    );
+    let ready = ready_uids(&db);
+    assert!(!ready.contains(&ship), "{ready:?}");
+    assert!(ready.contains(&write) && ready.contains(&test), "{ready:?}");
+    // Positioned in file order among the parent's children.
+    let ship_id = item_of(&db, &ship);
+    let children = db
+        .read(move |conn| jkb_core::containment::children(conn, ship_id))
+        .unwrap();
+    assert_eq!(children, [item_of(&db, &write), item_of(&db, &test)]);
+
+    // One child done is not enough; both are.
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [x] Write it ^write\n  - [ ] Test it ^test\n",
+    )
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert!(!ready_uids(&db).contains(&ship));
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [x] Write it ^write\n  - [x] Test it ^test\n",
+    )
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert!(ready_uids(&db).contains(&ship), "{:?}", ready_uids(&db));
+}
+
+/// Out-denting a subtask drops its containment row with its edge, and `jkb undo` of that import
+/// puts both back: the row is journalled like the edge.
+#[test]
+fn an_outdent_drops_the_container_and_undo_restores_it() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let (ship, write) = (format!("{uri}#ship"), format!("{uri}#write"));
+    assert_eq!(container_of(&db, &write), Some(item_of(&db, &ship)));
+
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n- [ ] Write it ^write\n",
+    )
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert!(!has_parent_edge(&db, &ship, &write));
+    assert_eq!(container_of(&db, &write), None);
+    assert!(ready_uids(&db).contains(&ship));
+
+    db.write_txn("t", jkb_core::undo::undo_last).unwrap();
+    assert!(has_parent_edge(&db, &ship, &write));
+    assert_eq!(container_of(&db, &write), Some(item_of(&db, &ship)));
+    assert!(!ready_uids(&db).contains(&ship));
+}
+
+/// A subtask whose line is deleted is cancelled and leaves its parent's containment with the
+/// `parent_of` edge the import drops, so its parent no longer lists it.
+#[test]
+fn a_deleted_subtask_line_leaves_its_parent() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n",
+    )
+    .unwrap();
+    let uri = uri_for(&file);
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let (ship, write) = (format!("{uri}#ship"), format!("{uri}#write"));
+    let write_id = item_of(&db, &write);
+
+    fs::write(&file, "## Work\n- [ ] Ship it ^ship\n").unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(kb_status(&db, &write).as_deref(), Some("cancelled"));
+    assert_eq!(
+        db.read(move |conn| jkb_core::containment::parent(conn, write_id))
+            .unwrap(),
+        None
+    );
+    assert!(ready_uids(&db).contains(&ship));
+}
+
+/// An import that changes nothing about a task's parent journals no containment write, so a sync
+/// of an unrelated edit does not grow the changelog by a row per subtask.
+#[test]
+fn an_unrelated_edit_rewrites_no_containment_row() {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n",
+    )
+    .unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
+    sync(&db, "docs/plan").unwrap();
+    let containment_entries = || -> i64 {
+        db.read(|conn| {
+            Ok(conn.query_row(
+                "SELECT count(*) FROM changelog WHERE entity_type = 'containment'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+    };
+    let before = containment_entries();
+    assert_eq!(before, 1);
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it now ^ship\n  - [ ] Write it ^write\n",
+    )
+    .unwrap();
+    sync(&db, "docs/plan").unwrap();
+    assert_eq!(containment_entries(), before);
 }
 
 // ---------------------------------------------------------------------------------------------

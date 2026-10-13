@@ -413,8 +413,9 @@ fn mirror_each(conn: &Connection, meta: &WriteMeta, tasks: Vec<(ItemId, String)>
 /// follow-up task, not handled here).
 ///
 /// A parent bound to a synced `file://` line takes only a child bound to that same file: the file
-/// declares exactly its lines' children, so the next sync would unlink the edge to any other task
-/// and leave its containment row behind.
+/// declares exactly its lines' children, and a child whose line is elsewhere is one it cannot show
+/// (the sync owns only the edges between two of the file's own tasks, so it would keep the edge
+/// and render the parent without it).
 ///
 /// An execution plan or a design span is never a task's parent (design D53.6): a plan's work is
 /// under its steps, and a plan's listing and its *archived* both walk only from the steps, so a task
@@ -448,8 +449,7 @@ pub fn add_subtask(
             if file_of(child)?.as_deref() != Some(file.as_str()) {
                 return Err(Error::Types(TypeError::Validation(format!(
                     "`{}` is a line of {file}, which declares exactly its children: add the task \
-                     under it in the file (a parent edge to a task not in the file is removed by \
-                     the next sync)",
+                     under it in the file (the file cannot show a child whose line is not in it)",
                     p.uid
                 ))));
             }

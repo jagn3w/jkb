@@ -58,13 +58,13 @@ pub fn link_weighted(
     weight: Option<f64>,
     props: Option<&Value>,
 ) -> Result<EdgeId> {
-    if edge_type == EdgeType::DependsOn && creates_cycle(conn, src, dst)? {
+    if edge_type == EdgeType::DependsOn && closes_cycle(conn, src, dst, edge_type)? {
         return Err(TypeError::Validation(format!(
             "depends_on {src} -> {dst} would create a cycle"
         ))
         .into());
     }
-    if edge_type == EdgeType::ParentOf && is_parent_or_above(conn, dst, src)? {
+    if edge_type == EdgeType::ParentOf && closes_cycle(conn, src, dst, edge_type)? {
         let uid = |id: ItemId| -> Result<String> {
             Ok(conn
                 .prepare_cached("SELECT uid FROM items WHERE id = ?1")?
@@ -155,6 +155,26 @@ pub fn link_weighted(
     Ok(EdgeId::new(id))
 }
 
+/// Whether [`link`] would refuse `src -> dst` of `edge_type` because it closes a cycle of that
+/// type with the edges present — the very check `link` makes, for a caller that keeps a refused
+/// edge out of the store instead of failing (the `tasks` file sync parks such a `needs:^id`).
+/// Always `false` for a type `link` does not cycle-check.
+///
+/// # Errors
+/// Returns an error if the query fails.
+pub fn closes_cycle(
+    conn: &Connection,
+    src: ItemId,
+    dst: ItemId,
+    edge_type: EdgeType,
+) -> Result<bool> {
+    match edge_type {
+        EdgeType::DependsOn => creates_cycle(conn, src, dst),
+        EdgeType::ParentOf => is_parent_or_above(conn, dst, src),
+        _ => Ok(false),
+    }
+}
+
 /// Would adding `src depends_on dst` create a cycle? True if `dst` already
 /// (transitively) depends on `src`, or if `src == dst`.
 fn creates_cycle(conn: &Connection, src: ItemId, dst: ItemId) -> Result<bool> {
@@ -179,9 +199,9 @@ fn creates_cycle(conn: &Connection, src: ItemId, dst: ItemId) -> Result<bool> {
 /// Whether `ancestor` is `item` or one of its `parent_of` ancestors. `UNION` de-duplicates, so a
 /// cycle a hand-edited database already holds still ends the walk.
 ///
-/// Edges only: containment guards its own cycles (`containment::contain`), and the `tasks` file
-/// sync writes edges without containment, so a containment row its edge has left behind must not
-/// refuse a re-indent the file legitimately made.
+/// Edges only: containment guards its own cycles (`containment::contain`), and a containment row
+/// can disagree with the edges (an out-of-order `jkb undo` restores one without the other), so a
+/// stale row must not refuse a re-indent the file legitimately made.
 fn is_parent_or_above(conn: &Connection, ancestor: ItemId, item: ItemId) -> Result<bool> {
     Ok(conn
         .prepare_cached(
