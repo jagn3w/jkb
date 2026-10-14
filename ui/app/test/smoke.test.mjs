@@ -232,7 +232,7 @@ for (const { id, label, root, region, headers, tallIn = region, by } of [
     await page.getByRole("tab", { name: label, exact: true }).click();
     await page.locator(`#pane-${id}`).waitFor({ state: "visible" });
     const got = await page.evaluate(
-      ({ id, root, region, headers }) => {
+      ({ id, root, region, headers, tallIn, by }) => {
         const pane = document.getElementById(`pane-${id}`);
         const panes = document.querySelector(".panes");
         const scroller = pane.querySelector(region);
@@ -268,7 +268,7 @@ for (const { id, label, root, region, headers, tallIn = region, by } of [
     assert.equal(got.paneHeight, got.framesHeight, "the pane fills the row");
     assert.ok(Math.abs(got.rootHeight - got.paneHeight) <= 1, `the tab fills its pane: ${JSON.stringify(got)}`);
     got.after.forEach((a, i) => {
-      assert.ok(a.inView, `${headers[i]} is in view after scrolling to the end: ${JSON.stringify(got)}`);
+      assert.ok(a.inView, `${headers[i]} is in view scrolled ${how}: ${JSON.stringify(got)}`);
       assert.ok(Math.abs(a.top - got.before[i]) <= 0.5, `${headers[i]} did not move: ${JSON.stringify(got)}`);
     });
   });
