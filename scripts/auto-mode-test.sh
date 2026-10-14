@@ -536,9 +536,14 @@ check_that "--help strips the comment markers" \
 # what it finds above it, and that is the machine, not the posture: in the agent sandbox
 # `/tmp/.mcp.json` is a device masking the file, which doctor lists as invalid settings beside a
 # posture that is fine. Each problem is a `- <path>…` line, so the ones under `$proj/` are the
-# posture's. A deliberately bad posture beside it proves the narrowed check still fails.
+# posture's — matched by the directory's resolved path, which is what doctor prints (on macOS
+# `mktemp` answers under /var/folders or /tmp, both symlinks into /private, and the unresolved path
+# would match nothing, passing any posture). A deliberately bad posture beside it proves the
+# narrowed check still fails.
 doctor_problems() { # <project dir>: doctor's problems in that project's own files, one per line
-    (cd "$1" && "$real_claude" doctor 2>&1 || true) | sed -n '/Invalid settings/,/^$/p' | grep -F -- "- $1/" || true
+    local dir
+    dir="$(cd "$1" && pwd -P)"
+    (cd "$dir" && "$real_claude" doctor 2>&1 || true) | sed -n '/Invalid settings/,/^$/p' | grep -F -- "- $dir/" || true
 }
 if [ -x "$real_claude" ]; then
     proj="$tmp/schema"
@@ -552,7 +557,7 @@ if [ -x "$real_claude" ]; then
     mkdir -p "$bad/.claude"
     jq '.require | .permissions.defaultMode = "notAMode"' "$posture" > "$bad/.claude/settings.json"
     check_that "a posture with an invalid defaultMode fails that same check" \
-        "$(grep -qF "$bad/.claude/settings.json" <<<"$(doctor_problems "$bad")" && echo yes || echo no)"
+        "$(grep -qF "/schema-bad/.claude/settings.json" <<<"$(doctor_problems "$bad")" && echo yes || echo no)"
 else
     echo "  skip  schema validation (claude not installed)"
 fi
