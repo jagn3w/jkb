@@ -129,6 +129,44 @@ test("rows join a session's processes with its notification, needing input first
   assert.deepEqual(joinSessions([], []), []);
 });
 
+test("a design's prompt names its row; one the registry does not list is an ended row only with Ended too", () => {
+  const h = (session, over) => ({ session, pid: "1", instance: "i#b", cwd: "/r/live", startedAt: 10, startSource: "startup", seenAt: 100, endedAt: null, endReason: null, ...over });
+  const p = (session, over) => ({
+    uid: `prompt:${session}`,
+    design: "design:d",
+    session,
+    cwd: `/r/${session.slice(0, 2)}`,
+    launch: "task",
+    subject: "task:t",
+    title: "Play · Build it",
+    created_at: "2026-10-14T10:00:00.000Z",
+    ...over,
+  });
+  const gone = "bbbbbbbb-0000-4000-8000-000000000000";
+  const prompts = [p(S1), p(gone)];
+  const [live] = joinSessions([h(S1)], [], { prompts, ended: false });
+  assert.equal(live.prompt?.session, S1, "a listed session carries its prompt");
+  assert.equal(live.cwd, "/r/live", "the registry's directory wins over the prompt's");
+  assert.equal(joinSessions([h(S1)], [], { prompts, ended: false }).length, 1, "without Ended too, no prompt-only row");
+
+  const rows = joinSessions([h(S1)], [], { prompts, ended: true });
+  assert.deepEqual(rows.map((r) => r.session), [S1, gone], "live first, the prompt-only row after");
+  const ended = rows[1];
+  assert.equal(ended.live, false);
+  assert.deepEqual(ended.holders, []);
+  assert.equal(ended.cwd, `/r/${gone.slice(0, 2)}`, "resumed where its prompt was recorded");
+  assert.equal(ended.startedAt, Date.parse("2026-10-14T10:00:00.000Z"));
+  assert.equal(ended.seenAt, ended.startedAt);
+  assert.equal(ended.endedAt, null);
+  assert.equal(ended.prompt?.design, "design:d");
+
+  // A notified session the registry lost is live, not ended, whatever its prompt says.
+  const [notified] = joinSessions([], [{ session: gone, tool: "", state: "awaiting_user", updatedAt: 20 }], { prompts, ended: true }).filter((r) => r.session === gone);
+  assert.equal(notified.live, true);
+  assert.equal(notified.seenAt, 20);
+  assert.equal(joinSessions([], []).length, 0, "no prompts: as before");
+});
+
 test("a claude/notify message says which session moved; anything else on the topic is nothing", () => {
   assert.equal(NOTIFY_TOPIC, "claude/notify");
   assert.deepEqual(parseNotifyMessage("notify.post", { id: "x", session: S1, title: "Claude Code" }), { session: S1 });

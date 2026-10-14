@@ -31,7 +31,7 @@ const { APP_GROUP } = await load(path.join(src, "main", "topicFeeds.ts"));
 const { DESIGN_GROUP } = await load(path.join(src, "main", "designFeeds.ts"));
 const { gitPlace } = await load(path.join(src, "main", "gitPlace.ts"));
 const { NotifyWatch } = await load(path.join(src, "renderer", "src", "sessions", "watch.ts"));
-const { loadHolders, liveCwds, MAX_PAGES } = await load(path.join(src, "renderer", "src", "sessions", "data.ts"));
+const { loadHolders, loadPrompts, liveCwds, MAX_PAGES, promptName } = await load(path.join(src, "renderer", "src", "sessions", "data.ts"));
 const { recordAttached, reattachPlan, mergeRecords, tearsDown } = await load(path.join(src, "renderer", "src", "sessions", "reattach.ts"));
 const { RESUME_SCRIPT, PLAY_TASK_SCRIPT, sessionResumeSpec, resumedDir } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
 const { sessionAction, owningTerminals, HOST_SESSION_NOTE } = await load(path.join(src, "renderer", "src", "sessions", "resume.ts"));
@@ -494,6 +494,40 @@ test("without the feed the records are still read, and why the dot may be stale 
 
 // ---- the registry reads ----------------------------------------------------------------------------
 
+test("every design's prompts are read once per repo, each design titled; a failed read is the error", async () => {
+  const design = (uid, repo, title) => ({ uid, title, namespace: `designs/${repo}`, seq: 1, topic: `design/${uid}` });
+  const prompt = (session, d) => ({
+    uid: `prompt:${session}`,
+    design: d,
+    session,
+    cwd: "/home/vscode/repos/jkb",
+    launch: "new",
+    subject: null,
+    title: "New · Tighten it",
+    created_at: "2026-10-14T10:00:00.000Z",
+  });
+  const asked = [];
+  const op = async (r) => {
+    asked.push(r);
+    if (r.op === "design.list") {
+      return ok({ result: "designs", designs: [design("design:a", "jkb", "Alpha"), design("design:b", "jkb", "Beta"), design("design:z", "zed", "Zed")] });
+    }
+    return ok({ result: "design_prompts", repo: r.repo, prompts: r.repo === "jkb" ? [prompt(S1, "design:a")] : [prompt(S2, "design:z")] });
+  };
+  const got = await loadPrompts(op);
+  assert.deepEqual(
+    asked.map((r) => r.repo ?? r.op),
+    ["design.list", "jkb", "zed"],
+    "one listing, then one read per repo — not one per design",
+  );
+  assert.deepEqual(got.value.prompts.map((p) => p.session), [S1, S2]);
+  assert.equal(promptName(got.value.prompts[0], got.value.titles), "Alpha · New · Tighten it");
+  assert.equal(promptName(prompt(S1, "design:gone"), got.value.titles), "design:gone · New · Tighten it", "an unlisted design is named by its uid");
+
+  const old = async (r) => (r.op === "design.list" ? op(r) : err("invalid", "missing field `uid`"));
+  assert.equal((await loadPrompts(old)).error.code, "invalid", "a daemon without the repo form says so");
+});
+
 test("the registry is read a page at a time, to its end or a bound", async () => {
   const holder = (session, over = {}) => ({ session, pid: "1", instance: "i", cwd: `/r/${session.slice(0, 4)}`, seen_at: 10, ...over });
   const pages = { undefined: { sessions: [holder(S1)], next: "p2" }, p2: { sessions: [holder(S2)] } };
@@ -681,6 +715,7 @@ const row = (holders, over = {}) => ({
   endReason: null,
   notify: null,
   needsInput: false,
+  prompt: null,
   ...over,
 });
 

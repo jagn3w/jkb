@@ -10,6 +10,7 @@
 
 import type { OpResponse, Outcome } from "./daemon.js";
 import { failed } from "./daemon.js";
+import type { DesignPromptRecord } from "./prompts.js";
 
 /** The topic notifications are sent on (`jkb_core::notify::TOPIC`), which the app reads with its own group. */
 export const NOTIFY_TOPIC = "claude/notify";
@@ -175,7 +176,10 @@ export interface SessionRow {
   readonly live: boolean;
   /** Its processes, most recently seen first; empty for a session known only by its notification. */
   readonly holders: readonly SessionHolder[];
-  /** Where it runs: the most recently seen live holder's directory (else the most recent one's); empty when unknown. */
+  /**
+   * Where it runs: the most recently seen live holder's directory (else the most recent one's, else
+   * where its prompt was recorded); empty when unknown.
+   */
   readonly cwd: string;
   readonly startedAt: number | null;
   readonly seenAt: number | null;
@@ -185,6 +189,19 @@ export interface SessionRow {
   readonly notify: NotifyRecord | null;
   /** The red dot: its notification awaits the user (D53.9). */
   readonly needsInput: boolean;
+  /** The design prompt it was launched as, if a design's launch recorded it. */
+  readonly prompt: DesignPromptRecord | null;
+}
+
+/** What else `joinSessions` lists beside the registry and the notifications. */
+export interface JoinPrompts {
+  /** Every design's recorded prompts (`design.prompts` by repo), joined to the rows by session id. */
+  readonly prompts: readonly DesignPromptRecord[];
+  /**
+   * Whether a prompt neither the registry nor a notification lists makes a row of its own: an ended
+   * session, named by its design. *Ended too* governs these as it does the registry's ended rows.
+   */
+  readonly ended: boolean;
 }
 
 /** Whether a notification is the needs-input dot: `awaiting_user`, as the record's derived state says. */
@@ -198,12 +215,18 @@ export function needingInput(records: readonly NotifyRecord[]): Set<string> {
 }
 
 /**
- * The registry's rows grouped by session and joined with the notification records. Ordered by what
- * the operator acts on first: sessions needing input, then live ones, then the rest — each most
- * recently seen first. A notification whose session the registry does not list still makes a row:
- * a session waiting on the operator is never hidden by a registry row that was lost.
+ * The registry's rows grouped by session and joined with the notification records and the design
+ * prompts. Ordered by what the operator acts on first: sessions needing input, then live ones, then
+ * the rest — each most recently seen first. A notification whose session the registry does not list
+ * still makes a row: a session waiting on the operator is never hidden by a registry row that was
+ * lost. A prompt the registry does not list makes an ended row when `with.ended` asks for them —
+ * where it was recorded is where it resumes (`sessionAction`).
  */
-export function joinSessions(holders: readonly SessionHolder[], notified: readonly NotifyRecord[]): SessionRow[] {
+export function joinSessions(
+  holders: readonly SessionHolder[],
+  notified: readonly NotifyRecord[],
+  with_: JoinPrompts = { prompts: [], ended: false },
+): SessionRow[] {
   const by = new Map<string, SessionHolder[]>();
   for (const h of holders) {
     const list = by.get(h.session);
@@ -211,26 +234,32 @@ export function joinSessions(holders: readonly SessionHolder[], notified: readon
     else list.push(h);
   }
   const notes = new Map(notified.map((n) => [n.session, n]));
-  const sessions = new Set([...by.keys(), ...notes.keys()]);
+  const prompts = new Map(with_.prompts.map((p) => [p.session, p]));
+  const sessions = new Set([...by.keys(), ...notes.keys(), ...(with_.ended ? prompts.keys() : [])]);
   const rows: SessionRow[] = [];
   for (const session of sessions) {
     const held = [...(by.get(session) ?? [])].sort((a, b) => b.seenAt - a.seenAt);
     const live = held.filter((h) => h.endedAt === null);
     const notify = notes.get(session) ?? null;
+    const prompt = prompts.get(session) ?? null;
     const lead = live[0] ?? held[0];
     const starts = held.map((h) => h.startedAt).filter((t): t is number => t !== null);
+    // Known only by its prompt: it started when its launch recorded it, and nothing has seen it since.
+    const recorded = prompt === null ? NaN : Date.parse(prompt.created_at);
+    const promptAt = held.length === 0 && notify === null && Number.isFinite(recorded) ? recorded : null;
     const lastEnd = live.length > 0 ? undefined : [...held].sort((a, b) => (b.endedAt ?? 0) - (a.endedAt ?? 0))[0];
     rows.push({
       session,
       live: live.length > 0 || (held.length === 0 && notify !== null),
       holders: held,
-      cwd: lead?.cwd ?? "",
-      startedAt: starts.length > 0 ? Math.min(...starts) : null,
-      seenAt: lead?.seenAt ?? notify?.updatedAt ?? null,
+      cwd: lead?.cwd ?? prompt?.cwd ?? "",
+      startedAt: starts.length > 0 ? Math.min(...starts) : promptAt,
+      seenAt: lead?.seenAt ?? notify?.updatedAt ?? promptAt,
       endedAt: lastEnd?.endedAt ?? null,
       endReason: lastEnd?.endReason ?? null,
       notify,
       needsInput: needsInput(notify),
+      prompt,
     });
   }
   const rank = (r: SessionRow): number => (r.needsInput ? 0 : r.live ? 1 : 2);
