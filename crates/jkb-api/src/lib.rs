@@ -827,6 +827,11 @@ pub enum Request {
         /// Its first text.
         #[serde(default)]
         body: String,
+        /// The design of the same repo it is nested under, in the same transaction: a refused
+        /// nesting creates nothing, since a design cannot be removed once made. Never sent when
+        /// absent, so a client still creates a top-level design against a daemon that predates it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        under: Option<String>,
     },
     /// Nest a design under another design of its repo ([`designs::nest`]).
     #[serde(rename = "design.move")]
@@ -4153,9 +4158,14 @@ impl LocalBackend {
             Request::DesignList { repo, review } => Response::Designs {
                 designs: db.read_with(move |c| designs::list(c, repo.as_deref(), review))?,
             },
-            Request::DesignCreate { repo, title, body } => Response::DesignCreated {
+            Request::DesignCreate {
+                repo,
+                title,
+                body,
+                under,
+            } => Response::DesignCreated {
                 design: db.write_txn_with(actor, move |c, m| {
-                    designs::create(c, m, &repo, &title, &body)
+                    designs::create(c, m, &repo, &title, &body, under.as_deref())
                 })?,
             },
             Request::DesignMove { uid, under } => Response::DesignMeta {

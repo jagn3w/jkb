@@ -535,35 +535,45 @@ pub struct Removed {
 /// changelog entries of their own. Capturing them here is the only thing that makes the
 /// delete reversible — without it, `undo` would restore a naked item stripped of its
 /// placements and, worse, its edges.
+/// The item's own row, every column, as the column map an item delete's snapshot carries under
+/// `item` — what `undo` re-inserts.
+fn item_row(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
+    let id = item.get();
+    conn.prepare_cached(
+        "SELECT uid, kind, content, content_hash, mime, status, resolution, priority, due,
+                    metadata, created_at, updated_at, claimant_id, claimed_at, content_rev,
+                    chunked_rev
+             FROM items WHERE id = ?1",
+    )?
+    .query_row([id], |r| {
+        Ok(json!({
+            "id": id,
+            "uid": r.get::<_, String>(0)?,
+            "kind": r.get::<_, String>(1)?,
+            "content": r.get::<_, Option<String>>(2)?,
+            "content_hash": r.get::<_, Option<String>>(3)?,
+            "mime": r.get::<_, Option<String>>(4)?,
+            "status": r.get::<_, Option<String>>(5)?,
+            "resolution": r.get::<_, Option<String>>(6)?,
+            "priority": r.get::<_, Option<i64>>(7)?,
+            "due": r.get::<_, Option<String>>(8)?,
+            "metadata": r.get::<_, String>(9)?,
+            "created_at": r.get::<_, String>(10)?,
+            "updated_at": r.get::<_, String>(11)?,
+            "claimant_id": r.get::<_, Option<String>>(12)?,
+            "claimed_at": r.get::<_, Option<String>>(13)?,
+            // V030; its vector and `vector_sources` row go with it, so a restore is pending.
+            "content_rev": r.get::<_, i64>(14)?,
+            "chunked_rev": r.get::<_, Option<i64>>(15)?,
+        }))
+    })
+    .optional()?
+    .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))
+}
+
 fn snapshot(conn: &Connection, item: ItemId) -> Result<serde_json::Value> {
     let id = item.get();
-    let row = conn
-        .prepare_cached(
-            "SELECT uid, kind, content, content_hash, mime, status, resolution, priority, due,
-                    metadata, created_at, updated_at, claimant_id, claimed_at
-             FROM items WHERE id = ?1",
-        )?
-        .query_row([id], |r| {
-            Ok(json!({
-                "id": id,
-                "uid": r.get::<_, String>(0)?,
-                "kind": r.get::<_, String>(1)?,
-                "content": r.get::<_, Option<String>>(2)?,
-                "content_hash": r.get::<_, Option<String>>(3)?,
-                "mime": r.get::<_, Option<String>>(4)?,
-                "status": r.get::<_, Option<String>>(5)?,
-                "resolution": r.get::<_, Option<String>>(6)?,
-                "priority": r.get::<_, Option<i64>>(7)?,
-                "due": r.get::<_, Option<String>>(8)?,
-                "metadata": r.get::<_, String>(9)?,
-                "created_at": r.get::<_, String>(10)?,
-                "updated_at": r.get::<_, String>(11)?,
-                "claimant_id": r.get::<_, Option<String>>(12)?,
-                "claimed_at": r.get::<_, Option<String>>(13)?,
-            }))
-        })
-        .optional()?
-        .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
+    let row = item_row(conn, item)?;
 
     let placements = {
         let mut stmt = conn.prepare_cached(
@@ -1022,6 +1032,35 @@ pub fn set_content(
     Ok(())
 }
 
+/// Record that `item`'s chunks were cut from its text at content revision `rev` (`items.chunked_rev`,
+/// V030), so the embed stage knows whether they still describe it.
+///
+/// Called only by the chunker (`jkb-ingest`), in the transaction that writes the chunks it cut:
+/// a document whose `chunked_rev` is not its `content_rev` is re-chunked before it is embedded.
+/// Changelogged like any column, so undoing a re-chunk puts back the old chunks *and* the rev that
+/// says they are stale.
+///
+/// # Errors
+/// Returns [`jkb_types::Error::NotFound`] if the item does not exist; otherwise a database error.
+pub fn set_chunked_rev(conn: &Connection, meta: &WriteMeta, item: ItemId, rev: i64) -> Result<()> {
+    let before: Option<Option<i64>> = conn
+        .prepare_cached("SELECT chunked_rev FROM items WHERE id = ?1")?
+        .query_row([item.get()], |row| row.get(0))
+        .optional()?;
+    let before = before.ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {item}"))))?;
+    conn.prepare_cached("UPDATE items SET chunked_rev = ?2 WHERE id = ?1")?
+        .execute(params![item.get(), rev])?;
+    changelog::upsert(
+        conn,
+        meta,
+        Entity::Items,
+        &item.get().to_string(),
+        Some(&json!({ "chunked_rev": before })),
+        Some(&json!({ "chunked_rev": rev })),
+    )?;
+    Ok(())
+}
+
 /// The `metadata` key holding a file-backed task's **unresolved needs**: the `^id`s its line's
 /// `needs:` modifiers name that no task in its file defines, in file order. Kept so the file's
 /// text survives a round trip without the reference becoming either an edge to nothing or
@@ -1386,6 +1425,75 @@ mod tests {
                 .read(|conn| Ok(conn.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))?))
                 .unwrap();
             prop_assert_eq!(n, 1);
+        }
+
+        /// `content_rev` (V030) strictly increases exactly when an item's content changes, by
+        /// whichever path writes it — the content repo, a raw column write, `jkb undo`'s generic
+        /// restore — and stays put for a write of the same text. A stored vector's provenance is
+        /// this number, so a change it missed would leave a vector of old text reading as current,
+        /// and a bump with no change would re-embed for nothing. FTS stays consistent throughout:
+        /// the bump is an UPDATE fired from inside the content UPDATE.
+        #[test]
+        fn content_rev_increases_iff_content_changes(
+            ops in proptest::collection::vec((0_u8..4, 0_u8..3), 1..12)
+        ) {
+            let db = Db::open_in_memory().unwrap();
+            // Seeded without a changelog entry, so no undo below can take the item itself away.
+            let id = db
+                .write_txn("t", |conn, _| {
+                    Ok(jkb_types::ItemId::new(conn.query_row(
+                        "INSERT INTO items (uid, kind, content) VALUES ('n', 'note', 'body') RETURNING id",
+                        [],
+                        |r| r.get(0),
+                    )?))
+                })
+                .unwrap();
+            let state = |db: &Db| {
+                db.read(move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT content, content_rev FROM items WHERE id = ?1",
+                        [id.get()],
+                        |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
+                    )?)
+                })
+                .unwrap()
+            };
+            for (op, text) in ops {
+                let text = ["alpha", "beta", "body"][usize::from(text)];
+                let (before, rev_before) = state(&db);
+                match op {
+                    0 => db
+                        .write_txn("t", move |c, m| super::set_content(c, m, id, text, None))
+                        .unwrap(),
+                    1 => db
+                        .write_txn("t", move |c, _| {
+                            c.execute("UPDATE items SET content = ?2 WHERE id = ?1", rusqlite::params![id.get(), text])?;
+                            Ok(())
+                        })
+                        .unwrap(),
+                    2 => db
+                        .write_txn("t", move |c, _| {
+                            c.execute("UPDATE items SET content = NULL WHERE id = ?1", [id.get()])?;
+                            Ok(())
+                        })
+                        .unwrap(),
+                    // Undo may have nothing left it can take back; only what it does write matters.
+                    _ => {
+                        let _ = db.write_txn("t", |c, m| crate::undo::undo_last(c, m).map(|_| ()));
+                    }
+                }
+                let (after, rev_after) = state(&db);
+                if after == before {
+                    prop_assert_eq!(rev_after, rev_before, "no change, yet the rev moved");
+                } else {
+                    prop_assert!(rev_after > rev_before, "the content changed but the rev did not rise");
+                }
+            }
+            let fts = db.read(|conn| {
+                Ok(conn.execute_batch("INSERT INTO fts_items(fts_items) VALUES('integrity-check')"))
+            })
+            .unwrap();
+            prop_assert!(fts.is_ok(), "FTS is inconsistent: {:?}", fts);
         }
     }
 

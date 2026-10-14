@@ -443,17 +443,6 @@ pub fn live_by_hash(conn: &Connection) -> Result<Vec<(String, GrantRow)>> {
     Ok(out)
 }
 
-/// A number that changes whenever a grant is minted or revoked — what a daemon's cache compares to
-/// know it is stale without re-reading every row.
-///
-/// # Errors
-/// A database error.
-pub fn generation(conn: &Connection) -> Result<(i64, i64)> {
-    Ok(conn
-        .prepare_cached("SELECT coalesce(max(id), 0), count(revoked_at) FROM role_grants")?
-        .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?)
-}
-
 /// Grants, newest first: only those scoped to `scope` when given, and revoked ones — and ones their
 /// minter may no longer grant, which [`resolve`] no longer answers (review round 6) — only when
 /// `include_revoked`.

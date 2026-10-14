@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:task-lifecycle-18dcdeffaafbcfd87c069f, edit there (version 114.cYGwr8r1378CAYKo9cTruwUBh8rc4biU9QIBjOSnvIrrzQ4BjLzKt5Cd2AUBjvz45fSu2A0Bj5TL-7iHgwYBkMil2eDEzAMBjdLbv9f-9wQBkrivg62IuQ4BlpLLyPLkmAEBlpT2grSY0gQBl_KTjajtuwkBm4berKa5_gYBnuDUwZGG8gMBofblneKFuA0BotCO-afV7wgBqOjc06jB-QIBrJKai5vD2gIBrcLivemFyQQBsqqj8brGiQwBs7zX_LLn6AUBtf7U0ZCpvAwBtuaOpse_oAkBtsqjha2ppQQBtpiMnZfPgQsBvvax4ZGW2wYBwfzcsMibxAwBw6ratsvXCAHE1I7tgKvsDgHD6NWzpfupCQHGpqG-2-zGCQHH5KKojMwiAdCIrOa8rq8JAdSskO2_1bwFAdXGhL2xm7cPAdWOyaW7hIIDAduG3dnJiLQEAeDm5sGD6rUHAeHavY3KjZsLAeLaoqqpz6IJAeCOzej_k80CAerMz_K_94UBAeqK9aq5hPkGAfDS-NWr5ckLAfOytMOG4t4EAfS0t6v-o_ANAfX-rtmt-vEEAfaiw-aFpYANAfbslevNyHoB_Yjoid2wkQYB_dakx6mh3w0B_9yx8p6JmwoBgKm_lbr31Q0BgZ27_JT9rAMBhIWS9IeapA0Bhae59vPx-AoBhqHwycuzxAoBh4fWg8q79Q0Bit-6l4Wprw0BjdHWvb2O-A4BjcfDyc_llg8Bj5fqg9GohQcBk7Hmg4uU2AkBk5PmlsyXlgkBk7-h2qSg3ggBlqmrgaP4qgKs5wWXpeGpjb_VBAGYn8LK3t-nCwGZqdfqnNn-CAGa8eSp-v2-BAGg1bamxrlnAaKftbHfki4Bo4PB_PfpsAwBpdmYyJPIvgsBqImgkqXz8Q0BqaOkiNPXpwoBqbGkpNyznAIBrvHo_pyBeAGup5_Mj4LBCAGyhauIiO-UDwG02eeoz_eAAgG0yZ7Jn8PFCAG32bXx-an3DAG7kcGOj47YDgG-pfjsvNPRAwG-9aO5xPbECwG_x6_K2-u2DgHC5au0qq-dCAHIyYSv9rvyDgHMw9-08LDJCAHNkfDcsY_gDQHOu5bAvpvPB5wL0Lu07_eSWAHan4mk1JWmBwHc27ajqYWtAwHfh9baiOzxCgHgnaay18bLAwHflfjBpdb3CwHlwZbF2s7CCwHljaWUkvyeCQHsu82uhsiICwHur6L-yN7zDgHw95Dh9o-xAwHx0avxlrPECAHyy4jLntqlCgHz18zIqq7BCgH3196ovJTtCwH4hcO45MLZDAH43cKC95LLAgH6t5nE3pzwCAH5j4aOoarHBwH-uevR3deGCQE, blake3 bc41123353c2a29111f65499e08d67dde3bef5a07247a4e10033aeb549ecb044) -->
+<!-- generated from jkb design design:task-lifecycle-18dcdeffaafbcfd87c069f, edit there (version 115.cYGwr8r1378CAYKo9cTruwUBh8rc4biU9QIBjOSnvIrrzQ4BjLzKt5Cd2AUBjvz45fSu2A0Bj5TL-7iHgwYBkMil2eDEzAMBjdLbv9f-9wQBkrivg62IuQ4BlpLLyPLkmAEBlpT2grSY0gQBl_KTjajtuwkBm4berKa5_gYBnuDUwZGG8gMBofblneKFuA0BotCO-afV7wgBqOjc06jB-QIBrJKai5vD2gIBrcLivemFyQQBsqqj8brGiQwBs7zX_LLn6AUBtf7U0ZCpvAwBtuaOpse_oAkBtsqjha2ppQQBtpiMnZfPgQsBvvax4ZGW2wYBwfzcsMibxAwBw6ratsvXCAHE1I7tgKvsDgHD6NWzpfupCQHGpqG-2-zGCQHH5KKojMwiAdCIrOa8rq8JAdSskO2_1bwFAdXGhL2xm7cPAdWOyaW7hIIDAduG3dnJiLQEAeDm5sGD6rUHAeHavY3KjZsLAeLaoqqpz6IJAeCOzej_k80CAerMz_K_94UBAeqK9aq5hPkGAfDS-NWr5ckLAfOytMOG4t4EAfS0t6v-o_ANAfX-rtmt-vEEAfaiw-aFpYANAfbslevNyHoB_Yjoid2wkQYB_dakx6mh3w0B_9yx8p6JmwoBgKm_lbr31Q0BgZ27_JT9rAMBhIWS9IeapA0Bhae59vPx-AoBhqHwycuzxAoBh4fWg8q79Q0Bit-6l4Wprw0BjdHWvb2O-A4BjcfDyc_llg8Bj5fqg9GohQcBk7Hmg4uU2AkBk5PmlsyXlgkBk7-h2qSg3ggBlqmrgaP4qgKs5wWXpeGpjb_VBAGYn8LK3t-nCwGZqdfqnNn-CAGa8eSp-v2-BAGg1bamxrlnAaKftbHfki4Bo4PB_PfpsAwBpdmYyJPIvgsBqImgkqXz8Q0BqaOkiNPXpwoBqbGkpNyznAIBrvHo_pyBeAGup5_Mj4LBCAGyhauIiO-UDwG02eeoz_eAAgG0yZ7Jn8PFCAG32bXx-an3DAG7kcGOj47YDgG-pfjsvNPRAwG-9aO5xPbECwG_x6_K2-u2DgHC5au0qq-dCAHIyYSv9rvyDgHMw9-08LDJCAHNkfDcsY_gDQHOu5bAvpvPB5wL0Lu07_eSWAHan4mk1JWmBwHc27ajqYWtAwHfh9baiOzxCgHgnaay18bLAwHflfjBpdb3CwHlwZbF2s7CCwHljaWUkvyeCQHsu82uhsiICwHur6L-yN7zDgHw95Dh9o-xAwHx0avxlrPECAHyy4jLntqlCgHz18zIqq7BCgH3196ovJTtCwH4hcO45MLZDAH43cKC95LLAgH6t5nE3pzwCAH5j4aOoarHBwH-uevR3deGCQE, blake3 bbdcab9a3e9f81cda81fab02a2d9c3e980547bb985c7bac3e7eef41a0a745b06) -->
 # Task lifecycle
 
 How a task moves from the frontier to merged. A task is decomposed into subtasks, so the
@@ -247,7 +247,8 @@ with the user's own config and refs stays the authority.
 ### A session is a git worktree
 
 One task, one worktree, one branch: `<repo>/.jkb/work/<session>` on branch `task/<session>`,
-plus `<repo>/.jkb/base/`, a checkout of the land target when it lives nowhere else. Worktrees
+plus `<repo>/.jkb/base/`, a checkout of the land target when it lives nowhere else, and `<repo>/.jkb/graft/`, a
+permanently detached worktree where grafts are rebased and gated. Worktrees
 share the repo's object store, so a session costs a checkout, not a clone, and every branch is
 visible from the main copy. The session name is the task uid's slug, truncated and made
 path-safe, with a counter on collision; naming it after the task rather than a random id is
@@ -304,24 +305,47 @@ on. Trunk is compared against the canonical name, not against two spellings gues
 
 `jkb task land` is the merge queue's algorithm in Rust, with the same reason for each step:
 
-1. **Rebase detached, never checked out.** `git rebase <onto> <branch>` checks the branch out
-   first, which git refuses while the session worktree holds it. Detaching at the branch commit
-   does not claim the ref, so it is allowed. `merge-queue.sh` carries the scar from getting this
-   wrong: the failure reported as a content conflict and ejected every group.
-2. **Fast-forward the target** to the rebased result: linear, no merge commit.
-3. **Run the gate on the integrated result.** This earns the whole design: two sessions each
-   green alone can break once both are in, and the only place that is visible is after the
-   second is grafted.
-4. **Red gate or conflict: roll the target back** to its pre-graft tip and eject, telling you to
-   rebase in your session worktree. Never resolve a conflict on the user's behalf; the person
-   with the context is the one who wrote the branch.
+1. **Graft in `.jkb/graft`, a worktree that is never on a branch.** `git rebase <onto> <branch>`
+   checks the branch out first, which git refuses while the session worktree holds it.
+   Detaching at the branch commit claims no ref, so `.jkb/graft` is detached there and rebased
+   onto `onto`'s live tip. `onto` has not moved. `merge-queue.sh` carries the scar from checking
+   the branch out: the failure reported as a content conflict and ejected every group.
+2. **Gate there, still detached.** The tree at the graft is byte-identical to what `onto`
+   becomes, so the gate tests exactly the integrated result. This earns the whole design: two
+   sessions each green alone can break once both are in, and this is the only place that is
+   visible. Meanwhile `onto` still names only gated commits.
+3. **Green: fast-forward `onto` by compare-and-swap** in the checkout that holds it (the one you
+   work in, else `.jkb/base`), which was never detached: refuse if its tip is no longer the one
+   the graft rebased onto, else `merge --ff-only`, hooks off. A target that moved during the gate
+   is left where the other writer put it, never clobbered and never rewound.
+4. **Red gate or conflict: nothing to undo.** `onto` never moved and no checkout changed branch;
+   you are told to reproduce in your session worktree and land again. Never resolve a conflict
+   on the user's behalf; the person with the context is the one who wrote the branch.
+
+It used to fast-forward first and `reset --hard` on red, which `merge-queue.sh` stopped doing on
+2026-09-12: for the whole gate `onto` named ungated commits an implementer could cut from, and an
+interrupted gate or a failed rollback left it there with nothing recording that it had moved. The
+first reorder gated in whichever checkout held `onto`, detaching it for the gate, and then needed
+a guard against the checkout an interrupted land left behind. Three review rounds found the guard
+wrong three ways (it detached the operator's tree, it refused over every reviewer `--detach`
+worktree, it refused over a missing worktree directory) because it was a predicate over other
+people's checkouts. The fix is that no land ever changes what any other checkout is on: the graft
+tree is jkb's, holds no branch, is reset unconditionally at the start of every land (a stopped
+rebase aborted, tracked edits reset, untracked files cleaned, ignored build output kept warm),
+and is read by nothing (`land_dir_in` matches `.jkb/base` by path and `onto` by branch, and a detached
+`.jkb/graft` is neither). An interrupted land leaves a detached, ungated graft there, which is
+where one always is. Rejected: a throwaway worktree per land (the same safety, but a cold
+`target/` wherever the gate runs outside the container); recording the in-flight land in the KB
+(a record of a state that is harmless); an `update-ref` compare-and-swap on the ref (correct only
+when `onto` is checked out nowhere; under a checkout it leaves the working tree showing the landed
+diff reversed).
 
 Two sessions finishing at once must graft one after the other, or the second one's gate result
 is meaningless, so landing holds the land lock. On green the task is moved to `done` through
 the machine's `land` event, its claim released, the session worktree removed and the session
 branch deleted, since it has been rebased into the target and the ref is a duplicate.
 
-`graft` rebases a **detached HEAD**, so it never moves the session's branch ref. That is
+`graft` rebases in `.jkb/graft`, detached, so it never moves the session's branch ref. That is
 invisible in the normal path, which deletes the branch, but `--keep-worktree` must point the
 branch at the commit that landed, or the kept session reads as N commits ahead of a target that
 already contains its work, and landing again re-runs the whole graft.
@@ -340,8 +364,9 @@ remedy, and is not a second copy of the land rule.
 
 ### `.jkb/base` is a reusable cache, released when its batch is spent
 
-The land happens in whichever worktree already holds the target, else in `.jkb/base`, which is
-switched to whatever branch a land needs. `git worktree add` refuses an existing path, so a
+The **advance** happens in whichever worktree already holds the target, else in `.jkb/base`,
+which is switched to whatever branch a land needs; the graft and the gate happen in
+`.jkb/graft` (above). `git worktree add` refuses an existing path, so a
 second base checkout would wedge landing the moment a batch landed onto a different branch than
 the last, until the directory was deleted by hand. Once its batch has merged, `.jkb/base` is
 removed: holding a checkout of a dead branch both attracts new sessions onto it and stops
@@ -759,24 +784,18 @@ jkb client, so its caller must export `JKB` and `JKB_DB`; `.claude/workflows/tas
 `QUEUE_ENV` does, and the script header states the contract. The CLI is the home of the human
 path because the UI calls it directly and it must work in any repo.
 
-### `jkb task land` and the merge queue deliberately differ in two places
+### `jkb task land` and the merge queue deliberately differ in one place
 
 They are no longer the same algorithm, and the divergence is deliberate rather than drift, so it
-is recorded here and not only in a Rust comment. Both differences date from the 2026-09-12 queue
+is recorded here and not only in a Rust comment. The difference dates from the 2026-09-12 queue
 rework.
 
-- **Ordering.** The queue gates the rebased commit while it is still detached and only then
-  fast-forwards, so `<target>` never points at an ungated commit. `jkb task land` still
-  fast-forwards first and rewinds with `reset --hard` on red: the window is the whole gate, and an
-  implementer told to cut from the integration branch can carry ungated commits away inside it.
-  Filed, not fixed: reordering the human path changes `graft`'s contract and `do_land`'s flow and
-  wants its own change.
 - **What "nothing to land" asks.** The queue asks the content question (a branch whose net diff
   against its merge-base is empty is refused however many commits it carries), because it closes
   whole task groups unattended, and a phantom landing there unblocks dependents with nothing
   implemented. `gitrepo::graft` still asks the commit question (`ahead_count == 0`).
 
-Both are tracked as their own tasks. Until they close, a reader comparing the two must expect them
+It is tracked as its own task. Until it closes, a reader comparing the two must expect them
 to differ **here** and nowhere else.
 
 ## Auto-close

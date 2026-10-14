@@ -132,6 +132,17 @@ export const designOps = {
     op: "design.prompt",
     ask: { kind: "discuss", uid, base, start, end },
   }),
+  /**
+   * A new design of `repo`, nested under the design `under` when one is named. The nesting is the
+   * same write as the creation, so a refused parent creates nothing; `under` is never sent when
+   * absent, so a top-level design is still made by a daemon that predates the field.
+   */
+  create: (repo: string, title: string, under?: string) => ({
+    op: "design.create",
+    repo,
+    title,
+    ...(under === undefined ? {} : { under }),
+  }),
 } as const;
 
 // ---- decoding answers -------------------------------------------------------------------------
@@ -220,6 +231,11 @@ function field<T>(
 
 export function decodeDesigns(o: Outcome<OpResponse>): Outcome<readonly Design[]> {
   return field(o, "designs", (r) => r["designs"], (v): v is readonly Design[] => Array.isArray(v) && v.every(isDesign));
+}
+
+/** `design.create`'s answer: the new design, naming its parent when it was made under one. */
+export function decodeDesignCreated(o: Outcome<OpResponse>): Outcome<Design> {
+  return field(o, "design_created", (r) => r["design"], isDesign);
 }
 
 export function decodeDesignDoc(o: Outcome<OpResponse>): Outcome<DesignDoc> {

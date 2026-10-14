@@ -1476,6 +1476,37 @@ fn a_grant_revoked_behind_the_cache_is_refused_and_its_connection_closed() {
     );
 }
 
+/// A grant this daemon serves authenticates on the grantee's very first request, even when a miss
+/// has just refreshed the cache: without the post-grant invalidation the new token would wait out
+/// the refresh interval and be refused `401` meanwhile.
+#[test]
+fn a_grant_authenticates_at_once_after_a_miss_refreshed_the_cache() {
+    let f = Fixture::new();
+    let root = root_token(&f);
+    let ls = json!({ "op": "kb.ls" });
+    // A token naming nothing misses, and that miss claims the refresh interval.
+    let started = Instant::now();
+    let (status, body) = post(&f, &"0".repeat(64), None, &ls);
+    assert_eq!(status, 401, "{body}");
+    let (status, granted) = post(
+        &f,
+        &root,
+        None,
+        &json!({ "op": "role.grant", "role": "reviewer", "agent": "rev" }),
+    );
+    assert_eq!(status, 200, "{granted}");
+    let Response::Granted { token, .. } = serde_json::from_str(&granted).unwrap() else {
+        panic!("granted")
+    };
+    let (status, body) = post(&f, &token, None, &ls);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the grantee's call must land inside the refresh interval to test anything: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(status, 200, "the new grant authenticates at once: {body}");
+}
+
 /// `POST /v1/op` with `token`, and an `Idempotency-Key` when one is given: the status and the body.
 /// `POST /v1/op`, or the keyed route when there is a key.
 fn post(f: &Fixture, token: &str, key: Option<&str>, body: &serde_json::Value) -> (u16, String) {

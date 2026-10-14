@@ -164,6 +164,62 @@ pub fn sweep_stale(conn: &Connection) -> Result<StaleRows> {
     })
 }
 
+/// The SQL condition under which item `alias` needs a vector from `vector`: it has content, and
+/// either no vector in `vector`'s table, or no `vector_sources` row, or one recording a content
+/// revision other than the item's (`V030`). **The** pending rule — every reader that asks "what is
+/// waiting for the embedder" (the embed pass, `jkb doctor`'s count) splices this fragment in rather
+/// than spelling its own, so a reader cannot disagree with the writer about what is stale.
+///
+/// Freshness is derived from what [`VectorIndexer::upsert_vector`] recorded, never marked: the
+/// `V030` trigger counts content changes in `items.content_rev`, and the sidecar names the revision
+/// each vector was computed from. Nothing sets or clears a flag, so no writer of content has
+/// anything to remember. A vector stored before `V030` has no sidecar row and is pending until it is
+/// replaced, once; [`forget_sources`] makes the whole store so on purpose (`jkb index --all`).
+///
+/// "No vector in this table" is its own clause because the sidecar is one row per item while the
+/// vectors live in one table per embedding dimension: a store whose model changed has sidecar rows
+/// describing another table's vectors. The clause catches the first switch; switching back to a
+/// table that still holds vectors of since-edited text is not caught (the sidecar then describes
+/// the newer table), and `jkb index --all` is the remedy.
+///
+/// `alias` is the caller's alias for `items` in the query the fragment is spliced into; it is one
+/// of this workspace's own identifiers, never input. Bare blank content is pending here — the
+/// embed pass decides blankness once, by `str::trim`, which SQL's ASCII `trim` cannot spell.
+///
+/// # Errors
+/// Returns an error if the catalog lookup fails.
+pub fn pending_predicate(conn: &Connection, vector: &VectorIndexer, alias: &str) -> Result<String> {
+    if !vector.table_exists(conn)? {
+        return Ok(format!("{alias}.content IS NOT NULL"));
+    }
+    Ok(format!(
+        // `NOT IN` over the vec table's key is a lookup, not a scan, and every candidate is drawn
+        // from `items`, so an orphan vector row (one whose item is gone) can never match it.
+        "{alias}.content IS NOT NULL
+         AND ({alias}.id NOT IN (SELECT item_id FROM {table})
+              OR NOT EXISTS (SELECT 1 FROM vector_sources vs
+                              WHERE vs.item_id = {alias}.id
+                                AND vs.content_rev = {alias}.content_rev))",
+        table = vector.table
+    ))
+}
+
+/// Forget which text every stored vector was computed from, so every content item is pending.
+/// Returns how many sidecar rows were removed.
+///
+/// `jkb index --all`: re-embed the store in place. Deletes no vector — each keeps serving until
+/// the pass replaces it — and the pass it schedules is the ordinary resumable one, so an
+/// interrupted run is finished by a plain `jkb index`. Not a mark: nothing has to be cleared
+/// afterwards, because [`VectorIndexer::upsert_vector`] writes provenance beside each vector.
+///
+/// # Errors
+/// Returns an error if the statement fails.
+pub fn forget_sources(conn: &Connection) -> Result<usize> {
+    Ok(conn
+        .prepare_cached("DELETE FROM vector_sources")?
+        .execute([])?)
+}
+
 /// Create the delete-GC trigger for one `vec_items_<dim>` table, if it is not already there.
 ///
 /// A trigger lives in the database file rather than in a process, so it fires for every
@@ -363,20 +419,35 @@ impl VectorIndexer {
         Ok(())
     }
 
-    /// Add or replace the vector for `id`, if item `id` exists. Returns whether a vector was
-    /// written: `false` means the item is gone and nothing was.
+    /// Add or replace the vector for `id`, computed from the item's text at content revision
+    /// `rev`, and record that provenance in `vector_sources` (`V030`) with the next store-wide
+    /// `seq` — if item `id` exists and is still at `rev`. Returns whether a vector was written:
+    /// `false` means the item is gone, or its text changed since it was read for embedding, and
+    /// nothing was.
     ///
-    /// The existence check is here, inside the caller's write transaction, rather than at each
-    /// caller: embedding happens outside any transaction (it is the slow part), so an item can be
-    /// deleted between being read for embedding and its vector being stored. The GC trigger
-    /// removes a vector when its item is deleted, but cannot stop one being written afterwards —
-    /// a long `index_pending` backfill did exactly that, recreating the orphan the trigger exists
-    /// to prevent.
+    /// **The one vector writer**, so the provenance cannot be skipped: freshness is derived from
+    /// these rows ([`pending_predicate`]), never marked. Both checks are here, inside the caller's
+    /// write transaction, rather than at each caller: embedding happens outside any transaction
+    /// (it is the slow part), so an item can be deleted or edited between being read for
+    /// embedding and its vector being stored. The GC trigger removes a vector when its item is
+    /// deleted, but cannot stop one being written afterwards — a long `index_pending` backfill did
+    /// exactly that, recreating the orphan the trigger exists to prevent. An edit in that window
+    /// has bumped `content_rev`; storing the old text's vector under the new rev would make the
+    /// edit look embedded for good, so the item is left pending instead.
+    ///
+    /// For a document `rev` is the revision its chunks were cut from, and the vector their
+    /// centroid. `seq` is what lets a document see that a chunk's vector was written after its own.
     ///
     /// # Errors
     /// Returns [`crate::Error`] if `embedding`'s length is not the table dim, or a
     /// statement fails.
-    pub fn upsert_vector(&self, conn: &Connection, id: ItemId, embedding: &[f32]) -> Result<bool> {
+    pub fn upsert_vector(
+        &self,
+        conn: &Connection,
+        id: ItemId,
+        rev: i64,
+        embedding: &[f32],
+    ) -> Result<bool> {
         if embedding.len() != self.dim {
             return Err(TypesError::Validation(format!(
                 "embedding length {} does not match vec table dim {}",
@@ -385,10 +456,10 @@ impl VectorIndexer {
             ))
             .into());
         }
-        let exists = conn
-            .prepare_cached("SELECT 1 FROM items WHERE id = ?1")?
-            .exists([id.get()])?;
-        if !exists {
+        let current = conn
+            .prepare_cached("SELECT 1 FROM items WHERE id = ?1 AND content_rev = ?2")?
+            .exists(params![id.get(), rev])?;
+        if !current {
             return Ok(false);
         }
         let bytes = embedding_to_bytes(embedding);
@@ -404,7 +475,30 @@ impl VectorIndexer {
             self.table
         ))?
         .execute(params![id.get(), bytes])?;
+        // `max(seq) + 1` is above every row that exists, which is all a comparison of two rows'
+        // `seq` needs; a value freed by a delete off the top is reissued only when no row holds it.
+        conn.prepare_cached(
+            "INSERT INTO vector_sources (item_id, content_rev, seq)
+             VALUES (?1, ?2, (SELECT coalesce(max(seq), 0) + 1 FROM vector_sources))
+             ON CONFLICT (item_id) DO UPDATE SET content_rev = excluded.content_rev,
+                                                 seq = excluded.seq",
+        )?
+        .execute(params![id.get(), rev])?;
         Ok(true)
+    }
+
+    /// Delete every vector in this indexer's table and forget every vector's provenance, leaving
+    /// the whole store pending (`jkb index --rebuild`). The next embed pass re-derives it,
+    /// resumably. Creates the table if absent, so a rebuild of a store that never had one is a
+    /// no-op rather than an error.
+    ///
+    /// # Errors
+    /// Returns an error if the catalog refuses this embedder or a statement fails.
+    pub fn clear(&self, conn: &Connection) -> Result<()> {
+        self.ensure_ready(conn)?;
+        conn.execute_batch(&format!("DELETE FROM {};", self.table))?;
+        forget_sources(conn)?;
+        Ok(())
     }
 
     /// The stored vectors for `ids`, as an `item_id -> embedding` map. Ids with no vector
@@ -689,7 +783,7 @@ impl Indexer for VectorIndexer {
         // supplied, leave the item un-vectorized for a later embed pass.
         if let Some(embedding) = item.embedding {
             self.ensure_ready(conn)?;
-            self.upsert_vector(conn, item.id, embedding)?;
+            self.upsert_vector(conn, item.id, item.content_rev, embedding)?;
         }
         Ok(())
     }
@@ -702,23 +796,32 @@ impl Indexer for VectorIndexer {
         Ok(())
     }
 
+    /// Empty the table and the provenance, then re-embed every content item from its own text —
+    /// **except documents**. A document's vector is the centroid of its chunks' (`jkb-ingest`'s
+    /// `Pipeline::embed_document`, the only writer of one), and embedding its whole text here gave
+    /// it a vector of a truncated prefix that claims to describe all of it. Documents are left
+    /// pending for the embed pass. Blank text is skipped: there is nothing to embed.
     fn rebuild(&self, conn: &Connection) -> Result<()> {
-        self.ensure_ready(conn)?;
-        conn.execute_batch(&format!("DELETE FROM {};", self.table))?;
+        self.clear(conn)?;
 
         // Re-derive every vector from item content (the source of truth). Collect
         // first so the read statement is dropped before we borrow `conn` to write.
-        let rows: Vec<(i64, String)> = {
-            let mut stmt =
-                conn.prepare_cached("SELECT id, content FROM items WHERE content IS NOT NULL")?;
+        let rows: Vec<(i64, String, i64)> = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, content, content_rev FROM items
+                  WHERE content IS NOT NULL AND kind <> 'document'",
+            )?;
             let collected = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             collected
         };
-        for (id, content) in rows {
+        for (id, content, rev) in rows {
+            if content.trim().is_empty() {
+                continue;
+            }
             let embedding = self.embedder.embed(&content)?;
-            self.upsert_vector(conn, ItemId::new(id), &embedding)?;
+            self.upsert_vector(conn, ItemId::new(id), rev, &embedding)?;
         }
         Ok(())
     }

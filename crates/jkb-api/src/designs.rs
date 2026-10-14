@@ -366,18 +366,27 @@ pub fn list(conn: &Connection, repo: Option<&str>, review: bool) -> Result<Vec<D
     Ok(out)
 }
 
-/// `design.create`.
+/// `design.create`: a design under `designs/<repo>`, nested under the design `under` when one is
+/// named. Both are one transaction's: the caller's `write_txn` rolls the creation back when the
+/// nesting is refused, so a refused parent leaves no top-level design behind (a design cannot be
+/// removed).
 ///
 /// # Errors
-/// The engine's refusal.
+/// The engine's refusal of either: an unknown parent, or one in another repo.
 pub fn create(
     conn: &Connection,
     meta: &WriteMeta,
     repo: &str,
     title: &str,
     body: &str,
+    under: Option<&str>,
 ) -> Result<Design, ApiError> {
-    Ok(design::create(conn, meta, repo, title, body)?.into())
+    let made = design::create(conn, meta, repo, title, body)?;
+    match under {
+        None => Ok(made.into()),
+        // The design as the nesting leaves it, naming its parent.
+        Some(parent) => Ok(design::tree::nest(conn, meta, &made.uid, parent)?.into()),
+    }
 }
 
 /// What `design.split` made.

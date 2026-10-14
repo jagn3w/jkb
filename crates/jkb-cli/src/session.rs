@@ -22,6 +22,8 @@ const JKB_DIR: &str = ".jkb";
 const WORK_DIR: &str = "work";
 /// A checkout of the land target, made only when it is checked out nowhere else.
 const BASE_DIR: &str = "base";
+/// Where a landing rebases and gates its graft: a worktree that is never on a branch.
+const GRAFT_DIR: &str = "graft";
 /// The branch prefix for a session's own branch: `task/<session>`.
 pub const BRANCH_PREFIX: &str = "task/";
 /// Longest session name minted from a task uid — long enough to stay readable in
@@ -44,6 +46,15 @@ pub fn worktree_path(repo_root: &Path, name: &str) -> PathBuf {
 #[must_use]
 pub fn base_worktree(repo_root: &Path) -> PathBuf {
     jkb_dir(repo_root).join(BASE_DIR)
+}
+
+/// `<repo>/.jkb/graft` — where `jkb task land` rebases a session branch onto its target and runs
+/// the gate. Always detached, so it holds no branch and no reader of the worktree list mistakes it
+/// for a session (`.jkb/work`) or a land target (matched by branch, or `.jkb/base` by path); every
+/// landing resets it first, so whatever an interrupted one left there is never in the way.
+#[must_use]
+pub fn graft_worktree(repo_root: &Path) -> PathBuf {
+    jkb_dir(repo_root).join(GRAFT_DIR)
 }
 
 /// The branch a session works on.
@@ -119,7 +130,7 @@ pub struct Session {
 /// Make git ignore `.jkb/` in this repo, locally.
 ///
 /// Session worktrees live inside the repo, so without this the very first session makes the
-/// working tree dirty — and `land` refuses a dirty target, because a red gate rolls it back.
+/// working tree dirty — and `land` refuses a dirty target, because it fast-forwards it.
 /// The exclusion goes in `.git/info/exclude` rather than `.gitignore`: it is local, needs no
 /// commit, and jkb has no business editing a tracked file in someone else's repo.
 ///

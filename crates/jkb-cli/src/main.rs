@@ -196,12 +196,23 @@ enum Command {
         /// The transaction id to undo (default: the most recent).
         txn: Option<i64>,
     },
-    /// Embed content-bearing items not yet in the vector index (needs the embedder).
+    /// Embed content-bearing items whose vector is missing or out of date (needs the embedder).
+    ///
+    /// An item is out of date when its text changed after its vector was written; an edited
+    /// document is re-chunked and its vector re-derived from its new chunks.
     Index {
         /// Remove derived-index rows whose item is gone, instead of embedding. Needs no
         /// embedder, so it works offline.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["all", "rebuild"])]
         sweep: bool,
+        /// Re-embed every content item, replacing each vector in place. Old vectors serve until
+        /// replaced, and an interrupted run is finished by a plain `jkb index`.
+        #[arg(long, conflicts_with = "rebuild")]
+        all: bool,
+        /// Delete this model's vectors, then re-embed every content item. Vector search finds
+        /// nothing until each is replaced; an interrupted run is finished by a plain `jkb index`.
+        #[arg(long)]
+        rebuild: bool,
     },
     /// Health checks, integrity, and backup.
     Doctor {
@@ -1283,8 +1294,9 @@ enum TaskCmd {
         #[arg(long)]
         onto: Option<String>,
     },
-    /// Land a session: rebase its branch onto the target, fast-forward, run the gate, and on
-    /// green mark the task done and clean the session up. Serialized per repo.
+    /// Land a session: rebase its branch onto the target, run the gate on the result, and only
+    /// on green fast-forward the target, mark the task done and clean the session up. Serialized
+    /// per repo.
     Land {
         /// The task uid.
         #[arg(required_unless_present = "break_lock")]
@@ -1815,7 +1827,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Task { cmd } => cmd_task(&db, &db_path, cmd, json),
         Command::View { cmd } => cmd_view(&db, cmd, json),
         Command::Undo { txn } => cmd_undo(&db, txn),
-        Command::Index { sweep } => cmd_index(&db, sweep),
+        Command::Index {
+            sweep,
+            all,
+            rebuild,
+        } => cmd_index(&db, sweep, all, rebuild),
         Command::Doctor { backup, fix } => {
             let backend = jkb_api::LocalBackend::new(db.clone()).with_actor("cli");
             doctor::run(
@@ -1960,7 +1976,7 @@ WORKING A TASK IN PARALLEL (each session is its own git worktree)
                               --onto <branch> names the STAGING branch it lands on; omit it
                               and jkb joins the batch in flight, or cuts one from trunk.
   jkb task land <uid>         rebase the session onto its target, run the repo's gate, and
-                              on green mark the task done and ARCHIVE the session (moved to
+                              only on green advance the target, mark the task done and ARCHIVE the session (moved to
                               .jkb/archive, deleted after 30 days — never deleted here). Serial:
                               one land at a time, so a red gate means YOUR branch broke it.
                               REFUSES a task with no recorded review, or whose review left a
@@ -3089,58 +3105,63 @@ pub(crate) fn cmd_task_land(
     let head = refuse_unless_may_land(kb, &ctx.root, &facts.uid, &branch, &onto)?;
     let waiver_owed = review::enforce(kb, uid, &facts.review, no_review, json)?;
 
-    let land_dir = land_dir_for(&ctx, &onto)?;
-    let gate_place = gate_place_for(kb, uid, &head, &land_dir, no_gate, gate_on_host)?;
-
-    let (outcome, pre) = gitrepo::graft(&land_dir, &branch, &onto)?;
-    // TWO FAILURES, TWO REMEDIES. They were one arm, and the message it printed was written for
-    // the rebase conflict — so a refused fast-forward sent the user to rebase a branch that had
-    // rebased cleanly, which reproduces every time it is tried. `scripts/merge-queue.sh` splits
-    // the same pair (exit 1 against exit 4) and for the same reason: only one of them is the
-    // branch's fault.
+    // GRAFT, GATE, THEN ADVANCE — the order `scripts/merge-queue.sh` settled on — in two
+    // checkouts. The graft and the gate happen in `.jkb/graft`, jkb's own, always detached and
+    // reset at the start of every landing; the gate sees exactly what `onto` becomes. Only a green
+    // gate touches `target_dir`, the checkout holding `onto` (the operator's, else `.jkb/base`),
+    // by a compare-and-swap against the tip the graft rebased onto; it is never detached, so no
+    // landing, finished or interrupted, changes what branch anyone's checkout is on. This used to
+    // fast-forward `onto` first and rewind it with `reset --hard` on red, so for the whole gate
+    // `onto` named commits that had passed nothing, and an interrupted gate left it there.
+    let (target_dir, graft_dir) = land_checkouts(&ctx, &onto)?;
+    let gate_place = gate_place_for(kb, uid, &head, &graft_dir, no_gate, gate_on_host)?;
+    let (outcome, pre) = gitrepo::graft(&graft_dir, &branch, &onto)?;
     let grafted = match outcome {
-        gitrepo::Graft::Landed { grafted } => grafted,
+        gitrepo::Graft::Rebased { grafted } => grafted,
         gitrepo::Graft::Conflict => anyhow::bail!(
             "{branch} does not rebase cleanly onto {onto} — nothing changed. Rebase it where \
              the context is: cd {} && git rebase {onto}, fix the conflict, then land again",
             sess.worktree.display()
         ),
-        gitrepo::Graft::CouldNotAdvance { why } => anyhow::bail!(
-            "{branch} rebased onto {onto} cleanly, but {onto} could not be advanced onto the \
-             result. Nothing changed, and the branch is fine — rebasing it will not help. This is \
-             usually transient: something else moved or held {onto} while the graft ran. git \
-             said: {why}\n\nTry landing again; if it repeats, look at what else is writing to \
-             {onto} (`git worktree list`, a running watcher, a held index.lock in {})",
-            land_dir.display()
-        ),
     };
 
-    let (gate, source) = session::resolve_gate(store, kb, &ctx.root, &ctx.key, gate_flag, no_gate)?;
-    if !json {
-        println!(
-            "gate: {} ({})",
-            gate.as_deref().unwrap_or("(none)"),
-            source.label()
-        );
-    }
-    if let Some(cmd) = &gate {
-        if let (session::GatePlace::Container { name, .. }, false) = (&gate_place, json) {
-            println!("gate: running in the dev container `{name}`");
-        }
-        let (passed, output) = session::run_gate(&land_dir, cmd, &gate_place, json)?;
-        if !passed {
-            gitrepo::reset_hard(&land_dir, &pre)?;
-            let tail = output
-                .map(|o| format!("\n{}", tail_lines(&o, 20)))
-                .unwrap_or_default();
-            anyhow::bail!(
-                "gate failed on the integrated result — {onto} rolled back to {}, {branch} \
-                 untouched. Reproduce in the session (cd {} && {cmd}) and land again.{tail}",
-                &pre[..pre.len().min(8)],
-                sess.worktree.display()
+    // Everything between the graft and the verdict, in one place, so that every way out of it
+    // that is not green — a red gate, a gate that could not be spawned, a gate lookup that failed
+    // — is reported as leaving `onto` where it was. None of them has moved anything but the
+    // graft tree, which the next landing resets.
+    let gated = (|| -> Result<_> {
+        let (gate, source) =
+            session::resolve_gate(store, kb, &ctx.root, &ctx.key, gate_flag, no_gate)?;
+        if !json {
+            println!(
+                "gate: {} ({})",
+                gate.as_deref().unwrap_or("(none)"),
+                source.label()
             );
         }
-    }
+        let mut verdict = Verdict::Green;
+        if let Some(cmd) = &gate {
+            if let (session::GatePlace::Container { name, .. }, false) = (&gate_place, json) {
+                println!("gate: running in the dev container `{name}`");
+            }
+            let (passed, output) = session::run_gate(&graft_dir, cmd, &gate_place, json)?;
+            if !passed {
+                verdict = Verdict::Red { output };
+            }
+        }
+        Ok((gate, source, verdict))
+    })();
+    let (gate, source) = conclude_graft(
+        &PendingGraft {
+            target_dir: &target_dir,
+            onto: &onto,
+            branch: &branch,
+            pre: &pre,
+            grafted: &grafted,
+            session: &sess.worktree,
+        },
+        gated,
+    )?;
 
     settle_landing(
         kb,
@@ -3165,6 +3186,83 @@ pub(crate) fn cmd_task_land(
         },
         json,
     )
+}
+
+/// What a landing's gate said. No gate at all is `Green`: `--no-gate`, or none found, which the
+/// gate line printed before it says.
+enum Verdict {
+    Green,
+    /// Red, with the gate's output when it was captured (`--json`).
+    Red {
+        output: Option<String>,
+    },
+}
+
+/// A graft [`gitrepo::graft`] left detached in `.jkb/graft`, awaiting its gate's verdict.
+struct PendingGraft<'a> {
+    /// The checkout holding `onto`, which a green verdict advances.
+    target_dir: &'a Path,
+    onto: &'a str,
+    branch: &'a str,
+    /// `onto`'s tip when the graft rebased onto it — what the advance compares against.
+    pre: &'a str,
+    grafted: &'a str,
+    /// The session worktree, where a red gate is reproduced.
+    session: &'a Path,
+}
+
+/// The gate's verdict on a detached graft, acted on: green puts `onto` on the graft — only if its
+/// checkout is still on `onto` at `pre` — and anything else leaves everything where it was, with
+/// nothing to undo: `onto` never moved and no checkout changed branch. The graft tree is left as
+/// it is; the next landing resets it. Returns the gate and where it came from, for the landing's
+/// record.
+///
+/// `gated` is the gate's run: `Err` when it could not be resolved or spawned.
+fn conclude_graft(
+    g: &PendingGraft<'_>,
+    gated: Result<(Option<String>, session::GateSource, Verdict)>,
+) -> Result<(Option<String>, session::GateSource)> {
+    let PendingGraft {
+        target_dir,
+        onto,
+        branch,
+        pre,
+        grafted,
+        session,
+    } = *g;
+    match gated {
+        Err(e) => Err(e.context(format!(
+            "the landing stopped before its gate passed — {onto} never moved."
+        ))),
+        Ok((gate, _, Verdict::Red { output })) => {
+            let tail = output
+                .map(|o| format!("\n{}", tail_lines(&o, 20)))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "gate failed on the integrated result — {onto} never moved (still {}), {branch} \
+                 untouched. Reproduce in the session (cd {} && {}) and land again.{tail}",
+                &pre[..pre.len().min(8)],
+                session.display(),
+                gate.as_deref().unwrap_or_default()
+            );
+        }
+        Ok((gate, source, Verdict::Green)) => {
+            // Green: put `onto` on the gated commit — only if it is still where the graft found it.
+            if let gitrepo::Advance::Refused { why } =
+                gitrepo::advance(target_dir, onto, pre, grafted)?
+            {
+                anyhow::bail!(
+                    "{branch} rebased onto {onto} cleanly and PASSED the gate, but {onto} was not \
+                     advanced onto the result: {why}\n\nNothing was landed and the branch is fine \
+                     — rebasing it will not help. Land again; if it repeats, look at what else is \
+                     writing to {onto} (`git worktree list`, a running watcher, a held index.lock \
+                     in {})",
+                    target_dir.display()
+                );
+            }
+            Ok((gate, source))
+        }
+    }
 }
 
 /// Whether this caller may land `uid` from `branch` onto `onto` at all — asked with the payload the
@@ -3239,29 +3337,30 @@ struct Landed<'a> {
     head: Option<&'a str>,
 }
 
-/// Mark the task done, free the claim, and dispose of the session (design D36.4).
 /// Where a landing's gate runs, settled BEFORE the graft so a refusal — no container to run the
-/// candidate's code in — has moved nothing (D52.12). Running it on the host instead is the operator's
-/// call, recorded on the task first: the op is operator-only, so a caller that may not make it is
-/// refused here too.
+/// candidate's code in — has moved nothing (D52.12). Asked of `.jkb/graft`, where the gate runs,
+/// once it exists: the placement is decided on its canonical path. Running it on the host instead
+/// is the operator's call, recorded on the task first: the op is operator-only, so a caller that
+/// may not make it is refused here too.
 fn gate_place_for(
     kb: &session_cli::Kb<'_>,
     uid: &str,
     head: &str,
-    land_dir: &Path,
+    graft_dir: &Path,
     no_gate: bool,
     gate_on_host: bool,
 ) -> Result<session::GatePlace> {
     if no_gate {
         return Ok(session::GatePlace::Here);
     }
-    let place = session::gate_place(land_dir, gate_on_host)?;
+    let place = session::gate_place(graft_dir, gate_on_host)?;
     if gate_on_host {
         kb.ran_on_host(uid, head)?;
     }
     Ok(place)
 }
 
+/// Mark the task done, free the claim, and dispose of the session (design D36.4).
 fn settle_landing(
     kb: &session_cli::Kb<'_>,
     stores: &archive::Stores<'_>,
@@ -4216,9 +4315,20 @@ impl Disposal {
     }
 }
 
-/// The working tree to graft in: wherever `onto` is already checked out, else a checkout of
-/// it under `.jkb/base`. `git` refuses to check one branch out twice, so borrowing an
-/// existing checkout is not an optimization — it is the only option when there is one.
+/// The two checkouts a landing onto `onto` uses: the one it advances `onto` in ([`land_dir_for`]),
+/// and `.jkb/graft`, made ready for the graft and its gate.
+fn land_checkouts(ctx: &repo::RepoCtx, onto: &str) -> Result<(PathBuf, PathBuf)> {
+    let target_dir = land_dir_for(ctx, onto)?;
+    let graft_dir = session::graft_worktree(&ctx.root);
+    gitrepo::prepare_graft_tree(&ctx.root, &graft_dir, onto)?;
+    Ok((target_dir, graft_dir))
+}
+
+/// The checkout a landing advances `onto` in: wherever `onto` is already checked out, else a
+/// checkout of it under `.jkb/base`. `git` refuses to check one branch out twice, so borrowing an
+/// existing checkout is not an optimization — it is the only option when there is one. The graft
+/// and its gate happen elsewhere, in `.jkb/graft` (`gitrepo::prepare_graft_tree`); this checkout
+/// is only fast-forwarded, after a green gate, and never detached.
 ///
 /// `.jkb/base` is **reused**, switched to whatever branch this land needs. `git worktree add`
 /// refuses a path that already exists, so adding a second one would fail the moment a batch
@@ -4650,7 +4760,7 @@ fn sweep_stale(db: &Db) -> Result<jkb_index::StaleRows> {
     db.write_txn_with::<_, anyhow::Error, _>("cli", |conn, _meta| Ok(jkb_index::sweep_stale(conn)?))
 }
 
-fn cmd_index(db: &Db, sweep: bool) -> Result<()> {
+fn cmd_index(db: &Db, sweep: bool, all: bool, rebuild: bool) -> Result<()> {
     // The on-demand half of the derived-index hygiene pair (design D40). `AUTOINCREMENT`
     // makes a leftover vector row harmless — its id is never reissued, so nothing can inherit
     // its embedding — but not absent, and an index that only grows is worth being able to
@@ -4667,12 +4777,27 @@ fn cmd_index(db: &Db, sweep: bool) -> Result<()> {
         }
         return Ok(());
     }
-    // Embed every content-bearing item not yet in the vector index (D21): this covers
-    // items created by file sync, not just the ingest pipeline. Needs a live embedder.
-    let pipeline = Pipeline::new(embedder()?);
+    // Embed every content-bearing item whose vector is missing or out of date (D21): this
+    // covers items created and edited by file sync, not just the ingest pipeline. Needs a live
+    // embedder. What is out of date is derived from each vector's recorded provenance (V030),
+    // so `--all` and `--rebuild` only forget that provenance and the ordinary pass does the rest
+    // — committed per batch, so an interrupted run is finished by a plain `jkb index`.
+    let embedder = embedder()?;
+    if rebuild {
+        let vector = jkb_index::VectorIndexer::new(embedder.clone());
+        db.write_txn_with::<_, anyhow::Error, _>(
+            "cli",
+            move |conn, _meta| Ok(vector.clear(conn)?),
+        )?;
+    } else if all {
+        db.write_txn_with::<_, anyhow::Error, _>("cli", |conn, _meta| {
+            Ok(jkb_index::forget_sources(conn)?)
+        })?;
+    }
+    let pipeline = Pipeline::new(embedder);
     let pending = pipeline.unembedded_count(db)?;
     if pending == 0 {
-        println!("index: nothing to embed (all content items are indexed)");
+        println!("index: nothing to embed (every content item's vector is current)");
         return Ok(());
     }
     println!("index: embedding {pending} pending item(s)…");
@@ -4704,8 +4829,8 @@ fn report_embedder(db: &Db) {
     };
     println!("embedder: {embed_status}");
     match embedder().and_then(|e| Ok(Pipeline::new(e).unembedded_count(db)?)) {
-        Ok(pending) => println!("un-embedded items: {pending}"),
-        Err(e) => println!("un-embedded items: unknown ({e})"),
+        Ok(pending) => println!("items awaiting a vector (missing or stale): {pending}"),
+        Err(e) => println!("items awaiting a vector (missing or stale): unknown ({e})"),
     }
 }
 

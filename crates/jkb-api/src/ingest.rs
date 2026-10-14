@@ -9,7 +9,7 @@
 //!
 //! A backend with no embedder — `jkb serve`, which never calls a model for a client — captures without
 //! embedding: the document is keyword-searchable at once and gains vectors when the host runs
-//! `jkb index --pending`.
+//! `jkb index`.
 
 use std::sync::Arc;
 
@@ -140,7 +140,7 @@ fn refusal(e: jkb_ingest::Error) -> ApiError {
 
 /// The embedder of a backend that calls no model. It names the host's default model and dimension: the
 /// model is part of an ingestion's idempotency key, so a repeat of the same text resumes this capture,
-/// and the dimension names the vector table a repeat checks for vectors `jkb index --pending` wrote.
+/// and the dimension names the vector table a repeat checks for vectors `jkb index` wrote.
 struct NoModel;
 
 impl Embedder for NoModel {
@@ -165,7 +165,7 @@ impl NoModel {
     fn unavailable() -> jkb_types::Error {
         jkb_types::Error::EmbedderUnavailable(
             "this backend calls no model for a client; the host embeds the document with \
-             `jkb index --pending`"
+             `jkb index`"
                 .to_owned(),
         )
     }

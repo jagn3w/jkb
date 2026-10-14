@@ -10,7 +10,12 @@
 //! - **Embed** is a separate, resumable stage. Embeddings are computed off the
 //!   writer thread (no DB lock held during network I/O), then written in a second
 //!   transaction. If the embedder is down, capture still succeeds and the source is
-//!   left un-embedded for a later [`Pipeline::index_pending`] pass.
+//!   left pending for a later [`Pipeline::index_pending`] pass.
+//!
+//! What is pending is derived, never marked (`V030`): an item whose vector is missing or was
+//! computed from text it no longer holds ([`jkb_index::pending_predicate`]), plus the documents
+//! `Pipeline::embed_document` must re-derive — re-chunked after an edit, or re-centred after a
+//! chunk's vector changed.
 //!
 //! Idempotency is the `ingestions` row keyed `(source_hash, pipeline_version,
 //! strategy, embedder_model)`: a completed run is a no-op; a captured-but-not-embedded
@@ -22,9 +27,10 @@ use std::sync::Arc;
 use rusqlite::{Connection, OptionalExtension};
 
 use jkb_core::item::NewItem;
+use jkb_core::WriteMeta;
 use jkb_core::{edge, ingestion, item, ns, placement, Db};
-use jkb_index::VectorIndexer;
-use jkb_types::{EdgeType, Embedder, ItemId, PlacementRole};
+use jkb_index::{Indexer as _, VectorIndexer};
+use jkb_types::{EdgeType, Embedder, ItemId, NamespaceId, PlacementRole};
 
 use crate::adapter::{self, ParsedDocument, SourceAdapter};
 use crate::chunk::{self, ChunkConfig};
@@ -49,8 +55,9 @@ pub struct Outcome {
     pub document: ItemId,
     /// The number of chunks derived from the document.
     pub chunk_count: usize,
-    /// Whether the source's items are vector-embedded (false if the embedder was
-    /// down — the source is still captured and keyword-searchable).
+    /// Whether the source's items are vector-embedded and current (false if the embedder was
+    /// down, or the document was edited during the run — the source is still captured and
+    /// keyword-searchable, and `jkb index` finishes it).
     pub embedded: bool,
     /// True if an earlier run captured this source, so this call wrote no items — it may still have
     /// written vectors, or marked a capture embedded since complete.
@@ -66,11 +73,10 @@ enum Capture {
         document: ItemId,
         chunk_count: usize,
     },
-    /// Captured (or resumed): these `(item, content)` pairs need embedding.
+    /// Captured (or resumed): the document and its chunks need embedding.
     Pending {
         document: ItemId,
         chunk_count: usize,
-        items: Vec<(ItemId, String)>,
         /// Captured by an earlier run, so this one wrote no items.
         resumed: bool,
     },
@@ -168,7 +174,7 @@ impl Pipeline {
         let chunks = chunk::chunk_text(&parsed.text, &self.chunking);
 
         let capture = self.capture(db, raw, parsed, namespace, &source_hash, chunks)?;
-        let (document, chunk_count, items, resumed) = match capture {
+        let (document, chunk_count, resumed) = match capture {
             Capture::Complete {
                 document,
                 chunk_count,
@@ -184,15 +190,14 @@ impl Pipeline {
             Capture::Pending {
                 document,
                 chunk_count,
-                items,
                 resumed,
-            } => (document, chunk_count, items, resumed),
+            } => (document, chunk_count, resumed),
         };
 
-        // A resumed capture whose every item already has a vector was embedded since — by `jkb index
-        // --pending`, which writes vectors but keys no ingestion. It is complete, and a repeat run says so
+        // A resumed capture whose document and chunks are all current was embedded since — by `jkb
+        // index`, which writes vectors but keys no ingestion. It is complete, and a repeat run says so
         // rather than resuming it forever.
-        if resumed && self.all_embedded(db, &items)? {
+        if resumed && self.document_is_current(db, document)? {
             self.mark_complete(db, &source_hash)?;
             return Ok(Outcome {
                 document,
@@ -207,7 +212,7 @@ impl Pipeline {
         // stands (keyword-searchable); leave it for `index_pending` (D21).
         if let Err(e) = self.embedder.health_check() {
             warnings.push(format!(
-                "embedder unavailable — captured but not embedded (run index --pending later): {e}"
+                "embedder unavailable — captured but not embedded (run `jkb index` later): {e}"
             ));
             return Ok(Outcome {
                 document,
@@ -219,11 +224,11 @@ impl Pipeline {
             });
         }
 
-        self.embed_and_complete(db, &source_hash, document, &items)?;
+        let embedded = self.embed_and_complete(db, &source_hash, document)?;
         Ok(Outcome {
             document,
             chunk_count,
-            embedded: true,
+            embedded,
             already_ingested: false,
             warnings,
         })
@@ -300,11 +305,9 @@ impl Pipeline {
                 }),
                 Some(_) => {
                     // Captured earlier but not embedded: resume at embed.
-                    let (document, items) = load_items(conn, &hash)?;
                     Ok(Capture::Pending {
-                        document,
-                        chunk_count: items.len().saturating_sub(1),
-                        items,
+                        document: document_id(conn, &hash)?,
+                        chunk_count: count_chunks(conn, &hash)?,
                         resumed: true,
                     })
                 }
@@ -322,37 +325,18 @@ impl Pipeline {
                         },
                     )?;
                     placement::place(conn, meta, document, ns_id, PlacementRole::Primary, 0)?;
-
-                    let mut items = vec![(document, text)];
-                    for (idx, chunk) in chunks.iter().enumerate() {
-                        let position = i64::try_from(idx).map_err(|_| {
-                            Error::Types(jkb_types::Error::Validation("too many chunks".to_owned()))
-                        })?;
-                        let chunk_id = item::upsert(
-                            conn,
-                            meta,
-                            &NewItem {
-                                uid: format!("b3:{hash}:{idx}"),
-                                kind: "chunk".to_owned(),
-                                content: Some(chunk.clone()),
-                                content_hash: None,
-                                mime: Some(mime.clone()),
-                            },
-                        )?;
-                        edge::link(conn, meta, chunk_id, document, EdgeType::DerivedFrom, None)?;
-                        placement::place(
-                            conn,
-                            meta,
-                            chunk_id,
-                            ns_id,
-                            PlacementRole::Chunk,
-                            position,
-                        )?;
-                        // The document CONTAINS its chunks (design D35), so they are listed
-                        // by expanding it rather than as flat siblings beside it.
-                        jkb_core::containment::contain(conn, meta, chunk_id, document, position)?;
-                        items.push((chunk_id, chunk.clone()));
-                    }
+                    write_chunks(
+                        conn,
+                        meta,
+                        &Cut {
+                            document,
+                            rev: content_rev(conn, document)?,
+                            uid_prefix: &format!("b3:{hash}"),
+                            chunks: &chunks,
+                            mime: Some(&mime),
+                            namespace: Some(ns_id),
+                        },
+                    )?;
 
                     // Through the core repo, so the marker is CHANGELOGGED and `undo` takes
                     // it in the same transaction as the items it describes. Written directly
@@ -362,11 +346,9 @@ impl Pipeline {
                     // verb able to clear the row.
                     ingestion::record_capture(conn, meta, key)?;
 
-                    let chunk_count = chunks.len();
                     Ok(Capture::Pending {
                         document,
-                        chunk_count,
-                        items,
+                        chunk_count: chunks.len(),
                         resumed: false,
                     })
                 }
@@ -374,73 +356,33 @@ impl Pipeline {
         })
     }
 
-    /// Embed `items` (off-thread), write the vectors, and mark the ingestion complete.
+    /// Embed a captured `document` through [`Pipeline::embed_document`] and, once it and its chunks
+    /// are current, mark the ingestion complete. Returns whether they are.
     ///
-    /// `document`'s own vector is **averaged from its chunks** rather than embedded from its
-    /// text — see [`Pipeline::derive_document_vectors`] for why a truncated document vector
-    /// is worse than none. This is the same rule the `index_pending` mop-up applies, so a
-    /// document gets the same vector whichever path indexed it.
-    fn embed_and_complete(
-        &self,
-        db: &Db,
-        source_hash: &str,
-        document: ItemId,
-        items: &[(ItemId, String)],
-    ) -> Result<()> {
-        let mut embeddings = Vec::with_capacity(items.len());
-        for (id, content) in items.iter().filter(|(id, _)| *id != document) {
-            embeddings.push((*id, self.embedder.embed(content)?));
-        }
-        let chunk_vectors: Vec<Vec<f32>> = embeddings.iter().map(|(_, v)| v.clone()).collect();
-        match centroid(&chunk_vectors) {
-            Some(c) => embeddings.push((document, c)),
-            // No chunks (a source short enough that chunking produced none): the document's
-            // own text is short by construction, so embedding it directly is safe.
-            None => {
-                if let Some((_, text)) = items.iter().find(|(id, _)| *id == document) {
-                    embeddings.push((document, self.embedder.embed(text)?));
-                }
-            }
-        }
-
-        let vector = VectorIndexer::new(self.embedder.clone());
-        let hash = source_hash.to_owned();
-        let strategy = self.strategy();
-        let model = self.embedder.model().to_owned();
-        let pipeline_version = self.version;
-
-        db.write_txn_with::<(), Error, _>("ingest-embed", move |conn, _meta| {
-            vector.ensure_ready(conn)?;
-            for (id, embedding) in &embeddings {
-                vector.upsert_vector(conn, *id, embedding)?;
-            }
-            ingestion::mark_complete(
-                conn,
-                ingestion::Key {
-                    source_hash: &hash,
-                    pipeline_version,
-                    strategy: &strategy,
-                    embedder_model: &model,
-                },
-            )?;
-            Ok(())
-        })
-    }
-
-    /// Whether every one of `items` already has a vector in this pipeline's index.
-    fn all_embedded(&self, db: &Db, items: &[(ItemId, String)]) -> Result<bool> {
-        let ids: Vec<ItemId> = items
-            .iter()
-            .filter(|(_, content)| !content.trim().is_empty())
-            .map(|(id, _)| *id)
-            .collect();
-        if ids.is_empty() {
+    /// The same function `index_pending` calls, so a document gets the same vector whichever path
+    /// indexed it — including one edited between its capture and this resume, which is re-chunked
+    /// first rather than given its old chunks' centroid under its new text. An embedder error fails
+    /// the ingest, as it always has: the caller asked for this one source, not a backfill.
+    fn embed_and_complete(&self, db: &Db, source_hash: &str, document: ItemId) -> Result<bool> {
+        let mut report = IndexReport::default();
+        self.embed_document(db, document, Failures::Propagate, &mut report)?;
+        if !self.document_is_current(db, document)? {
+            // An edit landed mid-run: what was embedded no longer describes the document, and
+            // nothing was stored for it. The next run (or `jkb index`) finishes it.
             return Ok(false);
         }
+        self.mark_complete(db, source_hash)?;
+        Ok(true)
+    }
+
+    /// Whether `document` and every chunk of it are current: nothing to re-chunk, no chunk pending,
+    /// and no vector of its own left to derive.
+    fn document_is_current(&self, db: &Db, document: ItemId) -> Result<bool> {
         let vector = VectorIndexer::new(self.embedder.clone());
-        let found =
-            db.read_with::<usize, Error, _>(move |conn| Ok(vector.vectors_for(conn, &ids)?.len()))?;
-        Ok(found == items.iter().filter(|(_, c)| !c.trim().is_empty()).count())
+        db.read_with::<bool, Error, _>(move |conn| {
+            Ok(stale_chunks(conn, &vector, document)?.is_empty()
+                && matches!(derivation(conn, &vector, document)?, Derivation::Current))
+        })
     }
 
     /// Mark the ingestion of `source_hash` complete.
@@ -463,37 +405,82 @@ impl Pipeline {
         })
     }
 
-    /// The content-bearing items not yet in the vector index, **excluding** those whose
-    /// content is empty or whitespace-only. A blank line preserved for round-trip (e.g.
-    /// by the `tasks` file serializer) is a content item with nothing to embed, and
-    /// asking the model to embed `""` yields a zero-length vector — so those are skipped
-    /// here rather than sent to the embedder.
+    /// The items waiting for the embedder: those [`jkb_index::pending_predicate`] names, plus the
+    /// documents [`Pipeline::embed_document`] has to re-derive ([`document_rule`]).
+    ///
+    /// Blank text — empty or whitespace-only by `str::trim`, decided here and only here (see
+    /// [`is_blank`]) — is excluded: there is nothing to embed, and asking a model to embed `""`
+    /// yields a zero-length vector. A blank line preserved for round-trip by the `tasks` file
+    /// serializer is such an item. The one exception is a document whose chunks were cut from text
+    /// it no longer holds: blank now, it still has old chunks to remove.
     fn pending_items(&self, db: &Db) -> Result<Vec<Pending>> {
-        let table = VectorIndexer::new(self.embedder.clone())
-            .table_name()
-            .to_owned();
-        let rows = db.read_with::<Vec<Pending>, Error, _>(move |conn| {
-            let sql = pending_rows_sql(conn, &table)?;
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok(Pending {
-                        id: ItemId::new(r.get(0)?),
-                        content: r.get::<_, String>(1)?,
-                        kind: r.get::<_, String>(2)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })?;
-        Ok(rows
+        Ok(self
+            .pending_rows(db)?
             .into_iter()
-            .filter(|p| !p.content.trim().is_empty())
+            .filter(|(p, rechunk)| !is_blank(&p.content) || *rechunk)
+            .map(|(p, _)| p)
             .collect())
     }
 
-    /// The number of content-bearing items not yet in the vector index (excluding
-    /// empty/whitespace-only content, which is not embeddable).
+    /// Every row [`Pipeline::pending_items`] considers, with whether it is a document to re-chunk,
+    /// before the blank filter.
+    fn pending_rows(&self, db: &Db) -> Result<Vec<(Pending, bool)>> {
+        let vector = VectorIndexer::new(self.embedder.clone());
+        db.read_with::<Vec<(Pending, bool)>, Error, _>(move |conn| {
+            let sql = format!(
+                "SELECT i.id, i.content, i.kind, i.content_rev,
+                        {rechunk}
+                   FROM items i
+                  WHERE ({pending})
+                     OR (i.kind = '{KIND_DOCUMENT}' AND i.content IS NOT NULL AND ({rule}))",
+                pending = jkb_index::pending_predicate(conn, &vector, "i")?,
+                rule = document_rule("i"),
+                rechunk = needs_rechunk_sql("i"),
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        Pending {
+                            id: ItemId::new(r.get(0)?),
+                            content: r.get::<_, String>(1)?,
+                            kind: r.get::<_, String>(2)?,
+                            rev: r.get(3)?,
+                        },
+                        r.get::<_, bool>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Delete the vectors of items whose text is now blank. Their vector describes text they no
+    /// longer hold — a note emptied, a document edited to nothing — so a search for that text would
+    /// still find them, and there is nothing to replace it with. Returns how many were removed.
+    fn drop_blank_vectors(&self, db: &Db) -> Result<usize> {
+        let blank: Vec<ItemId> = self
+            .pending_rows(db)?
+            .into_iter()
+            .filter(|(p, rechunk)| is_blank(&p.content) && !*rechunk)
+            .map(|(p, _)| p.id)
+            .collect();
+        if blank.is_empty() {
+            return Ok(0);
+        }
+        let vector = VectorIndexer::new(self.embedder.clone());
+        db.write_txn_with::<usize, Error, _>("index-pending", move |conn, _meta| {
+            let held = vector.vectors_for(conn, &blank)?;
+            for id in held.keys() {
+                vector.remove(conn, *id)?;
+            }
+            Ok(held.len())
+        })
+    }
+
+    /// The number of items waiting for the embedder: a vector missing, or computed from text the
+    /// item no longer holds, or a document to re-derive (excluding blank text, which is not
+    /// embeddable).
     ///
     /// # Errors
     /// Returns an error if the query fails.
@@ -501,55 +488,216 @@ impl Pipeline {
         Ok(self.pending_items(db)?.len())
     }
 
-    /// Embed every content-bearing item that isn't in the vector index yet (the
-    /// `index --pending` pass, D21). Returns the number embedded.
+    /// Embed every item whose vector is missing or out of date — never embedded, or edited since —
+    /// replacing any old vector, and re-derive every document whose chunks changed (the `jkb index`
+    /// pass, D21). Returns what it wrote.
+    ///
+    /// Documents whose chunks were cut from text they no longer hold are re-cut first. Items other
+    /// than documents are then embedded from their own text, in committed batches. Then every
+    /// document still pending goes through [`Pipeline::embed_document`] — listed again **after** that
+    /// pass, because a chunk whose vector was just written has a later `seq` than its document's,
+    /// which is what makes the document pending ([`document_rule`]).
     ///
     /// # Errors
     /// Returns [`jkb_types::Error::EmbedderUnavailable`] (via [`Error::Types`]) if
     /// the embedder is down, or a database error.
     pub fn index_pending(&self, db: &Db) -> Result<IndexReport> {
-        let pending = self.pending_items(db)?;
+        let rows = self.pending_rows(db)?;
         let mut report = IndexReport::default();
-        if pending.is_empty() {
+        if !rows
+            .iter()
+            .any(|(p, rechunk)| !is_blank(&p.content) || *rechunk)
+        {
+            self.drop_blank_vectors(db)?;
             return Ok(report);
         }
         // Actionable failure if the embedder is down (D21 / task 7.5).
         self.embedder.health_check()?;
 
-        // A document is embedded from its chunks, not from its own text (see
-        // `derive_document_vectors`), so it is held back until the chunks are in.
-        let (documents, direct): (Vec<Pending>, Vec<Pending>) =
-            pending.into_iter().partition(|p| p.kind == KIND_DOCUMENT);
-
-        for batch in direct.chunks(EMBED_BATCH) {
-            let mut embeddings = Vec::with_capacity(batch.len());
-            for item in batch {
-                match self.embedder.embed(&item.content) {
-                    Ok(v) => embeddings.push((item.id, v)),
-                    // One bad item must not discard the whole backfill. A run over tens of
-                    // thousands of items will meet a transient failure eventually; losing
-                    // every other item's work to it makes the mop-up path unusable exactly
-                    // when it is most needed.
-                    Err(e) => {
-                        report.failed += 1;
-                        report.note_failure(&e.to_string());
-                    }
-                }
+        // Re-cut first — no model call — so the pass below never embeds chunks of text a document
+        // no longer holds, only for the re-cut to delete them. After an upgrade every vector is
+        // pending, and a document edited before it would otherwise have its old chunks embedded
+        // once more for nothing.
+        for (p, rechunk) in &rows {
+            if *rechunk {
+                self.rechunk_if_stale(db, p.id)?;
             }
+        }
+
+        let direct: Vec<Pending> = self
+            .pending_items(db)?
+            .into_iter()
+            .filter(|p| p.kind != KIND_DOCUMENT)
+            .collect();
+        for batch in direct.chunks(EMBED_BATCH) {
+            let embeddings = self.embed_each(batch, Failures::Count, &mut report)?;
             report.embedded += self.store_vectors(db, embeddings)?;
         }
 
-        report.derived = self.derive_document_vectors(db, &documents)?;
+        let documents: Vec<ItemId> = self
+            .pending_items(db)?
+            .into_iter()
+            .filter(|p| p.kind == KIND_DOCUMENT)
+            .map(|p| p.id)
+            .collect();
+        for document in documents {
+            self.embed_document(db, document, Failures::Count, &mut report)?;
+        }
+        self.drop_blank_vectors(db)?;
         Ok(report)
     }
 
-    /// Write a batch of vectors in one transaction, returning how many landed. An item deleted
-    /// since it was read for embedding gets no vector (`upsert_vector` checks) and is not counted.
+    /// Bring `document`'s vector up to date: **the only writer of a document vector**, called by
+    /// both [`Pipeline::index_pending`] and the ingest path, so the two cannot come to disagree.
+    ///
+    /// 1. If its chunks were cut from text it no longer holds ([`needs_rechunk`]), they are removed and new ones cut from the current text, in one write transaction
+    ///    with no model call ([`Pipeline::rechunk_if_stale`]).
+    /// 2. Its pending chunks are embedded.
+    /// 3. If it is pending — its own vector stale, or a chunk's written after it — its vector
+    ///    becomes the **centroid of its current chunks'**, or an embedding of its own text only
+    ///    when it has no chunks at all.
+    ///
+    /// Never a truncated self-embedding. A document's content is the whole source — a transcript
+    /// can be a hundred times the embedder's context — and embedding it directly embeds a prefix
+    /// that claims to describe the whole, ranking against queries about its opening and missing
+    /// everything after. The chunks already cover the whole text, so their centroid is both cheaper
+    /// (no model call) and more faithful. The shelved `vector_stale` design got this wrong three
+    /// ways, each a rule some other writer had to remember; here the rule is this function.
+    ///
+    /// Embedder errors are counted into `report` or propagated, per `failures`.
+    ///
+    /// # Errors
+    /// A database error, or (with [`Failures::Propagate`]) the embedder's.
+    fn embed_document(
+        &self,
+        db: &Db,
+        document: ItemId,
+        failures: Failures,
+        report: &mut IndexReport,
+    ) -> Result<()> {
+        self.rechunk_if_stale(db, document)?;
+
+        let vector = VectorIndexer::new(self.embedder.clone());
+        let stale = {
+            let vector = VectorIndexer::new(self.embedder.clone());
+            db.read_with::<Vec<Pending>, Error, _>(move |conn| {
+                stale_chunks(conn, &vector, document)
+            })?
+        };
+        for batch in stale.chunks(EMBED_BATCH) {
+            let embeddings = self.embed_each(batch, failures, report)?;
+            report.embedded += self.store_vectors(db, embeddings)?;
+        }
+
+        let plan =
+            db.read_with::<Derivation, Error, _>(move |conn| derivation(conn, &vector, document))?;
+        match plan {
+            // Nothing to write, or an edit raced this run and the document re-chunks next time.
+            Derivation::Current | Derivation::Wait => {}
+            Derivation::Centroid { rev, vectors } => {
+                if let Some(c) = centroid(&vectors) {
+                    report.derived += self.store_vectors(db, vec![(document, rev, c)])?;
+                }
+            }
+            Derivation::OwnText { rev, text } => {
+                let own = Pending {
+                    id: document,
+                    content: text,
+                    kind: KIND_DOCUMENT.to_owned(),
+                    rev,
+                };
+                let embeddings = self.embed_each(std::slice::from_ref(&own), failures, report)?;
+                report.embedded += self.store_vectors(db, embeddings)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-cut `document`'s chunks if they were cut from text it no longer holds
+    /// ([`needs_rechunk`]). Returns whether it did.
+    ///
+    /// One write transaction with no model call: the old chunk items are removed (and their
+    /// vectors with them, by the GC trigger and `vector_sources`' cascade), new ones are cut from
+    /// the current text, and `chunked_rev` is set beside them. Read and cut inside the transaction,
+    /// so no edit can land between the text read and the rev recorded for it.
+    ///
+    /// A new chunk's uid is `<document uid>:<blake3 of the text>:<idx>`. The document's uid keeps
+    /// it inside the `b3:<source hash>:` prefix every lookup of a capture's chunks matches; the text
+    /// hash keeps a re-cut from colliding with the captured `b3:<source hash>:<idx>` uids or with
+    /// another document edited to the same text, which a bare `b3:<text hash>:<idx>` would — two
+    /// documents would then share chunk items.
+    ///
+    /// Removing a chunk is an ordinary changelogged delete, so `jkb undo` of a re-chunk restores
+    /// the old chunks and the old `chunked_rev`, which re-chunks again at the next pass: the chunks
+    /// follow the text, not the undo.
+    fn rechunk_if_stale(&self, db: &Db, document: ItemId) -> Result<bool> {
+        let chunking = self.chunking;
+        db.write_txn_with::<bool, Error, _>(self.actor, move |conn, meta| {
+            if !needs_rechunk(conn, document)? {
+                return Ok(false);
+            }
+            let (uid, content, rev, mime): DocumentRow = conn
+                .prepare_cached("SELECT uid, content, content_rev, mime FROM items WHERE id = ?1")?
+                .query_row([document.get()], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?;
+            for old in chunk_ids_of(conn, document)? {
+                item::remove(conn, meta, old, true)?;
+            }
+            let text = content.unwrap_or_default();
+            let chunks = chunk::chunk_text(&text, &chunking);
+            let text_hash = blake3::hash(text.as_bytes()).to_hex();
+            write_chunks(
+                conn,
+                meta,
+                &Cut {
+                    document,
+                    rev,
+                    uid_prefix: &format!("{uid}:{text_hash}"),
+                    chunks: &chunks,
+                    mime: mime.as_deref(),
+                    namespace: primary_namespace_id(conn, document)?,
+                },
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Embed each of `items` from its own text, off the writer thread. A rejected item is counted
+    /// into `report` and skipped, or fails the call, per `failures`.
+    ///
+    /// Counting is the backfill's policy: one bad item must not discard the whole run. A run over
+    /// tens of thousands of items will meet a transient failure eventually; losing every other
+    /// item's work to it makes the mop-up path unusable exactly when it is most needed. The item
+    /// stays pending, so a later run retries it.
+    fn embed_each(
+        &self,
+        items: &[Pending],
+        failures: Failures,
+        report: &mut IndexReport,
+    ) -> Result<Vec<Embedded>> {
+        let mut embeddings = Vec::with_capacity(items.len());
+        for item in items {
+            match self.embedder.embed(&item.content) {
+                Ok(v) => embeddings.push((item.id, item.rev, v)),
+                Err(e) if failures == Failures::Count => {
+                    report.failed += 1;
+                    report.note_failure(&e.to_string());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(embeddings)
+    }
+
+    /// Write a batch of vectors in one transaction, returning how many landed. An item deleted or
+    /// edited since it was read for embedding gets no vector (`upsert_vector` checks its rev) and
+    /// is not counted; an edited one stays pending for the next run.
     ///
     /// Committing per batch rather than once at the end is what makes a long backfill
     /// resumable: interrupting it keeps everything already written, and re-running picks up
     /// only what is still missing.
-    fn store_vectors(&self, db: &Db, embeddings: Vec<(ItemId, Vec<f32>)>) -> Result<usize> {
+    fn store_vectors(&self, db: &Db, embeddings: Vec<Embedded>) -> Result<usize> {
         if embeddings.is_empty() {
             return Ok(0);
         }
@@ -557,90 +705,273 @@ impl Pipeline {
         db.write_txn_with::<usize, Error, _>("index-pending", move |conn, _meta| {
             vector.ensure_ready(conn)?;
             let mut landed = 0;
-            for (id, embedding) in &embeddings {
-                if vector.upsert_vector(conn, *id, embedding)? {
+            for (id, rev, embedding) in &embeddings {
+                if vector.upsert_vector(conn, *id, *rev, embedding)? {
                     landed += 1;
                 }
             }
             Ok(landed)
         })
     }
-
-    /// Give each document a vector **averaged from its chunks** rather than embedded from
-    /// its own text.
-    ///
-    /// A document's content is the whole source — a transcript can be a hundred times the
-    /// embedder's context. Embedding it directly means embedding a truncated prefix, which
-    /// does not merely lose information: it produces a vector that claims to describe the
-    /// document while describing only its opening, so the document ranks against queries
-    /// about its beginning and misses everything after. The chunks already cover the whole
-    /// text, so their centroid is both cheaper (no model call) and more faithful.
-    ///
-    /// A document with no chunks (short enough that ingest made none, or created by a path
-    /// that does not chunk) falls back to embedding its own content, which is safe because
-    /// it is short by construction.
-    fn derive_document_vectors(&self, db: &Db, documents: &[Pending]) -> Result<usize> {
-        if documents.is_empty() {
-            return Ok(0);
-        }
-        let mut derived = Vec::new();
-        let mut fallback = Vec::new();
-        for doc in documents {
-            let id = doc.id;
-            let embedder = self.embedder.clone();
-            let vectors = db.read_with::<Vec<Vec<f32>>, Error, _>(move |conn| {
-                let chunk_ids = chunk_ids_of(conn, id)?;
-                let indexer = VectorIndexer::new(embedder);
-                Ok(indexer
-                    .vectors_for(conn, &chunk_ids)?
-                    .into_values()
-                    .collect())
-            })?;
-            match centroid(&vectors) {
-                Some(c) => derived.push((doc.id, c)),
-                None => fallback.push(doc),
-            }
-        }
-        for doc in fallback {
-            if let Ok(v) = self.embedder.embed(&doc.content) {
-                derived.push((doc.id, v));
-            }
-        }
-        let mut written = 0;
-        for batch in derived.chunks(EMBED_BATCH) {
-            written += self.store_vectors(db, batch.to_vec())?;
-        }
-        Ok(written)
-    }
 }
 
-/// Whether a table named `table` exists.
-fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
-    let found: Option<i64> = conn
-        .prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?
-        .query_row([table], |r| r.get(0))
+/// Whether `text` has nothing to embed. **The** blankness test: SQL's `trim` strips only ASCII
+/// spaces, so a run of no-break spaces (as PDF extraction yields) was blank to one check and not to
+/// another, and a chunk that was never embedded held its document pending forever.
+fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+/// The SQL condition under which document `alias` must be re-derived even if its own vector's
+/// provenance matches: its chunks were cut from an earlier revision of its text, or a chunk's
+/// vector was written after its own (`vector_sources.seq`), so its centroid predates it.
+///
+/// [`jkb_index::pending_predicate`] covers the document's own row; this is the rule a document
+/// adds because its vector derives from its chunks rather than its text. `alias` is one of this
+/// crate's identifiers, never input.
+fn document_rule(alias: &str) -> String {
+    format!(
+        "({rechunk})
+         OR EXISTS (SELECT 1 FROM edges e
+                      JOIN items c ON c.id = e.src_item_id AND c.kind = 'chunk'
+                      JOIN vector_sources cs ON cs.item_id = c.id
+                     WHERE e.dst_item_id = {alias}.id AND e.type = 'derived_from'
+                       AND cs.seq > (SELECT ds.seq FROM vector_sources ds
+                                      WHERE ds.item_id = {alias}.id))",
+        rechunk = needs_rechunk_sql(alias),
+    )
+}
+
+/// The SQL condition under which document `alias`'s chunks were cut from text it no longer holds,
+/// so they must be re-cut before it is embedded. **The** re-chunk rule: [`needs_rechunk`], the
+/// pending listing and [`document_rule`] all splice this in.
+///
+/// The revision its chunks were cut from is `chunked_rev`, or — when that is NULL but the document
+/// has chunks — 0. NULL with chunks is a chunked document `chunked_rev` cannot describe: one
+/// deleted before `V030` and restored by `jkb undo` after it, whose snapshot had no such column. Its
+/// chunks were cut at capture, and the revision count starts at 0 for every pre-`V030` item. NULL
+/// with no chunks is a document no chunker cut (a synced file), which is never re-cut. `alias` is one
+/// of this crate's identifiers, never input; the result is never NULL.
+fn needs_rechunk_sql(alias: &str) -> String {
+    format!(
+        "coalesce(coalesce({alias}.chunked_rev,
+                           CASE WHEN EXISTS (SELECT 1 FROM edges rce
+                                               JOIN items rcc ON rcc.id = rce.src_item_id
+                                                             AND rcc.kind = 'chunk'
+                                              WHERE rce.dst_item_id = {alias}.id
+                                                AND rce.type = 'derived_from')
+                                THEN 0 END) <> {alias}.content_rev, 0)"
+    )
+}
+
+/// Whether `document`'s chunks must be re-cut ([`needs_rechunk_sql`]); false for an item that is
+/// gone.
+fn needs_rechunk(conn: &Connection, document: ItemId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(&format!(
+            "SELECT {} FROM items d WHERE d.id = ?1",
+            needs_rechunk_sql("d")
+        ))?
+        .query_row([document.get()], |r| r.get::<_, bool>(0))
+        .optional()?
+        .unwrap_or(false))
+}
+
+/// `document`'s chunks that [`jkb_index::pending_predicate`] names, minus blank ones.
+fn stale_chunks(
+    conn: &Connection,
+    vector: &VectorIndexer,
+    document: ItemId,
+) -> Result<Vec<Pending>> {
+    let sql = format!(
+        "SELECT c.id, c.content, c.kind, c.content_rev FROM edges e
+           JOIN items c ON c.id = e.src_item_id
+          WHERE e.dst_item_id = ?1 AND e.type = 'derived_from' AND c.kind = 'chunk'
+            AND {pending}
+          ORDER BY c.id",
+        pending = jkb_index::pending_predicate(conn, vector, "c")?
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut rows = stmt
+        .query_map([document.get()], |r| {
+            Ok(Pending {
+                id: ItemId::new(r.get(0)?),
+                content: r.get(1)?,
+                kind: r.get(2)?,
+                rev: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.retain(|p| !is_blank(&p.content));
+    Ok(rows)
+}
+
+/// What [`Pipeline::embed_document`] is to write for a document, decided in one read.
+enum Derivation {
+    /// Its vector is current, or it has nothing to embed.
+    Current,
+    /// Pending, but not derivable now: its text changed since its chunks were cut (an edit raced
+    /// this run), or none of its chunks has a current vector yet. It stays pending.
+    Wait,
+    /// The centroid of these chunk vectors, stored under content revision `rev`.
+    Centroid { rev: i64, vectors: Vec<Vec<f32>> },
+    /// No chunks at all: an embedding of its own `text`, stored under `rev`.
+    OwnText { rev: i64, text: String },
+}
+
+/// Decide `document`'s vector: whether it is pending ([`jkb_index::pending_predicate`] or
+/// [`document_rule`]), and if so from what.
+fn derivation(conn: &Connection, vector: &VectorIndexer, document: ItemId) -> Result<Derivation> {
+    let sql = format!(
+        "SELECT d.content, d.content_rev, ({pending}) OR ({rule})
+           FROM items d WHERE d.id = ?1",
+        pending = jkb_index::pending_predicate(conn, vector, "d")?,
+        rule = document_rule("d"),
+    );
+    let row: Option<(Option<String>, i64, bool)> = conn
+        .prepare_cached(&sql)?
+        .query_row([document.get()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .optional()?;
-    Ok(found.is_some())
-}
+    let Some((Some(text), rev, true)) = row else {
+        return Ok(Derivation::Current);
+    };
+    if needs_rechunk(conn, document)? {
+        return Ok(Derivation::Wait);
+    }
 
-/// `SELECT count(*)` of un-embedded content items (all of them if no vec table yet).
-/// `SELECT id, content` of un-embedded content items.
-fn pending_rows_sql(conn: &Connection, table: &str) -> rusqlite::Result<String> {
-    Ok(if table_exists(conn, table)? {
-        format!(
-            // "Indexed" means a vector for an item that exists. The bare subquery already says
-            // exactly that: every candidate `id` is drawn from `items`, so an orphan vector row
-            // (one whose item is gone) can never match it. Joining the vec table back to `items`
-            // to make the point explicit changed nothing but the plan, on the query behind both
-            // `jkb index` and `jkb doctor`'s un-embedded count over the whole store.
-            "SELECT id, content, kind FROM items
-             WHERE content IS NOT NULL
-               AND id NOT IN (SELECT item_id FROM {table})"
-        )
+    // Every non-blank chunk, and whether its vector is current.
+    let sql = format!(
+        "SELECT c.id, c.content, NOT ({pending}) FROM edges e
+           JOIN items c ON c.id = e.src_item_id
+          WHERE e.dst_item_id = ?1 AND e.type = 'derived_from' AND c.kind = 'chunk'",
+        pending = jkb_index::pending_predicate(conn, vector, "c")?
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let chunks = stmt
+        .query_map([document.get()], |r| {
+            Ok((
+                ItemId::new(r.get(0)?),
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, bool>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let chunks: Vec<(ItemId, bool)> = chunks
+        .into_iter()
+        .filter(|(_, content, _)| content.as_deref().is_some_and(|c| !is_blank(c)))
+        .map(|(id, _, current)| (id, current))
+        .collect();
+
+    if chunks.is_empty() {
+        // Short by construction when ingest made it — every non-empty text yields a chunk — so
+        // this is a document no chunker cut (a synced file), or one with nothing to embed.
+        return Ok(if is_blank(&text) {
+            Derivation::Current
+        } else {
+            Derivation::OwnText { rev, text }
+        });
+    }
+    // Only current vectors: a chunk the embedder rejected keeps its old one, if any, and the
+    // centroid is taken without it. Its vector, when it lands, has a later `seq` than the
+    // document's, so the document is re-centred then.
+    let current: Vec<ItemId> = chunks
+        .iter()
+        .filter(|(_, current)| *current)
+        .map(|(id, _)| *id)
+        .collect();
+    let vectors: Vec<Vec<f32>> = vector.vectors_for(conn, &current)?.into_values().collect();
+    Ok(if vectors.is_empty() {
+        Derivation::Wait
     } else {
-        "SELECT id, content, kind FROM items WHERE content IS NOT NULL".to_owned()
+        Derivation::Centroid { rev, vectors }
     })
 }
+
+/// A document as [`Pipeline::rechunk_if_stale`] reads it: uid, content, `content_rev`, mime.
+type DocumentRow = (String, Option<String>, i64, Option<String>);
+
+/// One cut of a document's chunks, for [`write_chunks`].
+struct Cut<'a> {
+    /// The document the chunks are derived from.
+    document: ItemId,
+    /// The document's `content_rev` the chunks were cut from, recorded as its `chunked_rev`.
+    rev: i64,
+    /// Each chunk's uid is `<uid_prefix>:<idx>`.
+    uid_prefix: &'a str,
+    chunks: &'a [String],
+    mime: Option<&'a str>,
+    /// Where the chunks are placed (the document's home), if it has one.
+    namespace: Option<NamespaceId>,
+}
+
+/// Write `cut`'s chunk items — `derived_from` the document, placed in its namespace by position,
+/// contained by it — and record the revision they were cut from (`items.chunked_rev`) beside them.
+/// The one writer of chunks, shared by capture and re-chunking, so the two cut the same shape.
+fn write_chunks(conn: &Connection, meta: &WriteMeta, cut: &Cut<'_>) -> Result<()> {
+    for (idx, chunk) in cut.chunks.iter().enumerate() {
+        let position = i64::try_from(idx).map_err(|_| {
+            Error::Types(jkb_types::Error::Validation("too many chunks".to_owned()))
+        })?;
+        let chunk_id = item::upsert(
+            conn,
+            meta,
+            &NewItem {
+                uid: format!("{}:{idx}", cut.uid_prefix),
+                kind: "chunk".to_owned(),
+                content: Some(chunk.clone()),
+                content_hash: None,
+                mime: cut.mime.map(str::to_owned),
+            },
+        )?;
+        edge::link(
+            conn,
+            meta,
+            chunk_id,
+            cut.document,
+            EdgeType::DerivedFrom,
+            None,
+        )?;
+        if let Some(ns_id) = cut.namespace {
+            placement::place(conn, meta, chunk_id, ns_id, PlacementRole::Chunk, position)?;
+        }
+        // The document CONTAINS its chunks (design D35), so they are listed
+        // by expanding it rather than as flat siblings beside it.
+        jkb_core::containment::contain(conn, meta, chunk_id, cut.document, position)?;
+    }
+    item::set_chunked_rev(conn, meta, cut.document, cut.rev)?;
+    Ok(())
+}
+
+/// `item`'s current `content_rev`.
+fn content_rev(conn: &Connection, item: ItemId) -> Result<i64> {
+    Ok(conn
+        .prepare_cached("SELECT content_rev FROM items WHERE id = ?1")?
+        .query_row([item.get()], |r| r.get(0))?)
+}
+
+/// The namespace `item` is primarily placed in, if any.
+fn primary_namespace_id(conn: &Connection, item: ItemId) -> Result<Option<NamespaceId>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT namespace_id FROM placements WHERE item_id = ?1 AND role = 'primary'
+              ORDER BY id LIMIT 1",
+        )?
+        .query_row([item.get()], |r| r.get::<_, i64>(0))
+        .optional()?
+        .map(NamespaceId::new))
+}
+
+/// Whether [`Pipeline::embed_document`] and [`Pipeline::embed_each`] count an embedder error and
+/// carry on (a backfill) or fail with it (an ingest of one source).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Failures {
+    Count,
+    Propagate,
+}
+
+/// A vector ready to store: the item, the content revision it was computed from (for a document,
+/// the revision its chunks were cut from), and the vector.
+type Embedded = (ItemId, i64, Vec<f32>);
 
 /// The item kind ingest stores a whole source document as. Its chunks are separate items
 /// linked back to it by `derived_from`.
@@ -651,11 +982,13 @@ const KIND_DOCUMENT: &str = "document";
 /// against the model call that dominates each item.
 const EMBED_BATCH: usize = 256;
 
-/// One un-embedded item awaiting a vector.
+/// One item awaiting a vector: never embedded, or edited since it was.
 struct Pending {
     id: ItemId,
     content: String,
     kind: String,
+    /// Its `content_rev` when `content` was read; the vector is stored only if it still is.
+    rev: i64,
 }
 
 /// What one [`Pipeline::index_pending`] run did.
@@ -778,26 +1111,6 @@ fn count_chunks(conn: &Connection, hash: &str) -> Result<usize> {
     Ok(usize::try_from(n).unwrap_or(0))
 }
 
-/// The document item plus its chunks, as `(id, content)` pairs, for the embed stage.
-fn load_items(conn: &Connection, hash: &str) -> Result<(ItemId, Vec<(ItemId, String)>)> {
-    let document = document_id(conn, hash)?;
-    let doc_content: String = conn
-        .prepare_cached("SELECT content FROM items WHERE id = ?1")?
-        .query_row([document.get()], |r| r.get(0))?;
-    let mut items = vec![(document, doc_content)];
-
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, content FROM items WHERE uid GLOB ?1 AND content IS NOT NULL ORDER BY id",
-    )?;
-    let chunks = stmt
-        .query_map([chunk_uid_glob(hash)], |r| {
-            Ok((ItemId::new(r.get(0)?), r.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    items.extend(chunks);
-    Ok((document, items))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,9 +1150,6 @@ mod tests {
                 2,
                 "the document and its own chunk, not the sibling's"
             );
-            let (_, items) = load_items(conn, "a?c").unwrap();
-            let texts: Vec<&str> = items.iter().map(|(_, c)| c.as_str()).collect();
-            assert_eq!(texts, ["the document", "its chunk"]);
             Ok(())
         })
         .unwrap();

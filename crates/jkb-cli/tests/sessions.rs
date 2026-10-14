@@ -321,9 +321,10 @@ fn a_task_held_by_another_live_owner_refuses_a_session() {
 }
 
 /// A red gate must leave the target exactly as it was — that is the difference between a
-/// merge queue and just merging.
+/// merge queue and just merging. It is never moved in the first place: the gate runs on the
+/// graft while it is detached, and only green advances the target.
 #[test]
-fn a_red_gate_rolls_the_target_back_and_keeps_the_session() {
+fn a_red_gate_leaves_the_target_where_it_was_and_keeps_the_session() {
     let f = Fixture::new();
     let uid = f.add_task("failing task");
     let s = f.work(&uid);
@@ -347,6 +348,473 @@ fn a_red_gate_rolls_the_target_back_and_keeps_the_session() {
     );
     assert_eq!(f.status_of(&uid), "in_progress", "still yours to fix");
     assert!(wt.exists(), "the session survives a red gate");
+}
+
+/// **The gate runs before the target moves** — the order `scripts/merge-queue.sh` settled on. The
+/// gate itself checks that the target still points at its pre-graft tip, so it goes red under the
+/// old fast-forward-then-gate order, in which the target named ungated commits for the whole gate
+/// and anyone cutting from it carried them away.
+#[test]
+fn the_target_does_not_move_until_the_gate_has_passed() {
+    let f = Fixture::new();
+    let uid = f.add_task("gated before it lands");
+    let s = f.work(&uid);
+    let (onto, wt) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        PathBuf::from(s["worktree"].as_str().unwrap()),
+    );
+    commit_in(&wt, "g.txt", "x\n", "add g");
+    let before = git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]);
+
+    let gate = format!(
+        "test \"$(git -C '{}' rev-parse refs/heads/{onto})\" = {before}",
+        f.repo.display()
+    );
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", &gate, "--no-review"])
+        .assert()
+        .success();
+
+    let after = git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]);
+    assert_ne!(after, before, "a green gate advances the target");
+    assert_eq!(
+        git(&f.repo, &["show", &format!("{after}:g.txt")]),
+        "x",
+        "onto the graft the gate passed"
+    );
+    assert_eq!(f.status_of(&uid), "done");
+}
+
+/// **A gate that never finishes leaves the target where it was.** The landing is killed mid-gate
+/// — no red verdict, no rollback, nothing after the gate runs at all. Under the old order the
+/// target had already been fast-forwarded, so it was left on ungated commits with no record that
+/// it had moved. Now the target is untouched, and the next landing goes through.
+#[test]
+fn an_interrupted_gate_leaves_the_target_where_it_was() {
+    let f = Fixture::new();
+    let uid = f.add_task("interrupted mid-gate");
+    let s = f.work(&uid);
+    let (onto, wt) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        PathBuf::from(s["worktree"].as_str().unwrap()),
+    );
+    commit_in(&wt, "i.txt", "x\n", "add i");
+    let before = git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]);
+
+    // The gate's shell is the landing's own child: killing its parent is the landing being
+    // interrupted while the gate runs.
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &uid,
+            "--gate",
+            "kill -9 $PPID",
+            "--no-review",
+        ])
+        .assert()
+        .failure();
+
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]),
+        before,
+        "an interrupted gate left the target on commits that never passed it"
+    );
+    assert_eq!(f.status_of(&uid), "in_progress");
+    assert!(wt.exists(), "the session survives");
+
+    // What the interrupted landing left in `.jkb/graft` is no obstacle to the next one.
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", "true", "--no-review"])
+        .assert()
+        .success();
+    assert_ne!(
+        git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]),
+        before
+    );
+    assert_eq!(f.status_of(&uid), "done");
+}
+
+/// `refs/heads/<branch>` in `dir`'s repository.
+fn tip(dir: &Path, branch: &str) -> String {
+    git(dir, &["rev-parse", &format!("refs/heads/{branch}")])
+}
+
+/// **The operator's checkout of the target is on the target at every observable point** — before
+/// the landing, while its gate runs, and after a red gate, an interrupted gate and a green one.
+/// The graft and the gate happen in `.jkb/graft`; the checkout holding the target is only
+/// fast-forwarded. The first reorder gated in that checkout, detached for the gate, so a red or
+/// interrupted landing left the operator's own tree on an ungated commit, and the next landing,
+/// finding no checkout of the target, went to `.jkb/base` instead.
+///
+/// The gates assert the checkout's branch themselves and leave a mark only when it held, so a
+/// gate that was never run cannot pass for one that saw the right thing. The interrupted landing
+/// is followed by a green one with no step in between, which is the recovery.
+#[test]
+fn the_operators_checkout_of_the_target_never_leaves_it() {
+    let f = Fixture::new();
+    let uid = f.add_task("landed from the operator's checkout");
+    let s = f.work(&uid);
+    let (onto, wt) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        PathBuf::from(s["worktree"].as_str().unwrap()),
+    );
+    // The operator works on the land target in the main checkout.
+    git(&f.repo, &["switch", "-q", &onto]);
+    commit_in(&wt, "op.txt", "x\n", "add op");
+    let on_onto = |when: &str| {
+        assert_eq!(
+            git(&f.repo, &["symbolic-ref", "HEAD"]),
+            format!("refs/heads/{onto}"),
+            "the operator's checkout left the target {when}"
+        );
+    };
+    on_onto("before the landing");
+    let before = tip(&f.repo, &onto);
+    let mark = f.home.path().join("gate-saw-the-target");
+    let still_on = format!(
+        "test \"$(git -C '{}' symbolic-ref HEAD)\" = refs/heads/{onto} && touch '{}'",
+        f.repo.display(),
+        mark.display()
+    );
+
+    // Red.
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &uid,
+            "--gate",
+            &format!("{still_on} && false"),
+            "--no-review",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("gate failed"));
+    assert!(
+        mark.exists(),
+        "the red gate did not see the checkout on the target"
+    );
+    on_onto("after a red gate");
+    assert_eq!(tip(&f.repo, &onto), before);
+    std::fs::remove_file(&mark).unwrap();
+
+    // Interrupted: the gate's shell kills the landing that spawned it.
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &uid,
+            "--gate",
+            &format!("{still_on} && kill -9 $PPID"),
+            "--no-review",
+        ])
+        .assert()
+        .failure();
+    assert!(
+        mark.exists(),
+        "the interrupted gate did not see the checkout on the target"
+    );
+    on_onto("after an interrupted gate");
+    assert_eq!(tip(&f.repo, &onto), before);
+    assert_eq!(f.status_of(&uid), "in_progress");
+    std::fs::remove_file(&mark).unwrap();
+
+    // Green, straight after the interruption: nothing to clear up by hand.
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", &still_on, "--no-review"])
+        .assert()
+        .success();
+    assert!(
+        mark.exists(),
+        "the green gate did not see the checkout on the target"
+    );
+    on_onto("after a green gate");
+    assert_ne!(tip(&f.repo, &onto), before, "the target was not advanced");
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("op.txt")).unwrap(),
+        "x\n",
+        "the operator's checkout was not fast-forwarded with its branch"
+    );
+    assert_eq!(f.status_of(&uid), "done");
+}
+
+/// **What a red gate leaves in `.jkb/graft` is no obstacle to the next landing.** The gate edits
+/// a tracked file only the graft has; the old land checkout could not be switched back over that
+/// edit, and was left detached on the ungated graft. The graft tree is reset at the start of every
+/// landing, so the next one simply goes through, and the edit does not land.
+///
+/// Nor is the graft tree mistaken for a session or a land target meanwhile: it is detached, and
+/// neither listing names it.
+#[test]
+fn a_gate_that_dirties_the_graft_tree_does_not_stop_the_next_landing() {
+    let f = Fixture::new();
+    let uid = f.add_task("red and dirty");
+    let s = f.work(&uid);
+    let (onto, wt) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        PathBuf::from(s["worktree"].as_str().unwrap()),
+    );
+    commit_in(&wt, "only-here.txt", "x\n", "add only-here");
+    let before = tip(&f.repo, &onto);
+
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &uid,
+            "--gate",
+            "echo edited > only-here.txt; false",
+            "--no-review",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("gate failed"))
+        .stderr(predicate::str::contains("never moved"));
+    let graft = f.repo.join(".jkb").join("graft");
+    assert_eq!(
+        std::fs::read_to_string(graft.join("only-here.txt")).unwrap(),
+        "edited\n",
+        "the premise: the gate's edit is still in the graft tree"
+    );
+    assert_eq!(tip(&f.repo, &onto), before);
+    assert_eq!(f.status_of(&uid), "in_progress");
+
+    let sessions = f
+        .jkb()
+        .args(["task", "sessions", "--json"])
+        .output()
+        .unwrap();
+    assert!(sessions.status.success(), "{sessions:?}");
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&sessions.stdout).unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the graft tree is listed as a session: {rows:?}"
+    );
+    let staging = f.staging(&[]).to_string();
+    assert!(
+        !staging.contains(".jkb/graft"),
+        "the graft tree is named in the staging listing: {staging}"
+    );
+
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", "true", "--no-review"])
+        .assert()
+        .success();
+    assert_eq!(
+        git(
+            &f.repo,
+            &["show", &format!("refs/heads/{onto}:only-here.txt")]
+        ),
+        "x",
+        "the gate's edit landed"
+    );
+    assert_eq!(f.status_of(&uid), "done");
+}
+
+/// **An untracked file a gate leaves in `.jkb/graft` does not stop a later landing that adds it,
+/// and ignored build output there stays warm.** `reset --hard` keeps untracked files, so without
+/// the `clean -fd` a branch adding `new.txt` failed `checkout --detach` on every landing until
+/// somebody deleted the file by hand — and the gate would not have seen exactly what the target
+/// becomes. Ignored files are deliberately kept (`clean` without `-x`), so a gate's build directory
+/// is not rebuilt from cold every landing.
+#[test]
+fn a_gate_s_untracked_file_does_not_block_a_branch_that_adds_it() {
+    let f = Fixture::new();
+    let a = f.add_task("leaves a stray file");
+    let b = f.add_task("adds the same file");
+    let sa = f.work(&a);
+    let sb = f.work(&b);
+    let onto = sa["onto"].as_str().unwrap().to_owned();
+    assert_eq!(sb["onto"].as_str().unwrap(), onto, "the premise: one batch");
+    commit_in(
+        Path::new(sa["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a\n",
+        "add a",
+    );
+    commit_in(
+        Path::new(sb["worktree"].as_str().unwrap()),
+        "new.txt",
+        "from b\n",
+        "add new",
+    );
+    // `warm/` is ignored, as a build directory would be.
+    let exclude = f.repo.join(".git/info/exclude");
+    let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
+    text.push_str("warm/\n");
+    std::fs::write(&exclude, text).unwrap();
+
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &a,
+            "--gate",
+            "echo stray > new.txt; mkdir -p warm; echo built > warm/out; false",
+            "--no-review",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("gate failed"));
+    let graft = f.repo.join(".jkb").join("graft");
+    assert!(
+        graft.join("new.txt").exists() && graft.join("warm/out").exists(),
+        "the premise: the gate left an untracked and an ignored file in the graft tree"
+    );
+
+    f.jkb()
+        .args([
+            "task",
+            "land",
+            &b,
+            "--gate",
+            "test \"$(cat new.txt)\" = 'from b' && test -f warm/out",
+            "--no-review",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        git(&f.repo, &["show", &format!("refs/heads/{onto}:new.txt")]),
+        "from b"
+    );
+    assert_eq!(f.status_of(&b), "done");
+}
+
+/// **A reviewer's detached checkout of a task branch never blocks a landing.** `git worktree add
+/// --detach <path> <branch>` is how a reviewer reads a branch; a guard keyed on detached
+/// checkouts above the target refused every landing while one existed. Nothing here inspects
+/// other checkouts, so the landing goes through and the reviewer's checkout is left as it was.
+#[test]
+fn a_reviewers_detached_checkout_does_not_block_a_landing() {
+    let f = Fixture::new();
+    let uid = f.add_task("under review");
+    let s = f.work(&uid);
+    let (onto, wt, branch) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        PathBuf::from(s["worktree"].as_str().unwrap()),
+        s["branch"].as_str().unwrap().to_owned(),
+    );
+    commit_in(&wt, "rv.txt", "x\n", "add rv");
+    let head = tip(&f.repo, &branch);
+    let review = f.home.path().join("review");
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            review.to_str().unwrap(),
+            &branch,
+        ],
+    );
+    let before = tip(&f.repo, &onto);
+
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", "true", "--no-review"])
+        .assert()
+        .success();
+    assert_ne!(tip(&f.repo, &onto), before);
+    assert_eq!(f.status_of(&uid), "done");
+    assert_eq!(
+        git(&review, &["rev-parse", "HEAD"]),
+        head,
+        "the reviewer's checkout moved"
+    );
+    assert!(
+        !git_cmd(&review, &["symbolic-ref", "-q", "HEAD"])
+            .status()
+            .unwrap()
+            .success(),
+        "the reviewer's checkout was put on a branch"
+    );
+}
+
+/// **A directory at `.jkb/graft` that git does not register is refused, with its remedy.** It is
+/// not known to be jkb's, so the landing neither resets nor removes it, and nothing moves.
+#[test]
+fn an_unregistered_graft_directory_refuses_the_landing_with_its_remedy() {
+    let f = Fixture::new();
+    let uid = f.add_task("graft path taken");
+    let s = f.work(&uid);
+    let (onto, wt) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        PathBuf::from(s["worktree"].as_str().unwrap()),
+    );
+    commit_in(&wt, "u.txt", "x\n", "add u");
+    let graft = f.repo.join(".jkb").join("graft");
+    std::fs::create_dir_all(&graft).unwrap();
+    std::fs::write(graft.join("keep.txt"), "someone's\n").unwrap();
+    let before = tip(&f.repo, &onto);
+
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", "true", "--no-review"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "git does not know it as a worktree",
+        ))
+        .stderr(predicate::str::contains("move it out of the way"));
+    assert_eq!(tip(&f.repo, &onto), before);
+    assert_eq!(f.status_of(&uid), "in_progress");
+    assert_eq!(
+        std::fs::read_to_string(graft.join("keep.txt")).unwrap(),
+        "someone's\n"
+    );
+
+    // Moved out of the way, the landing goes through.
+    std::fs::remove_dir_all(&graft).unwrap();
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", "true", "--no-review"])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&uid), "done");
+}
+
+/// **A target moved during the gate is refused, not clobbered.** The advance is a
+/// compare-and-swap against the tip the graft rebased onto: something else moving the target
+/// while the gate runs gets its commit kept and the landing refused, and the task stays open.
+/// Under the old order the target had already been advanced before the gate, so the other
+/// writer's move silently replaced the landing and the task was marked done over work that was
+/// not in the target.
+#[test]
+fn a_target_moved_during_the_gate_is_refused_not_clobbered() {
+    let f = Fixture::new();
+    let uid = f.add_task("raced during the gate");
+    let s = f.work(&uid);
+    let (onto, wt) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        PathBuf::from(s["worktree"].as_str().unwrap()),
+    );
+    commit_in(&wt, "r.txt", "x\n", "add r");
+    let before = git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]);
+    // A commit on top of the target that the graft does not contain — another writer's.
+    let tree = git(&f.repo, &["rev-parse", &format!("{before}^{{tree}}")]);
+    let other = git(
+        &f.repo,
+        &["commit-tree", &tree, "-p", &before, "-m", "someone else"],
+    );
+
+    let gate = format!(
+        "git -C '{}' update-ref refs/heads/{onto} {other}",
+        f.repo.display()
+    );
+    f.jkb()
+        .args(["task", "land", &uid, "--gate", &gate, "--no-review"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("PASSED the gate"))
+        .stderr(predicate::str::contains("moved while the gate ran"));
+
+    assert_eq!(
+        git(&f.repo, &["rev-parse", &format!("refs/heads/{onto}")]),
+        other,
+        "the other writer's move was overwritten"
+    );
+    assert_eq!(f.status_of(&uid), "in_progress", "nothing landed");
+    assert!(wt.exists());
 }
 
 /// Two sessions touching the same lines: the second must eject, not be resolved blind.
@@ -3801,10 +4269,10 @@ fn a_group_branch_tagged_after_its_work(f: &Fixture) -> (String, String) {
 /// A land target whose checkout has uncommitted changes refuses the landing, and does not lose
 /// them.
 ///
-/// Landing rolls the target back with `reset --hard` when the gate goes red, so uncommitted work
-/// sitting in that checkout would be destroyed by a landing that had nothing to do with it. The
-/// sibling test covers a dirty *session*; the target is the one whose changes a rollback actually
-/// reaches.
+/// Landing fast-forwards that checkout after a green gate, so uncommitted work sitting in it would
+/// be carried onto the landed commit, or refuse the fast-forward only after the whole gate had
+/// run, by a landing that had nothing to do with it. The sibling test covers a dirty *session*;
+/// the target is the checkout the advance actually reaches.
 ///
 /// There is one rule — `staging::target_dirty_reason` — and this exercises it through the
 /// command; the test below exercises it through the row. `cmd_task_land` used to carry a second,

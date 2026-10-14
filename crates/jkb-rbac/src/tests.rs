@@ -83,8 +83,13 @@ fn every_defect_shape_is_found() {
                 role: R::A,
                 permits: &[P::Read, P::Read],
             },
+            // Shadowed by the first row for `A`, so `Admin` is still held by nobody.
             Grant {
                 role: R::A,
+                permits: &[P::Read, P::Admin],
+            },
+            Grant {
+                role: R::B,
                 permits: &[],
             },
         ],
@@ -92,11 +97,22 @@ fn every_defect_shape_is_found() {
     let d = BAD.check();
     assert!(d.contains(&TableDefect::DuplicateRole(R::A)));
     assert!(d.contains(&TableDefect::RepeatedPermission(R::A, P::Read)));
-    assert!(d.contains(&TableDefect::UngrantedRole(R::B)));
     assert!(d.contains(&TableDefect::UngrantedRole(R::C)));
     assert!(d.contains(&TableDefect::UnheldPermission(P::Write)));
     assert!(d.contains(&TableDefect::UnheldPermission(P::Admin)));
-    assert_eq!(d.len(), 6, "{d:?}");
+    assert_eq!(d.len(), 5, "an empty row is not a defect: {d:?}");
+    assert!(!BAD.permits(R::A, P::Admin), "the first row wins");
+    assert_eq!(BAD.roles_for(P::Admin), vec![], "so nobody holds it");
+    assert_eq!(BAD.roles_for(P::Read), vec![R::A], "each role once");
+
+    // A refusal names only roles that would in fact have been allowed.
+    let Decision::Deny(no) = RoleBased::new(&BAD).authorize(
+        &Holds(vec![R::B]),
+        &Needs(Requirement::Permission(P::Admin)),
+    ) else {
+        panic!("nobody holds admin")
+    };
+    assert!(no.allowed_roles.is_empty(), "{:?}", no.allowed_roles);
 }
 
 #[test]

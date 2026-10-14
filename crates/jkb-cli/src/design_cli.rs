@@ -522,6 +522,7 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
                 repo,
                 title: title.join(" "),
                 body,
+                under: None,
             })? {
                 Response::DesignCreated { design } => design,
                 other => return unexpected("design.create", &other),
