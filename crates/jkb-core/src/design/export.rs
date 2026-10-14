@@ -276,7 +276,11 @@ fn render_body(design: &DesignText, mut body: String) -> String {
 /// the table that points at it do not change.
 fn tree_text(conn: &Connection, id: ItemId, design: &DesignText) -> Result<String> {
     let mut body = approved_text(design);
-    for (_, child) in super::tree::descendants(conn, id)? {
+    for (child_id, child) in super::tree::descendants(conn, id)? {
+        // A retired design leaves every export, the one its parent inlines it into included.
+        if super::retired_item(conn, child_id)? {
+            continue;
+        }
         let text = approved_text(&super::read(conn, &child)?);
         if text.trim().is_empty() {
             continue;
@@ -366,7 +370,8 @@ fn repo_path(path: &str, what: &str) -> Result<String> {
 /// a design into a repo where its path is taken. [`export`] refuses such a design, naming both.
 ///
 /// # Errors
-/// An unknown design, a path that is not a `docs/` file, or one another design already targets.
+/// An unknown or retired design, a path that is not a `docs/` file, or one another design already
+/// targets.
 pub fn set_doc_target(
     conn: &Connection,
     meta: &crate::WriteMeta,
@@ -384,6 +389,7 @@ pub fn set_doc_target(
         )));
     }
     let id = design_id(conn, uid)?;
+    refuse_retired(conn, id, uid)?;
     let repo = repo_of(conn, id)?.ok_or_else(|| {
         invalid(format!(
             "design {uid} is in no repo (`{}/<repo>`), so its doc target names no checkout",
@@ -505,10 +511,22 @@ fn sharer(conn: &Connection, id: ItemId, repo: Option<&str>, path: &str) -> Resu
     Ok(None)
 }
 
+/// Refuse a retired design: it has left every export (`super::retire`), so neither rendering it for
+/// its file nor pointing it at one is asked of it until it is restored.
+fn refuse_retired(conn: &Connection, id: ItemId, uid: &str) -> Result<()> {
+    if super::retired_item(conn, id)? {
+        return Err(invalid(format!(
+            "design {uid} is retired, so it is not exported — restore it first with `jkb design \
+             restore {uid}`"
+        )));
+    }
+    Ok(())
+}
+
 /// The design `uid` rendered for its doc target.
 ///
 /// # Errors
-/// An unknown design, one whose stored text or metadata does not read, or one whose doc target
+/// A retired design, an unknown design, one whose stored text or metadata does not read, or one whose doc target
 /// another design now in its repo also names — which `set_doc_target` refuses, but an undo
 /// restoring an older target, or `jkb ns mv` of a design into a repo where its path is taken, can
 /// still leave. Refused here, so a single-design export and `--all` alike never let two designs
@@ -516,6 +534,7 @@ fn sharer(conn: &Connection, id: ItemId, repo: Option<&str>, path: &str) -> Resu
 pub fn export(conn: &Connection, uid: &str) -> Result<Exported> {
     let design = read(conn, uid)?;
     let id = design_id(conn, uid)?;
+    refuse_retired(conn, id, uid)?;
     let doc_target = meta_of(conn, id)?.doc_target;
     let repo = repo_of(conn, id)?;
     if let Some(path) = &doc_target {
@@ -542,7 +561,7 @@ pub fn export(conn: &Connection, uid: &str) -> Result<Exported> {
 /// # Errors
 /// A design [`export`] refuses.
 pub fn exports(conn: &Connection, repo: Option<&str>) -> Result<Vec<Exported>> {
-    super::list(conn, repo)?
+    super::list(conn, repo, false)?
         .into_iter()
         .filter(|d| d.meta.doc_target.is_some())
         .map(|d| export(conn, &d.uid))

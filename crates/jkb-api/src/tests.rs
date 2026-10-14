@@ -438,6 +438,13 @@ fn samples() -> Vec<Request> {
         Request::DesignList {
             repo: None,
             review: true,
+            retired: true,
+        },
+        Request::DesignRetire {
+            uid: "design:x".into(),
+        },
+        Request::DesignRestore {
+            uid: "design:x".into(),
         },
         Request::DesignCreate {
             repo: "jkb".into(),

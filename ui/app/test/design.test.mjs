@@ -864,3 +864,97 @@ test("a created design is opened once the listing is read again, unless the oper
   const refused = err("invalid", "no");
   assert.deepEqual(await run(refused, false), { out: refused, log: ["create"] });
 });
+
+// ---- Retire and restore --------------------------------------------------------------------------
+
+const { changeAndReload, listRetired, nestedCount, restoreDesign, retireConfirm, retiredByRepo, retireDesign, sidebarRepos } = await load(
+  path.join(src, "renderer", "src", "design", "retire.ts"),
+);
+
+test("a retire takes every design nested under it, at any depth, and the confirm says so", () => {
+  assert.equal(nestedCount(TREE, "design:a"), 1);
+  assert.equal(nestedCount(TREE, "design:a1"), 0);
+  assert.equal(nestedCount(TREE, "design:j"), 0);
+  assert.equal(nestedCount(TREE, "design:gone"), 0);
+  const deep = [{ repo: "x", designs: [node("design:p", "P", [node("design:c", "C", [node("design:g", "G")]), node("design:d", "D")])] }];
+  assert.equal(nestedCount(deep, "design:p"), 3);
+  const lone = retireConfirm({ title: "Lone", doc_target: null }, 0).join("\n");
+  assert.match(lone, /Retire “Lone”\?/);
+  const tree = retireConfirm({ title: "P" }, 3).join("\n");
+  assert.match(tree, /the 3 designs nested under it/);
+  assert.match(retireConfirm({ title: "P" }, 1).join("\n"), /the design nested under it/);
+});
+
+test("the retire confirm says what stays, how to take it back, and that a generated file is the operator's to remove", () => {
+  const lines = retireConfirm({ title: "T", doc_target: "docs/t.md" }, 0).join("\n");
+  for (const stays of ["Nothing is deleted", "spans and approvals", "plans", "tasks", "threads", "prompts", "jkb design cat"]) {
+    assert.ok(lines.includes(stays), `${stays}: ${lines}`);
+  }
+  assert.match(lines, /Retired fold/);
+  assert.match(lines, /jkb undo/);
+  assert.match(lines, /docs\/t\.md stays .* `git rm`/);
+  assert.ok(!retireConfirm({ title: "T" }, 0).join("\n").includes("git rm"), "no file, no file to remove");
+});
+
+test("retire and restore are one op each, and a refusal is passed on verbatim", async () => {
+  const design = { uid: "design:a", title: "A", namespace: "designs/alpha", seq: 1, topic: "design/design.a", retired: true };
+  const d = scriptedDaemon({
+    "design.retire": async () => ok({ result: "designs", designs: [design] }),
+    "design.restore": async () => ok({ result: "designs", designs: [{ ...design, retired: false }] }),
+  });
+  assert.deepEqual(await retireDesign(d.op, "design:a"), ok([design]));
+  assert.deepEqual(await restoreDesign(d.op, "design:a"), ok([{ ...design, retired: false }]));
+  assert.deepEqual(
+    d.calls.map((c) => c.request),
+    [
+      { op: "design.retire", uid: "design:a" },
+      { op: "design.restore", uid: "design:a" },
+    ],
+  );
+  const why = "design design:a has 1 task(s) under it that are not done or cancelled: task:x — finish or cancel them first";
+  const refusing = scriptedDaemon({ "design.retire": async () => err("invalid", why) });
+  assert.deepEqual(await retireDesign(refusing.op, "design:a"), err("invalid", why));
+});
+
+test("the retired designs are their own listing, and a daemon older than retiring has none", async () => {
+  const design = { uid: "design:r", title: "R", namespace: "designs/alpha", seq: 1, topic: "design/design.r", retired: true };
+  const d = scriptedDaemon({ "design.list": async () => ok({ result: "designs", designs: [design] }) });
+  assert.deepEqual(await listRetired(d.op), ok([design]));
+  assert.deepEqual(d.calls[0].request, { op: "design.list", retired: true });
+  const old = scriptedDaemon({ "design.list": async () => err("bad_request", "unknown field `retired`") });
+  assert.deepEqual(await listRetired(old.op), ok([]));
+  const down = scriptedDaemon({ "design.list": async () => err("unavailable", "no daemon") });
+  assert.equal((await listRetired(down.op)).ok, false);
+});
+
+test("each repo's Retired fold nests designs retired together, offering Restore only at a tree's top", () => {
+  const d = (uid, repo, parent) => ({ uid, title: uid, namespace: `designs/${repo}`, seq: 1, topic: `design/${uid}`, parent, retired: true });
+  const byRepo = retiredByRepo([d("design:p", "alpha", null), d("design:c", "alpha", "design:p"), d("design:orphan", "alpha", "design:live"), d("design:z", "zeta", null)]);
+  // A child retired with its parent sits under it; one whose parent is live is a top of its own.
+  assert.deepEqual(
+    byRepo.get("alpha").map((n) => [n.design.uid, n.children.map((c) => c.design.uid)]),
+    [
+      ["design:orphan", []],
+      ["design:p", ["design:c"]],
+    ],
+  );
+  // A repo with only retired designs is still listed, so its fold can be reached.
+  assert.deepEqual(sidebarRepos(TREE, byRepo), ["alpha", "jkb", "zeta"]);
+  assert.deepEqual(sidebarRepos([], new Map()), []);
+});
+
+test("a retire or restore reads both listings again only when it was done", async () => {
+  const run = async (answer) => {
+    const log = [];
+    const out = await changeAndReload({
+      change: async () => {
+        log.push("change");
+        return answer;
+      },
+      reload: async () => log.push("reload"),
+    });
+    return { out, log };
+  };
+  assert.deepEqual(await run(ok([])), { out: ok([]), log: ["change", "reload"] });
+  assert.deepEqual(await run(err("forbidden", "only the operator")), { out: err("forbidden", "only the operator"), log: ["change"] });
+});

@@ -712,3 +712,42 @@
   justify-content: flex-end;
   gap: var(--space-2);
 }
+
+/* *Retire…*: a confirm under the open design's title, and each repo's Retired fold in the sidebar. */
+
+.design-retire {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+  font-size: var(--text-sm);
+}
+
+.design-retire p {
+  margin: 0;
+}
+
+.design-retire-refusal {
+  color: var(--alert);
+  background: var(--alert-soft);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius);
+  white-space: pre-wrap;
+}
+
+.design-retire-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.tree-retired .tree-label {
+  cursor: default;
+}
+
+.tree-retired .tree-label:hover {
+  background: transparent;
+}

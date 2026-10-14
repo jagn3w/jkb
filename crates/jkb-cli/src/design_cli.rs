@@ -460,6 +460,41 @@ fn prompt_cmd(ops: &Ops<'_>, what: DesignPromptCmd) -> Result<()> {
     }
 }
 
+/// `jkb design retire` and `jkb design restore`: the designs the op touched, the one named first.
+fn retire_or_restore(ops: &Ops<'_>, op: &str, request: Request) -> Result<()> {
+    let designs = match ops.call(request)? {
+        Response::Designs { designs } => designs,
+        other => return unexpected(op, &other),
+    };
+    if ops.json {
+        println!("{}", serde_json::to_string_pretty(&designs)?);
+        return Ok(());
+    }
+    let verb = if op == "design.retire" {
+        "retired"
+    } else {
+        "restored"
+    };
+    for d in &designs {
+        println!(
+            "{verb} {}  {}{}",
+            d.uid,
+            d.title,
+            d.doc_target
+                .as_deref()
+                .map(|t| format!("  (exports to {t})"))
+                .unwrap_or_default()
+        );
+    }
+    if verb == "retired" && designs.iter().any(|d| d.doc_target.is_some()) {
+        println!(
+            "its generated file stays in docs/ until you `git rm` it; `jkb design export --check \
+             --against-db` names it"
+        );
+    }
+    Ok(())
+}
+
 /// `jkb design …`.
 ///
 /// # Errors
@@ -467,7 +502,7 @@ fn prompt_cmd(ops: &Ops<'_>, what: DesignPromptCmd) -> Result<()> {
 #[allow(clippy::too_many_lines)] // one arm per subcommand
 pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
     match cmd {
-        DesignCmd::Ls { repo, all } => {
+        DesignCmd::Ls { repo, all, retired } => {
             let repo = if all || global {
                 None
             } else {
@@ -481,6 +516,7 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             let designs = match ops.call(Request::DesignList {
                 repo,
                 review: false,
+                retired,
             })? {
                 Response::Designs { designs } => designs,
                 other => return unexpected("design.list", &other),
@@ -488,7 +524,14 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
             if ops.json {
                 println!("{}", serde_json::to_string_pretty(&designs)?);
             } else if designs.is_empty() {
-                println!("(no designs)");
+                println!(
+                    "{}",
+                    if retired {
+                        "(no retired designs)"
+                    } else {
+                        "(no designs)"
+                    }
+                );
             } else {
                 for d in designs {
                     println!(
@@ -505,6 +548,12 @@ pub(crate) fn run(ops: &Ops<'_>, cmd: DesignCmd, global: bool) -> Result<()> {
                 }
             }
             Ok(())
+        }
+        DesignCmd::Retire { uid } => {
+            retire_or_restore(ops, "design.retire", Request::DesignRetire { uid })
+        }
+        DesignCmd::Restore { uid } => {
+            retire_or_restore(ops, "design.restore", Request::DesignRestore { uid })
         }
         DesignCmd::Create {
             title,

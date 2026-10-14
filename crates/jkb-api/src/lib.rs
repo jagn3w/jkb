@@ -816,6 +816,22 @@ pub enum Request {
         /// false, so a client newer than the daemon still lists against one that predates it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         review: bool,
+        /// The retired designs instead of the live ones. Never sent when false, like `review`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        retired: bool,
+    },
+    /// Retire a design and every design nested under it (operator; [`designs::retire`]).
+    #[serde(rename = "design.retire")]
+    DesignRetire {
+        /// The design.
+        uid: String,
+    },
+    /// Restore a retired design and every design nested under it (operator;
+    /// [`designs::restore`]).
+    #[serde(rename = "design.restore")]
+    DesignRestore {
+        /// The design.
+        uid: String,
     },
     /// Create a design under `designs/<repo>` ([`designs::create`]).
     #[serde(rename = "design.create")]
@@ -1688,6 +1704,8 @@ impl Request {
         "workflow.agent_copy",
         "workflow.agent_set",
         "design.list",
+        "design.retire",
+        "design.restore",
         "design.create",
         "design.move",
         "design.split",
@@ -1861,6 +1879,8 @@ impl Request {
             Self::DesignPrompts { .. } => "design.prompts",
             Self::DesignPromptOf { .. } => "design.prompt_of",
             Self::DesignCompact { .. } => "design.compact",
+            Self::DesignRetire { .. } => "design.retire",
+            Self::DesignRestore { .. } => "design.restore",
             Self::AttestMint { .. } => "attest.mint",
             Self::AttestRelease { .. } => "attest.release",
             Self::TaskClaims { .. } => "task.claims",
@@ -2044,7 +2064,9 @@ impl Request {
             | Self::DesignPromptRecord { .. }
             | Self::DesignTarget { .. }
             | Self::DesignSources { .. }
-            | Self::DesignCompact { .. } => false,
+            | Self::DesignCompact { .. }
+            | Self::DesignRetire { .. }
+            | Self::DesignRestore { .. } => false,
         }
     }
 
@@ -4155,8 +4177,19 @@ impl LocalBackend {
                     wrote,
                 }
             }
-            Request::DesignList { repo, review } => Response::Designs {
-                designs: db.read_with(move |c| designs::list(c, repo.as_deref(), review))?,
+            Request::DesignList {
+                repo,
+                review,
+                retired,
+            } => Response::Designs {
+                designs: db
+                    .read_with(move |c| designs::list(c, repo.as_deref(), review, retired))?,
+            },
+            Request::DesignRetire { uid } => Response::Designs {
+                designs: db.write_txn_with(actor, move |c, m| designs::retire(c, m, &uid))?,
+            },
+            Request::DesignRestore { uid } => Response::Designs {
+                designs: db.write_txn_with(actor, move |c, m| designs::restore(c, m, &uid))?,
             },
             Request::DesignCreate {
                 repo,

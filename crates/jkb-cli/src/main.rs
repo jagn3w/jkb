@@ -436,6 +436,22 @@ enum DesignCmd {
         /// Every repo's designs.
         #[arg(long, conflicts_with = "repo")]
         all: bool,
+        /// The retired designs instead (`jkb design retire`).
+        #[arg(long)]
+        retired: bool,
+    },
+    /// Retire a design and every design nested under it (operator): it leaves `ls`, the Design
+    /// tab and `export --all`, and keeps its text, spans, plans and threads. Refused while a task
+    /// under it is not done or cancelled. `jkb design restore` or `jkb undo` takes it back.
+    Retire {
+        /// The design.
+        uid: String,
+    },
+    /// Restore a retired design and every design nested under it (operator). Refused under a
+    /// retired parent: restore the parent.
+    Restore {
+        /// The design.
+        uid: String,
     },
     /// Create a design under `designs/<repo>` (the ambient repo unless `--repo`).
     Create {

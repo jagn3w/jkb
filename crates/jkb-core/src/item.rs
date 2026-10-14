@@ -459,10 +459,49 @@ pub fn get_many(conn: &Connection, items: &[ItemId]) -> Result<HashMap<ItemId, I
 /// see it was tried. Link the edge that killed it ([`jkb_types::EdgeType::Refutes`],
 /// `RulesOut`, `Supersedes`) so the tombstone says *why*.
 ///
+/// **Refuses a design.** A design's resolution is whether it is retired, and only
+/// `design::retire`/`design::restore` write it — they hold the operator-only permission, refuse
+/// while work under the design is open, cover the whole tree and refuse a child under a retired
+/// parent. Through here (`jkb inv resolve`, any investigation verb) a design would be retired or
+/// restored past all of that, so the refusal is here, where every caller passes.
+///
 /// # Errors
-/// Returns [`jkb_types::Error::NotFound`] if `item` does not exist; otherwise a
-/// database error.
+/// Returns [`jkb_types::Error::NotFound`] if `item` does not exist, a validation error if it is
+/// a design; otherwise a database error.
 pub fn set_resolution(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    resolution: Resolution,
+) -> Result<()> {
+    if let Some(m) = get(conn, item)?.filter(|m| m.kind == crate::design::KIND) {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "`{}` is a design: whether it is retired is set only by `jkb design retire {}` and \
+             `jkb design restore {}`, never as a resolution",
+            m.uid, m.uid, m.uid
+        ))));
+    }
+    write_resolution(conn, meta, item, resolution)
+}
+
+/// Set a design's resolution: what `design::retire` and `design::restore` write, and nothing else.
+/// The [`crate::design::ResolutionKey`] can be made only inside the design module, so no other
+/// caller can reach this.
+///
+/// # Errors
+/// As [`set_resolution`], less the design refusal.
+pub(crate) fn set_design_resolution(
+    conn: &Connection,
+    meta: &WriteMeta,
+    design: ItemId,
+    resolution: Resolution,
+    _key: crate::design::ResolutionKey,
+) -> Result<()> {
+    write_resolution(conn, meta, design, resolution)
+}
+
+/// The one writer of `items.resolution`, logged so `jkb undo` restores the column.
+fn write_resolution(
     conn: &Connection,
     meta: &WriteMeta,
     item: ItemId,
@@ -746,14 +785,17 @@ fn memory_reason(conn: &Connection, item: ItemId) -> Result<Option<String>> {
 pub fn remove(conn: &Connection, meta: &WriteMeta, item: ItemId, force: bool) -> Result<Removed> {
     let before = snapshot(conn, item)?;
 
-    // Not even with `force`: the snapshot above is what `jkb undo` restores, and a design's
-    // document — its CRDT updates — is not in it. Deleting would report an undoable delete and then
-    // bring back a design with no text.
-    if crate::design::holds_document(conn, item)? {
+    // Not even with `force`, and judged by kind, never by whether it holds a document: the snapshot
+    // above is what `jkb undo` restores, and a design's document (its CRDT updates), its doc target,
+    // sources and every item contained under it are not in it. An empty design was once deletable
+    // because the guard asked about updates, and its undo would have brought back a broken item. A
+    // design is retired instead (`design::retire`), which hides it and keeps everything.
+    if before["item"]["kind"].as_str() == Some(crate::design::KIND) {
+        let uid = before["item"]["uid"].as_str().unwrap_or_default();
         return Err(Error::Types(TypeError::Validation(format!(
-            "refusing to delete {item}: it is a design, and its document (the updates in \
-             `design_updates`) is not part of what `jkb undo` restores, so the delete could not be \
-             taken back"
+            "refusing to delete {uid}: it is a design, and a design is never deleted — what \
+             `jkb undo` restores of a delete would not include its document, plans or threads. \
+             Retire it instead with `jkb design retire {uid}`, which hides it and keeps everything"
         ))));
     }
 

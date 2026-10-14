@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:file-sync-18dcdeef6c224108fa2300, edit there (version 69.RIOou72fgOIEAYaImc2B2ncBhsWF0bmAxAEBh7m0rZXXrwMBif2Pn-b6iAUBjLvqmPXIggoBjqOpm6TkoAEBj9bemOnWjgcBkMbDkJT7qA8BjpjYqprXkwsBk6yl8K64wQQBlaCDwuzPYgGVm4DUrKHXCwGXvYrd2vORAgGViKXG3caPAQGX2vzBpaLKBgGYwq3b6_a8BQGl1ob2qvGXBgGmv_Gy3J7TDAGmj8-I_aWBBgGms7eD4q7hBAGpnqzIr47yDwGq4dmf4erZAQGrtqaxiYjqDwGsv9P2p7UrAa3stqT1svoKAa7enPKY680IAamPpqnV6KABAbDf1pnD8ZcMAbHqyILSmJUHAbP65YyTvo0DAbWo-qqettYOAbbR9sOc6a4NAbbGiqaMwZsJAbaFjuCY0foOAbmxj7u5jd0GAbmGqZv9wZkPAbzJgeCz_KEDAcP1vODh_NgLAcbRgIqdmqAGAciDo5GK7MYIAcrnnIur-cUPAcuv_d2S1twNAdDQ_Jmi170OAdLChZPEzqMBAdPs5634w7ADAdKFk_3OpOcFAdXJp7Hmy5kBAdrDl9CQ0JIJAd60tPrl4b4MAeDriqTy2_MFAeK8u764quUEAeOau42pzZgMAeL9uJWA4_4EAeSkq43xuYYPAeaG7tyAoP0CAem147Wxi8gDAeyH54GUlIgBAe7Mx5HNu4sMAe6nuK-09uIDAfHci53TraQPAfL9lo7AhyQB86Ld9cCpswwB8oaGyr6D2wsB9Zid07Wxggb-tgP27ZCasMGDBQHz5uiP39fICgHyjsLoyKXaAQE, blake3 c7d1a392191a42fc5ce7be0d72d5f20c9f09b1063d894b82f11e3974e3c454ed) -->
+<!-- generated from jkb design design:file-sync-18dcdeef6c224108fa2300, edit there (version 70.RIOou72fgOIEAYaImc2B2ncBhsWF0bmAxAEBh7m0rZXXrwMBif2Pn-b6iAUBjLvqmPXIggoBjqOpm6TkoAEBj9bemOnWjgcBkMbDkJT7qA8BjpjYqprXkwsBk6yl8K64wQQBlaCDwuzPYgGVm4DUrKHXCwGXvYrd2vORAgGViKXG3caPAQGX2vzBpaLKBgGYwq3b6_a8BQGl1ob2qvGXBgGmv_Gy3J7TDAGmj8-I_aWBBgGms7eD4q7hBAGpnqzIr47yDwGq4dmf4erZAQGrtqaxiYjqDwGsv9P2p7UrAa3stqT1svoKAa7enPKY680IAamPpqnV6KABAbDf1pnD8ZcMAbHqyILSmJUHAbP65YyTvo0DAbWo-qqettYOAbbR9sOc6a4NAbbGiqaMwZsJAbaFjuCY0foOAbmxj7u5jd0GAbmGqZv9wZkPAbzJgeCz_KEDAcP1vODh_NgLAcbRgIqdmqAGAciDo5GK7MYIAcrnnIur-cUPAcuv_d2S1twNAdDQ_Jmi170OAdLChZPEzqMBAdPs5634w7ADAdKFk_3OpOcFAdXJp7Hmy5kBAdrDl9CQ0JIJAd60tPrl4b4MAeDriqTy2_MFAeK8u764quUEAeOau42pzZgMAeL9uJWA4_4EAeSkq43xuYYPAeaG7tyAoP0CAem147Wxi8gDAeyH54GUlIgBAe7Mx5HNu4sMAe6nuK-09uIDAfHci53TraQPAfL9lo7AhyQB86Ld9cCpswwB8oaGyr6D2wsB9Zid07Wxggb-tgP27ZCasMGDBQHz5uiP39fICgHyjsLoyKXaAQE, blake3 67b075197ea5a777066593285f0fc4f3c790ee7c72c9e3a58285920406efd859) -->
 # File sync
 
 File sync round-trips files on disk to items in the knowledge base. A mount binds a directory
@@ -69,7 +69,17 @@ One `tasks.md` ⇄ many `kind='task'` items. A checkbox is a status (`[ ]` open,
 `[~]` in progress, `[-]` cancelled). A trailing run of quick-add modifiers (`!p<n>` priority,
 `@<date>` due, `#<facet>=<value>` tags, `+<ns>` mirror placements) sets the matching fields,
 using the quote-aware tokenizer style of `task.rs`. `needs:^<id>` becomes a `depends_on` edge,
-and two-space indentation becomes `parent_of`. `##`/`###` headers become sections, and
+and indentation becomes `parent_of`: a task is the child of the nearest open task whose leading
+whitespace its own strictly extends, compared as strings (2150abb; expanding tabs to columns
+read a tab-indented child under a four-space parent as a sibling). A `needs:^<id>` naming no
+task in the file is parked on its task (`SyncItem::unresolved_needs`, stored as
+`metadata.unresolved_needs`) and reported as a warning, never kept in its title, where the
+round-trip guard read it as a pre-existing problem that excused every later write (e65a5fc).
+Render writes it back as a trailing modifier, and it becomes an edge as soon as a `tasks.md`
+the task is bound into defines the id, not only on the next disk read (819452a), unless that
+edge would close a `depends_on` cycle, when it stays parked with a warning so resolution never
+fails a reconcile (75ac77f). A `needs:^id` word in new text for a file-backed task is refused,
+pointing at `jkb task depend` (0b134f5). `##`/`###` headers become sections, and
 everything else (prose, the legend comment, blank lines) is preserved verbatim.
 
 ### Stable in-file identity is a visible caret `^id`
@@ -120,7 +130,10 @@ non-slug `^id`, or any mid-line sigil is ordinary text and never an error, becau
 descriptions are prose that contains `+`, `#`, `@` and `^` ("run fmt + clippy and fix #123").
 This also matches `render`, which always emits modifiers trailing. The only hard parse
 failures, which quarantine the file, are genuine structural corruption: two lines claiming
-the same `^id`, an in-file `depends_on` cycle, or non-UTF-8. Prose never fails.
+the same `^id`, an in-file `depends_on` cycle, an indentation that neither extends nor is
+extended by the open task's (a tab/space mix with no single reading, 2150abb), or non-UTF-8.
+A dangling `needs:^id` is not one: it once quarantined the whole file and is now parked.
+Prose never fails.
 
 The cost of that leniency is recorded under "Still open" below: a truncated file parses
 cleanly.
@@ -220,8 +233,6 @@ For `tasks`, base, disk and KB are compared per `local_id`: disjoint edits (a di
 changed on each side) merge automatically (`Outcome::Merged`); edits to the same task are the
 conflict unit, resolved by the mount's `conflict_policy`: `manual` reports and touches
 nothing, `disk_wins` imports, `kb_wins` exports. Direction is decided per file, the merge is
-per item, and the write-back re-renders the whole file, never a partial one. A merge builds
-its sections as the union of disk and KB, and takes its layout from disk alone.
 
 ### Every outcome is named, and a resolution is never silent
 
@@ -234,9 +245,6 @@ throws one side's edits away, so it must never read as an ordinary import or exp
 `SyncReport::resolved()` names it. `Failed` is per file: one bad file, or one unparseable
 base, is reported rather than propagated with `?`, so it cannot end the run or, under the
 watcher, kill a mount's thread. `Refused` and `Failed` are reported like `Conflict`, not as a
-non-zero exit, so the watcher does not die on one file. The watcher prints every
-resolution, failure, refusal and conflict: a `kb_wins` resolution settles the journal `ok`,
-so without that line it was invisible on every surface in the system, `jkb doctor` included.
 
 ### Quarantine, don't destroy
 
@@ -254,17 +262,16 @@ Items are created or updated before any edge is linked, so every `local_id` reso
 `ItemId` by the time an edge names it. Pass 1 upserts items (with `content_hash = None`, so
 identical-title tasks do not dedup-collapse), sets status, priority and due only where they
 differ (keeping the changelog quiet), reconciles tags (`tag::remove` stale, `tag::apply`
-missing) and places each item under its section. Pass 2 links the desired `parent_of` and
-`depends_on` edges (idempotent `edge::link`, skipping `src == dst`) and `edge::unlink`s any
-current edge of those types no longer desired; an in-file cycle quarantines. Then the items
-absent from the disk document are detached, the base blob is persisted and the journal
-upserted.
 
 ### A task removed from the file is cancelled and detached, never deleted
 
 A line deleted from `tasks.md` marks its item `status=cancelled` and detaches it (its binding
-becomes `managed:`). The item, its edges and its history stay, and it drops out of the ready
-frontier. Putting the line back restores the same item: `create_item` re-attaches an item
+becomes `managed:`). The item, its dependencies and its history stay, and it drops out of the
+ready frontier. `parent_of` is the exception, because a cancelled item is hidden from every
+listing: a deleted parent's line releases its remaining open subtasks, unlinking the edge with
+the containment row (578d535, which found the subtask reachable nowhere), and a deleted
+subtask's line leaves its parent. Undo restores both. Putting the line back restores the same
+item: `create_item` re-attaches an item
 whose file-derived uid already exists rather than failing the whole sync on `UNIQUE
 constraint failed: items.uid`, as it once did.
 
@@ -392,7 +399,11 @@ whole structure:
 files sharing one structure is unrepresentable, whatever `namespace_for` does. `apply_doc` is
 its only writer. `assemble_kb_doc` is *structure from the journal row, items from this file's
 bindings*, and bindings are already file-specific (`binding::synced_uris_for_file`, which
-escapes LIKE metacharacters and anchors on `<uri>#`).
+anchors on `<uri>#` with a case-exact GLOB minted by `jkb_core::sql::prefix_glob`, escaping
+`*`, `?` and `[` as one-character classes). It escaped LIKE metacharacters until 0a447b0: LIKE
+folds ASCII case while every identity it matched is compared with `=`, so `docs/plan` gathered
+`docs/Plan`'s bindings. `a#b.md` beside `a.md` are separate documents
+(`files_named_with_a_hash_beside_their_prefix_stay_apart`, dbca056).
 
 Rejected: deriving structure by re-parsing the base blob on every reconcile. `reconcile`
 already loads the journal row as its first act (`sync_state::get`), so a column on it is free;
@@ -473,9 +484,6 @@ covered by that argument:
 `kb_wins` is a shipped policy, so this is not obscure. The guards below are what cover both.
 
 An earlier draft added "and `jkb undo`, since `namespaces` is in `UNDOABLE_TABLES`". That was
-false: `ns::ensure` takes no `WriteMeta` and never changelogs, and `INVERSES` had no entry for
-an update or delete on `namespaces`, so the listing was inert for this path. The other legs
-were sufficient on their own.
 
 ### No bound item is silently dropped
 
@@ -541,7 +549,6 @@ overwrite a hand-written file it had never read.
 
 `archive_current_bytes` runs in `reconcile_file`, above the direction dispatch, so it covers
 all four sites that overwrite a synced file rather than the one (`kb_wins`) that used to carry
-the rule. A failed archive stops that file instead of degrading to best effort.
 
 ### A data-loss test asserts the bytes on disk, and the sibling's
 
@@ -639,7 +646,6 @@ first sync (a quarantine, so no bindings) whose directory is then replaced by a 
 by the out-of-scope sweep (a fifth review): `discover` never walks into the link, so kept in
 scope its flag could never be reconciled or cleared. Pinned by
 `a_bound_file_reached_through_a_link_stays_flagged_naming_the_link` and
-`a_flagged_unbound_file_behind_a_link_is_settled`.
 
 ### The watcher exports a change made in the database
 
@@ -670,10 +676,6 @@ A first review added what the first version missed: asked only on an idle tick, 
 under a mount (a build, git, a task worktree) held the export off for as long as it lasted,
 and so did an unbounded drain of that churn; unspaced, a fleet writing anywhere made every
 mount render every bound file on each tick.
-
-Sync's own writes do not count, or every pass would trigger the next. What that leaves: a
-mount's `ensure_all_mirrors` (a sync write) that changes another mount's render is not seen
-until that mount's next pass.
 
 ### A flagged file is re-judged only when its remedy could have landed
 

@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:namespaces-18dcd5bda1dce798858c69, edit there (version 66.QYCbtJ2e474NAYGhk6zryPEBAf-4_azcsMoFAYnEiZzUubsOgPECip3usezp-w8BiZSAmbL_7g0BjOmAk7GMwAMBjtWo9_nAuw8Bj4GL_ufeiwEBkLGb8_3CnAwBkvjUhJDTqQEBlJHuxo6sjwQBmPv2l67ksAMBqefihKOnuA8Brd-MganIvwkBrtevofrfywcBrr-WoazRlQUBsJKU_8qh2QUBscO73MKTxgwBsqi29p_U9gIBsrC52vi-jQsBu_rpp-CkwgcBvI7Li7GJtQ0BwO6rtf_TyAEBwrir0PbCswMBwuuKl7_iVwHE8cbi9u8bAcTKj82RoOwCAcbC74-ix_wOAcODlOKRp3YByJHZ_p7PnwcBysv7reaPngkBytbB0qD_hwsBzLfbwJPKyQMBy5OFiqqK0gUBzrzgqPeVnwIB0ZGdpavwug4B05X6s6Or8QIB1sLnqtDruQIB2fy-lumW0AQB2uuaj52S3QoB2rWdo-rbng4B3J-tvPXp8wsB2vqrs-fdyQQB4IjM7K75pA4B4JGG0NyujAsB45n9ourfgAEB45vW0ZOT2wcB5Nv7yK64jAcB6tXa-bvpjQsB7dupluG9JgHu8NvqndOwBQHu1K7B3rp8AfLLweHIxcAOAfKNwc6v6OgIAfbvwcWV4a8GAffut-zDw4MNAfjQ35S4ydQPAfni4Oum0MIGAfqnp6v_xI4PAffUusnOktsFAffUufPww7IFAfn1x_PYjfkFAfqsqL_o5tAHAf_ioaCM6_kJAQ, blake3 487f6d6ef03c9b241248d2b768aeeffd83bc2d422750dc8876d0eb3ee5583553) -->
+<!-- generated from jkb design design:namespaces-18dcd5bda1dce798858c69, edit there (version 74.QoCbtJ2e474NAYGhk6zryPEBAf-4_azcsMoFAYnEiZzUubsOgPECip3usezp-w8BiZSAmbL_7g0BjOmAk7GMwAMBjtWo9_nAuw8Bj4GL_ufeiwEBkLGb8_3CnAwBkvjUhJDTqQEBlJHuxo6sjwQBmPv2l67ksAMBqefihKOnuA8Brd-MganIvwkBrtevofrfywcBrr-WoazRlQUBsJKU_8qh2QUBscO73MKTxgwBsqi29p_U9gIBsrC52vi-jQsBu_rpp-CkwgcBvI7Li7GJtQ0BwO6rtf_TyAEBwrir0PbCswMBwuuKl7_iVwHE8cbi9u8bAcTKj82RoOwCAcbC74-ix_wOAcODlOKRp3YByJHZ_p7PnwcBysv7reaPngkBytbB0qD_hwsBzLfbwJPKyQMBy5OFiqqK0gUBzrzgqPeVnwIBzr2G5QgW0ZGdpavwug4B05X6s6Or8QIB1sLnqtDruQIB2fy-lumW0AQB2uuaj52S3QoB2rWdo-rbng4B3J-tvPXp8wsB2vqrs-fdyQQB4IjM7K75pA4B4JGG0NyujAsB45n9ourfgAEB45vW0ZOT2wcB5Nv7yK64jAcB6tXa-bvpjQsB7dupluG9JgHu8NvqndOwBQHu1K7B3rp8AfLLweHIxcAOAfKNwc6v6OgIAfbvwcWV4a8GAffut-zDw4MNAfjQ35S4ydQPAfni4Oum0MIGAfqnp6v_xI4PAffUusnOktsFAffUufPww7IFAfn1x_PYjfkFAfqsqL_o5tAHAf_ioaCM6_kJAQ, blake3 d0ee8fe7bd2fff282551a71c58c3f3ac760fee59358988ac5fabe12ac32d047f) -->
 # Namespaces
 
 jkb is one global database (`~/.jkb/jkb.db`) meant to span every repo and project, to serve
@@ -13,14 +13,13 @@ round-tripped to disk by a serializer. Every decision below keeps the two axes i
 How files map onto namespaces, and what keeps file sync from losing data, is the file-sync
 design; the storage substrate itself is the foundation design.
 
-## The global layout
-
 The layout was set in an audit and design session on 2026-07-24. The audit found the store
 repo-specific at the global top level (see History): a second repo would have collided with
 the first. Only `tasks/`, already partitioned per repo by task homing, was organized for a
 global tool, and nothing put new data in a sensible place automatically. The decisions below
 generalize the one pattern that already scaled.
 
+## The global layout
 ### Repo content lives under `repos/<repo>/…`
 
 A repo's file-synced content (its `openspec/`, its code-review logs, source-derived
@@ -298,8 +297,7 @@ A type nobody applies is a type nobody has, so `nstype::RESERVED_TYPES` declares
 path's contract, applied from two directions. Migration `V008` back-fills existing databases
 with `json_set` on `namespaces.metadata`, guarded by `json_extract(metadata,'$.type') IS NULL`
 so a hand-set type is never clobbered. `ns::ensure` stamps a reserved path as it creates it,
-so a fresh database and a later `jkb ns mk tasks` both get the type; that stamp has no
-changelog entry, matching how `V001` seeds the `_sys` namespaces (schema, not a user edit).
+so a fresh database and a later `jkb ns mk tasks` both get the type. The stamp is part of the created row, which `ns::ensure` logs as an insert; re-stamping a cleared reserved type on an existing row is logged as a metadata update. It once had no changelog entry ("schema, not a user edit", as `V001` seeds `_sys`), and since `write_txn` numbers transactions from the changelog, a transaction that only created a namespace was invisible to undo: a bare `jkb undo` after `jkb ns mk` reverted the previous change and left the namespace standing (88ebee5). Undoing a namespace's creation keeps it, counting nothing, when a child, a placement or a mount has since moved in, rather than refusing: `ns::ensure` logs only the transaction that created the namespace, so a refusal turned an explicit `jkb undo <txn>` of the first task filed there into an error (b10f07c).
 `V008` raised the schema version, so a binary built before it refuses the shared database
 until rebuilt.
 
@@ -627,7 +625,7 @@ investigation reached a verified fix, and its post-mortem is stored as a `reflec
 
 `jkb inv ls` shows each investigation's unit count, so an emptied investigation is visibly
 empty. Found in the same dogfood run: after `jkb undo` removed an investigation's units, the
-namespace and its type survived (undo inverts item inserts, not `ns::ensure`), and the listing
+namespace and its type survived (undo then inverted item inserts, not `ns::ensure`; since 88ebee5 undoing the transaction that created a namespace removes it too, unless it is still occupied), and the listing
 implied a populated investigation. Undo is unchanged and consistent with tasks; the defect was
 a listing implying state that was not there.
 

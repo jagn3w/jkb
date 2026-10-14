@@ -83,6 +83,18 @@ fn exports(ops: &Ops<'_>, uid: Option<String>, repo: Option<String>) -> Result<V
     }
 }
 
+/// The retired designs (of `repo`, when named): what `export --all` skips and `--against-db` names.
+fn retired(ops: &Ops<'_>, repo: Option<String>) -> Result<Vec<Design>> {
+    match ops.call(Request::DesignList {
+        repo,
+        review: false,
+        retired: true,
+    })? {
+        Response::Designs { designs } => Ok(designs),
+        other => unexpected("design.list", &other),
+    }
+}
+
 fn meta_answer(ops: &Ops<'_>, op: &str, request: Request) -> Result<Design> {
     match ops.call(request)? {
         Response::DesignMeta { design } => Ok(design),
@@ -130,14 +142,20 @@ fn design_is_here(ops: &Ops<'_>, uid: &str, here: &str) -> Result<()> {
     let designs = match ops.call(Request::DesignList {
         repo: None,
         review: false,
+        retired: false,
     })? {
         Response::Designs { designs } => designs,
         other => return unexpected("design.list", &other),
     };
-    let design = designs
-        .into_iter()
-        .find(|d| d.uid == uid)
-        .with_context(|| format!("no design {uid}"))?;
+    // A retired design is found too: whether it may be exported is the op's to answer, and it says
+    // so (`design::export`), for every client alike.
+    let design = match designs.into_iter().find(|d| d.uid == uid) {
+        Some(d) => d,
+        None => retired(ops, None)?
+            .into_iter()
+            .find(|d| d.uid == uid)
+            .with_context(|| format!("no design {uid}"))?,
+    };
     same_repo(uid, repo_of_row(&design).as_deref(), here)
 }
 
@@ -219,6 +237,27 @@ fn export(
                 e.uid,
                 e.version
             );
+        }
+    }
+    // A retired design keeps its generated file; `--all` says it was skipped, so a file that stops
+    // changing is explained rather than silently left behind.
+    if all {
+        for d in retired(ops, Some(here.clone()))? {
+            let Some(target) = d.doc_target else {
+                continue;
+            };
+            if ops.json {
+                done.push(serde_json::json!({
+                    "uid": d.uid,
+                    "doc_target": target,
+                    "skipped": "retired",
+                }));
+            } else {
+                println!(
+                    "{:<9} {target}  ← {} (retired; `git rm` the file, or `jkb design restore {}`)",
+                    "skipped", d.uid, d.uid
+                );
+            }
         }
     }
     if ops.json {
@@ -404,6 +443,7 @@ fn check_against_db(ops: &Ops<'_>, repo: Option<String>) -> Result<()> {
     let (root, cwd) = checkout()?;
     let repo = checkout_repo(ops, &root, &cwd, repo)?;
     let files = generated_files(&root)?;
+    let retired_uids: Vec<String> = retired(ops, None)?.into_iter().map(|d| d.uid).collect();
     let mut problems = Vec::new();
     for (rel, text) in &files {
         if let Some(p) = tampered(rel, text.as_deref()) {
@@ -412,6 +452,13 @@ fn check_against_db(ops: &Ops<'_>, repo: Option<String>) -> Result<()> {
             let Some(uid) = gen::generated_from(text) else {
                 continue;
             };
+            if retired_uids.iter().any(|r| r == uid) {
+                problems.push(format!(
+                    "{rel}: belongs to design {uid}, which is retired — `git rm {rel}`, or `jkb \
+                     design restore {uid}` if it should stay"
+                ));
+                continue;
+            }
             problems.extend(drift(ops, &repo, rel, text, uid));
         }
     }

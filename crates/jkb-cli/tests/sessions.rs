@@ -6645,6 +6645,128 @@ fn a_hand_edited_generated_doc_fails_the_export_check() {
         .stderr(predicate::str::contains("does not exist"));
 }
 
+/// A retired design keeps its generated file: `export --all` reports it skipped rather than writing
+/// it, and `--check --against-db` names the file as a retired design's until it is removed. `ls`
+/// leaves it out, `ls --retired` lists it, and `restore` brings it back.
+#[test]
+#[allow(clippy::too_many_lines)] // one retire lifecycle, read top to bottom
+fn a_retired_designs_file_is_skipped_by_export_all_and_named_by_the_database_check() {
+    let f = Fixture::new();
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = f.jkb().arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let against_db = || {
+        f.jkb()
+            .args(["design", "export", "--check", "--against-db"])
+            .assert()
+    };
+    f.jkb()
+        .args(["mount", "create", "repos/proj", f.repo.to_str().unwrap()])
+        .assert()
+        .success();
+    let uid = json(&[
+        "design",
+        "create",
+        "Gone",
+        "--repo",
+        "proj",
+        "--body",
+        "Decided.\n",
+    ])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let version = || {
+        json(&["design", "cat", &uid])["version"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let span = json(&[
+        "design",
+        "span",
+        &uid,
+        "--base",
+        &version(),
+        "--find",
+        "Decided.\n",
+    ])["span"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    f.jkb()
+        .args(["design", "approve", &span, "--base", &version()])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["design", "export", &uid, "--to", "docs/gone.md"])
+        .assert()
+        .success();
+    against_db().success();
+
+    f.jkb()
+        .args(["design", "retire", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("retired {uid}")))
+        .stdout(predicate::str::contains("git rm"));
+    let uids = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["uid"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert!(uids(&json(&["design", "ls", "--repo", "proj"])).is_empty());
+    let retired = json(&["design", "ls", "--repo", "proj", "--retired"]);
+    assert_eq!(uids(&retired), vec![uid.clone()]);
+    assert_eq!(retired[0]["retired"], true);
+
+    // `--all` writes nothing for it, and says so.
+    let path = f.repo.join("docs/gone.md");
+    let before = std::fs::read_to_string(&path).unwrap();
+    f.jkb()
+        .args(["design", "export", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skipped"))
+        .stdout(predicate::str::contains("docs/gone.md"))
+        .stdout(predicate::str::contains(uid.as_str()));
+    let skipped = json(&["design", "export", "--all"]);
+    assert_eq!(skipped[0]["skipped"], "retired", "{skipped}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    // The database check names the file as the retired design's, until it is removed.
+    against_db()
+        .failure()
+        .stderr(predicate::str::contains("docs/gone.md"))
+        .stderr(predicate::str::contains("retired"))
+        .stderr(predicate::str::contains("git rm"));
+    std::fs::remove_file(&path).unwrap();
+    against_db().success();
+    // Exporting it by name says to restore it first.
+    f.jkb()
+        .args(["design", "export", &uid])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("retired"));
+
+    // Restored, it is listed again and its missing file is a problem once more.
+    f.jkb()
+        .args(["design", "restore", &uid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("restored {uid}")));
+    assert_eq!(
+        uids(&json(&["design", "ls", "--repo", "proj"])),
+        vec![uid.clone()]
+    );
+    against_db()
+        .failure()
+        .stderr(predicate::str::contains("does not exist"));
+}
+
 /// `jkb design export --check` opens no database and reaches no daemon (D55.6, amended), so
 /// `scripts/check.sh` and CI run it on any machine. Here the database it would open is in a
 /// directory that does not exist, and remote mode names a port nothing listens on: the check still

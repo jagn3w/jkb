@@ -1025,15 +1025,19 @@ fn a_listing_that_asks_no_counts_sends_no_review_field() {
     let plain = serde_json::to_value(crate::Request::DesignList {
         repo: None,
         review: false,
+        retired: false,
     })
     .unwrap();
     assert!(plain.get("review").is_none(), "{plain}");
+    assert!(plain.get("retired").is_none(), "{plain}");
     let asked = serde_json::to_value(crate::Request::DesignList {
         repo: None,
         review: true,
+        retired: true,
     })
     .unwrap();
     assert_eq!(asked["review"], json!(true));
+    assert_eq!(asked["retired"], json!(true));
 }
 
 fn listed(b: &LocalBackend) -> Vec<crate::designs::Design> {
@@ -1111,4 +1115,75 @@ fn a_create_with_no_parent_sends_no_under_field() {
     })
     .unwrap();
     assert!(plain.get("under").is_none(), "{plain}");
+}
+
+/// `design.retire` and `design.restore` are the operator's alone (`Admin`, like `item.rm`): hiding a
+/// design from every role is not a designer's call. `design.list` leaves a retired design out unless
+/// asked for the retired ones, and each listed design says whether it is retired.
+#[test]
+fn retiring_and_restoring_a_design_is_the_operators_and_the_listing_follows() {
+    let kb = Kb::new();
+    let designer = kb.as_role("designer");
+    let uid = create(&designer, "Words.");
+    for op in ["design.retire", "design.restore"] {
+        let e = call(&designer, json!({ "op": op, "uid": uid })).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Forbidden, "{op}: {e:?}");
+    }
+    let uids = |r: Response| match r {
+        Response::Designs { designs } => designs
+            .into_iter()
+            .map(|d| (d.uid, d.retired))
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        uids(ok(&kb.op, json!({ "op": "design.retire", "uid": uid }))),
+        vec![(uid.clone(), true)]
+    );
+    assert!(listed(&kb.op).iter().all(|d| d.uid != uid));
+    assert!(listed(&designer).iter().all(|d| d.uid != uid));
+    assert_eq!(
+        uids(ok(&kb.op, json!({ "op": "design.list", "retired": true }))),
+        vec![(uid.clone(), true)]
+    );
+    // Still read: nothing but the listing moved.
+    ok(&designer, json!({ "op": "design.cat", "uid": uid }));
+    assert_eq!(
+        uids(ok(&kb.op, json!({ "op": "design.restore", "uid": uid }))),
+        vec![(uid.clone(), false)]
+    );
+    assert!(listed(&kb.op).iter().any(|d| d.uid == uid && !d.retired));
+    // A design is still never removed, by the operator either: the refusal says to retire it.
+    let e = call(
+        &kb.op,
+        json!({ "op": "item.rm", "uid": uid, "force": true }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("jkb design retire"), "{e:?}");
+}
+
+/// Over the wire too: `inv.write { resolve }` (a `TaskWrite` op) cannot retire or restore a design,
+/// and `design.export` refuses a retired one.
+#[test]
+fn inv_resolve_cannot_retire_a_design_and_export_refuses_a_retired_one() {
+    let kb = Kb::new();
+    let uid = create(&kb.op, "Words.");
+    for to in ["abandoned", "unresolved"] {
+        let e = call(
+            &kb.op,
+            json!({ "op": "inv.write", "write": "resolve", "uid": uid, "resolution": to }),
+        )
+        .unwrap_err();
+        assert!(e.message.contains("jkb design retire"), "{to}: {e:?}");
+    }
+    assert!(listed(&kb.op).iter().any(|d| d.uid == uid));
+    ok(&kb.op, json!({ "op": "design.retire", "uid": uid }));
+    let e = call(
+        &kb.op,
+        json!({ "op": "inv.write", "write": "resolve", "uid": uid, "resolution": "unresolved" }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("jkb design restore"), "{e:?}");
+    let e = call(&kb.op, json!({ "op": "design.export", "uid": uid })).unwrap_err();
+    assert!(e.message.contains("retired"), "{e:?}");
 }

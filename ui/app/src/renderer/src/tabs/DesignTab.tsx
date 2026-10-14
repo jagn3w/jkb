@@ -22,6 +22,7 @@ import { jumpTo } from "../design/jump";
 import { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading, type Listing } from "../design/listing";
 import { PlansView } from "../design/PlansView";
 import { PromptsPane } from "../design/PromptsPane";
+import { changeAndReload, listRetired, nestedCount, restoreDesign, retireConfirm, retiredByRepo, retireDesign } from "../design/retire";
 import { SessionRegistry, type RegistryNotice } from "../design/registry";
 import { ReviewBar } from "../design/ReviewBar";
 import { TasksView } from "../design/TasksView";
@@ -150,6 +151,8 @@ function DesignView({
   onRevealed,
   onDiscuss,
   onNotice,
+  nested,
+  onRetire,
 }: {
   readonly design: Design;
   readonly session: DesignSession | undefined;
@@ -161,6 +164,10 @@ function DesignView({
   readonly onRevealed: () => void;
   readonly onDiscuss: (from: number, to: number, shown: string) => void;
   readonly onNotice: (message: string) => void;
+  /** How many designs are nested under it: what a retire takes with it. */
+  readonly nested: number;
+  /** Retire it; the daemon's refusal, as it is, or `undefined` once retired. */
+  readonly onRetire: () => Promise<string | undefined>;
 }): React.JSX.Element {
   // Arriving by *Next* is a review walk: it lands on the Design view whatever was last shown here,
   // or the passage it reveals would be off screen and `n` dead.
@@ -170,6 +177,20 @@ function DesignView({
     rememberView(design.uid, v);
   };
   const [task, setTask] = useState<string | undefined>(undefined);
+  // *Retire…*: the confirm, and the refusal it shows verbatim when the daemon refuses.
+  const [retiring, setRetiring] = useState(false);
+  const [retireBusy, setRetireBusy] = useState(false);
+  const [refusal, setRefusal] = useState<string | undefined>(undefined);
+  const confirmRetire = async (): Promise<void> => {
+    setRetireBusy(true);
+    try {
+      const refused = await onRetire();
+      setRefusal(refused);
+      if (refused === undefined) setRetiring(false);
+    } finally {
+      setRetireBusy(false);
+    }
+  };
   const [prompts, setPrompts] = useState<number | undefined>(undefined);
   const plans = usePlans(design.uid, repo, onNotice);
   const threads = useThreads(design, session, repo, onNotice);
@@ -250,7 +271,61 @@ function DesignView({
               {session.feedProblem !== undefined && session.status.kind !== "failed" ? " · not live" : ""}
             </span>
           )}
+          <button
+            type="button"
+            className="bar-button"
+            aria-expanded={retiring}
+            onClick={() => {
+              setRetiring((r) => !r);
+              setRefusal(undefined);
+            }}
+            title="Retire this design: it leaves the list, and nothing is deleted"
+          >
+            Retire…
+          </button>
         </div>
+        {retiring && (
+          <form
+            className="design-retire"
+            aria-label="Retire design"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!retireBusy) void confirmRetire();
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && !retireBusy) {
+                e.preventDefault();
+                setRetiring(false);
+                setRefusal(undefined);
+              }
+            }}
+          >
+            {retireConfirm(design, nested).map((line) => (
+              <p key={line}>{line}</p>
+            ))}
+            {refusal !== undefined && (
+              <p className="design-retire-refusal" role="alert">
+                {refusal}
+              </p>
+            )}
+            <div className="design-retire-actions">
+              <button
+                type="button"
+                className="bar-button"
+                disabled={retireBusy}
+                onClick={() => {
+                  setRetiring(false);
+                  setRefusal(undefined);
+                }}
+              >
+                Cancel
+              </button>
+              <button type="submit" className="bar-button" disabled={retireBusy} autoFocus>
+                {retireBusy ? "Retiring…" : "Retire"}
+              </button>
+            </div>
+          </form>
+        )}
         <div className="view-tabs" role="tablist" aria-label="Design views">
           {VIEWS.map((v) => (
             <button
@@ -349,12 +424,20 @@ export function DesignTab(): React.JSX.Element {
   const uidNow = useRef(uid);
   uidNow.current = uid;
   const [notice, setNotice] = useState<string | undefined>(undefined);
+  // The retired designs, for the sidebar's Retired folds: their own listing, read beside the live one.
+  const [retired, setRetired] = useState<readonly Design[]>([]);
   /** The design *Next* moved to, whose first unreviewed passage is shown once it is read. */
   const [revealIn, setRevealIn] = useState<string | undefined>(undefined);
 
   /** The listing, with review counts — or without, from a daemon that predates them. */
   const load = useCallback(async (): Promise<readonly Design[] | undefined> => {
     setListing(listingLoading);
+    // A failed read of the retired ones keeps the folds as they were: the live listing is the tab's.
+    void listRetired((r) => window.jkb.op(r))
+      .then((answer) => {
+        if (answer.ok) setRetired(answer.value);
+      })
+      .catch(() => undefined);
     try {
       let answer = decodeDesigns(await window.jkb.op(designOps.list(undefined, true)));
       // A daemon older than the counts refuses the field it does not know: list without them, so
@@ -507,6 +590,26 @@ export function DesignTab(): React.JSX.Element {
     [load, pickDesign],
   );
 
+  const retiredTree = useMemo(() => retiredByRepo(retired), [retired]);
+
+  // *Retire…* and *Restore*: one op each, then both listings read again. A refusal is shown as the
+  // daemon said it — a retire names the open tasks that hold it — in the confirm, or the tab's notice.
+  const onRetire = useCallback(
+    async (uid: string): Promise<string | undefined> => {
+      const done = await changeAndReload({ change: () => retireDesign((r) => window.jkb.op(r), uid), reload: load });
+      return done.ok ? undefined : done.error.message;
+    },
+    [load],
+  );
+  const onRestore = useCallback(
+    async (uid: string): Promise<void> => {
+      setNotice(undefined);
+      const done = await changeAndReload({ change: () => restoreDesign((r) => window.jkb.op(r), uid), reload: load });
+      if (!done.ok) setNotice(`Cannot restore the design: ${done.error.message}`);
+    },
+    [load],
+  );
+
   return (
     <div className="design-tab">
       <DesignSidebar
@@ -518,6 +621,8 @@ export function DesignTab(): React.JSX.Element {
         onRefresh={() => void load()}
         openRepo={repo}
         onCreate={onCreate}
+        retired={retiredTree}
+        onRestore={onRestore}
       />
       <div className="design-main">
         {notice !== undefined && (
@@ -586,6 +691,8 @@ export function DesignTab(): React.JSX.Element {
               onRevealed={onRevealed}
               onDiscuss={(f, t, shown) => void onDiscuss(f, t, shown)}
               onNotice={setNotice}
+              nested={tree === undefined ? 0 : nestedCount(tree, design.uid)}
+              onRetire={() => onRetire(design.uid)}
             />
           )}
         </div>
