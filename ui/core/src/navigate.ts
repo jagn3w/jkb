@@ -1,7 +1,7 @@
 //! Finding your way around designs: the sidebar's tree of repos and designs, and the unreviewed
 //! passages *See next* walks. Pure, so the app and its tests read the same answers.
 
-import { repoOf, stateRuns, type Design, type Span } from "./design.js";
+import { repoOf, stateRuns, type Design, type ReviewCounts, type Span } from "./design.js";
 
 // ---- the sidebar tree -------------------------------------------------------------------------
 
@@ -73,6 +73,22 @@ export function treeOrder(tree: readonly RepoNode[]): Design[] {
   };
   for (const r of tree) r.designs.forEach(walk);
   return out;
+}
+
+/**
+ * A design's review counts with every descendant's added in: what its sidebar row shows, so a
+ * folded parent still says how much under it is left to review. A design whose counts are unknown
+ * (a daemon that predates them) adds nothing; a subtree with none known is `undefined`.
+ */
+export function subtreeReview(node: DesignNode): ReviewCounts | undefined {
+  const parts = [node.design.review, ...node.children.map(subtreeReview)].filter((c): c is ReviewCounts => c !== undefined);
+  if (parts.length === 0) return undefined;
+  return parts.reduce((a, c) => ({
+    proposed: a.proposed + c.proposed,
+    approved: a.approved + c.approved,
+    staged: a.staged + c.staged,
+    implemented: a.implemented + c.implemented,
+  }));
 }
 
 // ---- unreviewed passages ----------------------------------------------------------------------

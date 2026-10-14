@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { designTree, passageAt, stepPassage, treeOrder, unreviewedPassages } from "../dist/index.js";
+import { designTree, passageAt, stepPassage, subtreeReview, treeOrder, unreviewedPassages } from "../dist/index.js";
 
 const design = (uid, title, repo = "jkb", parent) => ({
   uid,
@@ -121,4 +121,25 @@ test("a design with unknown counts, or any PROPOSED text, has something to revie
   assert.deepEqual(designOps.list(undefined, true), { op: "design.list", review: true });
   const bad = decodeDesigns({ ok: true, value: { result: "designs", designs: [d({ proposed: "x" })] } });
   assert.equal(bad.ok, false, "malformed counts are refused");
+});
+
+test("a row's counts are its design's own plus every descendant's; unknown counts add nothing", () => {
+  const counts = (proposed, approved, staged, implemented) => ({ proposed, approved, staged, implemented });
+  const withReview = (d, review) => (review === undefined ? d : { ...d, review });
+  const [jkb] = designTree([
+    withReview(design("d:p", "Parent"), counts(1, 2, 0, 0)),
+    withReview(design("d:c", "Child", "jkb", "d:p"), counts(3, 0, 1, 0)),
+    withReview(design("d:g", "Grandchild", "jkb", "d:c"), counts(0, 0, 0, 5)),
+    design("d:u", "Unknown", "jkb", "d:p"),
+    design("d:lone", "Lone unknown"),
+    withReview(design("d:under", "Under unknown", "jkb", "d:lone"), counts(2, 0, 0, 0)),
+    design("d:none", "Nothing known"),
+  ]).map((r) => r.designs);
+  const at = (uid) => jkb.find((n) => n.design.uid === uid);
+  assert.deepEqual(subtreeReview(at("d:p")), counts(4, 2, 1, 5));
+  // The child alone: its own and its grandchild's, not its parent's.
+  assert.deepEqual(subtreeReview(at("d:p").children.find((n) => n.design.uid === "d:c")), counts(3, 0, 1, 5));
+  // A design with unknown counts still shows what is known under it.
+  assert.deepEqual(subtreeReview(at("d:lone")), counts(2, 0, 0, 0));
+  assert.equal(subtreeReview(at("d:none")), undefined);
 });
