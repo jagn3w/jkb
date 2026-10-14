@@ -336,8 +336,9 @@ fn assign(
 /// not read approved in its child refuses the whole split rather than silently demoting it.
 ///
 /// # Errors
-/// An unknown design, a retired one ([`child_position`]), a `base` that is not its current version, a level outside 1–6, no heading of
-/// that level, a span crossing a section's edge (the split never cuts a span), or a database error.
+/// An unknown design, a retired one (`child_position`), a `base` that is not its current version, a
+/// level outside 1–6, no heading of that level, a span crossing a section's edge (the split never
+/// cuts a span), or a database error.
 pub fn split(
     conn: &Connection,
     meta: &WriteMeta,

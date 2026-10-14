@@ -3505,3 +3505,79 @@ fn a_retired_design_leaves_every_export() {
     retire_it(&db, &alone).unwrap();
     assert_eq!(all(&db), vec![parent]);
 }
+
+/// A design's resolution is written only by `retire` and `restore`: `jkb inv resolve` (and every
+/// other caller of the generic setter) is refused both ways — it would retire with no open-task
+/// check and no tree, or restore a child under a retired parent — and names the design verbs.
+#[test]
+fn inv_resolve_cannot_retire_or_restore_a_design() {
+    let db = db();
+    let (parent, child, _) = three_deep(&db);
+    let resolve = |uid: &str, to: &str| {
+        let (uid, to) = (uid.to_owned(), to.to_owned());
+        db.write_txn("t", move |c, m| {
+            crate::investigation::resolve_unit(c, m, &uid, &to)
+        })
+    };
+    let e = resolve(&parent, "abandoned").unwrap_err().to_string();
+    assert!(e.contains(&format!("jkb design retire {parent}")), "{e}");
+    assert!(!retired_now(&db, &parent), "a refusal writes nothing");
+    retire_it(&db, &parent).unwrap();
+    let e = resolve(&child, "unresolved").unwrap_err().to_string();
+    assert!(e.contains(&format!("jkb design restore {child}")), "{e}");
+    assert!(retired_now(&db, &child));
+    // The generic setter itself refuses, whoever calls it.
+    let p = parent.clone();
+    let e = db
+        .write_txn("t", move |c, m| {
+            let id = design_id(c, &p)?;
+            item::set_resolution(c, m, id, jkb_types::Resolution::Success)
+        })
+        .unwrap_err();
+    assert!(e.to_string().contains("is a design"), "{e}");
+}
+
+/// Restore makes the whole tree live: a child retired on its own before its parent comes back with
+/// the parent too (only `jkb undo` of the parent's retire leaves it retired).
+#[test]
+fn restoring_a_parent_restores_a_child_retired_before_it() {
+    let db = db();
+    let (parent, child, grandchild) = three_deep(&db);
+    retire_it(&db, &child).unwrap();
+    retire_it(&db, &parent).unwrap();
+    let back = restore_it(&db, &parent).unwrap();
+    assert_eq!(back.len(), 3);
+    for uid in [&parent, &child, &grandchild] {
+        assert!(!retired_now(&db, uid), "{uid}");
+    }
+    assert!(retired_listed(&db).is_empty());
+}
+
+/// The export op refuses a retired design, by uid as well as by `--all`: rendering it or pointing it
+/// at a file is not asked of it until it is restored.
+#[test]
+fn a_retired_design_is_refused_by_export_and_by_set_doc_target() {
+    let db = db();
+    let uid = create_in(&db, "jkb", "Gone", "x");
+    retire_it(&db, &uid).unwrap();
+    let u = uid.clone();
+    let e = db
+        .read(move |c| export::export(c, &u))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("retired") && e.contains("jkb design restore"),
+        "{e}"
+    );
+    let u = uid.clone();
+    let e = db
+        .write_txn("t", move |c, m| {
+            export::set_doc_target(c, m, &u, "docs/g.md")
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("retired"), "{e}");
+    restore_it(&db, &uid).unwrap();
+    let u = uid.clone();
+    db.read(move |c| export::export(c, &u)).unwrap();
+}

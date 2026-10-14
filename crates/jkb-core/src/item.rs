@@ -459,10 +459,49 @@ pub fn get_many(conn: &Connection, items: &[ItemId]) -> Result<HashMap<ItemId, I
 /// see it was tried. Link the edge that killed it ([`jkb_types::EdgeType::Refutes`],
 /// `RulesOut`, `Supersedes`) so the tombstone says *why*.
 ///
+/// **Refuses a design.** A design's resolution is whether it is retired, and only
+/// `design::retire`/`design::restore` write it — they hold the operator-only permission, refuse
+/// while work under the design is open, cover the whole tree and refuse a child under a retired
+/// parent. Through here (`jkb inv resolve`, any investigation verb) a design would be retired or
+/// restored past all of that, so the refusal is here, where every caller passes.
+///
 /// # Errors
-/// Returns [`jkb_types::Error::NotFound`] if `item` does not exist; otherwise a
-/// database error.
+/// Returns [`jkb_types::Error::NotFound`] if `item` does not exist, a validation error if it is
+/// a design; otherwise a database error.
 pub fn set_resolution(
+    conn: &Connection,
+    meta: &WriteMeta,
+    item: ItemId,
+    resolution: Resolution,
+) -> Result<()> {
+    if let Some(m) = get(conn, item)?.filter(|m| m.kind == crate::design::KIND) {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "`{}` is a design: whether it is retired is set only by `jkb design retire {}` and \
+             `jkb design restore {}`, never as a resolution",
+            m.uid, m.uid, m.uid
+        ))));
+    }
+    write_resolution(conn, meta, item, resolution)
+}
+
+/// Set a design's resolution: what `design::retire` and `design::restore` write, and nothing else.
+/// The [`crate::design::ResolutionKey`] can be made only inside the design module, so no other
+/// caller can reach this.
+///
+/// # Errors
+/// As [`set_resolution`], less the design refusal.
+pub(crate) fn set_design_resolution(
+    conn: &Connection,
+    meta: &WriteMeta,
+    design: ItemId,
+    resolution: Resolution,
+    _key: crate::design::ResolutionKey,
+) -> Result<()> {
+    write_resolution(conn, meta, design, resolution)
+}
+
+/// The one writer of `items.resolution`, logged so `jkb undo` restores the column.
+fn write_resolution(
     conn: &Connection,
     meta: &WriteMeta,
     item: ItemId,

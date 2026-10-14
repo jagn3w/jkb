@@ -1161,3 +1161,29 @@ fn retiring_and_restoring_a_design_is_the_operators_and_the_listing_follows() {
     .unwrap_err();
     assert!(e.message.contains("jkb design retire"), "{e:?}");
 }
+
+/// Over the wire too: `inv.write { resolve }` (a `TaskWrite` op) cannot retire or restore a design,
+/// and `design.export` refuses a retired one.
+#[test]
+fn inv_resolve_cannot_retire_a_design_and_export_refuses_a_retired_one() {
+    let kb = Kb::new();
+    let uid = create(&kb.op, "Words.");
+    for to in ["abandoned", "unresolved"] {
+        let e = call(
+            &kb.op,
+            json!({ "op": "inv.write", "write": "resolve", "uid": uid, "resolution": to }),
+        )
+        .unwrap_err();
+        assert!(e.message.contains("jkb design retire"), "{to}: {e:?}");
+    }
+    assert!(listed(&kb.op).iter().any(|d| d.uid == uid));
+    ok(&kb.op, json!({ "op": "design.retire", "uid": uid }));
+    let e = call(
+        &kb.op,
+        json!({ "op": "inv.write", "write": "resolve", "uid": uid, "resolution": "unresolved" }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("jkb design restore"), "{e:?}");
+    let e = call(&kb.op, json!({ "op": "design.export", "uid": uid })).unwrap_err();
+    assert!(e.message.contains("retired"), "{e:?}");
+}

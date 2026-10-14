@@ -147,11 +147,14 @@ fn design_is_here(ops: &Ops<'_>, uid: &str, here: &str) -> Result<()> {
         Response::Designs { designs } => designs,
         other => return unexpected("design.list", &other),
     };
-    let Some(design) = designs.into_iter().find(|d| d.uid == uid) else {
-        if retired(ops, None)?.iter().any(|d| d.uid == uid) {
-            bail!("design {uid} is retired — restore it first with `jkb design restore {uid}`");
-        }
-        bail!("no design {uid}");
+    // A retired design is found too: whether it may be exported is the op's to answer, and it says
+    // so (`design::export`), for every client alike.
+    let design = match designs.into_iter().find(|d| d.uid == uid) {
+        Some(d) => d,
+        None => retired(ops, None)?
+            .into_iter()
+            .find(|d| d.uid == uid)
+            .with_context(|| format!("no design {uid}"))?,
     };
     same_repo(uid, repo_of_row(&design).as_deref(), here)
 }

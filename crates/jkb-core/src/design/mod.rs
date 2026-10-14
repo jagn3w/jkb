@@ -569,6 +569,11 @@ pub fn row(conn: &Connection, uid: &str) -> Result<DesignRow> {
 /// The resolution a retired design carries. `abandoned` already says it, so retiring needs no new
 /// column, value or migration, and `jkb undo` of a retire is an ordinary column restore.
 const RETIRED: Resolution = Resolution::Abandoned;
+/// The permit [`item::set_design_resolution`] asks for: its field is private to this module, so
+/// only [`retire`] and [`restore`] can write a design's resolution (the generic
+/// [`item::set_resolution`] refuses a design).
+pub(crate) struct ResolutionKey(());
+
 /// How many of the open tasks a refused retire names before it says how many more there are.
 const OPEN_TASKS_NAMED: usize = 10;
 
@@ -661,16 +666,17 @@ pub fn retire(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<Desi
         // A child retired on its own before stays as it is: one more write would make undoing this
         // retire bring it back too.
         if !retired_item(conn, design)? {
-            item::set_resolution(conn, meta, design, RETIRED)?;
+            item::set_design_resolution(conn, meta, design, RETIRED, ResolutionKey(()))?;
         }
         out.push(row(conn, &design_uid)?);
     }
     Ok(out)
 }
 
-/// Restore retired design `uid` and every design nested under it ([`retire`]'s inverse, which `jkb
-/// undo` of the retire also is). Refused under a retired parent: the parent is restored first, or
-/// the design would list under a parent no listing shows.
+/// Restore retired design `uid` and make its whole tree live: every retired design nested under it
+/// is restored too, a child retired on its own before the parent included. (`jkb undo` of a retire
+/// is narrower: it restores only what that retire wrote.) Refused under a retired parent: the parent
+/// is restored first, or the design would list under a parent no listing shows.
 ///
 /// # Errors
 /// An unknown design, one that is not retired, a retired parent, or a database error.
@@ -693,7 +699,13 @@ pub fn restore(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<Des
     let mut out = Vec::with_capacity(tree.len());
     for (design, design_uid) in tree {
         if retired_item(conn, design)? {
-            item::set_resolution(conn, meta, design, Resolution::Unresolved)?;
+            item::set_design_resolution(
+                conn,
+                meta,
+                design,
+                Resolution::Unresolved,
+                ResolutionKey(()),
+            )?;
         }
         out.push(row(conn, &design_uid)?);
     }
