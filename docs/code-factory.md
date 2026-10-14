@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:code-factory-18dcdf2fb12449281bfddd, edit there (version 216.1QGBvNO6msyoB_rFCIGwstrHwusCAYPk-8DR24cLAYTMr_Tq1_MLAYXq3P7A984LAYiK45y_poUMAYjYpJeL5P4EAYqq0IzWw7kOAYzWtJT0jKoKAY2kkZP5g8oKAYyqsdfz5NAMAY-az8Hcte8GAY-wosv2818BkIC16MGKswMBkoKMuY6DrwQBkvD9lOWmzwcBlMKR7O3w1wEBlIL7sf7LngwBlpCGpdez7QoBl7CU1pPXywoBlura69iFvwUBmOTQrpOipA0BmrLImt2xrQkBm-6Y5rKg_w4Bm_qHj-HcoAkBncjY0p2XjwIBnZCc_peF7A8Bnqzlm7r31wgBoJb0rpKdqQkBn5qZw9iJ4gUBouSgvJLX_ggBo7LWrP71UAGk3s_Mj6_aCAGl1uPKsNK3CwGm5q_AqJiLCQGPpq73wcTTCwGo6v7iroX-BQGp-PTz74oqAai2idLR8doJAaSQnd_drpAPAZ2Uq8DYxc0BAa3khoi2s9ANAa3mopOTioIKAayexM-KrYMHAbDKn_vr9ZINAbCUkd3H-7cGAZbAr4fo8a4F9x2zhriKgZTHCwG00tbkyKfhBQGd0PC7moDXCdkBnt7zobz2ywEBsbC4t_GC_gGVAbmwyeSB3JMJAbmou6TgjY4DAbuW_qOSx_MHAb3Ggr_2q98HAb3G0uLv9NkEAb3m9YyN8-ADAcC0zNfA8ucPAb3yxba3uq8MAcKK99nyxcIBAcCC6NmboDUBvpS8g6LqxAQ6xdSQ-biKmAYByMjAzajB-AYBybDetNK6zAgByoKnjvig7wUBy9yM84-d0QYByqCsgPG1_wf-Bs2Yvrns2bcOAdKK-7GqwaMNAdPypIOgj8ACAdSk_v-Q5KsLAdXMgYT6h4sBAdXUjPH8tKMMAdbKkInukQ8B2Mi9lOzL2QoB2PKYisyruwQB2Ia1iq7d8wsB0s6H1MzwxQvFAdbYooubv8MO6gHXwPbBwYGeC0Te6Mvbo_zfAgHftNWvoefICgHfgqvCrurPAgHe_P-nuY7RCwHf-MWP7ugWAd6G9tHKrrMNAeD6kviFjZsOAePAir77vv8LAeb-mYGw06sHAee0mNWn35IOAeea6MSR2bMNAem27rC6qAEB6Z6g1L3p7wsB6di_-52O6QgB7OjvwNvjzwMB58zVxNPLvQfEAfCMkurR7IcLAfHO7-vu75sFAfCkh9L-76MIAfP265LcprwFAfTKm5T8npIMAfLc0ISpwfEEAfHQ04uniMEHwAP55rusypC2AQH73oXYvPeVDAH7xIrqmfr1DAH9xvbsoOyLCAH-sLH_roupCFL_8KO0wef1CAGA4Y3DypGfCQH9uMn_0vfhCLYBgtGvlOOB_QIBgp_EwpHX_gYB_NTx2r6wngQBhunfxdmz1wEBhoGHrt61kwUBiPf3qNGIpgQBiP2n5ef0_QcBhtPG-N7lVQGL1c7NncmIDgGMo-W_mvSVBwGMpbO_zJCZDwGHmZzP07aUDwGIwZOr5PHvCwGNndHH--bRBgGJjZumgOiUAwGI_bS189_aBQGTwarpwIaoDgGUpfSTw7_LBgGTv9_S46SODQGWp5yB-4BfAZez7obB5-YOAZibzOeQxNwCAZjdgpPFqPgGAY-7kOjTooMFAZmnyJSsl9kOqgScu7vygfWSCwGgx_fhhIX7CAGho8euuPeeDgGio_SXjbvcAgGixdr-v6f0DQGk0dbl4daeAwGlifPBieeuCgGmwcPMy4OZBgGn4dCak4naAQGo66HNmaDjCAGh05vr2YuTCZEQqq3nje-EvQgBq_-wn87ppwUBrfWz2IWCsATNAa7hg_DosIcBAbH1ypD-7pYBAbLzvsO6wJcDAbPN5NOOkYgKAbSHj4LqzuQDAbWVrceF2skOAbbh7OH5rcALAbudv_3B-bYGAb23wrGmkq4EAb6Ju7WF8vgKAb_n9ur-uTQBwPuO4vL-qQEBwM34l6qZxAMBwon7_JfvqgUBw72C6JbttQIBveX7jobuiwkBxenE7qPDyAkBxLvs5ZrSCgHCp5KyxIKlDwHIr87xpbmiAgHJk5La_OcCAcr3wLehsMsNAcmFkc0BAsz508WVndkNAcCJ7IXIqYwC_QLPnamclMe4DgHPt_31qpafDQHSjaj4prbBAgHY0_SmoaLkCQHZ_767vPuKDwHak4CR35iuCgHc4Y7N2oDtCwHd8-SKmajmBQHet9PW9-cNAd_Tl4OO78oEAd7n0pir44wPAeOX1r6DpIkHAebZ2PewwMMEAee5memskYgJAenNwI64_dgOAev1gPis3ucNAez19vL7k4QJAe3NpOLo2OQKAezP7LWwyf0FAe-V0q_826QIAfDzwqn1iN0JAfHtyMy-z4EGAez5o_DHoLUEAfOr8MSEyMwOAfTrk6eOhMQEAfW5yaC9mGIB9JPYqqXO_wYB8_nTgf7Q0QUB-LnphdP34Q0B-dmYotbyzQwB-amGxOLlnwIB-uuQsviU5goB_IXe97mI_AUB-bHH_cTx0QwB_dP3mu2MDQH328C_6tCWDAE, blake3 74ab9181bcd686f5f5c68ef2087db471a53e271b55ce4e8c744c724bb1051256) -->
+<!-- generated from jkb design design:code-factory-18dcdf2fb12449281bfddd, edit there (version 216.1QGBvNO6msyoB_rFCIGwstrHwusCAYPk-8DR24cLAYTMr_Tq1_MLAYXq3P7A984LAYiK45y_poUMAYjYpJeL5P4EAYqq0IzWw7kOAYzWtJT0jKoKAY2kkZP5g8oKAYyqsdfz5NAMAY-az8Hcte8GAY-wosv2818BkIC16MGKswMBkoKMuY6DrwQBkvD9lOWmzwcBlMKR7O3w1wEBlIL7sf7LngwBlpCGpdez7QoBl7CU1pPXywoBlura69iFvwUBmOTQrpOipA0BmrLImt2xrQkBm-6Y5rKg_w4Bm_qHj-HcoAkBncjY0p2XjwIBnZCc_peF7A8Bnqzlm7r31wgBoJb0rpKdqQkBn5qZw9iJ4gUBouSgvJLX_ggBo7LWrP71UAGk3s_Mj6_aCAGl1uPKsNK3CwGm5q_AqJiLCQGPpq73wcTTCwGo6v7iroX-BQGp-PTz74oqAai2idLR8doJAaSQnd_drpAPAZ2Uq8DYxc0BAa3khoi2s9ANAa3mopOTioIKAayexM-KrYMHAbDKn_vr9ZINAbCUkd3H-7cGAZbAr4fo8a4F9x2zhriKgZTHCwG00tbkyKfhBQGd0PC7moDXCdkBnt7zobz2ywEBsbC4t_GC_gGVAbmwyeSB3JMJAbmou6TgjY4DAbuW_qOSx_MHAb3Ggr_2q98HAb3G0uLv9NkEAb3m9YyN8-ADAcC0zNfA8ucPAb3yxba3uq8MAcKK99nyxcIBAcCC6NmboDUBvpS8g6LqxAQ6xdSQ-biKmAYByMjAzajB-AYBybDetNK6zAgByoKnjvig7wUBy9yM84-d0QYByqCsgPG1_wf-Bs2Yvrns2bcOAdKK-7GqwaMNAdPypIOgj8ACAdSk_v-Q5KsLAdXMgYT6h4sBAdXUjPH8tKMMAdbKkInukQ8B2Mi9lOzL2QoB2PKYisyruwQB2Ia1iq7d8wsB0s6H1MzwxQvFAdbYooubv8MO6gHXwPbBwYGeC0Te6Mvbo_zfAgHftNWvoefICgHfgqvCrurPAgHe_P-nuY7RCwHf-MWP7ugWAd6G9tHKrrMNAeD6kviFjZsOAePAir77vv8LAeb-mYGw06sHAee0mNWn35IOAeea6MSR2bMNAem27rC6qAEB6Z6g1L3p7wsB6di_-52O6QgB7OjvwNvjzwMB58zVxNPLvQfEAfCMkurR7IcLAfHO7-vu75sFAfCkh9L-76MIAfP265LcprwFAfTKm5T8npIMAfLc0ISpwfEEAfHQ04uniMEHwAP55rusypC2AQH73oXYvPeVDAH7xIrqmfr1DAH9xvbsoOyLCAH-sLH_roupCFL_8KO0wef1CAGA4Y3DypGfCQH9uMn_0vfhCLYBgtGvlOOB_QIBgp_EwpHX_gYB_NTx2r6wngQBhunfxdmz1wEBhoGHrt61kwUBiPf3qNGIpgQBiP2n5ef0_QcBhtPG-N7lVQGL1c7NncmIDgGMo-W_mvSVBwGMpbO_zJCZDwGHmZzP07aUDwGIwZOr5PHvCwGNndHH--bRBgGJjZumgOiUAwGI_bS189_aBQGTwarpwIaoDgGUpfSTw7_LBgGTv9_S46SODQGWp5yB-4BfAZez7obB5-YOAZibzOeQxNwCAZjdgpPFqPgGAY-7kOjTooMFAZmnyJSsl9kOqgScu7vygfWSCwGgx_fhhIX7CAGho8euuPeeDgGio_SXjbvcAgGixdr-v6f0DQGk0dbl4daeAwGlifPBieeuCgGmwcPMy4OZBgGn4dCak4naAQGo66HNmaDjCAGh05vr2YuTCZEQqq3nje-EvQgBq_-wn87ppwUBrfWz2IWCsATNAa7hg_DosIcBAbH1ypD-7pYBAbLzvsO6wJcDAbPN5NOOkYgKAbSHj4LqzuQDAbWVrceF2skOAbbh7OH5rcALAbudv_3B-bYGAb23wrGmkq4EAb6Ju7WF8vgKAb_n9ur-uTQBwPuO4vL-qQEBwM34l6qZxAMBwon7_JfvqgUBw72C6JbttQIBveX7jobuiwkBxenE7qPDyAkBxLvs5ZrSCgHCp5KyxIKlDwHIr87xpbmiAgHJk5La_OcCAcr3wLehsMsNAcmFkc0BAsz508WVndkNAcCJ7IXIqYwC_QLPnamclMe4DgHPt_31qpafDQHSjaj4prbBAgHY0_SmoaLkCQHZ_767vPuKDwHak4CR35iuCgHc4Y7N2oDtCwHd8-SKmajmBQHet9PW9-cNAd_Tl4OO78oEAd7n0pir44wPAeOX1r6DpIkHAebZ2PewwMMEAee5memskYgJAenNwI64_dgOAev1gPis3ucNAez19vL7k4QJAe3NpOLo2OQKAezP7LWwyf0FAe-V0q_826QIAfDzwqn1iN0JAfHtyMy-z4EGAez5o_DHoLUEAfOr8MSEyMwOAfTrk6eOhMQEAfW5yaC9mGIB9JPYqqXO_wYB8_nTgf7Q0QUB-LnphdP34Q0B-dmYotbyzQwB-amGxOLlnwIB-uuQsviU5goB_IXe97mI_AUB-bHH_cTx0QwB_dP3mu2MDQH328C_6tCWDAE, blake3 acbc989e1c43afb50fa721de7b5116ecd0cc36303308d18ae2a25f51af8ab4c5) -->
 # Code Factory
 
 Code Factory is the first standalone app on jkb: one place to **design, plan and implement** with
@@ -188,6 +188,28 @@ context isolation intact, the page still has no `require` or `process`, so a ren
 passed with the sandbox off. `getLastWebPreferences` is undocumented; if Electron drops it the test
 fails rather than passes. The unreachable-daemon smoke writes a token for its closed port, so the
 status it checks comes from a refused connection, not from a missing token.
+
+Every tab is a fixed frame whose regions scroll
+
+Operator feedback (2026-10-14): scrolling a long design carried the Design / Plans / Tasks / Prompts
+tabs off screen with it, and the Sessions tab filled only part of the window. Both are one defect in
+the shell, not in the tabs. Each top-level tab already roots at `height: 100%` and gives its own
+regions `overflow: auto` (the design sidebar, the document, each view pane, the Tasks list and its
+detail, the session list and its preview, the Workflows lists and graphs, the Container body), but the
+`.pane` section `App.tsx` wraps each tab in has no height, so the 100% resolves to the content's
+height, none of those regions ever overflows, and `.panes` scrolls the whole tab instead. (Read from
+the CSS, not yet measured in the running app.)
+
+The rule lives in the shell, so no tab has to remember it: the pane is exactly the row between the top
+bar and the terminal (`.pane` `height: 100%; min-height: 0`), `.panes` itself never scrolls, and a tab
+scrolls only inside its own regions. **Fixed:** the top bar and tab strip; in the Design tab the
+sidebar's header, the design's title row and its four view tabs, and the Document's *See next* bar;
+each view's own bar (`.pane-bar`) in Plans, Tasks and Prompts; the Sessions tab's filter row.
+**Scrolling, each on its own:** the sidebar tree, the document with its thread margin, each view's
+body, the Tasks list apart from its detail, the session list apart from its preview, the Workflows
+lists and graphs, and the Container body. The Electron smoke pins it per tab: with content taller
+than the window, `.panes` has nothing to scroll and the tab's header is still in the viewport after its
+body is scrolled to the end.
 
 ## Trust: the app runs from an installed copy, updated from `main`
 
@@ -668,6 +690,8 @@ Built as the Document pane: `@jkb/core`'s `design.ts` (the answers' shapes and d
 live-update message, and `stateRuns`, the span-state derivation the editor draws), the app's
 `src/main/designFeeds.ts` (the live feeds), `src/renderer/src/design/` (`session.ts` the Yjs peer,
 `editor.ts` the CodeMirror extensions, `DocumentEditor.tsx`, `discuss.ts`, `registry.ts`) and
+`tabs/DesignTab.tsx` (the design view and its tabs), `design/DesignSidebar.tsx` (the design tree) and
+`design/ReviewBar.tsx` (*See next*); it began with repo and design pickers, which the sidebar replaced.
 
 ### *Discuss* turns a selection into a Claude session, and is an op first
 
@@ -814,7 +838,21 @@ per design. Chosen over the side-by-side columns, which left the document too na
 ### The design list is a sidebar tree, like Notion's
 
 The repo and design dropdowns are replaced by a collapsible sidebar on the left: repos at the top level,
-designs under them, child designs under their parents.
+designs under them, child designs under their parents. What is folded is per-window state. Each row
+shows a thin bar of the design's span states and its unreviewed share, from `design.list` asked with
+`review: true`: non-whitespace characters per span state (`DesignText::state_counts`, the spans'
+derived states, a demoted span whole as PROPOSED). It reads every document, so it is opt-in, and the
+app re-reads it a second after any approval or staging on an open design.
+
+**A parent's bar covers its subtree** (operator feedback, 2026-10-14). A row's bar and unreviewed share
+sum the counts of the design and of every design under it, so a parent (folded or not) says how much of
+its whole tree is unreviewed, not only of its own text. The sum is the app's, over the tree `design.ls`
+already returns with each design's own `review` counts; nothing new is stored or served. *See next*
+still skips by a design's **own** counts, since it walks the passages of one document at a time.
+
+**The sidebar's width is the operator's** (2026-10-14). A drag handle on its right edge resizes it, as
+Notion's does, between 180px (a row's title and bar stay legible) and half the window; double-clicking
+the handle restores the 260px default. The width is per-window state, like what is folded.
 
 ### Designs nest: a child design is contained by its parent
 
@@ -858,6 +896,8 @@ the one `docs/` file. The children have no doc target of their own, so `docs/` a
 The Document pane has *Previous* and *Next* unreviewed buttons with an "n of m" counter, and the `n` and
 `p` keys when the editor is not focused. Unreviewed means reads PROPOSED: uncovered text and demoted
 spans, from the same `stateRuns` the editor draws, so the walk can never disagree with the colours.
+Past the last passage, *Next* opens the next design in the sidebar's order and moves to its first
+unreviewed passage. Designs with nothing unreviewed by the sidebar's counts are skipped.
 
 ### Selected text offers its actions beside it: comment, approve, discuss
 
@@ -1307,6 +1347,23 @@ The list is `session.list` joined with notify state (`notify_sessions`: `awaitin
 `awaiting_tool`). The **red dot**, on the tab and on the session, is `awaiting_user`, fed by the app's
 own consumer group on `claude/notify`, the same stream the macOS notifier reads. A permission prompt
 (`awaiting_tool`) is shown as *awaiting permission: Bash* on its row, without the dot.
+
+### A design's prompts are in the list too, ended or not
+
+Operator feedback (2026-10-14): every prompt recorded on a design appears in the Sessions list, not only
+the sessions the registry holds. The registry has a row only for a session whose hooks ran, so a
+design's *Discuss* or *Play* session from before a rebuild was in that design's Prompts tab and nowhere
+here. The list is the registry joined with every design's prompts **by session uuid**, which is exact
+because a prompt's uid is `prompt:<uuid>`. A session in both is one row that also names its design and
+subject. A prompt with no registry row is an ended row, named by its design and subject, and resumes
+through `sessionResumeSpec` from the prompt's recorded directory, as the Prompts pane does. *Ended too*
+hides and shows those rows as it does ended registry rows.
+
+The prompts come in one read, not one `design.prompts {uid}` call per design: the first piece is a
+repo-scoped form of that op (every live design's prompts in a repo, each with its design uid), with the
+CLI beside it per "An app over jkb is a client of the op set". The tab's filling only part of the window
+is the shell's defect, not this tab's (the shell design, "Every tab is a fixed frame whose regions
+scroll").
 
 ### The state is derived once, in Rust, and carried
 
