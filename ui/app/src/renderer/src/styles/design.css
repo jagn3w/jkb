@@ -3,10 +3,23 @@
 
 /* The tab: the design tree on the left, the open design on the right. */
 .design-tab {
+  position: relative;
   display: grid;
-  grid-template-columns: minmax(200px, 260px) minmax(0, 1fr);
+  /* The sidebar's width is the tab's inline style (useSidebarWidth); this is it before that applies. */
+  grid-template-columns: 260px minmax(0, 1fr);
   height: 100%;
   min-height: 0;
+}
+
+/* The sidebar's drag handle, on its right edge: outside the sidebar, so it stays put as the list scrolls. */
+.sidebar-resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  margin-left: -3px;
+  cursor: ew-resize;
+  z-index: 1;
 }
 
 .design-main {

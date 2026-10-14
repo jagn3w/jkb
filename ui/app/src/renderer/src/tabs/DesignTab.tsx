@@ -27,6 +27,7 @@ import { SessionRegistry, type RegistryNotice } from "../design/registry";
 import { ReviewBar } from "../design/ReviewBar";
 import { TasksView } from "../design/TasksView";
 import { ThreadMargin } from "../design/ThreadMargin";
+import { useSidebarWidth } from "../design/useSidebarWidth";
 import { useThreads } from "../design/useThreads";
 import { usePlans } from "../design/usePlans";
 import type { DesignSession, SessionBridge, SyncStatus } from "../design/session";
@@ -601,6 +602,7 @@ export function DesignTab(): React.JSX.Element {
     },
     [load],
   );
+  const sidebar = useSidebarWidth();
   const onRestore = useCallback(
     async (uid: string): Promise<void> => {
       setNotice(undefined);
@@ -611,7 +613,17 @@ export function DesignTab(): React.JSX.Element {
   );
 
   return (
-    <div className="design-tab">
+    <div className="design-tab" style={{ gridTemplateColumns: `${sidebar.width}px minmax(0, 1fr)` }}>
+      <div
+        className="sidebar-resize"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize the design list"
+        aria-valuenow={sidebar.width}
+        title="Drag to resize; double-click for the default width"
+        style={{ left: sidebar.width }}
+        {...sidebar.handle}
+      />
       <DesignSidebar
         tree={tree}
         active={design?.uid}
