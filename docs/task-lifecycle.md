@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:task-lifecycle-18dcdeffaafbcfd87c069f, edit there (version 115.cYGwr8r1378CAYKo9cTruwUBh8rc4biU9QIBjOSnvIrrzQ4BjLzKt5Cd2AUBjvz45fSu2A0Bj5TL-7iHgwYBkMil2eDEzAMBjdLbv9f-9wQBkrivg62IuQ4BlpLLyPLkmAEBlpT2grSY0gQBl_KTjajtuwkBm4berKa5_gYBnuDUwZGG8gMBofblneKFuA0BotCO-afV7wgBqOjc06jB-QIBrJKai5vD2gIBrcLivemFyQQBsqqj8brGiQwBs7zX_LLn6AUBtf7U0ZCpvAwBtuaOpse_oAkBtsqjha2ppQQBtpiMnZfPgQsBvvax4ZGW2wYBwfzcsMibxAwBw6ratsvXCAHE1I7tgKvsDgHD6NWzpfupCQHGpqG-2-zGCQHH5KKojMwiAdCIrOa8rq8JAdSskO2_1bwFAdXGhL2xm7cPAdWOyaW7hIIDAduG3dnJiLQEAeDm5sGD6rUHAeHavY3KjZsLAeLaoqqpz6IJAeCOzej_k80CAerMz_K_94UBAeqK9aq5hPkGAfDS-NWr5ckLAfOytMOG4t4EAfS0t6v-o_ANAfX-rtmt-vEEAfaiw-aFpYANAfbslevNyHoB_Yjoid2wkQYB_dakx6mh3w0B_9yx8p6JmwoBgKm_lbr31Q0BgZ27_JT9rAMBhIWS9IeapA0Bhae59vPx-AoBhqHwycuzxAoBh4fWg8q79Q0Bit-6l4Wprw0BjdHWvb2O-A4BjcfDyc_llg8Bj5fqg9GohQcBk7Hmg4uU2AkBk5PmlsyXlgkBk7-h2qSg3ggBlqmrgaP4qgKs5wWXpeGpjb_VBAGYn8LK3t-nCwGZqdfqnNn-CAGa8eSp-v2-BAGg1bamxrlnAaKftbHfki4Bo4PB_PfpsAwBpdmYyJPIvgsBqImgkqXz8Q0BqaOkiNPXpwoBqbGkpNyznAIBrvHo_pyBeAGup5_Mj4LBCAGyhauIiO-UDwG02eeoz_eAAgG0yZ7Jn8PFCAG32bXx-an3DAG7kcGOj47YDgG-pfjsvNPRAwG-9aO5xPbECwG_x6_K2-u2DgHC5au0qq-dCAHIyYSv9rvyDgHMw9-08LDJCAHNkfDcsY_gDQHOu5bAvpvPB5wL0Lu07_eSWAHan4mk1JWmBwHc27ajqYWtAwHfh9baiOzxCgHgnaay18bLAwHflfjBpdb3CwHlwZbF2s7CCwHljaWUkvyeCQHsu82uhsiICwHur6L-yN7zDgHw95Dh9o-xAwHx0avxlrPECAHyy4jLntqlCgHz18zIqq7BCgH3196ovJTtCwH4hcO45MLZDAH43cKC95LLAgH6t5nE3pzwCAH5j4aOoarHBwH-uevR3deGCQE, blake3 bbdcab9a3e9f81cda81fab02a2d9c3e980547bb985c7bac3e7eef41a0a745b06) -->
+<!-- generated from jkb design design:task-lifecycle-18dcdeffaafbcfd87c069f, edit there (version 115.cYGwr8r1378CAYKo9cTruwUBh8rc4biU9QIBjOSnvIrrzQ4BjLzKt5Cd2AUBjvz45fSu2A0Bj5TL-7iHgwYBkMil2eDEzAMBjdLbv9f-9wQBkrivg62IuQ4BlpLLyPLkmAEBlpT2grSY0gQBl_KTjajtuwkBm4berKa5_gYBnuDUwZGG8gMBofblneKFuA0BotCO-afV7wgBqOjc06jB-QIBrJKai5vD2gIBrcLivemFyQQBsqqj8brGiQwBs7zX_LLn6AUBtf7U0ZCpvAwBtuaOpse_oAkBtsqjha2ppQQBtpiMnZfPgQsBvvax4ZGW2wYBwfzcsMibxAwBw6ratsvXCAHE1I7tgKvsDgHD6NWzpfupCQHGpqG-2-zGCQHH5KKojMwiAdCIrOa8rq8JAdSskO2_1bwFAdXGhL2xm7cPAdWOyaW7hIIDAduG3dnJiLQEAeDm5sGD6rUHAeHavY3KjZsLAeLaoqqpz6IJAeCOzej_k80CAerMz_K_94UBAeqK9aq5hPkGAfDS-NWr5ckLAfOytMOG4t4EAfS0t6v-o_ANAfX-rtmt-vEEAfaiw-aFpYANAfbslevNyHoB_Yjoid2wkQYB_dakx6mh3w0B_9yx8p6JmwoBgKm_lbr31Q0BgZ27_JT9rAMBhIWS9IeapA0Bhae59vPx-AoBhqHwycuzxAoBh4fWg8q79Q0Bit-6l4Wprw0BjdHWvb2O-A4BjcfDyc_llg8Bj5fqg9GohQcBk7Hmg4uU2AkBk5PmlsyXlgkBk7-h2qSg3ggBlqmrgaP4qgKs5wWXpeGpjb_VBAGYn8LK3t-nCwGZqdfqnNn-CAGa8eSp-v2-BAGg1bamxrlnAaKftbHfki4Bo4PB_PfpsAwBpdmYyJPIvgsBqImgkqXz8Q0BqaOkiNPXpwoBqbGkpNyznAIBrvHo_pyBeAGup5_Mj4LBCAGyhauIiO-UDwG02eeoz_eAAgG0yZ7Jn8PFCAG32bXx-an3DAG7kcGOj47YDgG-pfjsvNPRAwG-9aO5xPbECwG_x6_K2-u2DgHC5au0qq-dCAHIyYSv9rvyDgHMw9-08LDJCAHNkfDcsY_gDQHOu5bAvpvPB5wL0Lu07_eSWAHan4mk1JWmBwHc27ajqYWtAwHfh9baiOzxCgHgnaay18bLAwHflfjBpdb3CwHlwZbF2s7CCwHljaWUkvyeCQHsu82uhsiICwHur6L-yN7zDgHw95Dh9o-xAwHx0avxlrPECAHyy4jLntqlCgHz18zIqq7BCgH3196ovJTtCwH4hcO45MLZDAH43cKC95LLAgH6t5nE3pzwCAH5j4aOoarHBwH-uevR3deGCQE, blake3 472a59c9d7b7f7870014d1ab6feb147233d94f5140e8c1aa259b2ceb840dc018) -->
 # Task lifecycle
 
 How a task moves from the frontier to merged. A task is decomposed into subtasks, so the
@@ -80,8 +80,6 @@ two meanings in one file for the three-way merge to disentangle. The other rejec
 The `parent_of` and `derived_from` edges carry what a containment row cannot: `edge::link`'s
 cycle guard, `jkb related` traversal, `derived_from` as the provenance search reads for
 `source_document`, and the `tasks` serializer's indentation round-trip and three-way merge
-`Sig`. `task::add_subtask` writes the edge and the containment row in one call so they cannot
-drift.
 
 ### Containment is a behaviour, not a node kind
 
@@ -262,7 +260,12 @@ session state file to drift.
 ### The session verbs
 
 `jkb task work <uid>` opens a session or *returns* the existing one. It is idempotent, so the
-button cannot fork the work. `jkb task land` integrates it (below). `jkb task abandon` drops it.
+button cannot fork the work. `jkb task land` integrates it (below). `jkb task abandon` drops it, under the land lock: it removes the worktree a land grafts from, so
+it takes the repo's `land:<repo>` lease before reading anything, as `land` does, and refuses at
+once while a live land holds it. Without it, an abandon run mid-gate archived the session and
+reopened the task, and the land then finished its graft: the commits on the target, the task
+`open` with its session gone. It refuses rather than waits, because a gate can run for minutes
+and the abandon can simply be re-run (`abandoning_refuses_while_a_land_holds_the_land_lock`).
 `jkb task sessions` lists what is in flight. `jkb task gate` shows or sets the verify command.
 
 ### The land target: the branch you started from, or one cut for the batch
@@ -452,10 +455,21 @@ left it held.
 
 `task.take` **judges** `task work`'s location before any git work: it writes the facets for trial
 in a savepoint, checks the task's `tasks.md` line, and rolls the trial back, so a refusal (a line
-that could not carry the place) leaves nothing to undo. `task.locate` records the location once
+that could not carry the place) leaves nothing to undo. The claim is judged before any git side
+effect too: `judge_claim` is the read-only half of the take, asked before `task work` writes
+`.git/info/exclude` or cuts a land target, and the take consumes its `JudgedClaim`, so it cannot
+run on a claim nobody judged (765eaa8). Before, a task held by another live owner was refused
+only at the take, after those writes. The pre-check honours whatever refusal `task.facts`
+reports, which is the machine's own verdict that the state has no `start` edge, instead of
+filtering it through a second copy of `is_terminal`, which dropped the refusal of a non-terminal
+task until the write after the git work (860131b). `task.locate` records the location once
 the worktree exists, and only while the run still holds the claim, so a displaced run cannot
 overwrite what its successor recorded. The take's `start` entry carries no branch or land
-target; `task.locate` adds a `note` carrying them when they changed. Writing the location with
+target; `task.locate` adds a `note` carrying them when they changed. `task.start` writes one
+history row per start: its `note` is written only when no transition row was (a kept claim, or an
+idempotent re-start). It used to follow every `start` row with a `note` repeating its labels,
+with no agent and `from == to`, so `jkb task why` showed one start as two entries (860131b,
+`a_start_is_one_entry_in_the_history`). Writing the location with
 the claim, as the first fix did, left a run that then failed its git work pointing the task at a
 branch nobody made, which `close-merged` would wait on for ever.
 
@@ -591,7 +605,6 @@ The round's remaining concerns were "a rule every call site must remember" one l
 each moved into a callee: the identity fence into `deletions_only`, the head check into
 `delete_branch_if_any` (`DropRecord` deletes branches too), and `target_dirty_reason` took the
 `Option` instead of two call sites each carrying an argument for why collapsing it was safe,
-arguments that for that consumer were both wrong.
 
 ## Staging branches and review-gated landing
 
@@ -658,7 +671,6 @@ was the question every consumer had. So `ahead_count` **refuses** an operand it 
 rather than returning zero, since zero is a load-bearing answer ("nothing to land") and a count
 that could not be taken must not be spelled the same way. `land_preflight` asks `branch_ref` for
 the same reason: it asked `has_branch` while the row asked remote-inclusively, so one shared
-blocker printed two opposite explanations of the same task.
 
 ### The staging branch is chosen, not inferred
 
@@ -838,8 +850,6 @@ no network, no GitHub remote, an unrecognized state, a parse failure (which is `
 rather than an empty list, since an empty list reads as *no pull request* and would let a task
 close on the strength of a schema change). The task is then *held with the reason printed*. It
 also gives an answer the inference never could: *closed without merging*. `close-merged` reports
-two buckets where it had six, each held task carrying the guard's own reason, and `--trunk` is
-gone.
 
 ### `gh`'s interface is verified against `gh`, not memory
 
@@ -983,7 +993,9 @@ run in a test: `Nondeterministic` (two rows for one `(from, event)`, never last-
 `UnreachableState`, `Wedged` (no path to a settled state), `NoSettledState`,
 `UnguardedReconciliation`, `UnusedEvent`. An undeclared pair is `Outcome::Undefined`, a named
 refusal, so no arm falls through to "do nothing quietly", which is how `--onto` was once silently
-ignored. `Machine::audit` is the dynamic half: `UnreachableRemedy`, `DeadEnd` (under some
+ignored. The refusal names the object in each machine's own words, `State::NOUN` with its article
+(`"a task"`, `"an investigation unit"`), required rather than defaulted, because the default it
+replaced said "task" in every machine's refusals (d01e3b3). `Machine::audit` is the dynamic half: `UnreachableRemedy`, `DeadEnd` (under some
 observable context a non-settled state accepts nothing: "held for ever", which static liveness
 cannot see because every path out is guarded), `AmbiguousReconciliation` and `UncoveredState`.
 
@@ -994,9 +1006,7 @@ so every check is shown to fire rather than merely to exist.
 
 Some events take a destination the caller names (`Dest::Stated`): an operator override, a synced
 file's checkbox. Such an edge is excluded from the liveness walks, because a state whose only exit
-is somebody naming a different state is still wedged; an escape hatch is not an exit. It does count
-for reachability: *can the object be here* is answered yes by an override. Collapsing the two
-reported `abandoned` investigation units, which only a person sets, as unreachable dead code.
+is somebody naming a different state is still wedged; an escape hatch is not an exit.
 
 ### Every verb is answerable at its own destination
 
@@ -1167,12 +1177,18 @@ was the symptom of a bad rule underneath, the more useful half.
 ### `task_transitions` is append-only, and makes no claim about the present
 
 `V015__task_transitions.sql` is an append-only history: one row per transition, with the actor and
-the evidence each guard fired on, indexed by item and by branch, `ON DELETE CASCADE`. Two facts
+the evidence each guard fired on, indexed by item, `ON DELETE CASCADE`. Two facts
 outlive git's memory, where a branch landed and that it landed, and an append-only history makes no
 claim about the present, so there is nothing to reconcile: a branch name that changes hands appends
 a row rather than corrupting one, and superseding stops being an operation. `transition::note`
 records a fact that is not a transition (learning a pull request number), spelled `note` in the
-`event` column. Reads: `history`, `latest_with_branch`, `land_target`, `landed`, `pull_request`.
+`event` column. Reads: `history`, `latest_with_branch`, `land_target`, `resumed`, `current_landing`, and `landing`,
+which returns the landing, the resumption, the pull request number and any recorded *no pull
+request* from one read. V015 also indexed the table by branch; V028 dropped that index, because the
+only `SELECT` is `history`, by item, and the table is otherwise only appended to (checked by
+grepping every statement that names it, and pinned by a test that `EXPLAIN QUERY PLAN`s the history
+read). `Landing::recorded` keeps only the **latest** landing: a task that landed on one branch and
+was re-landed on another shows only the second (f6c3a1d, `recorded_is_the_latest_landing`).
 
 It is deliberately **not** changelogged (the `blobs` precedent): it *is* an audit record, and a
 transition later reverted by `jkb undo` stays, which is the honest reading of a history.

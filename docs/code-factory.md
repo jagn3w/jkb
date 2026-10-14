@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:code-factory-18dcdf2fb12449281bfddd, edit there (version 190.vQGBvNO6msyoB_rFCIGwstrHwusCAYPk-8DR24cLAYTMr_Tq1_MLAYXq3P7A984LAYiK45y_poUMAYjYpJeL5P4EAYqq0IzWw7kOAYzWtJT0jKoKAY2kkZP5g8oKAYyqsdfz5NAMAY-az8Hcte8GAY-wosv2818BkIC16MGKswMBkoKMuY6DrwQBkvD9lOWmzwcBlMKR7O3w1wEBlIL7sf7LngwBlpCGpdez7QoBl7CU1pPXywoBlura69iFvwUBmOTQrpOipA0BmrLImt2xrQkBm-6Y5rKg_w4Bm_qHj-HcoAkBncjY0p2XjwIBnZCc_peF7A8Bnqzlm7r31wgBoJb0rpKdqQkBn5qZw9iJ4gUBouSgvJLX_ggBo7LWrP71UAGk3s_Mj6_aCAGl1uPKsNK3CwGm5q_AqJiLCQGPpq73wcTTCwGo6v7iroX-BQGp-PTz74oqAai2idLR8doJAaSQnd_drpAPAZ2Uq8DYxc0BAa3khoi2s9ANAa3mopOTioIKAayexM-KrYMHAbDKn_vr9ZINAbCUkd3H-7cGAbOGuIqBlMcLAbTS1uTIp-EFAbmwyeSB3JMJAbmou6TgjY4DAbuW_qOSx_MHAb3Ggr_2q98HAb3G0uLv9NkEAb3m9YyN8-ADAcC0zNfA8ucPAb3yxba3uq8MAcKK99nyxcIBAcXUkPm4ipgGAcjIwM2owfgGAcmw3rTSuswIAcqCp474oO8FAcvcjPOPndEGAcqgrIDxtf8H_gbNmL657Nm3DgHSivuxqsGjDQHT8qSDoI_AAgHUpP7_kOSrCwHVzIGE-oeLAQHV1Izx_LSjDAHWypCJ7pEPAdjIvZTsy9kKAdjymIrMq7sEAdiGtYqu3fMLAd7oy9uj_N8CAd-01a-h58gKAd-Cq8Ku6s8CAd78_6e5jtELAd_4xY_u6BYB3ob20cqusw0B4PqS-IWNmw4B48CKvvu-_wsB5v6ZgbDTqwcB57SY1affkg4B6bbusLqoAQHpnqDUvenvCwHp2L_7nY7pCAHs6O_A2-PPAwHwjJLq0eyHCwHxzu_r7u-bBQHwpIfS_u-jCAHz9uuS3Ka8BQH0ypuU_J6SDAHy3NCEqcHxBAH55rusypC2AQH73oXYvPeVDAH7xIrqmfr1DAH9xvbsoOyLCAH_8KO0wef1CAGA4Y3DypGfCQGC0a-U44H9AgGCn8TCkdf-BgGG6d_F2bPXAQGGgYeu3rWTBQGI9_eo0YimBAGI_afl5_T9BwGG08b43uVVAYvVzs2dyYgOAYyj5b-a9JUHAYyls7_MkJkPAYeZnM_TtpQPAYjBk6vk8e8LAY2d0cf75tEGAYmNm6aA6JQDAYj9tLXz39oFAZPBqunAhqgOAZSl9JPDv8sGAZO_39LjpI4NAZannIH7gF8Bl7PuhsHn5g4BmJvM55DE3AIBmN2Ck8Wo-AYBj7uQ6NOigwUBnLu78oH1kgsBoMf34YSF-wgBoqP0l4273AIBosXa_r-n9A0BpNHW5eHWngMBpYnzwYnnrgoBpsHDzMuDmQYBp-HQmpOJ2gEBqOuhzZmg4wgBqq3nje-EvQgBq_-wn87ppwUBruGD8OiwhwEBsfXKkP7ulgEBsvO-w7rAlwMBs83k046RiAoBtIePgurO5AMBtZWtx4XayQ4BtuHs4fmtwAsBu52__cH5tgYBvbfCsaaSrgQBvom7tYXy-AoBv-f26v65NAHA-47i8v6pAQHAzfiXqpnEAwHCifv8l--qBQHDvYLolu21AgG95fuOhu6LCQHF6cTuo8PICQHEu-zlmtIKAcivzvGluaICAcmTktr85wIByvfAt6Gwyw0BzPnTxZWd2Q0Bz52pnJTHuA4Bz7f99aqWnw0B0o2o-Ka2wQIB2NP0pqGi5AkB2f--u7z7ig8B2pOAkd-YrgoB3OGOzdqA7QsB3fPkipmo5gUB3rfT1vfnDQHf05eDju_KBAHe59KYq-OMDwHjl9a-g6SJBwHm2dj3sMDDBAHnuZnprJGICQHpzcCOuP3YDgHr9YD4rN7nDQHs9fby-5OECQHtzaTi6NjkCgHsz-y1sMn9BQHvldKv_NukCAHw88Kp9YjdCQHx7cjMvs-BBgHs-aPwx6C1BAHzq_DEhMjMDgH065OnjoTEBAH1ucmgvZhiAfST2Kqlzv8GAfP504H-0NEFAfi56YXT9-ENAfnZmKLW8s0MAfmphsTi5Z8CAfrrkLL4lOYKAfyF3ve5iPwFAfmxx_3E8dEMAQ, blake3 a727c03701411e84078d9c1a6fd969b04585e4cbe86afd2850c23fb260163e25) -->
+<!-- generated from jkb design design:code-factory-18dcdf2fb12449281bfddd, edit there (version 216.1QGBvNO6msyoB_rFCIGwstrHwusCAYPk-8DR24cLAYTMr_Tq1_MLAYXq3P7A984LAYiK45y_poUMAYjYpJeL5P4EAYqq0IzWw7kOAYzWtJT0jKoKAY2kkZP5g8oKAYyqsdfz5NAMAY-az8Hcte8GAY-wosv2818BkIC16MGKswMBkoKMuY6DrwQBkvD9lOWmzwcBlMKR7O3w1wEBlIL7sf7LngwBlpCGpdez7QoBl7CU1pPXywoBlura69iFvwUBmOTQrpOipA0BmrLImt2xrQkBm-6Y5rKg_w4Bm_qHj-HcoAkBncjY0p2XjwIBnZCc_peF7A8Bnqzlm7r31wgBoJb0rpKdqQkBn5qZw9iJ4gUBouSgvJLX_ggBo7LWrP71UAGk3s_Mj6_aCAGl1uPKsNK3CwGm5q_AqJiLCQGPpq73wcTTCwGo6v7iroX-BQGp-PTz74oqAai2idLR8doJAaSQnd_drpAPAZ2Uq8DYxc0BAa3khoi2s9ANAa3mopOTioIKAayexM-KrYMHAbDKn_vr9ZINAbCUkd3H-7cGAZbAr4fo8a4F9x2zhriKgZTHCwG00tbkyKfhBQGd0PC7moDXCdkBnt7zobz2ywEBsbC4t_GC_gGVAbmwyeSB3JMJAbmou6TgjY4DAbuW_qOSx_MHAb3Ggr_2q98HAb3G0uLv9NkEAb3m9YyN8-ADAcC0zNfA8ucPAb3yxba3uq8MAcKK99nyxcIBAcCC6NmboDUBvpS8g6LqxAQ6xdSQ-biKmAYByMjAzajB-AYBybDetNK6zAgByoKnjvig7wUBy9yM84-d0QYByqCsgPG1_wf-Bs2Yvrns2bcOAdKK-7GqwaMNAdPypIOgj8ACAdSk_v-Q5KsLAdXMgYT6h4sBAdXUjPH8tKMMAdbKkInukQ8B2Mi9lOzL2QoB2PKYisyruwQB2Ia1iq7d8wsB0s6H1MzwxQvFAdbYooubv8MO6gHXwPbBwYGeC0Te6Mvbo_zfAgHftNWvoefICgHfgqvCrurPAgHe_P-nuY7RCwHf-MWP7ugWAd6G9tHKrrMNAeD6kviFjZsOAePAir77vv8LAeb-mYGw06sHAee0mNWn35IOAeea6MSR2bMNAem27rC6qAEB6Z6g1L3p7wsB6di_-52O6QgB7OjvwNvjzwMB58zVxNPLvQfEAfCMkurR7IcLAfHO7-vu75sFAfCkh9L-76MIAfP265LcprwFAfTKm5T8npIMAfLc0ISpwfEEAfHQ04uniMEHwAP55rusypC2AQH73oXYvPeVDAH7xIrqmfr1DAH9xvbsoOyLCAH-sLH_roupCFL_8KO0wef1CAGA4Y3DypGfCQH9uMn_0vfhCLYBgtGvlOOB_QIBgp_EwpHX_gYB_NTx2r6wngQBhunfxdmz1wEBhoGHrt61kwUBiPf3qNGIpgQBiP2n5ef0_QcBhtPG-N7lVQGL1c7NncmIDgGMo-W_mvSVBwGMpbO_zJCZDwGHmZzP07aUDwGIwZOr5PHvCwGNndHH--bRBgGJjZumgOiUAwGI_bS189_aBQGTwarpwIaoDgGUpfSTw7_LBgGTv9_S46SODQGWp5yB-4BfAZez7obB5-YOAZibzOeQxNwCAZjdgpPFqPgGAY-7kOjTooMFAZmnyJSsl9kOqgScu7vygfWSCwGgx_fhhIX7CAGho8euuPeeDgGio_SXjbvcAgGixdr-v6f0DQGk0dbl4daeAwGlifPBieeuCgGmwcPMy4OZBgGn4dCak4naAQGo66HNmaDjCAGh05vr2YuTCZEQqq3nje-EvQgBq_-wn87ppwUBrfWz2IWCsATNAa7hg_DosIcBAbH1ypD-7pYBAbLzvsO6wJcDAbPN5NOOkYgKAbSHj4LqzuQDAbWVrceF2skOAbbh7OH5rcALAbudv_3B-bYGAb23wrGmkq4EAb6Ju7WF8vgKAb_n9ur-uTQBwPuO4vL-qQEBwM34l6qZxAMBwon7_JfvqgUBw72C6JbttQIBveX7jobuiwkBxenE7qPDyAkBxLvs5ZrSCgHCp5KyxIKlDwHIr87xpbmiAgHJk5La_OcCAcr3wLehsMsNAcmFkc0BAsz508WVndkNAcCJ7IXIqYwC_QLPnamclMe4DgHPt_31qpafDQHSjaj4prbBAgHY0_SmoaLkCQHZ_767vPuKDwHak4CR35iuCgHc4Y7N2oDtCwHd8-SKmajmBQHet9PW9-cNAd_Tl4OO78oEAd7n0pir44wPAeOX1r6DpIkHAebZ2PewwMMEAee5memskYgJAenNwI64_dgOAev1gPis3ucNAez19vL7k4QJAe3NpOLo2OQKAezP7LWwyf0FAe-V0q_826QIAfDzwqn1iN0JAfHtyMy-z4EGAez5o_DHoLUEAfOr8MSEyMwOAfTrk6eOhMQEAfW5yaC9mGIB9JPYqqXO_wYB8_nTgf7Q0QUB-LnphdP34Q0B-dmYotbyzQwB-amGxOLlnwIB-uuQsviU5goB_IXe97mI_AUB-bHH_cTx0QwB_dP3mu2MDQH328C_6tCWDAE, blake3 74ab9181bcd686f5f5c68ef2087db471a53e271b55ce4e8c744c724bb1051256) -->
 # Code Factory
 
 Code Factory is the first standalone app on jkb: one place to **design, plan and implement** with
@@ -508,10 +508,46 @@ editor re-reads states after every update and gap.
 until its first update, so the app could not subscribe to it. `design::create` now creates it;
 publishing still does too, for a design made before.
 
-### A design cannot be removed, and its creation is undone only while nothing later depends on it
+### A design is retired, never deleted, and its creation is undone only while nothing later depends on it
 
-`item::remove` refuses a design, even with `--force`: its updates are not in the delete's snapshot, so
-`jkb undo` would bring back a design with no text. Undoing a design's creation is refused while later
+`jkb design retire <uid>` sets the design's `resolution` to `abandoned`; `restore` clears it. A
+retired design leaves `jkb design ls`, the Design tab's tree, and `jkb design export --all`
+(`design::list` is the one reader all three ask, so there is one filter, not three), and is listed
+by `ls --retired` / `design.list { retired }`. Nothing else moves: its spans and their approvals,
+plans, steps, threads, prompts, doc target, sources and topic are keyed to an item that still
+exists, so `jkb design cat` still reads it and `jkb undo` of a retire is an ordinary column restore
+(`Inverse::Columns`), no new inverse. Retiring is recursive over nested designs in one transaction,
+so one undo restores the tree; restoring a child under a retired parent is refused, the parent
+first. A child retired on its own before its parent is left out of the parent's retire, so undoing
+that retire changes only what it changed; `restore` makes the whole tree live, that child included.
+It is refused while a non-terminal task is contained anywhere under the tree, not only under a
+step (named; finish or cancel them first); done and cancelled tasks stay contained. Nothing is
+nested or split under a retired design, and a retired child drops out of its parent's exported
+text. A retired design with a doc target keeps its generated file: `export --all` reports it
+skipped, `export <uid>` and setting its doc target are refused in core (so every client gets the
+refusal), `--check --against-db` names the file as belonging to a retired design, and the operator
+`git rm`s it. Retire and restore are operator-only (`Admin`, like `item.rm`): hiding work from
+every role is not a designer's call. They are also the only writers of a design's `resolution`:
+`item::set_resolution` refuses a design, since `jkb inv resolve` (a task-writer's op) could
+otherwise retire one past both checks (review round 1), and retire and restore write through a
+setter only the design module can call.
+
+`item::remove` refuses a design by kind, with or without a document, and says `retire`. It refused
+only through `holds_document`, so an empty design was deletable and its undo would bring back a
+design with no text; this text once said it refused a design "even with `--force`", which held only
+for a design with updates. What it cost to learn: the first draft was a real delete with undo. An
+item delete's snapshot would have to carry `design_updates`, `design_snapshots`,
+`design_doc_targets`, `design_sources` and every contained item (span, plan, step, thread, comment,
+prompt) with each one's own placements, edges and tags, recursively, and restore them under their
+original ids. That is the mechanical before-image pass the foundation design defers to `SQLite`'s
+session extension, not a verb. Rejected: a `metadata.retired` key (metadata is logged as one column,
+so undoing an older metadata write silently flips it back); `status = 'cancelled'` (`status` is the
+task axis, and a design is not a task); moving the item to an `_archive` namespace (`list` and
+`export` derive the repo from the namespace, and an archive-by-location is a name every reader must
+remember); a new `retired` resolution value (a rebuild of `items` for one word `abandoned` already
+says).
+
+Undoing a design's creation is refused while later
 work would cascade away with it: the design-owned tables carry `txn_id` and are listed in
 `design::DESIGN_OWNED`, so the undo is refused while any holds a row a later transaction wrote. The
 rule, its scope (designs only, by an explicit list) and the generic guard tried and dropped are
@@ -632,7 +668,6 @@ Built as the Document pane: `@jkb/core`'s `design.ts` (the answers' shapes and d
 live-update message, and `stateRuns`, the span-state derivation the editor draws), the app's
 `src/main/designFeeds.ts` (the live feeds), `src/renderer/src/design/` (`session.ts` the Yjs peer,
 `editor.ts` the CodeMirror extensions, `DocumentEditor.tsx`, `discuss.ts`, `registry.ts`) and
-`tabs/DesignTab.tsx` (the repo and design pickers).
 
 ### *Discuss* turns a selection into a Claude session, and is an op first
 
@@ -739,7 +774,7 @@ the design's text.
 ### One session per design per window, reused
 
 `design/registry.ts` keeps the sessions, and edits outlive the pane that held them. A pane *attaches* to
-the registry's session for a design and *detaches* when it stops showing it, by picker, *Jump to
+the registry's session for a design and *detaches* when it stops showing it, by the sidebar, *Next*, *Jump to
 context* or the tab closing. The session it leaves keeps sending what it holds and is disposed only once
 it has nothing unsent and no pane. Reopening the design reattaches to that same session, unless the
 session has stopped. A session owns the design's feed: it subscribes when it opens and unsubscribes when
@@ -761,6 +796,98 @@ single notice slot: every *Discuss* clears that slot, so an unread report of los
 the next click (round 3). A Refresh keeps the designs it already has while it loads and when it fails;
 emptying the list for a moment detached the open design.
 
+## The Design tab: navigation, nesting and review
+
+Operator feedback on the built tab (2026-10-11): the panes side by side were cramped, the design list was
+a dropdown, designs were too long to review (Code Factory alone was over 2,000 lines), and nothing took
+the reviewer from one unreviewed passage to the next. Nesting and splitting are ops and CLI first, then
+the UI, per "An app over jkb is a client of the op set".
+
+### The design view is tabs, like a pull request
+
+The open design is four tabs, after GitHub's pull-request page: **Design** (the Document pane),
+**Plans** (the Execution Plan pane and its archive drawer), **Tasks** (every task under the design's
+plans, grouped by step, with the Tasks pane as its detail) and **Prompts**. Each tab names its count:
+unreviewed passages, live plans, open tasks, prompts. The last tab is a per-window convenience, kept
+per design. Chosen over the side-by-side columns, which left the document too narrow to read.
+
+### The design list is a sidebar tree, like Notion's
+
+The repo and design dropdowns are replaced by a collapsible sidebar on the left: repos at the top level,
+designs under them, child designs under their parents.
+
+### Designs nest: a child design is contained by its parent
+
+A design may have a parent design, by the same containment edge subtasks use, so the tree is one read
+of the graph and nothing about it is stored twice. `design.move {uid, under}` (`jkb design mv <uid>
+--under <parent>`, or `--top`) re-parents one, refusing a cycle and a parent in another repo. Un-nesting (`--top`) is not built: it
+needs a containment delete that `jkb undo` can invert, and no op removes a containment row yet. A child
+is a whole design (its own CRDT body, topic, spans and prompts); only its plans are shared, below.
+
+A span is staged into a step of its own design's **tree**: `stage` and the derived state compare root
+designs (`tree::root_of`), not designs, so the plans of the root design can stage the spans of every child, and one plan can build a
+feature whose text is spread across children.
+
+### `design.split` turns sections into child designs, and keeps their approvals
+
+`jkb design split <uid> --base <token> [--level 2]` makes one child design per heading of that level,
+in order, moving each section's text out of the parent and leaving the parent the rest. A section runs
+from its heading to the next heading of that level or higher; headings inside a code fence are not cut
+at; the split is refused unless `--base` is the design's current version. It is one audited write, and
+`jkb undo` refuses it by name: undo is a forward update, so the restored text would be new characters,
+and the moved spans' anchors would cover none of them (measured: the first test of undoing a split left
+the span zero-width and unapprovable).
+
+Approvals survive the split. An approval attests to words by their Yjs ids, and moved text gets new ids,
+so the split re-records each moved span's approval in the same transaction: same reviewer, same
+approver, attested to the child's words, recording the design and version it was carried from; a carried span
+that would not read approved in its child refuses the whole split. The span's item moves to the child rather than being
+recreated, so its `stages` edges (and the derived STAGED/IMPLEMENTED) carry over untouched. Only a span
+whose approval holds at `--base` is carried; a demoted or PROPOSED span moves as PROPOSED, and the
+split refuses a heading that falls inside a span rather than cutting it. Chosen over re-approving every
+moved span by hand: the words are unchanged, so a second approval would attest to nothing new.
+
+### Export inlines the children
+
+A parent with a doc target renders its own text and then each child's, in tree order, depth first, into
+the one `docs/` file. The children have no doc target of their own, so `docs/` and the table in
+`CLAUDE.md` are unchanged by a split, and the generated header's hash covers the whole rendering.
+
+### *See next* walks the unreviewed passages
+
+The Document pane has *Previous* and *Next* unreviewed buttons with an "n of m" counter, and the `n` and
+`p` keys when the editor is not focused. Unreviewed means reads PROPOSED: uncovered text and demoted
+spans, from the same `stateRuns` the editor draws, so the walk can never disagree with the colours.
+
+### Selected text offers its actions beside it: comment, approve, discuss
+
+Selecting text in the Document pane brings up a short column of icons at the selection's right edge,
+like Google Docs: **Comment**, **Approve** and **Discuss** (the button that used to float over the
+selection). Each is an op first and a CLI command beside it, per "An app over jkb is a client of the
+op set".
+
+**Approve** approves exactly the words selected, at the version on screen. A selection that is
+exactly one span's text approves that span; any other selection makes a span over it and approves it
+in the same write (`design.approve_selection {uid, base, start, end}`). A selection that crosses an
+existing span's edge is refused rather than split. **Approving a selection is the operator's
+alone**: the op is operator-only (RBAC refuses every other principal), in the UI and from the CLI alike
+(`jkb design approve --find <quote> --base <token>`), so Claude never approves this way. Claude's own path is unchanged: `jkb design
+approve` of a span that names `claude` as its reviewer.
+
+**Comment** starts a thread anchored to the selection. A thread is an item (`kind = 'design_thread'`)
+contained by its design, anchored by two relative positions in the document's `threads` map as a span
+is, so it follows its words through edits and reads *detached* when they are deleted. Its comments are
+items contained by it, in order. **The operator starts threads; Claude replies** in them: starting a
+thread is the operator's, a reply is a `design` write any designer may make (`jkb design thread
+reply <thread> --text …`), and resolving one is the operator's. A thread is announced on the design's
+topic, so the open pane and any Claude session over the design hear it.
+
+Threads appear in a **right-hand margin**, each card level with the line its anchor starts on, as
+Google Docs places comments; the open one is highlighted with its words, and a resolved one folds away
+(shown again with a filter). The Prompts and Discuss machinery is unchanged: *Discuss* still starts a
+Claude session over the selection, and a thread can be handed to one (*Ask Claude* on the card), which
+starts the session with the thread's text and tells it to reply there.
+
 ## Execution plans, tasks and prompts are items and edges
 
 The cardinality the operator gave: **prompts (n:1) design (1:n) spans (1:n) execution plans (1:n)
@@ -768,8 +895,9 @@ tasks.** Plans and the Tasks pane were built with the engine in `crates/jkb-core
 the ops `design.plan_create`/`plan_step`/`plan`/`plans` and the *Play* prompts in
 `crates/jkb-api/src/designs/plans.rs`, and the CLI `jkb design plan ls|create|step|show` and `jkb
 design prompt play|task`; in the app, `@jkb/core`'s `plan.ts` (the shapes, the requests, the archive
-split, which tasks a Play pins) and `src/renderer/src/design/` `PlanColumn.tsx` (the Execution Plan pane
-and history drawer), `TaskPane.tsx` and `play.ts` (the terminal specs). Prompts were built with the
+split, which tasks a Play pins) and `src/renderer/src/design/` `usePlans.ts` (one read of the
+plans for both tabs, and *Play*), `PlansView.tsx` (the Plans tab and history drawer), `TasksView.tsx` (the
+Tasks tab), `TaskPane.tsx` and `play.ts` (the terminal specs). Prompts were built with the
 engine in `crates/jkb-core/src/design/prompts.rs`, the ops `design.prompt_record` (a designer's write),
 `design.prompts` (a read) and the *New prompt* prompt (`design.prompt` `{kind: "new", uid, text}`) in
 `crates/jkb-api/src/designs/prompts.rs`, the CLI `jkb design prompt record|ls|new`, and in the app

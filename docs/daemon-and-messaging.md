@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:daemon-and-messaging-18dcdf2a2d45d6f884c253, edit there (version 167.pgGE1J7o0dOTCwGFvsnWyuvJDAGGqJ7W_pWzCQGIoufM5rfTCgGI2LH6w6vJAgGLzITutqDlCAGN3vaWl6OcCQGP8reJgdCwDQGQ6N7RiM3zCAGS6JPyh53sAgGUoJSTyLi_DgGW3ITWkL_ZBQGXvpP-ha-RBQGY7ICV-PWdAQGYto-Wu72vCIICmqip1-2FiQQBm6K33_b0ygkBntKPufi7qwgBn4yey6jliwIBoOSytcfv_gYBobjY8IHJbgGf4P2Nq_a6BwGj7tnA58vEAwGjypmUze6WBAGlvOGdzpKkBAGmmPq7_ZhUAafovvvIl64HAafC2N2noI8IAamgurH98aUHAammxfOC8lsBnrTPuLeh_Q8Bo-jO1Z2JvwEBrfDCzaCi5QwBr4C8qYfGQQGvsqnllKiUCQGxwtflurm9BgGx9qm0nZ34BQG24v6C5vnZAwG34ObC3bzGAQG65vTKrvS1DgG7qtT7jaXqBgG83sCRxOnsAQG8yp7Sl9_eCwG8sPj_4rPSAQG7rsjIhqPMDwHA8NrzsraDCwHC-oCtgpb5DQHGhoiagp3RCQHGwNbdztf4BAHImsHf5OfvDAHI0qC7irmFCAHGjJiGjdC-DwHKgNu3h_CfAgHN1vnAr5mrAwHOqL_vnv_JDgHQ8K3O5pElAdHG-NnzkLkDAdKm8b71uLALAdOs672osBoB06aptKjozwrUHdXYlLqD_bkFAdiKu4qswIkBAdiY04eMk_MPAdrgn4XMtUb5xgja9Nnz1JvQCQHc5tXejfDTCAHc6p2fj-MrAd78l8m4_KkIAd-M1tKx95INAeDo14utzKMJAeG8r9na760OAeDOgryz27wGAd_OpOiH-6sHAdnuw_Hty-cGAejU9vTx_NgIAei8-7Dc4uUCAerShdPUxbcBAerewsLytf4CAe_sw8qQ4vEHAfCw17LO6McCAfKWoP35moMCAfPY8Mqa9bMJAfSq_eDZ6-wCAfKq4_bRxKMDTPKY7eGv1kf2Avq6zd_Fvp8KAfuwoJq684ANAfr8p6bPs8cLAfq6ucSYztECxiWFrZulp-ZsAYXrm8XNnfMHAYfJp5e18MYLAYnb5bT0qC8Bicul5dWkkAYBi7e0kOT15A8Bj9-0lYuc6wMBkPWcjd7ZuQIBmNevt_fduA4BnOPOlbGn7AoBncuemvWPkQkBnvGkyYqXowEBnu3xormPqQ0Bo6npr9e0sA4Bo6ubjffrtQkBo7fZyeiU5gYBpe2d6I_XmwYBo6WSxoD75wwBo93GwMjo9wMBqdvdxIbD0w8Bo4Xr9LPLuw8Br8HUhJfx4Q0BsJHmr4bd5woBr638rcaA4wgBr-_G3JmH-QUBto_tk-CtOwG258DcyIf0BAG46c_Z0tHECwG488qY7b6NBGq99avG_sTaAQG-4d7XwNSsA54BwoXHnPiKjg0Bw53T6NHn1Q8Bw8W4vq2Pkw4Bxf2j_buP1QwBxcHfiO-I1AIBx8my_8jb9QMBxfW13v2u1AUBx9ujm6ymxwEBy6WV97n-IgHLy52vtJ7lAwHNqbze_I9jAc-_xMfcnrsMKdH1jYrBqYsKAdOX3dzF3ZoMAdf3qOWE8YEIAdiV9vnR6ZsCAdrl7sOj66sDAdvb2-jN-bADAd3XkIDI__kHAd2tw-DejPIKAd6ZuczQ4bQCAeCN7rqYnKgCAeCZ56_qx6kGAePTo5LLtpMJAeT_zMLMkfoLAeW5kOixgIwBAeaHh5SLksYJAejZwdiTrPwLAen99-DA-M4MAeqH7c69mvgOAeuH7enlycYFAevT_eTXo9QOAev36_aT6sIJAeuHhpWEvpMNAejxnqOxlvkDAfCVmp6qsewIAfaTgKbL9ZYKAfaxk6315_MEAfjDv5aLyekIAffP_JjAqP0LAfr90_rN5r4NAfqt6rKYnf0BAfz1m4eCz_cBAfzvhb7Jk-0KAffHysbbqdQFAf__28-0zeUIAQ, blake3 70d91b8f609185b66ecd49dd9534f5d05a982abfe9e7811a805bb9655c4a0d56) -->
+<!-- generated from jkb design design:daemon-and-messaging-18dcdf2a2d45d6f884c253, edit there (version 168.pgGE1J7o0dOTCwGFvsnWyuvJDAGGqJ7W_pWzCQGIoufM5rfTCgGI2LH6w6vJAgGLzITutqDlCAGN3vaWl6OcCQGP8reJgdCwDQGQ6N7RiM3zCAGS6JPyh53sAgGUoJSTyLi_DgGW3ITWkL_ZBQGXvpP-ha-RBQGY7ICV-PWdAQGYto-Wu72vCIICmqip1-2FiQQBm6K33_b0ygkBntKPufi7qwgBn4yey6jliwIBoOSytcfv_gYBobjY8IHJbgGf4P2Nq_a6BwGj7tnA58vEAwGjypmUze6WBAGlvOGdzpKkBAGmmPq7_ZhUAafovvvIl64HAafC2N2noI8IAamgurH98aUHAammxfOC8lsBnrTPuLeh_Q8Bo-jO1Z2JvwEBrfDCzaCi5QwBr4C8qYfGQQGvsqnllKiUCQGxwtflurm9BgGx9qm0nZ34BQG24v6C5vnZAwG34ObC3bzGAQG65vTKrvS1DgG7qtT7jaXqBgG83sCRxOnsAQG8yp7Sl9_eCwG8sPj_4rPSAQG7rsjIhqPMDwHA8NrzsraDCwHC-oCtgpb5DQHGhoiagp3RCQHGwNbdztf4BAHImsHf5OfvDAHI0qC7irmFCAHGjJiGjdC-DwHKgNu3h_CfAgHN1vnAr5mrAwHOqL_vnv_JDgHQ8K3O5pElAdHG-NnzkLkDAdKm8b71uLALAdOs672osBoB06aptKjozwrUHdXYlLqD_bkFAdiKu4qswIkBAdiY04eMk_MPAdrgn4XMtUb5xgja9Nnz1JvQCQHc5tXejfDTCAHc6p2fj-MrAd78l8m4_KkIAd-M1tKx95INAeDo14utzKMJAeG8r9na760OAeDOgryz27wGAd_OpOiH-6sHAdnuw_Hty-cGAejU9vTx_NgIAei8-7Dc4uUCAerShdPUxbcBAerewsLytf4CAe_sw8qQ4vEHAfCw17LO6McCAfKWoP35moMCAfPY8Mqa9bMJAfSq_eDZ6-wCAfKq4_bRxKMDTPKY7eGv1kf2Avq6zd_Fvp8KAfuwoJq684ANAfr8p6bPs8cLAfq6ucSYztECxiWFrZulp-ZsAYXrm8XNnfMHAYfJp5e18MYLAYnb5bT0qC8Bicul5dWkkAYBi7e0kOT15A8Bj9-0lYuc6wMBkPWcjd7ZuQIBmNevt_fduA4BnOPOlbGn7AoBncuemvWPkQkBnvGkyYqXowEBnu3xormPqQ0Bo6npr9e0sA4Bo6ubjffrtQkBo7fZyeiU5gYBpe2d6I_XmwYBo6WSxoD75wwBo93GwMjo9wMBqdvdxIbD0w8Bo4Xr9LPLuw8Br8HUhJfx4Q0BsJHmr4bd5woBr638rcaA4wgBr-_G3JmH-QUBto_tk-CtOwG258DcyIf0BAG46c_Z0tHECwG488qY7b6NBGq99avG_sTaAQG-4d7XwNSsA54BwoXHnPiKjg0Bw53T6NHn1Q8Bw8W4vq2Pkw4Bxf2j_buP1QwBxcHfiO-I1AIBx8my_8jb9QMBxfW13v2u1AUBx9ujm6ymxwEBy6WV97n-IgHLy52vtJ7lAwHNqbze_I9jAc-_xMfcnrsMKdH1jYrBqYsKAdOX3dzF3ZoMAdf3qOWE8YEIAdiV9vnR6ZsCAdrl7sOj66sDAdvb2-jN-bADAd3XkIDI__kHAd2tw-DejPIKAd6ZuczQ4bQCAeCN7rqYnKgCAeCZ56_qx6kGAePTo5LLtpMJAeT_zMLMkfoLAeW5kOixgIwBAeaHh5SLksYJAejZwdiTrPwLAen99-DA-M4MAeqH7c69mvgOAeuH7enlycYFAevT_eTXo9QOAev36_aT6sIJAeuHhpWEvpMNAejxnqOxlvkDAfCVmp6qsewIAfaTgKbL9ZYKAfaxk6315_MEAfjDv5aLyekIAffP_JjAqP0LAfr90_rN5r4NAfqt6rKYnf0BAfz1m4eCz_cBAfzvhb7Jk-0KAffHysbbqdQFAf__28-0zeUIAQ, blake3 2921d8cbdff712b47c7a89657da3b8714ba764d01da048feae3e575228b5a05c) -->
 # Daemon and messaging
 
 This design records how processes that must not open `jkb.db` still reach the knowledge base, and
@@ -527,13 +527,13 @@ tagged by `result`.
 | `kb.tree` | `path?`, `all?`, `depth?` (≤ 48) | `tree` {`nodes`: [{`child`, `children`}]} |
 | `kb.cat` | `uid` | `content` {`content`} |
 | `kb.grep` | `pattern` (non-empty), `scope?`, `ignore_case?`, `mode?` (`lines`\|`names`\|`count`) | `grep_hits` {`hits`: [{`uid`, `kind`, `lines`: [{`line`, `text`}]}], `count`, `truncated`} |
-| `kb.search` | `dsl`, `default_scope?`, `route` (`vector`\|`fts`\|`hybrid`), `limit` (≤ 1000), `context?` (≤ 50) | `search_hits` {`hits`} |
+| `kb.search` | `dsl`, `default_scope?`, `route` (`vector`\|`fts`\|`hybrid`), `limit` (≤ 1000), `context?` (≤ 50) | `search_hits` {`hits`, `truncated?`, `orphan_vectors?` {`dropped`, `scanned`} (orphan vector rows the scan dropped rather than return; absent when none were; 4c3403d)} |
 | `kb.context` | `item` (an id), `n` (≤ 50) | `context` {`chunks` [{`item`, `position`, `is_hit`, `content`}], `truncated`}; no text is embedded |
 | `kb.related` | `uid`, `edges?`, `depth` (≤ 16), `direction?` (`out`\|`in`\|`both`) | `related` {`rows` [{`uid`, `kind`, `status?`, `resolution?`, `depth`, `via`, `direction`, `snippet?`}], `truncated`, `at_node_cap`}; the walk stops at 1000 items |
 | `kb.blobs` | `contains?` (non-empty), `limit` (≤ 10 000) | `blobs` {`blobs` [{`hash`, `size`, `mime?`, `created_at`}], `truncated`} |
 | `kb.blob` | `prefix` (4–64 hex digits, unique) | `blob` {`hash`, `text`}; a blob that is not UTF-8, or over 8 MiB, is refused, and `jkb blob cat` on the host reads any blob in-process |
 | `kb.history` | `path` (absolute, the client's), `home?` (re-rooted as `kb.ambient` does) | `versions` {`uri`, `versions` [{`ts`, `blob`, `status`}], `truncated`} |
-| `kb.health` | — | `health` {`schema_version`, `fts_ok`, `flagged` (≤ 200 {`uri`, `status`, `detail?`}), `flagged_count`, `vector_tables`, `stale_vectors`}; run on the writer, since FTS5's integrity check is an `INSERT` |
+| `kb.health` | — | `health` {`schema_version`, `fts_ok`, `flagged` (≤ 200 {`uri`, `status`, `detail?`}), `flagged_count`, `vector_tables`, `stale_vectors`, `unguarded_vector_tables?` (vector tables with no delete-GC trigger, so every item delete still orphans a row; absent from a daemon that predates it, which `jkb doctor` says rather than reading as healthy; dcd297b)}; run on the writer, since FTS5's integrity check is an `INSERT` |
 | `task.ready` | `dsl`, `default_scope?`, `limit?` | `items` {`items`} |
 | `task.show` | `uid` (a uid or bare slug) | `task` {`task`: {`item`, `transitions` (the last 5), `subtasks`}} |
 | `task.subtasks` | `uid`, `all?` | `children` {`children`} |
@@ -549,7 +549,7 @@ tagged by `result`.
 | `task.bind` | `uid`, `sync?` (`managed:` when absent) | `applied` |
 | `task.claim` | `uid`, `owner` (≤ 512 bytes) | `claimed` {`acquired`, `refusal`} |
 | `task.release` | `uid`, `owner` (≤ 512 bytes) | `released` {`released`} |
-| `task.facts` | `uid` | `task_state` {`uid`, `status`, `tags` (facet → values), `claim?`, `land_target?`, `start_refusal?` (for a finished task only), `terminal`, `open_subtasks`, `writable` (`false` for a task filed outside the daemon's file roots, asked before git work)} |
+| `task.facts` | `uid` | `task_state` {`uid`, `status`, `tags` (facet → values), `claim?`, `land_target?`, `start_refusal?` (when the lifecycle has no `start` edge out of the task's state -- the machine's own verdict, not a list of terminal statuses beside it, since 860131b; `task work` refuses with it before any git work), `terminal`, `open_subtasks`, `writable` (`false` for a task filed outside the daemon's file roots, asked before git work)} |
 | `task.by_branch` | `repo` | `branch_tasks` {`tasks`: branch → [{`uid`, `status`, `onto?`}], every task on the branch, in id order} |
 | `task.start` | `uid`, exactly one of `take` {`owner`, `displace?`} and `keep` (the claim kept), `place` {`branch`, `repo`, `onto?`} | `taken` {`taken`}; `false`, nothing written, when the claim is not the one judged |
 | `task.take` | `uid`, `take` {`owner`, `displace?`}, `place` {`branch`, `repo`, `onto`}; the place is judged (written for trial and rolled back), not recorded | `taken` {`taken`} |
@@ -563,9 +563,10 @@ tagged by `result`.
 | `task.claims` | `after?` (a page's `next`) | `claims` {`claims` [{`uid`, `owner`}] (≤ 1000 a page, task order), `next?`} |
 | `task.reclaim` | `dead` (≤ 1000 owners the client proved gone) | `reclaimed` {`cleared`, `refused` [{`owner`, `reason`}], `unwritable`} |
 | `task.staging` | `repo`, `all?` | `staging_tasks` {`tasks` [{`uid`, `title`, `status`, `tags`, `land_target`, `open_subtasks`}], `truncated`}; `staging ls` asks git the rest |
-| `task.pr_facts` | `uid` | `pr_facts` {`uid`, `pr?`, `branch?`, `live_landing`, `superseded?`, `resumed_at?`, `writable`} |
+| `task.pr_facts` | `uid` | `pr_facts` {`uid`, `pr?`, `branch?`, `branch_facet?` (its `branch=` facet, which tells *no recorded branch* from a session that predates the transition log), `live_landing`, `superseded?`, `resumed_at?`, `writable`, `pr_absent?` {`branch`, `remote_head?`} (the latest recorded *no pull request*, which the client judges against the branch's remote-tracking tip now)} |
 | `task.open_in_repo` | `repo` (≤ 255 bytes) | `uids` {`uids`, `truncated`}; the repo's unfinished tasks |
 | `task.pr_record` | `uid`, `number` (> 0) | `applied`; a `note` in the task's history |
+| `task.pr_absent` | `uid`, `branch` (refused `stale` unless it is the task's latest recorded branch), `remote_head?` (its remote-tracking tip when asked; absent when it had none) | `applied`; an entry in the task's history, so `close-merged` does not ask `gh` again until that tip moves (0c934d5, c0129e2) |
 | `task.close_merged` | `uid`, `merged` (`yes`\|`no`\|`unknown`, the client's `gh` answer), `observed` {`live_landing`, `resumed_at?`, `pr?`}, `pr?`, `dry_run?` | `closed` {`refusal?`}; `observed_landed`, judged in the op's transaction, held if the history no longer matches `observed` |
 | `item.show` | `uid`, `preview?` (characters; by kind when absent, ≤ 1 000 000) | `item` {`item` {`uid`, `kind`, `status?`, `resolution?`, `priority?`, `due?`, `mime?`, `binding?`, `namespace?`, `content_chars`, `content_hash?`, `created_at`, `updated_at`, `tags`, `preview`, `preview_truncated`}} |
 | `item.rm` | `uid` (full), `force?` | `item_removed` {`uid`, `kind`, `placements`, `edges`, `tags`} |
@@ -734,10 +735,8 @@ prefix matched it. The same file ingested from the container and from the host i
 ### No model call for a client, and ingests run one at a time
 
 `jkb serve` has no embedder, so a container's ingest is captured, keyword-searchable at once, and
-answered `embedded: false` with a warning; it gains vectors when the host runs `jkb index
---pending`. A repeat of the same text answers `already_ingested`; once the vectors exist (written by
-`index --pending`, which keys no ingestion) a repeat marks the ingestion complete and answers
-`embedded: true`. Nothing runs `index --pending` on its own yet.
+answered `embedded: false` with a warning; it gains vectors when the host runs `jkb index`. A repeat of the same text answers `already_ingested`; once the vectors exist (written by `jkb index`, which keys no ingestion) a repeat marks the ingestion complete and answers
+`embedded: true`. Nothing runs `jkb index` on its own yet. (This text, and the op's warning, named `jkb index --pending`, a flag `jkb index` never had: plain `jkb index` embeds what is unembedded.)
 
 A capture at the 1 MiB body cap holds the single writer for about half a second (measured by the
 ingest port's second review: 457 ms release, Linux; two in flight left a hook write 841 ms of its
@@ -951,7 +950,7 @@ a refusal comes before any git work. `task.locate` records it afterwards, compar
 run's owner, and notes the branch and land target. Round 1 found that a location refused after the
 worktree stranded the claim. Round 2 found that writing it with the claim left a failed run pointing
 the task at a branch nobody made. The take's history entry is unlabelled. The daemon does not judge
-a `displace`: a client can already drop any claim with `task.release`.
+a `displace`: a client can already drop any claim with `task.release`. The claim is also judged before any git work (765eaa8); the task-lifecycle design's worktree-sessions section records how.
 
 A consequence: the session ops' writes pass the `tasks.md` round-trip check, so for a file-backed
 task in a repo whose directory name contains a space, `task start`/`work` are now refused, because
@@ -960,7 +959,7 @@ the `repo=` value would break its line. They used to write it and break the line
 ### Worktree-removal records live in the database and name only the shared directory
 
 `archive::dispose` wrote `<db dir>/worktree-removals/*.json` naming full paths, and the host's reap
-service renames, deletes and runs `git branch -D` on what they name. The danger is a record choosing
+service renames, deletes and deletes the branches of what they name. The danger is a record choosing
 host paths. The records moved into `worktree_removals` (`V020`), and the sweep's lock into the
 `leases` table. Every path a client writes, or names by id, must be `~/`-relative, of plain
 segments, and under `~/repos` once resolved against the daemon's home
@@ -981,9 +980,7 @@ wrote it *and* it names no `~/` path (a client can re-point a host row under `~/
 repo root, resolved at the moment of acting (`archive::beneath`), lies under `~/repos`; one that
 resolves elsewhere is reported REFUSED and never touched. The sweep's rename and removal walk that
 resolved path with `O_NOFOLLOW` (`jkb_core::nofollow::rename_into`, `remove_tree`), so a link
-anywhere below the root is refused rather than followed. What remains is git: the sweep's `git
-worktree remove`/`branch -D` run with the path as spelled, and a branch is deleted only when its tip
-is the commit the record names. Clients read every record, the host's absolute paths included. A
+anywhere below the root is refused rather than followed. What remains is git: the sweep's `git worktree remove` and branch delete run with the path as spelled, and a branch is deleted only while its tip is the commit the record names, by git's own compare-and-delete; the task-lifecycle design records that rule and why `git branch -D` was replaced (088193e, 75f9a6f). Clients read every record, the host's absolute paths included. A
 disposal whose record the daemon refused says nothing will finish it.
 
 ### `task work` cancels a record by op, never by taking the sweep's lease
@@ -1862,7 +1859,7 @@ send and tail without shelling out.
 ### Embedding what the container ingests, and its search queries
 
 `jkb serve` calls no model, so `ingest.text` from the container is captured keyword-searchable only
-until someone runs `jkb index --pending` on the host. To decide: whether a host service (the reap
+until someone runs `jkb index` on the host. To decide: whether a host service (the reap
 service, or the watcher) runs it periodically, a host process calling the host's model on its own
 schedule rather than at a client's request. Embedding search query text in the daemon waits on the
 same decision; until then remote search is FTS only.

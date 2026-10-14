@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:foundation-18dcdeed0ab4d7709fd734, edit there (version 97.X4LfyqDozfwPAYLqkPH_p0UBhO2vnI20zgcBgvvZ1Mnb6Q0Bhu3u9vOuwQkBiefImrSgjgUBidepvMKL7AEBi-7vkr7UzwIBi4v13NKE4A0BjYWn0daWdwGQh6fnuO31DwGR4vys_rxrAZL-t5Wzl7ICAZSF453X3fYEAZXKovzQiI0NAZaB3JHjhKcNAZXZobTRvY8BAZi63c-qh70EAZmJ45HLrq0FAZXg2b340Z4KAZSTl_SJ7oQFAZ2Mx8bk4tkPAZ6VgO30xcYDAZ_PkrepqIABAZ-1w8KT-x0BosCV7pXhvg4BpfzbiJXP4AYBqY3Z4duPywYBqprvqf_k7gEBq7u0h9q0nwUBrcmgvui4_wgBreSM8OOM2gkBree0z5aL5Q4BsdCT8faJigQBtZjXif6wiwrfigS3l83i_4DFDwG46drXpriLDAG5hZyS-ojYDwG5wtCE2tavCgG72ZXjnJ-SCwG3kt3Iv43oAwG9x6qT5dr8CAG-9pjn9d3dBQG7npCdiY76CQHAwa2RrfHpBwHCkYvEusHvBAHEtOjXn4XQDgHGlI6whPnXCgHH3YKwwavqCAHIma7i1oOPBQHJ2JD6kb3dBQHKnpvM_br_DwHHlqzaquDIAQHMifX37fX2BgHNh9aKpqLsDQHJkYme__L_BAHPj-2Nzu2ZAwHP0onzzJWFCwHQ3-Lz5JSaCAHS5JfUxey_CgHQgOOmwqabCAHP8rD1vuNbAdWdgLio6tkIAdbDh5TWtcsPAdG3oL6mwcgIAdmW_t3a-ZELAdrm6Y-sraINAdvzrNjN48QKAdvs6rbhh7oPAduVj4GcpKMOAd6KqrX5jeMJAd62u72N-u4IAeDB0Pji9bcEAeHIyrDgov4LAeGGtb_I-v4OAeOTuJeas8gEAeT-nOrLy70IAeX8mPaHz6QEAebo062N5XoB5LHZ1qPBvQIB6OOByP2wgAMB6Jnf1O2t0QgB6KTkp5qUtgsB6O7o0pLooAUB4K_Th6zmqgcB6JOdntPMtwcB7pjK-piqhgcB8JSB9sq66g0B8ZCj_YuxuAQB8q_6gYm9lQQB8Prj56_kzgoB9vaf2vzcpA8B-dnGtKGi-A8B_PG7hYj2wgYB_6Px-ICjmg0B, blake3 8d7ce00cd7f20ab2fb59b68fda3bef88d124eb889127630bd37ad7e7927dc19c) -->
+<!-- generated from jkb design design:foundation-18dcdeed0ab4d7709fd734, edit there (version 97.X4LfyqDozfwPAYLqkPH_p0UBhO2vnI20zgcBgvvZ1Mnb6Q0Bhu3u9vOuwQkBiefImrSgjgUBidepvMKL7AEBi-7vkr7UzwIBi4v13NKE4A0BjYWn0daWdwGQh6fnuO31DwGR4vys_rxrAZL-t5Wzl7ICAZSF453X3fYEAZXKovzQiI0NAZaB3JHjhKcNAZXZobTRvY8BAZi63c-qh70EAZmJ45HLrq0FAZXg2b340Z4KAZSTl_SJ7oQFAZ2Mx8bk4tkPAZ6VgO30xcYDAZ_PkrepqIABAZ-1w8KT-x0BosCV7pXhvg4BpfzbiJXP4AYBqY3Z4duPywYBqprvqf_k7gEBq7u0h9q0nwUBrcmgvui4_wgBreSM8OOM2gkBree0z5aL5Q4BsdCT8faJigQBtZjXif6wiwrfigS3l83i_4DFDwG46drXpriLDAG5hZyS-ojYDwG5wtCE2tavCgG72ZXjnJ-SCwG3kt3Iv43oAwG9x6qT5dr8CAG-9pjn9d3dBQG7npCdiY76CQHAwa2RrfHpBwHCkYvEusHvBAHEtOjXn4XQDgHGlI6whPnXCgHH3YKwwavqCAHIma7i1oOPBQHJ2JD6kb3dBQHKnpvM_br_DwHHlqzaquDIAQHMifX37fX2BgHNh9aKpqLsDQHJkYme__L_BAHPj-2Nzu2ZAwHP0onzzJWFCwHQ3-Lz5JSaCAHS5JfUxey_CgHQgOOmwqabCAHP8rD1vuNbAdWdgLio6tkIAdbDh5TWtcsPAdG3oL6mwcgIAdmW_t3a-ZELAdrm6Y-sraINAdvzrNjN48QKAdvs6rbhh7oPAduVj4GcpKMOAd6KqrX5jeMJAd62u72N-u4IAeDB0Pji9bcEAeHIyrDgov4LAeGGtb_I-v4OAeOTuJeas8gEAeT-nOrLy70IAeX8mPaHz6QEAebo062N5XoB5LHZ1qPBvQIB6OOByP2wgAMB6Jnf1O2t0QgB6KTkp5qUtgsB6O7o0pLooAUB4K_Th6zmqgcB6JOdntPMtwcB7pjK-piqhgcB8JSB9sq66g0B8ZCj_YuxuAQB8q_6gYm9lQQB8Prj56_kzgoB9vaf2vzcpA8B-dnGtKGi-A8B_PG7hYj2wgYB_6Px-ICjmg0B, blake3 4ec228f27703dad146f898834fd073c62eed9f3170846b34380258f21208e557) -->
 # Foundation
 
 jkb is a local-first, agent-native knowledge base. It replaced two rigid tools: the arch-helper
@@ -253,9 +253,22 @@ long-lived writer connection, and get a new-or-existing row id in one statement 
 `INSERT … ON CONFLICT(…) DO UPDATE SET <no-op> RETURNING id`, dropping the extra `SELECT` per
 mutation. Values are always bound as parameters, never interpolated.
 
-### A backup checkpoints the WAL first
+### A backup is one `VACUUM INTO`, renamed into place
 
 WAL keeps a `.db-wal` sidecar, so a naive copy of the single file can miss committed state.
+`Db::backup` (and `jkb doctor --backup <path>`) runs on the writer thread, writes the copy with
+`VACUUM INTO` a sibling temp file unique per attempt (`<dest>.<pid>.<n>.tmp`), and renames it
+over the destination, so a repeat backup to a fixed path works and a failure leaves the previous
+backup intact. It refuses a destination that resolves to the live database or its `-wal`/`-shm`,
+since the rename would replace the open file under its own connection, and a destination that is
+not valid UTF-8: `VACUUM INTO` names its file as SQL text, and the lossy conversion wrote the
+backup to a different path while reporting success (dedd042).
+
+Superseded: the backup ran `wal_checkpoint(TRUNCATE)` and then copied the main file. A busy
+checkpoint reports failure as a row, not an error, and `execute_batch` steps past rows, so the
+copy silently omitted WAL frames not yet transferred and produced a backup that opened cleanly
+and lacked recent commits. `VACUUM INTO` reads through the WAL in one statement and errors
+instead of half-succeeding (79ae141).
 `Db::backup` (and `jkb doctor --backup <path>`) runs `wal_checkpoint(TRUNCATE)` and then copies,
 so the file reflects every committed write before the single-file backup story is relied on.
 
@@ -535,10 +548,6 @@ rowids explicitly so the FTS index stays aligned and is not rebuilt.
 
 A liveness join on reads could never have fixed this alone: under reuse the `item_id` names a
 live item, the wrong one. Pinned by `item::tests::a_deleted_items_id_is_never_reused` and by
-`jkb-index`'s integration test, which asserts a successor gets a fresh id (it previously
-asserted the id was reused, "the whole hazard"). A consequence: `V010` rebuilds `items`, so an
-older branch's binary cannot open a database this one has migrated, the usual shared-`jkb.db`
-divergence.
 
 ### The high-water mark is seeded from the changelog
 
@@ -595,6 +604,15 @@ opens the store without the extension, item deletion fails loudly rather than co
 silently, which is the correct direction of error. A test deletes an item on a registered
 connection with a vector table present and asserts the row is gone.
 
+`ensure_ready` is not the only installer. `sweep_stale` (so `jkb index --sweep` and
+`jkb doctor --fix`) installs the trigger on every vector table it finds, because a database with
+orphans is by definition one written before the trigger existed, and `ensure_ready` needs a live
+embedder to know its table name. `jkb doctor` also reports a vector table with no trigger beside
+it (`vector_tables_without_gc_trigger`, which shares the name with the installer through
+`gc_trigger_name`): it used to judge the index on the stale count alone, so a pre-trigger
+database with no orphans yet, which still left one behind on every item delete, read
+"vector index: ok" (dcd297b).
+
 Rejected: "every reader must filter" as the guarantee. It is the same procedural bet one layer
 out, and readers outgrow deleters: `vector.rs` already had three readers (`knn`, `vectors_for`,
 `distances_for`) plus `rebuild` and `doctor`.
@@ -608,9 +626,23 @@ applied in Rust after the query, not as a join: `sqlite-vec` requires a `k` and 
 once per item. The internal fetch never exceeds 4096, because `sqlite-vec` hard-errors above
 that (`SQLITE_VEC_VEC0_K_MAX`, `sqlite-vec.c:7111`) and `vector_ranked` already over-fetches to
 2048; multiplying the two over-fetches would have reached `k = 16384` and failed with a raw
-extension error on the main read. `knn_live` also reports whether the index was exhausted, so
-the search growth loop can tell that apart from live rows running out inside the budget; its old
-test, `hits.len() < fetch`, stops growing early once filtering happens inside.
+extension error on the main read.
+
+One search has one growth loop. `VectorIndexer::knn_page` runs exactly one `vec0` scan, filters
+dead rows and reports whether the index itself ran out, without truncating; the scoped search's
+over-fetch loop (`vector_ranked`) calls it, and `knn_live`, for the unrestricted search that has
+no loop of its own, doubles its fetch over `knn_page` until it has `k` live rows. `vector_ranked`
+used to call `knn_live`, and the nested loops multiplied: every `vec0` KNN scans the whole table
+whatever its `k`, so on a table full of orphans one scoped search with `k = 10` ran 27 full scans
+instead of six, counted by `SQLite`'s statement run counter in a search test (67a5416).
+Exhaustion is the index returning fewer rows than asked for, not `hits.len() < fetch`, which reads
+a page full of orphans as exhaustion and stops growth early.
+
+The filter also hid the only sign that a table needs a sweep, so each page counts the rows it
+scanned and dropped, `Searcher::search` returns them beside the hits, and `kb.search` carries an
+optional `orphan_vectors { dropped, scanned }`. When at least one scanned row in four was an
+orphan (`OrphanVectors::needs_sweep`), the CLI says so on stderr in both output modes, with the
+counts and a pointer at `jkb index --sweep` (4c3403d).
 
 The ingest pending query got the same filter for the mirror defect (it read the presence of an
 `item_id` as "indexed"); that matters only without reuse, which is why the sequence fix is the
@@ -629,7 +661,14 @@ including the non-obvious `vec0` shadow-table filter, so a report can never desc
 set from what a sweep would remove; that drift existed while `jkb doctor` carried its own copy.
 They surface as `jkb index --sweep` (needs no embedder, so it works offline) and
 `jkb doctor` / `jkb doctor --fix`. `StaleRows` is a struct rather than a count because the set of
-derived indexes is open, and a caller reading a field gets a compile error when one is added.
+derived indexes is open. That a reader gets a compile error when a field is added was claimed here
+before it held: every reader used `.vectors`, so a new field would have compiled everywhere and
+gone unreported. Every field reader (`jkb doctor`'s count and `--fix`, `jkb index --sweep`,
+`StaleRows::total`) now destructures it exhaustively, `StaleRows { vectors }` with no `..`
+(1da291f), and `total`/`is_empty` cover every index. The pair is the only public vocabulary: the
+raw `count_orphan_vectors`/`drop_orphan_vectors` are crate-private because they skip the trigger
+install `sweep_stale` performs, so a repair reaching for the more obvious name would leave a
+pre-trigger database producing orphans (ee368e6).
 With the trigger in place, these are repair for rows orphaned before it existed.
 
 ### Never pair two lists by index
@@ -860,7 +899,7 @@ The section numbers are those of the original v1 plan.
 `build()` and `truncate_to_chars`. `jkb-index`: `trait Indexer` (`name`, `accepts`, `index`,
 `remove`, `rebuild`), `IndexItem` and `Dispatcher` (`on_upsert`, `on_delete`, `rebuild_all`);
 `vector.rs`, the only `sqlite-vec` and `unsafe` module (`register()`, `VectorIndexer`,
-`ensure_ready` with its delete trigger, `knn_live`, `distances_for`, and `rebuild`, which
+`ensure_ready` with its delete trigger, `knn_page`, `knn_live`, `distances_for`, and `rebuild`, which
 re-embeds from content through an injected `Embedder`); `fts.rs` (`FtsIndexer`); and
 `count_stale` / `sweep_stale`.
 
@@ -872,7 +911,7 @@ check on the `ingestions` row, the blob (`blob.rs`, which re-exports core's
 windows with overlap and min/max bounds, a too-small tail folded into the final window, uid
 `b3:<hash>:<idx>`), `derived_from` edges and placements. `embed_and_complete` is a separate
 transaction with embeddings computed off-thread; it writes vectors and marks the ingestion
-complete. `index_pending` and `unembedded_count` finish what a down embedder left. `adapter.rs`
+complete. `index_pending` and `unembedded_count` finish what a down embedder or an edit left. `adapter.rs`
 is the `SourceAdapter` trait plus the adapters and `parse()` dispatch; `fetch.rs` is the
 headless-browser URL render. `Error` bridges `jkb_core` and `jkb_index`.
 
@@ -916,9 +955,6 @@ deleted on disk reconcile) and reconciles each in its own `write_txn`; export wr
 inside the transaction, so a failure rolls back with no hash drift. `watch.rs` runs a `notify`
 watcher: a full reconcile, then a debounced re-sync of only the event paths (`sync_paths`), with
 a full `sync` only on a watcher error or `need_rescan`, since the OS watches a directory subtree
-and glob filtering is ours. `watch_all` watches every mount on a thread each, stopped by a shared
-`Arc<AtomicBool>`, so `jkb service install`'s launchd or systemd unit can run
-`jkb sync --watch` at login; the OS supervisor owns the lifecycle.
 
 ### `jkb-sync` v2: multi-item serializers and the journal (Section 15)
 
