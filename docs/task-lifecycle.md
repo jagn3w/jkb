@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:task-lifecycle-18dcdeffaafbcfd87c069f, edit there (version 115.cYGwr8r1378CAYKo9cTruwUBh8rc4biU9QIBjOSnvIrrzQ4BjLzKt5Cd2AUBjvz45fSu2A0Bj5TL-7iHgwYBkMil2eDEzAMBjdLbv9f-9wQBkrivg62IuQ4BlpLLyPLkmAEBlpT2grSY0gQBl_KTjajtuwkBm4berKa5_gYBnuDUwZGG8gMBofblneKFuA0BotCO-afV7wgBqOjc06jB-QIBrJKai5vD2gIBrcLivemFyQQBsqqj8brGiQwBs7zX_LLn6AUBtf7U0ZCpvAwBtuaOpse_oAkBtsqjha2ppQQBtpiMnZfPgQsBvvax4ZGW2wYBwfzcsMibxAwBw6ratsvXCAHE1I7tgKvsDgHD6NWzpfupCQHGpqG-2-zGCQHH5KKojMwiAdCIrOa8rq8JAdSskO2_1bwFAdXGhL2xm7cPAdWOyaW7hIIDAduG3dnJiLQEAeDm5sGD6rUHAeHavY3KjZsLAeLaoqqpz6IJAeCOzej_k80CAerMz_K_94UBAeqK9aq5hPkGAfDS-NWr5ckLAfOytMOG4t4EAfS0t6v-o_ANAfX-rtmt-vEEAfaiw-aFpYANAfbslevNyHoB_Yjoid2wkQYB_dakx6mh3w0B_9yx8p6JmwoBgKm_lbr31Q0BgZ27_JT9rAMBhIWS9IeapA0Bhae59vPx-AoBhqHwycuzxAoBh4fWg8q79Q0Bit-6l4Wprw0BjdHWvb2O-A4BjcfDyc_llg8Bj5fqg9GohQcBk7Hmg4uU2AkBk5PmlsyXlgkBk7-h2qSg3ggBlqmrgaP4qgKs5wWXpeGpjb_VBAGYn8LK3t-nCwGZqdfqnNn-CAGa8eSp-v2-BAGg1bamxrlnAaKftbHfki4Bo4PB_PfpsAwBpdmYyJPIvgsBqImgkqXz8Q0BqaOkiNPXpwoBqbGkpNyznAIBrvHo_pyBeAGup5_Mj4LBCAGyhauIiO-UDwG02eeoz_eAAgG0yZ7Jn8PFCAG32bXx-an3DAG7kcGOj47YDgG-pfjsvNPRAwG-9aO5xPbECwG_x6_K2-u2DgHC5au0qq-dCAHIyYSv9rvyDgHMw9-08LDJCAHNkfDcsY_gDQHOu5bAvpvPB5wL0Lu07_eSWAHan4mk1JWmBwHc27ajqYWtAwHfh9baiOzxCgHgnaay18bLAwHflfjBpdb3CwHlwZbF2s7CCwHljaWUkvyeCQHsu82uhsiICwHur6L-yN7zDgHw95Dh9o-xAwHx0avxlrPECAHyy4jLntqlCgHz18zIqq7BCgH3196ovJTtCwH4hcO45MLZDAH43cKC95LLAgH6t5nE3pzwCAH5j4aOoarHBwH-uevR3deGCQE, blake3 ab761c85c82df7e1f3378436078507c61f13c890a0c9beeed04eb0c89d1b4ff4) -->
+<!-- generated from jkb design design:task-lifecycle-18dcdeffaafbcfd87c069f, edit there (version 115.cYGwr8r1378CAYKo9cTruwUBh8rc4biU9QIBjOSnvIrrzQ4BjLzKt5Cd2AUBjvz45fSu2A0Bj5TL-7iHgwYBkMil2eDEzAMBjdLbv9f-9wQBkrivg62IuQ4BlpLLyPLkmAEBlpT2grSY0gQBl_KTjajtuwkBm4berKa5_gYBnuDUwZGG8gMBofblneKFuA0BotCO-afV7wgBqOjc06jB-QIBrJKai5vD2gIBrcLivemFyQQBsqqj8brGiQwBs7zX_LLn6AUBtf7U0ZCpvAwBtuaOpse_oAkBtsqjha2ppQQBtpiMnZfPgQsBvvax4ZGW2wYBwfzcsMibxAwBw6ratsvXCAHE1I7tgKvsDgHD6NWzpfupCQHGpqG-2-zGCQHH5KKojMwiAdCIrOa8rq8JAdSskO2_1bwFAdXGhL2xm7cPAdWOyaW7hIIDAduG3dnJiLQEAeDm5sGD6rUHAeHavY3KjZsLAeLaoqqpz6IJAeCOzej_k80CAerMz_K_94UBAeqK9aq5hPkGAfDS-NWr5ckLAfOytMOG4t4EAfS0t6v-o_ANAfX-rtmt-vEEAfaiw-aFpYANAfbslevNyHoB_Yjoid2wkQYB_dakx6mh3w0B_9yx8p6JmwoBgKm_lbr31Q0BgZ27_JT9rAMBhIWS9IeapA0Bhae59vPx-AoBhqHwycuzxAoBh4fWg8q79Q0Bit-6l4Wprw0BjdHWvb2O-A4BjcfDyc_llg8Bj5fqg9GohQcBk7Hmg4uU2AkBk5PmlsyXlgkBk7-h2qSg3ggBlqmrgaP4qgKs5wWXpeGpjb_VBAGYn8LK3t-nCwGZqdfqnNn-CAGa8eSp-v2-BAGg1bamxrlnAaKftbHfki4Bo4PB_PfpsAwBpdmYyJPIvgsBqImgkqXz8Q0BqaOkiNPXpwoBqbGkpNyznAIBrvHo_pyBeAGup5_Mj4LBCAGyhauIiO-UDwG02eeoz_eAAgG0yZ7Jn8PFCAG32bXx-an3DAG7kcGOj47YDgG-pfjsvNPRAwG-9aO5xPbECwG_x6_K2-u2DgHC5au0qq-dCAHIyYSv9rvyDgHMw9-08LDJCAHNkfDcsY_gDQHOu5bAvpvPB5wL0Lu07_eSWAHan4mk1JWmBwHc27ajqYWtAwHfh9baiOzxCgHgnaay18bLAwHflfjBpdb3CwHlwZbF2s7CCwHljaWUkvyeCQHsu82uhsiICwHur6L-yN7zDgHw95Dh9o-xAwHx0avxlrPECAHyy4jLntqlCgHz18zIqq7BCgH3196ovJTtCwH4hcO45MLZDAH43cKC95LLAgH6t5nE3pzwCAH5j4aOoarHBwH-uevR3deGCQE, blake3 bbdcab9a3e9f81cda81fab02a2d9c3e980547bb985c7bac3e7eef41a0a745b06) -->
 # Task lifecycle
 
 How a task moves from the frontier to merged. A task is decomposed into subtasks, so the
@@ -330,15 +330,15 @@ a guard against the checkout an interrupted land left behind. Three review round
 wrong three ways (it detached the operator's tree, it refused over every reviewer `--detach`
 worktree, it refused over a missing worktree directory) because it was a predicate over other
 people's checkouts. The fix is that no land ever changes what any other checkout is on: the graft
-tree is jkb's, holds no branch, is reset unconditionally at the start of every land, and is read
-by nothing (`land_dir_in` matches `.jkb/base` by path and `onto` by branch, and a detached
+tree is jkb's, holds no branch, is reset unconditionally at the start of every land (a stopped
+rebase aborted, tracked edits reset, untracked files cleaned, ignored build output kept warm),
+and is read by nothing (`land_dir_in` matches `.jkb/base` by path and `onto` by branch, and a detached
 `.jkb/graft` is neither). An interrupted land leaves a detached, ungated graft there, which is
 where one always is. Rejected: a throwaway worktree per land (the same safety, but a cold
 `target/` wherever the gate runs outside the container); recording the in-flight land in the KB
 (a record of a state that is harmless); an `update-ref` compare-and-swap on the ref (correct only
 when `onto` is checked out nowhere; under a checkout it leaves the working tree showing the landed
 diff reversed).
-
 
 Two sessions finishing at once must graft one after the other, or the second one's gate result
 is meaningless, so landing holds the land lock. On green the task is moved to `done` through
