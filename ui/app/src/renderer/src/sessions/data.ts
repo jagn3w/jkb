@@ -6,9 +6,9 @@ import {
   decodeNotified,
   decodeSessionPage,
   designOps,
+  designRepos,
   failed,
   promptOps,
-  repoOf,
   sessionOps,
   type DesignPromptRecord,
   type NotifyRecord,
@@ -75,7 +75,7 @@ export interface Prompts {
 export async function loadPrompts(op: Op): Promise<Outcome<Prompts>> {
   const designs = decodeDesigns(await op(designOps.list()));
   if (!designs.ok) return designs;
-  const repos = [...new Set(designs.value.map((d) => repoOf(d.namespace)).filter((r): r is string => r !== undefined))].sort();
+  const repos = designRepos(designs.value);
   const answers = await Promise.all(repos.map(async (repo) => decodeDesignPrompts(await op(promptOps.listRepo(repo)))));
   const prompts: DesignPromptRecord[] = [];
   for (const a of answers) {

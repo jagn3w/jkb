@@ -89,11 +89,11 @@ export function SessionsTab(): React.JSX.Element {
     if (mine !== promptGeneration.current) return;
     setPrompts(answer.ok ? { kind: "loaded", value: answer.value } : { kind: "failed", message: answer.error.message });
   }, []);
-  // Prompts are recorded by launches, which the operator makes: read on opening, on Refresh, and
-  // with the registry when *Ended too* moves.
+  // On the registry's own triggers (opening, *Ended too*, a notification moving), so a session a
+  // design launch just started is named by its design as soon as it is listed, not at Refresh.
   useEffect(() => {
     void loadDesignPrompts();
-  }, [all, loadDesignPrompts]);
+  }, [all, needs.records, loadDesignPrompts]);
 
   const load = useCallback(async (withEnded: boolean) => {
     const mine = ++generation.current;
