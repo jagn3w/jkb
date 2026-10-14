@@ -571,7 +571,8 @@ fn samples() -> Vec<Request> {
             title: "t".into(),
         },
         Request::DesignPrompts {
-            uid: "design:x".into(),
+            uid: Some("design:x".into()),
+            repo: None,
         },
         Request::DesignPromptOf {
             session: "s".into(),

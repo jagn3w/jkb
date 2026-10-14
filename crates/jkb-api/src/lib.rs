@@ -1090,11 +1090,17 @@ pub enum Request {
         /// Its title.
         title: String,
     },
-    /// A design's recorded prompts, newest first ([`designs::prompts::list`]).
+    /// A design's recorded prompts, newest first ([`designs::prompts::list`]) — or, given `repo`
+    /// instead, every live design's prompts in that repo in one read
+    /// ([`designs::prompts::list_repo`]), each naming its design. Exactly one of the two.
     #[serde(rename = "design.prompts")]
     DesignPrompts {
         /// The design.
-        uid: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uid: Option<String>,
+        /// The repo (`designs/<repo>`), in place of `uid`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
     },
     /// The prompt a Claude Code session was recorded with, if any — the link from a session back to
     /// the design it worked ([`designs::prompts::of_session`], D53.9).
@@ -2714,8 +2720,12 @@ pub enum Response {
     },
     /// A `design.prompts`.
     DesignPrompts {
-        /// The design.
-        uid: String,
+        /// The design, when asked by design.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uid: Option<String>,
+        /// The repo, when asked by repo.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
         /// Its prompts, newest first.
         prompts: Vec<designs::prompts::DesignPrompt>,
     },
@@ -4383,12 +4393,20 @@ impl LocalBackend {
                     wrote,
                 }
             }
-            Request::DesignPrompts { uid } => {
-                let prompts = db.read_with({
-                    let uid = uid.clone();
-                    move |c| designs::prompts::list(c, &uid)
-                })?;
-                Response::DesignPrompts { uid, prompts }
+            Request::DesignPrompts { uid, repo } => {
+                let prompts = match (uid.clone(), repo.clone()) {
+                    (Some(uid), None) => db.read_with(move |c| designs::prompts::list(c, &uid))?,
+                    (None, Some(repo)) => {
+                        db.read_with(move |c| designs::prompts::list_repo(c, &repo))?
+                    }
+                    _ => {
+                        return Err(ApiError::with_code(
+                            ErrorCode::Invalid,
+                            "design.prompts takes exactly one of `uid` and `repo`",
+                        ))
+                    }
+                };
+                Response::DesignPrompts { uid, repo, prompts }
             }
             Request::DesignPromptOf { session } => {
                 let prompt = db.read_with({

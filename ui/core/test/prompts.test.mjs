@@ -55,6 +55,7 @@ test("a New prompt answer is decoded; an empty prompt is refused", () => {
 
 test("the requests are the ops the Rust side serves", () => {
   assert.deepEqual(promptOps.list("design:d"), { op: "design.prompts", uid: "design:d" });
+  assert.deepEqual(promptOps.listRepo("jkb"), { op: "design.prompts", repo: "jkb" });
   assert.deepEqual(promptOps.newPrompt("design:d", "Do it"), {
     op: "design.prompt",
     ask: { kind: "new", uid: "design:d", text: "Do it" },

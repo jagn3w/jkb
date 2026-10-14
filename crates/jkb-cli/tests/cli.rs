@@ -6056,6 +6056,26 @@ fn a_session_is_recorded_from_where_it_starts_and_listed_with_its_resume() {
         .stdout(predicate::str::contains(format!(
             "resume: cd {quoted} && claude --resume {session}"
         )));
+    // By repo: every live design's prompts there, each naming its design.
+    jkb(&db)
+        .args(["design", "prompt", "ls", "--repo", "jkb"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[new]  New · Tighten the intro"))
+        .stdout(predicate::str::contains(format!("design: {uid}")));
+    let listed = jkb(&db)
+        .args(["--json", "design", "prompt", "ls", "--repo", "jkb"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success(), "{listed:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["repo"], "jkb", "{listed}");
+    assert_eq!(listed["prompts"][0]["design"], uid.as_str(), "{listed}");
+    jkb(&db)
+        .args(["design", "prompt", "ls", "--repo", "other"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(no prompts)"));
     jkb(&db)
         .args([
             "design",
