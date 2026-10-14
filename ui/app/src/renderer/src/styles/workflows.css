@@ -3,14 +3,17 @@
  * node and the current state are drawn in ink, a copy is told apart by its border, and the one
  * warning (a copy behind its packaged template) carries the alert. */
 
+/* A column, not a grid of fixed rows: the notice between the bar and the split comes and goes, and
+ * in a three-row grid its absence put the split in the bar-sized row, to grow with its content. */
 .workflows-tab {
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   height: 100%;
   min-height: 0;
 }
 
 .workflows-split {
+  flex: 1;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
   min-height: 0;

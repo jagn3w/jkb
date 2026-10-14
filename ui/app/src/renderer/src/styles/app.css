@@ -131,7 +131,16 @@ pre {
   background: var(--alert);
 }
 
+/* The frame is fixed: the row between the top bar and the terminal never scrolls. Each pane fills
+ * it, so a tab's `height: 100%` is the row's, and the tab's own regions scroll while its headers stay
+ * put. A pane that overflows anyway scrolls itself (the smoke says none does), never the frame. */
 .panes {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.pane {
+  height: 100%;
   min-height: 0;
   overflow: auto;
 }
