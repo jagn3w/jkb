@@ -86,6 +86,21 @@ test("requests are the ops' own shapes", () => {
   // `under` only when named: a daemon that predates it refuses unknown fields.
   assert.deepEqual(designOps.create("jkb", "T"), { op: "design.create", repo: "jkb", title: "T" });
   assert.deepEqual(designOps.create("jkb", "T", "design:p"), { op: "design.create", repo: "jkb", title: "T", under: "design:p" });
+  // `retired` only when asked: a daemon that predates retiring refuses unknown fields.
+  assert.deepEqual(designOps.list(undefined, false, true), { op: "design.list", retired: true });
+  assert.deepEqual(designOps.list("jkb", true, false), { op: "design.list", repo: "jkb", review: true });
+  assert.deepEqual(designOps.retire("design:x"), { op: "design.retire", uid: "design:x" });
+  assert.deepEqual(designOps.restore("design:x"), { op: "design.restore", uid: "design:x" });
+});
+
+test("a listed design may say it is retired and where it exports, and must say so well-formed", () => {
+  const design = { uid: "design:r", title: "R", namespace: "designs/jkb", seq: 1, topic: "design/design.r" };
+  const with_ = (extra) => decodeDesigns(ok({ result: "designs", designs: [{ ...design, ...extra }] }));
+  assert.equal(with_({}).ok, true, "a daemon older than both fields");
+  assert.equal(with_({ retired: true, doc_target: "docs/r.md" }).ok, true);
+  assert.equal(with_({ retired: false, doc_target: null }).ok, true);
+  assert.equal(with_({ retired: "yes" }).ok, false);
+  assert.equal(with_({ doc_target: 3 }).ok, false);
 });
 
 test("design.create's answer is the new design, and nothing else is", () => {

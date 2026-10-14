@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import type { DesignNode, RepoNode, ReviewCounts } from "@jkb/core";
 
 import { createTargets, defaultTarget, type CreateTarget } from "./create";
+import { sidebarRepos } from "./retire";
 
 /** A thin bar of the design's span states, and how much of it is unreviewed. */
 function StateBar({ counts }: { readonly counts: ReviewCounts }): React.JSX.Element | null {
@@ -123,6 +124,96 @@ function DesignRow({
   );
 }
 
+/** A retired design in its repo's Retired fold: its title, the designs retired with it, and *Restore* on the top one. */
+function RetiredRow({
+  node,
+  depth,
+  top,
+  busy,
+  onRestore,
+}: {
+  readonly node: DesignNode;
+  readonly depth: number;
+  /** The top of a retired tree: the one design here that can be restored (the rest come with it). */
+  readonly top: boolean;
+  readonly busy: boolean;
+  readonly onRestore: (uid: string) => void;
+}): React.JSX.Element {
+  const { design, children } = node;
+  return (
+    <li role="treeitem" aria-selected={false}>
+      <div className="tree-row tree-retired" style={{ paddingLeft: `calc(var(--space-2) + ${depth} * var(--space-3))` }}>
+        <span className="tree-fold" aria-hidden="true" />
+        <span className="tree-label muted" title={design.uid}>
+          {design.title}
+        </span>
+        {top && (
+          <button
+            type="button"
+            className="bar-button"
+            disabled={busy}
+            onClick={() => onRestore(design.uid)}
+            aria-label={`Restore ${design.title}`}
+            title={children.length > 0 ? "Restore it and the designs retired under it" : "Restore it"}
+          >
+            Restore
+          </button>
+        )}
+      </div>
+      {children.length > 0 && (
+        <ul role="group">
+          {children.map((c) => (
+            <RetiredRow key={c.design.uid} node={c} depth={depth + 1} top={false} busy={busy} onRestore={onRestore} />
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
+/**
+ * A repo's retired designs, folded until opened: retired work is out of the way, not out of reach.
+ * Each retired tree is offered *Restore* at its top.
+ */
+function RetiredFold({
+  repo,
+  designs,
+  open,
+  onToggle,
+  onRestore,
+}: {
+  readonly repo: string;
+  readonly designs: readonly DesignNode[];
+  readonly open: boolean;
+  readonly onToggle: () => void;
+  readonly onRestore: (uid: string) => Promise<void>;
+}): React.JSX.Element {
+  const [busy, setBusy] = useState(false);
+  const restore = (uid: string): void => {
+    setBusy(true);
+    void onRestore(uid).finally(() => setBusy(false));
+  };
+  const count = (ns: readonly DesignNode[]): number => ns.reduce((n, d) => n + 1 + count(d.children), 0);
+  return (
+    <li role="treeitem" aria-expanded={open} aria-selected={false} className="tree-retired-fold">
+      <div className="tree-row" style={{ paddingLeft: "calc(var(--space-2) + var(--space-3))" }}>
+        <button type="button" className="tree-fold" aria-label={open ? `Fold retired designs of ${repo}` : `Unfold retired designs of ${repo}`} onClick={onToggle}>
+          {open ? "▾" : "▸"}
+        </button>
+        <span className="tree-label muted">Retired</span>
+        <span className="tree-count muted">{count(designs)}</span>
+      </div>
+      {open && (
+        <ul role="group" aria-label={`Retired designs of ${repo}`}>
+          {designs.map((n) => (
+            <RetiredRow key={n.design.uid} node={n} depth={2} top busy={busy} onRestore={restore} />
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
 /**
  * *New design*: a title, and where it goes — the top level of a repo (first offered: the open
  * design's repo) or under any design. With no designs yet there is no repo to offer, so one is typed.
@@ -219,6 +310,8 @@ export function DesignSidebar({
   onRefresh,
   openRepo,
   onCreate,
+  retired,
+  onRestore,
 }: {
   readonly tree: readonly RepoNode[] | undefined;
   readonly active: string | undefined;
@@ -230,8 +323,22 @@ export function DesignSidebar({
   readonly openRepo: string | undefined;
   /** Make a design and open it; `false` (refused) keeps the form open. */
   readonly onCreate: (title: string, target: Pick<CreateTarget, "repo" | "under">) => Promise<boolean>;
+  /** The retired designs by repo, nested as retired (`retiredByRepo`). */
+  readonly retired: ReadonlyMap<string, readonly DesignNode[]>;
+  /** Restore a retired design (and those retired under it); a refusal is the tab's notice. */
+  readonly onRestore: (uid: string) => Promise<void>;
 }): React.JSX.Element {
   const [folded, setFolded] = useState<ReadonlySet<string>>(readFolded);
+  // Which repos' Retired folds are open: closed until asked, and not remembered.
+  const [retiredOpen, setRetiredOpen] = useState<ReadonlySet<string>>(() => new Set());
+  const toggleRetired = (repo: string): void => {
+    setRetiredOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(repo)) next.delete(repo);
+      else next.add(repo);
+      return next;
+    });
+  };
   const [creating, setCreating] = useState(false);
   // The open design is always visible: its repo and every design above it unfold when it opens,
   // however it was opened (*Next*, *Jump to context*), or no row would say which design it is. Once
@@ -284,11 +391,13 @@ export function DesignSidebar({
       )}
       {tree === undefined ? (
         <p className="sidebar-hint muted">{error !== undefined ? `Cannot list designs: ${error}` : "Loading designs…"}</p>
-      ) : tree.length === 0 ? (
+      ) : tree.length === 0 && retired.size === 0 ? (
         <p className="sidebar-hint muted">No designs yet.</p>
       ) : (
         <ul className="design-tree" role="tree" aria-label="Designs by repo">
-          {tree.map((r) => {
+          {sidebarRepos(tree, retired).map((repo) => {
+            const r = tree.find((t) => t.repo === repo) ?? { repo, designs: [] };
+            const gone = retired.get(repo) ?? [];
             const key = `repo:${r.repo}`;
             const open = !folded.has(key);
             return (
@@ -318,6 +427,15 @@ export function DesignSidebar({
                         onPick={onPick}
                       />
                     ))}
+                    {gone.length > 0 && (
+                      <RetiredFold
+                        repo={r.repo}
+                        designs={gone}
+                        open={retiredOpen.has(r.repo)}
+                        onToggle={() => toggleRetired(r.repo)}
+                        onRestore={onRestore}
+                      />
+                    )}
                   </ul>
                 )}
               </li>

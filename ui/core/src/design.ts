@@ -25,6 +25,10 @@ export interface Design {
   readonly topic: string;
   /** The design it is nested under, or `null` at the top level. Absent from a daemon older than nesting. */
   readonly parent?: string | null;
+  /** Where `jkb design export` writes it, relative to the repository root. */
+  readonly doc_target?: string | null;
+  /** Retired (`design.retire`): listed only when the retired ones are asked for. Absent from a daemon older than retiring. */
+  readonly retired?: boolean;
   /** Non-whitespace characters per span state, when the listing was asked for them. */
   readonly review?: ReviewCounts;
 }
@@ -119,11 +123,20 @@ export interface DesignPrompt {
 
 /** The `design.*` requests the Document pane makes, as `jkb_api::Request` serializes them. */
 export const designOps = {
-  list: (repo?: string, review = false) => ({
+  /**
+   * The live designs, or with `retired` the retired ones instead. `review` and `retired` are never
+   * sent when false, so a daemon that predates them (and refuses unknown fields) still lists.
+   */
+  list: (repo?: string, review = false, retired = false) => ({
     op: "design.list",
     ...(repo === undefined ? {} : { repo }),
     ...(review ? { review: true } : {}),
+    ...(retired ? { retired: true } : {}),
   }),
+  /** Retire a design and every design under it (the operator's): answered as `designs`, each as it lists now. */
+  retire: (uid: string) => ({ op: "design.retire", uid }),
+  /** Restore a retired design and every design under it; refused under a retired parent. */
+  restore: (uid: string) => ({ op: "design.restore", uid }),
   cat: (uid: string) => ({ op: "design.cat", uid }),
   state: (uid: string, since?: string) =>
     since === undefined ? { op: "design.state", uid } : { op: "design.state", uid, since },
@@ -194,6 +207,8 @@ function isDesign(v: unknown): v is Design {
     isNumber(v["seq"]) &&
     isString(v["topic"]) &&
     (v["parent"] === undefined || v["parent"] === null || isString(v["parent"])) &&
+    (v["doc_target"] === undefined || v["doc_target"] === null || isString(v["doc_target"])) &&
+    (v["retired"] === undefined || typeof v["retired"] === "boolean") &&
     (v["review"] === undefined || isCounts(v["review"]))
   );
 }
