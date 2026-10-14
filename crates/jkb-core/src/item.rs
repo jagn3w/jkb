@@ -746,14 +746,17 @@ fn memory_reason(conn: &Connection, item: ItemId) -> Result<Option<String>> {
 pub fn remove(conn: &Connection, meta: &WriteMeta, item: ItemId, force: bool) -> Result<Removed> {
     let before = snapshot(conn, item)?;
 
-    // Not even with `force`: the snapshot above is what `jkb undo` restores, and a design's
-    // document — its CRDT updates — is not in it. Deleting would report an undoable delete and then
-    // bring back a design with no text.
-    if crate::design::holds_document(conn, item)? {
+    // Not even with `force`, and judged by kind, never by whether it holds a document: the snapshot
+    // above is what `jkb undo` restores, and a design's document (its CRDT updates), its doc target,
+    // sources and every item contained under it are not in it. An empty design was once deletable
+    // because the guard asked about updates, and its undo would have brought back a broken item. A
+    // design is retired instead (`design::retire`), which hides it and keeps everything.
+    if before["item"]["kind"].as_str() == Some(crate::design::KIND) {
+        let uid = before["item"]["uid"].as_str().unwrap_or_default();
         return Err(Error::Types(TypeError::Validation(format!(
-            "refusing to delete {item}: it is a design, and its document (the updates in \
-             `design_updates`) is not part of what `jkb undo` restores, so the delete could not be \
-             taken back"
+            "refusing to delete {uid}: it is a design, and a design is never deleted — what \
+             `jkb undo` restores of a delete would not include its document, plans or threads. \
+             Retire it instead with `jkb design retire {uid}`, which hides it and keeps everything"
         ))));
     }
 

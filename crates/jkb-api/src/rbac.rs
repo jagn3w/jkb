@@ -320,7 +320,10 @@ impl Request {
             // instead are the operator's, as choosing a strategy is.
             | Self::WorkflowAgentCopy { .. }
             | Self::WorkflowAgentSet { .. }
-            | Self::DesignCompact { .. } => OpPermission::Admin,
+            | Self::DesignCompact { .. }
+            // Hiding a design from every role is the operator's call, as deleting an item is.
+            | Self::DesignRetire { .. }
+            | Self::DesignRestore { .. } => OpPermission::Admin,
         }
     }
 
@@ -400,7 +403,9 @@ impl Request {
             | Self::DesignPromptRecord { .. }
             | Self::DesignTarget { .. }
             | Self::DesignSources { .. }
-            | Self::DesignCompact { .. } => Target::Shared,
+            | Self::DesignCompact { .. }
+            | Self::DesignRetire { .. }
+            | Self::DesignRestore { .. } => Target::Shared,
             // An approval is held to the reviewer the span names by the engine (`design::approve`),
             // and is how a mapped `reviewer` subagent — attested, so held to one task for shared
             // writes — signs off a span naming `claude` (D53.5). Shared, it could never run.

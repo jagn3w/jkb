@@ -51,6 +51,9 @@ pub struct Design {
     /// The design it is nested under, or `None` at the top level.
     #[serde(default)]
     pub parent: Option<String>,
+    /// Retired (`design.retire`): listed only by `design.list { retired: true }`.
+    #[serde(default)]
+    pub retired: bool,
     /// How much of its text is in each state, when the listing was asked for it (`review`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewCounts>,
@@ -80,6 +83,7 @@ impl From<DesignRow> for Design {
             doc_target: d.meta.doc_target,
             sources: d.meta.sources.into_iter().map(Source::from).collect(),
             parent: d.parent,
+            retired: d.retired,
             review: None,
         }
     }
@@ -343,13 +347,18 @@ impl From<EditAsk> for Edit {
     }
 }
 
-/// `design.list`.
+/// `design.list`: the live designs, or with `retired` the retired ones instead.
 ///
 /// # Errors
 /// A database error.
-pub fn list(conn: &Connection, repo: Option<&str>, review: bool) -> Result<Vec<Design>, ApiError> {
+pub fn list(
+    conn: &Connection,
+    repo: Option<&str>,
+    review: bool,
+    retired: bool,
+) -> Result<Vec<Design>, ApiError> {
     let mut out = Vec::new();
-    for row in design::list(conn, repo)? {
+    for row in design::list(conn, repo, retired)? {
         let mut d = Design::from(row);
         // Opt-in: it reads every design's document and derives every span's state.
         if review {
@@ -387,6 +396,30 @@ pub fn create(
         // The design as the nesting leaves it, naming its parent.
         Some(parent) => Ok(design::tree::nest(conn, meta, &made.uid, parent)?.into()),
     }
+}
+
+/// `design.retire`: retire a design and every design nested under it, in one write; the answer is
+/// each of them as it lists now.
+///
+/// # Errors
+/// The engine's refusal: an unknown or already retired design, or a task under it not yet done or
+/// cancelled (named).
+pub fn retire(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<Design>, ApiError> {
+    Ok(design::retire(conn, meta, uid)?
+        .into_iter()
+        .map(Design::from)
+        .collect())
+}
+
+/// `design.restore`: restore a retired design and every design nested under it.
+///
+/// # Errors
+/// The engine's refusal: an unknown design, one not retired, or one under a retired parent.
+pub fn restore(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<Design>, ApiError> {
+    Ok(design::restore(conn, meta, uid)?
+        .into_iter()
+        .map(Design::from)
+        .collect())
 }
 
 /// What `design.split` made.

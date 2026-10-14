@@ -127,7 +127,7 @@ pub fn nest(conn: &Connection, meta: &WriteMeta, uid: &str, under: &str) -> Resu
     let mut tree = vec![(old_root, String::new())];
     tree.extend(descendants(conn, old_root)?);
     let before = staged_spans(conn, &tree)?;
-    containment::contain(conn, meta, child, parent, next_position(conn, parent)?)?;
+    containment::contain(conn, meta, child, parent, child_position(conn, parent)?)?;
     let after = staged_spans(conn, &tree)?;
     // A span loses a staging when a step it counted before no longer counts: the same span still
     // STAGED through another step had silently left the first plan (review round 3).
@@ -180,9 +180,14 @@ fn staged_spans(
     Ok(out)
 }
 
-/// The position after every child `parent` holds, so a new child sorts last even after a sibling
-/// was moved away (counting the children ties with a remaining one).
-fn next_position(conn: &Connection, parent: ItemId) -> Result<i64> {
+/// The position a new child design takes under `parent`: after every child it holds, so it sorts
+/// last even after a sibling was moved away (counting the children ties with a remaining one).
+///
+/// Refused while `parent` is retired: a design nested or split out under a retired one would list
+/// with a parent no listing shows. Every writer that puts a design under another asks here, so none
+/// has to remember the rule.
+fn child_position(conn: &Connection, parent: ItemId) -> Result<i64> {
+    super::refuse_retired_parent(conn, parent)?;
     let max: Option<i64> = conn
         .prepare_cached("SELECT MAX(position) FROM containment WHERE parent_item_id = ?1")?
         .query_row([parent.get()], |r| r.get(0))?;
@@ -331,7 +336,7 @@ fn assign(
 /// not read approved in its child refuses the whole split rather than silently demoting it.
 ///
 /// # Errors
-/// An unknown design, a `base` that is not its current version, a level outside 1–6, no heading of
+/// An unknown design, a retired one ([`child_position`]), a `base` that is not its current version, a level outside 1–6, no heading of
 /// that level, a span crossing a section's edge (the split never cuts a span), or a database error.
 pub fn split(
     conn: &Connection,
@@ -413,7 +418,7 @@ pub fn split(
     let update = update.ok_or_else(|| invalid("the split removed nothing"))?;
     let seq = append_row_as(conn, meta, id, uid, &update, true)?;
 
-    let first = next_position(conn, id)?;
+    let first = child_position(conn, id)?;
     let mut children = Vec::new();
     let mut carried = 0;
     for (i, ((s, e, title), spans)) in sections.iter().zip(moving).enumerate() {

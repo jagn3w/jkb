@@ -37,7 +37,7 @@ use base64::Engine as _;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-use jkb_types::{EdgeType, Error as TypeError, ItemId, PlacementRole};
+use jkb_types::{EdgeType, Error as TypeError, ItemId, PlacementRole, Resolution};
 
 use crate::changelog::{self, Entity, Op};
 use crate::mq::{self, Draft, QueueError, TopicSpec};
@@ -221,6 +221,8 @@ pub struct DesignRow {
     pub meta: DesignMeta,
     /// The design it is nested under ([`tree`]), or `None` at the top level.
     pub parent: Option<String>,
+    /// Retired ([`retire`]): left out of every listing but `list(.., true)`.
+    pub retired: bool,
 }
 
 /// One piece of a span's text and the state it is in.
@@ -495,19 +497,24 @@ pub fn create(
         seq,
         meta: DesignMeta::default(),
         parent: None,
+        retired: false,
     })
 }
 
-/// Every design, or those of one repo, by uid.
+/// Every live design, or those of one repo, by uid — or, with `retired`, every retired one instead.
+///
+/// **The one reader** `design.list`, `jkb design ls`, the Design tab's tree and `export --all` ask,
+/// so a retired design leaves all of them by this one filter ([`retire`]).
 ///
 /// # Errors
 /// A database error.
-pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<DesignRow>> {
+pub fn list(conn: &Connection, repo: Option<&str>, retired: bool) -> Result<Vec<DesignRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT i.id, i.uid, COALESCE(i.content, '') FROM items i WHERE i.kind = ?1 ORDER BY i.uid",
+        "SELECT i.id, i.uid, COALESCE(i.content, '') FROM items i
+          WHERE i.kind = ?1 AND (i.resolution IS ?2) = ?3 ORDER BY i.uid",
     )?;
     let rows = stmt
-        .query_map([KIND], |r| {
+        .query_map(params![KIND, RETIRED.as_str(), retired], |r| {
             Ok((
                 ItemId::new(r.get(0)?),
                 r.get::<_, String>(1)?,
@@ -534,6 +541,7 @@ pub fn list(conn: &Connection, repo: Option<&str>) -> Result<Vec<DesignRow>> {
             uid,
             title,
             namespace,
+            retired,
         });
     }
     Ok(out)
@@ -554,7 +562,142 @@ pub fn row(conn: &Connection, uid: &str) -> Result<DesignRow> {
         seq: newest_seq(conn, id)?,
         meta: export::meta_of(conn, id)?,
         parent: parent_uid(conn, id)?,
+        retired: retired_item(conn, id)?,
     })
+}
+
+/// The resolution a retired design carries. `abandoned` already says it, so retiring needs no new
+/// column, value or migration, and `jkb undo` of a retire is an ordinary column restore.
+const RETIRED: Resolution = Resolution::Abandoned;
+/// How many of the open tasks a refused retire names before it says how many more there are.
+const OPEN_TASKS_NAMED: usize = 10;
+
+/// Whether the design item `design` is retired.
+pub(crate) fn retired_item(conn: &Connection, design: ItemId) -> Result<bool> {
+    Ok(item::get_resolution(conn, design)? == Some(RETIRED))
+}
+
+/// Whether design `uid` is retired ([`retire`]).
+///
+/// # Errors
+/// An unknown design, or a database error.
+pub fn is_retired(conn: &Connection, uid: &str) -> Result<bool> {
+    retired_item(conn, design_id(conn, uid)?)
+}
+
+/// Refuse to put a design under `design` while it is retired: one nested, created or split under a
+/// retired design would list with a parent no listing shows. Asked where every child design's
+/// position is chosen (`tree::child_position`).
+pub(crate) fn refuse_retired_parent(conn: &Connection, design: ItemId) -> Result<()> {
+    if retired_item(conn, design)? {
+        let uid = item::get(conn, design)?.map(|m| m.uid).unwrap_or_default();
+        return Err(invalid(format!(
+            "design {uid} is retired — restore it first (`jkb design restore {uid}`)"
+        )));
+    }
+    Ok(())
+}
+
+/// The tasks anywhere under `design` — under a plan's steps, a one-off, a subtask, or in a nested
+/// design — that are not `done` or `cancelled`, by uid.
+fn open_tasks_under(conn: &Connection, design: ItemId) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "WITH RECURSIVE under(id) AS (
+             SELECT child_item_id FROM containment WHERE parent_item_id = ?1
+             UNION
+             SELECT c.child_item_id FROM containment c JOIN under u ON c.parent_item_id = u.id
+         )
+         SELECT i.uid FROM under u JOIN items i ON i.id = u.id
+          WHERE i.kind = 'task' AND (i.status IS NULL OR i.status NOT IN ",
+        jkb_types::sql_terminal_list!(),
+        ") ORDER BY i.uid",
+    ))?;
+    let uids = stmt
+        .query_map([design.get()], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(uids)
+}
+
+/// Retire design `uid` and every design nested under it, in this one transaction, so one `jkb undo`
+/// brings the whole tree back. A retired design leaves [`list`] (and so `jkb design ls`, the Design
+/// tab's tree and `export --all`); nothing else moves — its text, spans, approvals, plans, steps,
+/// threads, prompts, doc target and sources stay keyed to an item that still exists, and `jkb
+/// design cat` still reads it. A design is retired, never deleted ([`item::remove`] refuses one).
+///
+/// Refused while any task under the tree is not `done` or `cancelled`: hiding a design would hide
+/// the work still going on under it. The refusal names those tasks.
+///
+/// # Errors
+/// An unknown design, one already retired, an open task under the tree, or a database error.
+pub fn retire(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<DesignRow>> {
+    let id = design_id(conn, uid)?;
+    if retired_item(conn, id)? {
+        return Err(invalid(format!("design {uid} is already retired")));
+    }
+    let open = open_tasks_under(conn, id)?;
+    if !open.is_empty() {
+        let named = open
+            .iter()
+            .take(OPEN_TASKS_NAMED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = open.len().saturating_sub(OPEN_TASKS_NAMED);
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        return Err(invalid(format!(
+            "design {uid} has {} task(s) under it that are not done or cancelled: {named}{more} — \
+             finish or cancel them first",
+            open.len()
+        )));
+    }
+    let mut tree = vec![(id, uid.to_owned())];
+    tree.extend(tree::descendants(conn, id)?);
+    let mut out = Vec::with_capacity(tree.len());
+    for (design, design_uid) in tree {
+        // A child retired on its own before stays as it is: one more write would make undoing this
+        // retire bring it back too.
+        if !retired_item(conn, design)? {
+            item::set_resolution(conn, meta, design, RETIRED)?;
+        }
+        out.push(row(conn, &design_uid)?);
+    }
+    Ok(out)
+}
+
+/// Restore retired design `uid` and every design nested under it ([`retire`]'s inverse, which `jkb
+/// undo` of the retire also is). Refused under a retired parent: the parent is restored first, or
+/// the design would list under a parent no listing shows.
+///
+/// # Errors
+/// An unknown design, one that is not retired, a retired parent, or a database error.
+pub fn restore(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<DesignRow>> {
+    let id = design_id(conn, uid)?;
+    if !retired_item(conn, id)? {
+        return Err(invalid(format!("design {uid} is not retired")));
+    }
+    if let Some(parent) = tree::parent_of(conn, id)? {
+        if retired_item(conn, parent)? {
+            let p = item::get(conn, parent)?.map(|m| m.uid).unwrap_or_default();
+            return Err(invalid(format!(
+                "design {uid} is nested under {p}, which is retired too — restore {p} first (`jkb \
+                 design restore {p}`), which restores {uid} with it"
+            )));
+        }
+    }
+    let mut tree = vec![(id, uid.to_owned())];
+    tree.extend(tree::descendants(conn, id)?);
+    let mut out = Vec::with_capacity(tree.len());
+    for (design, design_uid) in tree {
+        if retired_item(conn, design)? {
+            item::set_resolution(conn, meta, design, Resolution::Unresolved)?;
+        }
+        out.push(row(conn, &design_uid)?);
+    }
+    Ok(out)
 }
 
 /// The uid of the design `design` is nested under, if any.
@@ -1962,20 +2105,6 @@ pub(crate) fn undo_would_lose(conn: &Connection, item: ItemId, txn: i64) -> Resu
         }
     }
     Ok(None)
-}
-
-/// Whether removing `item` would lose a design document — its updates are not part of an item
-/// delete's snapshot, so `jkb undo` could not bring them back. `item::remove` refuses it.
-///
-/// # Errors
-/// A database error.
-pub(crate) fn holds_document(conn: &Connection, item: ItemId) -> Result<bool> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM design_updates WHERE design_id = ?1)
-                 OR EXISTS (SELECT 1 FROM design_snapshots WHERE design_id = ?1)",
-        )?
-        .query_row([item.get()], |r| r.get(0))?)
 }
 
 #[cfg(test)]

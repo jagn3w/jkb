@@ -276,7 +276,11 @@ fn render_body(design: &DesignText, mut body: String) -> String {
 /// the table that points at it do not change.
 fn tree_text(conn: &Connection, id: ItemId, design: &DesignText) -> Result<String> {
     let mut body = approved_text(design);
-    for (_, child) in super::tree::descendants(conn, id)? {
+    for (child_id, child) in super::tree::descendants(conn, id)? {
+        // A retired design leaves every export, the one its parent inlines it into included.
+        if super::retired_item(conn, child_id)? {
+            continue;
+        }
         let text = approved_text(&super::read(conn, &child)?);
         if text.trim().is_empty() {
             continue;
@@ -542,7 +546,7 @@ pub fn export(conn: &Connection, uid: &str) -> Result<Exported> {
 /// # Errors
 /// A design [`export`] refuses.
 pub fn exports(conn: &Connection, repo: Option<&str>) -> Result<Vec<Exported>> {
-    super::list(conn, repo)?
+    super::list(conn, repo, false)?
         .into_iter()
         .filter(|d| d.meta.doc_target.is_some())
         .map(|d| export(conn, &d.uid))

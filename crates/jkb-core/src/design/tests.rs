@@ -129,10 +129,13 @@ fn a_design_reads_back_its_body_with_a_version_token_that_round_trips() {
     assert_eq!(doc.title, "Code Factory");
     assert_eq!(doc.version.seq, 1);
     assert_eq!(Version::parse(&doc.version.token()).unwrap(), doc.version);
-    let listed = db.read(|c| list(c, Some("jkb"))).unwrap();
+    let listed = db.read(|c| list(c, Some("jkb"), false)).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].namespace.as_deref(), Some("designs/jkb"));
-    assert!(db.read(|c| list(c, Some("other"))).unwrap().is_empty());
+    assert!(db
+        .read(|c| list(c, Some("other"), false))
+        .unwrap()
+        .is_empty());
 }
 
 /// The point of D53.4's correction: an edit resolved against the version Claude read merges with an
@@ -700,6 +703,7 @@ fn a_design_with_a_document_cannot_be_removed_even_with_force() {
         })
         .unwrap_err();
     assert!(e.to_string().contains("design"), "{e}");
+    assert!(e.to_string().contains("jkb design retire"), "{e}");
 }
 
 #[test]
@@ -1777,7 +1781,7 @@ fn a_doc_target_is_a_docs_file_one_design_owns() {
     set_target(&db, &a, "docs/a.md").unwrap();
     assert_eq!(changelog_rows(&db), rows, "a repeat logs nothing");
     set_target(&db, &a, "docs/a2.md").unwrap();
-    let listed = db.read(|c| list(c, Some("jkb"))).unwrap();
+    let listed = db.read(|c| list(c, Some("jkb"), false)).unwrap();
     let row = listed.iter().find(|d| d.uid == a).unwrap();
     assert_eq!(row.meta.doc_target.as_deref(), Some("docs/a2.md"));
     undo_last(&db);
@@ -2644,7 +2648,7 @@ fn split_at(db: &Db, uid: &str, base: &str, level: usize) -> Result<tree::Split>
 }
 
 fn listed(db: &Db) -> Vec<DesignRow> {
-    db.read(|c| list(c, None)).unwrap()
+    db.read(|c| list(c, None, false)).unwrap()
 }
 
 /// The export's body: everything after its one header line.
@@ -3235,4 +3239,269 @@ fn state_counts_weigh_each_state_by_its_non_whitespace_characters() {
     edit_at(&db, &uid, &token(&db, &uid), replace("words", "texts")).unwrap();
     let c = cat(&db, &uid).state_counts();
     assert_eq!((c.approved, c.proposed), (6, 15));
+}
+
+// ---- retire and restore ------------------------------------------------------------------------
+
+fn retire_it(db: &Db, uid: &str) -> Result<Vec<DesignRow>> {
+    let uid = uid.to_owned();
+    db.write_txn("t", move |c, m| retire(c, m, &uid))
+}
+
+fn restore_it(db: &Db, uid: &str) -> Result<Vec<DesignRow>> {
+    let uid = uid.to_owned();
+    db.write_txn("t", move |c, m| restore(c, m, &uid))
+}
+
+fn retired_listed(db: &Db) -> Vec<String> {
+    db.read(|c| list(c, None, true))
+        .unwrap()
+        .into_iter()
+        .map(|d| d.uid)
+        .collect()
+}
+
+fn live_listed(db: &Db) -> Vec<String> {
+    listed(db).into_iter().map(|d| d.uid).collect()
+}
+
+fn retired_now(db: &Db, uid: &str) -> bool {
+    let uid = uid.to_owned();
+    db.read(move |c| is_retired(c, &uid)).unwrap()
+}
+
+/// A parent with a child and a grandchild, all of repo `jkb`.
+fn three_deep(db: &Db) -> (String, String, String) {
+    let parent = create_in(db, "jkb", "Parent", "Parent text.");
+    let child = create_in(db, "jkb", "Child", "Child text.");
+    let grandchild = create_in(db, "jkb", "Grandchild", "Grandchild text.");
+    nest_under(db, &child, &parent).unwrap();
+    nest_under(db, &grandchild, &child).unwrap();
+    (parent, child, grandchild)
+}
+
+/// Retiring takes the design and everything nested under it out of the listing, and `list(.., true)`
+/// lists exactly them; the text is still read, and `row` says it is retired.
+#[test]
+fn a_retired_tree_leaves_the_listing_and_is_listed_as_retired() {
+    let db = db();
+    let (parent, child, grandchild) = three_deep(&db);
+    let other = create_in(&db, "jkb", "Other", "x");
+    let touched = retire_it(&db, &parent).unwrap();
+    assert_eq!(
+        touched.iter().map(|d| d.uid.clone()).collect::<Vec<_>>(),
+        vec![parent.clone(), child.clone(), grandchild.clone()]
+    );
+    assert!(touched.iter().all(|d| d.retired));
+    assert_eq!(live_listed(&db), vec![other.clone()]);
+    let mut retired = retired_listed(&db);
+    retired.sort();
+    let mut want = vec![parent.clone(), child.clone(), grandchild.clone()];
+    want.sort();
+    assert_eq!(retired, want);
+    assert!(listed(&db).iter().all(|d| !d.retired));
+    assert!(retired_now(&db, &child));
+    assert!(!retired_now(&db, &other));
+    // Nothing moved: the text reads, and the nesting is kept.
+    assert_eq!(text(&db, &child), "Child text.");
+    let p = parent.clone();
+    let row_of_parent = db.read(move |c| row(c, &p)).unwrap();
+    assert!(row_of_parent.retired);
+    let c2 = child.clone();
+    assert_eq!(
+        db.read(move |c| row(c, &c2)).unwrap().parent.as_deref(),
+        Some(parent.as_str())
+    );
+    // Retiring twice is refused, by name.
+    let e = retire_it(&db, &parent).unwrap_err();
+    assert!(e.to_string().contains("already retired"), "{e}");
+}
+
+/// One `jkb undo` brings the whole tree back: the retire is one transaction of column writes.
+#[test]
+fn undoing_a_retire_restores_the_whole_tree_in_one_step() {
+    let db = db();
+    let (parent, child, grandchild) = three_deep(&db);
+    let before = live_listed(&db);
+    retire_it(&db, &parent).unwrap();
+    assert!(live_listed(&db).is_empty());
+    assert_eq!(
+        undo_last(&db),
+        3,
+        "one entry per design, all in one transaction"
+    );
+    assert_eq!(live_listed(&db), before);
+    for uid in [&parent, &child, &grandchild] {
+        assert!(!retired_now(&db, uid), "{uid}");
+    }
+    assert!(retired_listed(&db).is_empty());
+}
+
+/// A child retired on its own stays retired when its parent's later retire is undone: the parent's
+/// retire never wrote it.
+#[test]
+fn a_child_retired_first_is_not_part_of_its_parents_retire() {
+    let db = db();
+    let (parent, child, grandchild) = three_deep(&db);
+    retire_it(&db, &child).unwrap();
+    assert_eq!(live_listed(&db), vec![parent.clone()]);
+    retire_it(&db, &parent).unwrap();
+    assert_eq!(undo_last(&db), 1);
+    assert_eq!(live_listed(&db), vec![parent.clone()]);
+    assert!(retired_now(&db, &child) && retired_now(&db, &grandchild));
+}
+
+/// Refused while any task under the tree is open — under a step, a one-off, or in a nested design's
+/// plan — naming each; done and cancelled tasks do not hold it, and stay contained.
+#[test]
+fn retiring_is_refused_while_a_task_under_the_tree_is_open_and_names_it() {
+    let db = db();
+    let (parent, child, _) = three_deep(&db);
+    let plan = new_plan(&db, &child, &["build"]).unwrap();
+    let step = step_id(&db, &plan.steps[0].uid);
+    let t1 = task_under(&db, step, "task:under-step");
+    let one_off = {
+        let parent_id = step_id(&db, &parent);
+        task_under(&db, parent_id, "task:one-off")
+    };
+    let e = retire_it(&db, &parent).unwrap_err().to_string();
+    assert!(e.contains("task:under-step"), "{e}");
+    assert!(e.contains("task:one-off"), "{e}");
+    assert!(e.contains("2 task(s)"), "{e}");
+    assert!(!retired_now(&db, &parent), "a refusal writes nothing");
+    // Retiring the child alone names only what is under it.
+    let e = retire_it(&db, &child).unwrap_err().to_string();
+    assert!(
+        e.contains("task:under-step") && !e.contains("task:one-off"),
+        "{e}"
+    );
+
+    set_status(&db, t1, TaskStatus::InProgress);
+    assert!(retire_it(&db, &parent).is_err(), "in progress is open");
+    set_status(&db, t1, TaskStatus::Done);
+    set_status(&db, one_off, TaskStatus::Cancelled);
+    retire_it(&db, &parent).unwrap();
+    assert!(retired_now(&db, &child));
+    // The finished tasks stay where they were.
+    let still = db.read(move |c| containment::parent(c, t1)).unwrap();
+    assert_eq!(still, Some(step));
+}
+
+/// A refusal past the first ten tasks says how many more there are rather than listing them all.
+#[test]
+fn a_refused_retire_names_ten_tasks_and_counts_the_rest() {
+    let db = db();
+    let uid = create(&db, "x");
+    let id = step_id(&db, &uid);
+    for n in 0..12 {
+        task_under(&db, id, &format!("task:t{n:02}"));
+    }
+    let e = retire_it(&db, &uid).unwrap_err().to_string();
+    assert!(e.contains("12 task(s)") && e.contains("and 2 more"), "{e}");
+    assert!(e.contains("task:t09") && !e.contains("task:t10"), "{e}");
+}
+
+/// Restoring brings a retired design and its tree back; it is refused for a design that is not
+/// retired, and for one under a retired parent — the parent first.
+#[test]
+fn restore_is_refused_under_a_retired_parent_and_brings_back_the_tree() {
+    let db = db();
+    let (parent, child, grandchild) = three_deep(&db);
+    let e = restore_it(&db, &parent).unwrap_err();
+    assert!(e.to_string().contains("not retired"), "{e}");
+    retire_it(&db, &parent).unwrap();
+    let e = restore_it(&db, &child).unwrap_err().to_string();
+    assert!(e.contains(&parent) && e.contains("restore"), "{e}");
+    assert!(retired_now(&db, &child), "a refusal writes nothing");
+    let back = restore_it(&db, &parent).unwrap();
+    assert_eq!(back.len(), 3);
+    assert!(back.iter().all(|d| !d.retired));
+    for uid in [&parent, &child, &grandchild] {
+        assert!(!retired_now(&db, uid), "{uid}");
+    }
+    assert!(retired_listed(&db).is_empty());
+    // A restore is undone like any write.
+    undo_last(&db);
+    assert!(retired_now(&db, &grandchild));
+}
+
+/// Nothing is put under a retired design: a design nested or split under it would list with a
+/// parent no listing shows.
+#[test]
+fn nothing_is_nested_or_split_under_a_retired_design() {
+    let db = db();
+    let parent = create_in(&db, "jkb", "Parent", SPLIT_BODY);
+    let loose = create_in(&db, "jkb", "Loose", "x");
+    retire_it(&db, &parent).unwrap();
+    let e = nest_under(&db, &loose, &parent).unwrap_err().to_string();
+    assert!(e.contains("retired"), "{e}");
+    let base = token(&db, &parent);
+    let e = split_at(&db, &parent, &base, 2).unwrap_err().to_string();
+    assert!(e.contains("retired"), "{e}");
+    assert_eq!(live_listed(&db), vec![loose]);
+}
+
+/// `item::remove` refuses a design by kind — an empty one (which once slipped through, its guard
+/// asking only about a document) and a retired one alike, `force` or not — and says to retire it.
+#[test]
+fn an_empty_or_retired_design_is_refused_by_item_remove_which_says_retire() {
+    let db = db();
+    let empty = create(&db, "");
+    let retired = create(&db, "words");
+    retire_it(&db, &retired).unwrap();
+    for uid in [&empty, &retired] {
+        for force in [false, true] {
+            let u = uid.clone();
+            let e = db
+                .write_txn("t", move |c, m| {
+                    let id = design_id(c, &u)?;
+                    item::remove(c, m, id, force)
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(&format!("jkb design retire {uid}")), "{e}");
+        }
+        let u = uid.clone();
+        assert!(db.read(move |c| design_id(c, &u)).is_ok(), "still there");
+    }
+}
+
+/// A retired design leaves `export --all`'s listing, and a retired child leaves its parent's export.
+#[test]
+fn a_retired_design_leaves_every_export() {
+    let db = db();
+    let parent = create_in(&db, "jkb", "Parent", "Parent words.");
+    let child = create_in(&db, "jkb", "Child", "Child words.");
+    for (uid, quote) in [(&parent, "Parent words."), (&child, "Child words.")] {
+        let s = span(&db, uid, quote, Reviewer::Operator).unwrap();
+        approve_as(&db, &s, Approver::Operator).unwrap();
+    }
+    nest_under(&db, &child, &parent).unwrap();
+    let alone = create_in(&db, "jkb", "Alone", "y");
+    for (uid, path) in [(&parent, "docs/p.md"), (&alone, "docs/a.md")] {
+        let (u, p) = (uid.clone(), path.to_owned());
+        db.write_txn("t", move |c, m| export::set_doc_target(c, m, &u, &p))
+            .unwrap();
+    }
+    assert!(tree_export_body(&db, &parent).contains("Child words."));
+    retire_it(&db, &child).unwrap();
+    let body = tree_export_body(&db, &parent);
+    assert!(
+        body.contains("Parent words.") && !body.contains("Child words."),
+        "{body}"
+    );
+    let all = |db: &Db| -> Vec<String> {
+        db.read(|c| export::exports(c, Some("jkb")))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.uid)
+            .collect()
+    };
+    let mut both = vec![parent.clone(), alone.clone()];
+    both.sort();
+    let mut now = all(&db);
+    now.sort();
+    assert_eq!(now, both);
+    retire_it(&db, &alone).unwrap();
+    assert_eq!(all(&db), vec![parent]);
 }
