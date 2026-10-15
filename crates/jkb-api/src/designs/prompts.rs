@@ -3,8 +3,9 @@
 //!
 //! A design prompt is the record of one Claude Code session that worked the design: its pre-minted
 //! session uuid and the directory it runs in, written by the launch before Claude starts so the
-//! Prompts pane can resume it (`claude --resume <uuid>` there). `jkb design prompt record|ls` is the
-//! CLI for the same ops, and `jkb design prompt new` prints the prompt a *New prompt* starts with.
+//! Prompts pane (and, by repo, the Sessions tab) can resume it (`claude --resume <uuid>` there).
+//! `jkb design prompt record|ls` is the CLI for the same ops, and `jkb design prompt new` prints
+//! the prompt a *New prompt* starts with.
 
 use std::fmt::Write as _;
 
@@ -108,6 +109,26 @@ pub fn list(conn: &Connection, uid: &str) -> Result<Vec<DesignPrompt>, ApiError>
         .into_iter()
         .map(DesignPrompt::from)
         .collect())
+}
+
+/// `design.prompts` by repo: every live design's prompts in `designs/<repo>` in one read, each
+/// naming its design, newest first across them all (the Sessions tab's join, which would otherwise
+/// read once per design). A retired design's prompts are left out, like the design.
+///
+/// # Errors
+/// A database error, or a prompt that cannot be read.
+pub fn list_repo(conn: &Connection, repo: &str) -> Result<Vec<DesignPrompt>, ApiError> {
+    let mut out = Vec::new();
+    for d in design::list(conn, Some(repo), false)? {
+        out.extend(
+            prompts::list(conn, &d.uid)?
+                .into_iter()
+                .map(DesignPrompt::from),
+        );
+    }
+    // Stable, so one design's prompts keep their own order where two share a timestamp.
+    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(out)
 }
 
 /// `design.prompt_of`: the prompt a session was recorded with, or `None` when no launch recorded

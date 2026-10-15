@@ -791,10 +791,15 @@ enum DesignPromptCmd {
         #[arg(long)]
         title: String,
     },
-    /// A design's recorded prompts, newest first, each with the command that resumes it.
+    /// A design's recorded prompts, newest first, each with the command that resumes it. Without a
+    /// design, every live design's prompts in the ambient repo (or `--repo`'s), each naming its
+    /// design.
     Ls {
         /// The design.
-        uid: String,
+        uid: Option<String>,
+        /// Every live design's prompts in this repo (`designs/<repo>`) instead of one design's.
+        #[arg(long, conflicts_with = "uid")]
+        repo: Option<String>,
     },
     /// The prompt a Claude Code session was recorded with — the design it worked — or nothing
     /// (exit 0, `(none)`) when no launch recorded it.

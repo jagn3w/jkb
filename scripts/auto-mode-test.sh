@@ -531,14 +531,33 @@ check_that "--help strips the comment markers" \
 # is a closed set) would otherwise install cleanly and be silently ignored at runtime, which is
 # indistinguishable from a posture that is in force. Skipped when Claude Code is absent (CI has
 # none); a skip is announced, never silent.
+#
+# Only problems in the project's own files count. Doctor also walks up from the project and reports
+# what it finds above it, and that is the machine, not the posture: in the agent sandbox
+# `/tmp/.mcp.json` is a device masking the file, which doctor lists as invalid settings beside a
+# posture that is fine. Each problem is a `- <path>…` line, so the ones under `$proj/` are the
+# posture's — matched by the directory's resolved path, which is what doctor prints (on macOS
+# `mktemp` answers under /var/folders or /tmp, both symlinks into /private, and the unresolved path
+# would match nothing, passing any posture). A deliberately bad posture beside it proves the
+# narrowed check still fails.
+doctor_problems() { # <project dir>: doctor's problems in that project's own files, one per line
+    local dir
+    dir="$(cd "$1" && pwd -P)"
+    (cd "$dir" && "$real_claude" doctor 2>&1 || true) | sed -n '/Invalid settings/,/^$/p' | grep -F -- "- $dir/" || true
+}
 if [ -x "$real_claude" ]; then
     proj="$tmp/schema"
     mkdir -p "$proj/.claude"
     jq '.require' "$posture" > "$proj/.claude/settings.json"
-    doctor="$(cd "$proj" && "$real_claude" doctor 2>&1 || true)"
+    problems="$(doctor_problems "$proj")"
     check_that "the posture validates against Claude Code's own settings schema" \
-        "$(grep -q 'Invalid settings' <<<"$doctor" && echo no || echo yes)"
-    grep -q 'Invalid settings' <<<"$doctor" && sed -n '/Invalid settings/,/^$/p' <<<"$doctor" | sed 's/^/       /'
+        "$([ -z "$problems" ] && echo yes || echo no)"
+    [ -n "$problems" ] && sed 's/^/       /' <<<"$problems"
+    bad="$tmp/schema-bad"
+    mkdir -p "$bad/.claude"
+    jq '.require | .permissions.defaultMode = "notAMode"' "$posture" > "$bad/.claude/settings.json"
+    check_that "a posture with an invalid defaultMode fails that same check" \
+        "$(grep -qF "/schema-bad/.claude/settings.json" <<<"$(doctor_problems "$bad")" && echo yes || echo no)"
 else
     echo "  skip  schema validation (claude not installed)"
 fi

@@ -1187,3 +1187,102 @@ fn inv_resolve_cannot_retire_a_design_and_export_refuses_a_retired_one() {
     let e = call(&kb.op, json!({ "op": "design.export", "uid": uid })).unwrap_err();
     assert!(e.message.contains("retired"), "{e:?}");
 }
+
+/// `design.prompts` by repo: every live design's prompts in the repo in one read, each naming its
+/// design, newest first across designs; another repo's and a retired design's are left out. The
+/// Sessions tab joins the registry with it (`ui/core/src/prompts.ts`).
+#[test]
+fn a_repos_prompts_are_every_live_designs_in_one_read() {
+    let kb = Kb::new();
+    let first = create(&kb.op, "First.");
+    let second = create(&kb.op, "Second.");
+    let retired = create(&kb.op, "Retired.");
+    let elsewhere = match ok(
+        &kb.op,
+        json!({ "op": "design.create", "repo": "other", "title": "Elsewhere" }),
+    ) {
+        Response::DesignCreated { design } => design.uid,
+        other => panic!("{other:?}"),
+    };
+    let record = |design: &str, session: &str| {
+        ok(
+            &kb.op,
+            json!({ "op": "design.prompt_record", "uid": design, "session": session,
+                    "cwd": "/home/vscode/repos/jkb", "launch": "new", "title": session }),
+        );
+    };
+    let sessions = [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003",
+        "00000000-0000-4000-8000-000000000004",
+        "00000000-0000-4000-8000-000000000005",
+    ];
+    record(&first, sessions[0]);
+    record(&second, sessions[1]);
+    record(&first, sessions[2]);
+    record(&retired, sessions[3]);
+    record(&elsewhere, sessions[4]);
+    ok(&kb.op, json!({ "op": "design.retire", "uid": retired }));
+
+    let wire = serde_json::to_value(ok(
+        &kb.as_role("implementer"),
+        json!({ "op": "design.prompts", "repo": "jkb" }),
+    ))
+    .unwrap();
+    assert_eq!(wire["result"], "design_prompts");
+    assert_eq!(wire["repo"], "jkb");
+    assert!(wire.get("uid").is_none(), "{wire}");
+    let listed: Vec<(String, String)> = wire["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["design"].as_str().unwrap().to_owned(),
+                p["session"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let mut got = listed.clone();
+    got.sort();
+    let mut want = vec![
+        (first.clone(), sessions[0].to_owned()),
+        (second.clone(), sessions[1].to_owned()),
+        (first.clone(), sessions[2].to_owned()),
+    ];
+    want.sort();
+    assert_eq!(got, want, "only the repo's live designs' prompts");
+    let created: Vec<&str> = wire["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["created_at"].as_str().unwrap())
+        .collect();
+    assert!(
+        created.windows(2).all(|w| w[0] >= w[1]),
+        "newest first: {created:?}"
+    );
+
+    // By design, the answer still names the design and not a repo.
+    let wire =
+        serde_json::to_value(ok(&kb.op, json!({ "op": "design.prompts", "uid": first }))).unwrap();
+    assert_eq!(wire["uid"], json!(first));
+    assert!(wire.get("repo").is_none(), "{wire}");
+    assert_eq!(wire["prompts"].as_array().map(Vec::len), Some(2));
+
+    // A repo with no designs lists nothing; both or neither is refused.
+    let wire = serde_json::to_value(ok(
+        &kb.op,
+        json!({ "op": "design.prompts", "repo": "none" }),
+    ))
+    .unwrap();
+    assert_eq!(wire["prompts"], json!([]));
+    for ask in [
+        json!({ "op": "design.prompts" }),
+        json!({ "op": "design.prompts", "uid": first, "repo": "jkb" }),
+    ] {
+        let e = call(&kb.op, ask.clone()).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{ask}: {e:?}");
+    }
+}

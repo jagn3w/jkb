@@ -1,12 +1,18 @@
 /* The Design tab's Plans and Tasks views (D53.6). Colour is meaning only: a staged span
  * carries its state's accent, a failed or cancelled task is muted, nothing else is coloured. */
 
+/* Sticky: a pane bar sits inside the region that scrolls (a Design view, the Sessions preview, the
+ * Workflows column), and stays at its top while its own section scrolls under it. */
 .pane-bar {
+  position: sticky;
+  top: 0;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: var(--space-2);
   padding: var(--space-2) var(--space-3);
   border-bottom: var(--hairline-width) solid var(--hairline);
+  background: var(--bg);
   min-width: 0;
 }
 

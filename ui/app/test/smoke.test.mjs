@@ -206,6 +206,77 @@ for (const [id, label] of [
   });
 }
 
+// The fixed frame (operator feedback, 2026-10-14): each pane fills the row between the top bar and
+// the terminal, the row itself never scrolls, and each tab's own region scrolls under a header that
+// stays put. With no daemon the tabs are near empty, so each region is given a tall block to scroll
+// first. `root` is the tab's own element, `region` what scrolls, `headers` what must stay in view.
+// A pane bar is sticky within its own section (Workflows stacks two), so that one is checked with
+// the block inside its section (`tallIn`), scrolled part way rather than to the end.
+for (const { id, label, root, region, headers, tallIn = region, by } of [
+  { id: "design", label: "Design", root: ".design-tab", region: ".design-sidebar", headers: [".design-sidebar .sidebar-bar"] },
+  { id: "workflows", label: "Workflows", root: ".workflows-tab", region: ".workflows-main", headers: [".workflows-tab > .design-bar"] },
+  {
+    id: "workflows",
+    label: "Workflows",
+    root: ".workflows-tab",
+    region: ".workflows-main",
+    headers: [".workflows-tab > .design-bar", ".agents-pane .pane-bar"],
+    tallIn: ".agents-pane .pane-body",
+    by: 1000,
+  },
+  { id: "container", label: "Container", root: ".container-tab", region: ".container-body", headers: [".container-tab > .design-bar"] },
+  { id: "sessions", label: "Sessions", root: ".sessions-tab", region: ".sessions-list", headers: [".sessions-tab > .design-bar"] },
+]) {
+  const how = by === undefined ? "to the end" : `${by}px within ${tallIn}`;
+  test(`the ${label} tab fills the frame, which never scrolls, and ${headers.join(", ")} stay in view scrolled ${how}`, { skip }, async () => {
+    await page.getByRole("tab", { name: label, exact: true }).click();
+    await page.locator(`#pane-${id}`).waitFor({ state: "visible" });
+    const got = await page.evaluate(
+      ({ id, root, region, headers, tallIn, by }) => {
+        const pane = document.getElementById(`pane-${id}`);
+        const panes = document.querySelector(".panes");
+        const scroller = pane.querySelector(region);
+        const tall = document.createElement("div");
+        tall.style.height = "5000px";
+        // Not shrinkable: in a flex column (the Design sidebar, the Workflows main column) an empty
+        // item's automatic minimum is 0, so it would shrink to fit and leave nothing to scroll.
+        tall.style.flex = "none";
+        pane.querySelector(tallIn).append(tall);
+        const before = headers.map((h) => pane.querySelector(h).getBoundingClientRect().top);
+        scroller.scrollTop = by === null ? scroller.scrollHeight : by;
+        const box = pane.getBoundingClientRect();
+        const after = headers.map((h) => {
+          const r = pane.querySelector(h).getBoundingClientRect();
+          return { top: r.top, inView: r.top >= box.top - 0.5 && r.bottom <= box.bottom + 0.5 };
+        });
+        const out = {
+          scrolled: scroller.scrollTop,
+          framesScroll: panes.scrollHeight - panes.clientHeight,
+          paneScrolls: pane.scrollHeight - pane.clientHeight,
+          paneHeight: pane.clientHeight,
+          framesHeight: panes.clientHeight,
+          rootHeight: pane.querySelector(root).getBoundingClientRect().height,
+          before,
+          after,
+        };
+        scroller.scrollTop = 0;
+        tall.remove();
+        return out;
+      },
+      { id, root, region, headers, tallIn, by: by ?? null },
+    );
+    assert.ok(got.scrolled > 0, `${region} scrolls its own content: ${JSON.stringify(got)}`);
+    assert.equal(got.framesScroll, 0, `.panes has nothing to scroll: ${JSON.stringify(got)}`);
+    assert.equal(got.paneScrolls, 0, `the pane has nothing to scroll: ${JSON.stringify(got)}`);
+    assert.equal(got.paneHeight, got.framesHeight, "the pane fills the row");
+    assert.ok(Math.abs(got.rootHeight - got.paneHeight) <= 1, `the tab fills its pane: ${JSON.stringify(got)}`);
+    got.after.forEach((a, i) => {
+      assert.ok(a.inView, `${headers[i]} is in view scrolled ${how}: ${JSON.stringify(got)}`);
+      assert.ok(Math.abs(a.top - got.before[i]) <= 0.5, `${headers[i]} did not move: ${JSON.stringify(got)}`);
+    });
+  });
+}
+
 // The Design tab (D53.4): with no daemon there are no designs to list, and the pane says why rather
 // than showing an empty editor. Editing, live sync and Discuss against a real jkb are pinned by
 // design.test.mjs and yjs-wire.test.mjs.

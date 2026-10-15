@@ -1,10 +1,16 @@
 //! The Sessions tab's reads (D53.9), over an op call so they are tested with a stand-in daemon.
 
 import {
+  decodeDesignPrompts,
+  decodeDesigns,
   decodeNotified,
   decodeSessionPage,
+  designOps,
+  designRepos,
   failed,
+  promptOps,
   sessionOps,
+  type DesignPromptRecord,
   type NotifyRecord,
   type OpRequest,
   type OpResponse,
@@ -54,4 +60,32 @@ export function liveCwds(holders: readonly SessionHolder[]): Map<string, string>
     if (had === undefined || h.seenAt > had.seenAt) out.set(h.session, { cwd: h.cwd, seenAt: h.seenAt });
   }
   return new Map([...out].map(([s, v]) => [s, v.cwd]));
+}
+
+/** Every live design's prompts, and each design's title by uid: what names a row launched from a design. */
+export interface Prompts {
+  readonly prompts: readonly DesignPromptRecord[];
+  readonly titles: ReadonlyMap<string, string>;
+}
+
+/**
+ * Every design's prompts: the designs listed once, then each repo's prompts in one read
+ * (`design.prompts` by repo) — a read per repo, not per design.
+ */
+export async function loadPrompts(op: Op): Promise<Outcome<Prompts>> {
+  const designs = decodeDesigns(await op(designOps.list()));
+  if (!designs.ok) return designs;
+  const repos = designRepos(designs.value);
+  const answers = await Promise.all(repos.map(async (repo) => decodeDesignPrompts(await op(promptOps.listRepo(repo)))));
+  const prompts: DesignPromptRecord[] = [];
+  for (const a of answers) {
+    if (!a.ok) return a;
+    prompts.push(...a.value);
+  }
+  return { ok: true, value: { prompts, titles: new Map(designs.value.map((d) => [d.uid, d.title])) } };
+}
+
+/** How a row launched from a design is named: its design's title and its prompt's (which names the subject). */
+export function promptName(prompt: DesignPromptRecord, titles: ReadonlyMap<string, string>): string {
+  return `${titles.get(prompt.design) ?? prompt.design} · ${prompt.title}`;
 }

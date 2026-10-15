@@ -340,14 +340,27 @@ fn record_prompt(ops: &Ops<'_>, request: Request) -> Result<()> {
     }
 }
 
-/// `jkb design prompt ls` (D53.6): a design's prompts, newest first, each with how to resume it.
-fn list_prompts(ops: &Ops<'_>, uid: String) -> Result<()> {
-    let (uid, prompts) = match ops.call(Request::DesignPrompts { uid })? {
-        Response::DesignPrompts { uid, prompts } => (uid, prompts),
+/// `jkb design prompt ls` (D53.6): a design's prompts, newest first, each with how to resume it —
+/// or, with no design, every live design's prompts in the repo (`--repo`, else the ambient one),
+/// each naming its design.
+fn list_prompts(ops: &Ops<'_>, uid: Option<String>, repo: Option<String>) -> Result<()> {
+    let repo = match (&uid, repo) {
+        (Some(_), _) => None,
+        (None, Some(r)) => Some(r),
+        (None, None) => Some(ops.ambient_repo()?.ok_or_else(|| {
+            anyhow::anyhow!("not inside a repo: name a design, or the repo with --repo")
+        })?),
+    };
+    let by_repo = repo.is_some();
+    let (uid, repo, prompts) = match ops.call(Request::DesignPrompts { uid, repo })? {
+        Response::DesignPrompts { uid, repo, prompts } => (uid, repo, prompts),
         other => return unexpected("design.prompts", &other),
     };
     if ops.json {
-        let listing = serde_json::json!({ "uid": uid, "prompts": prompts });
+        let listing = match (uid, repo) {
+            (Some(uid), _) => serde_json::json!({ "uid": uid, "prompts": prompts }),
+            (None, repo) => serde_json::json!({ "repo": repo, "prompts": prompts }),
+        };
         println!("{}", serde_json::to_string_pretty(&listing)?);
         return Ok(());
     }
@@ -364,6 +377,9 @@ fn list_prompts(ops: &Ops<'_>, uid: String) -> Result<()> {
             "{}  [{}]  {}{subject}  {}",
             p.created_at, p.launch, p.title, p.uid
         );
+        if by_repo {
+            println!("    design: {}", p.design);
+        }
         println!(
             "    resume: cd {} && claude --resume {}",
             shell_word(&p.cwd),
@@ -430,7 +446,7 @@ fn prompt_cmd(ops: &Ops<'_>, what: DesignPromptCmd) -> Result<()> {
                 },
             );
         }
-        DesignPromptCmd::Ls { uid } => return list_prompts(ops, uid),
+        DesignPromptCmd::Ls { uid, repo } => return list_prompts(ops, uid, repo),
         DesignPromptCmd::Of { session } => return prompt_of(ops, session),
         DesignPromptCmd::Discuss { uid, range, base } => {
             let (start, end) = parse_range(&range)?;

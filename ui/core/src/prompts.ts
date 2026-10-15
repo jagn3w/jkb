@@ -42,6 +42,8 @@ export interface NewPrompt {
 export const promptOps = {
   /** A design's prompts, newest first. */
   list: (uid: string) => ({ op: "design.prompts", uid }),
+  /** Every live design's prompts in a repo, in one read, each naming its design (the Sessions tab). */
+  listRepo: (repo: string) => ({ op: "design.prompts", repo }),
   /** The prompt a Claude Code session was recorded with, if any (D53.9). */
   of: (session: string) => ({ op: "design.prompt_of", session }),
   /** The prompt a *New prompt* starts its session with: the operator's `text`, after the design's how-to. */
@@ -71,7 +73,7 @@ function isRecord(v: unknown): v is DesignPromptRecord {
   );
 }
 
-/** `design.prompts`' answer: the design's prompts, newest first. */
+/** `design.prompts`' answer: the design's (or the repo's) prompts, newest first. */
 export function decodeDesignPrompts(o: Outcome<OpResponse>): Outcome<readonly DesignPromptRecord[]> {
   if (!o.ok) return o;
   const prompts = o.value.result === "design_prompts" ? o.value["prompts"] : undefined;

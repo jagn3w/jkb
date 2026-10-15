@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 
-import type { DesignNode, RepoNode, ReviewCounts } from "@jkb/core";
+import { subtreeReview, type DesignNode, type RepoNode, type ReviewCounts } from "@jkb/core";
 
 import { createTargets, defaultTarget, type CreateTarget } from "./create";
 import { sidebarRepos } from "./retire";
 
-/** A thin bar of the design's span states, and how much of it is unreviewed. */
+/** A thin bar of the span states of a design and the designs under it, and how much is unreviewed. */
 function StateBar({ counts }: { readonly counts: ReviewCounts }): React.JSX.Element | null {
   const total = counts.proposed + counts.approved + counts.staged + counts.implemented;
   if (total === 0) return null;
@@ -79,6 +79,8 @@ function DesignRow({
 }): React.JSX.Element {
   const { design, children } = node;
   const open = !folded.has(design.uid);
+  // The whole subtree's counts; *See next* still skips by a design's own (`hasUnreviewed`).
+  const review = subtreeReview(node);
   return (
     <li role="treeitem" aria-selected={design.uid === active} aria-expanded={children.length > 0 ? open : undefined}>
       <div className="tree-row" style={{ paddingLeft: `calc(var(--space-2) + ${depth} * var(--space-3))` }}>
@@ -103,7 +105,7 @@ function DesignRow({
         >
           {design.title}
         </button>
-        {design.review !== undefined && <StateBar counts={design.review} />}
+        {review !== undefined && <StateBar counts={review} />}
       </div>
       {children.length > 0 && open && (
         <ul role="group">

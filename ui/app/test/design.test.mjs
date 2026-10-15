@@ -49,6 +49,7 @@ const { SessionRegistry } = await load(path.join(src, "renderer", "src", "design
 const { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading } = await load(path.join(src, "renderer", "src", "design", "listing.ts"));
 const { LAUNCH_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
 const { createAndOpen, createDesign, createTargets, defaultTarget } = await load(path.join(src, "renderer", "src", "design", "create.ts"));
+const { SIDEBAR_WIDTH, clampSidebarWidth, parseSidebarWidth } = await load(path.join(src, "renderer", "src", "design", "sidebarWidth.ts"));
 const Y = require("yjs");
 
 const TOPIC = "design/design.factory-1";
@@ -957,4 +958,18 @@ test("a retire or restore reads both listings again only when it was done", asyn
   };
   assert.deepEqual(await run(ok([])), { out: ok([]), log: ["change", "reload"] });
   assert.deepEqual(await run(err("forbidden", "only the operator")), { out: err("forbidden", "only the operator"), log: ["change"] });
+});
+
+test("the sidebar's width stays between 180px and half the window, and an unreadable one is the default", () => {
+  assert.equal(SIDEBAR_WIDTH.default, 260);
+  assert.equal(clampSidebarWidth(100, 1000), 180);
+  assert.equal(clampSidebarWidth(400.4, 1000), 400);
+  assert.equal(clampSidebarWidth(700, 1000), 500);
+  assert.equal(clampSidebarWidth(Number.NaN, 1000), 260);
+  // A window too narrow for half of it to reach the minimum still gets the minimum.
+  assert.equal(clampSidebarWidth(260, 300), 180);
+  assert.equal(parseSidebarWidth(null), 260);
+  assert.equal(parseSidebarWidth(""), 260);
+  assert.equal(parseSidebarWidth("wide"), 260);
+  assert.equal(parseSidebarWidth("320"), 320);
 });

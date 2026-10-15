@@ -21,7 +21,7 @@ import {
 import { containerPathOf } from "../../../shared/terminal";
 import { titled } from "../design/launch";
 import { useNavigation } from "../navigation";
-import { loadHolders, type Holders } from "../sessions/data";
+import { loadHolders, loadPrompts, promptName, type Holders, type Prompts } from "../sessions/data";
 import { useNeedsInput } from "../sessions/NeedsInputProvider";
 import { HOST_SESSION_NOTE, owningTerminals, sessionAction } from "../sessions/resume";
 import type { TerminalEntry } from "../terminal/state";
@@ -65,6 +65,10 @@ const shortId = (session: string): string => session.slice(0, 8);
  * never re-attached; of one that ran on the host the tab says only that — the app runs no program on
  * the host, and offers none to run (`sessions/resume.ts`).
  *
+ * Every design's prompts are joined in by session id (`design.prompts` by repo): a session launched
+ * from a design is named by it, and one the registry no longer lists is still an ended row, resumed
+ * where its prompt was recorded — shown, like the registry's ended rows, with *Ended too*.
+ *
  * The registry is re-read on demand — Refresh, the *Ended too* toggle, and whenever a notification
  * moves (which the feed already announces). Nothing announces a session starting or ending, and
  * D53.1 rules out a poll loop.
@@ -75,7 +79,21 @@ export function SessionsTab(): React.JSX.Element {
   const [all, setAll] = useState(false);
   const [listing, setListing] = useState<Listing>({ kind: "loading" });
   const [selected, setSelected] = useState<string | undefined>(undefined);
+  const [prompts, setPrompts] = useState<Loaded<Prompts>>({ kind: "loading" });
   const generation = useRef(0);
+  const promptGeneration = useRef(0);
+
+  const loadDesignPrompts = useCallback(async () => {
+    const mine = ++promptGeneration.current;
+    const answer = await loadPrompts(op);
+    if (mine !== promptGeneration.current) return;
+    setPrompts(answer.ok ? { kind: "loaded", value: answer.value } : { kind: "failed", message: answer.error.message });
+  }, []);
+  // On the registry's own triggers (opening, *Ended too*, a notification moving), so a session a
+  // design launch just started is named by its design as soon as it is listed, not at Refresh.
+  useEffect(() => {
+    void loadDesignPrompts();
+  }, [all, needs.records, loadDesignPrompts]);
 
   const load = useCallback(async (withEnded: boolean) => {
     const mine = ++generation.current;
@@ -92,9 +110,14 @@ export function SessionsTab(): React.JSX.Element {
   }, [all, needs.records, load]);
 
   const rows = useMemo(
-    () => joinSessions(listing.kind === "loaded" ? listing.value.holders : [], needs.records),
-    [listing, needs.records],
+    () =>
+      joinSessions(listing.kind === "loaded" ? listing.value.holders : [], needs.records, {
+        prompts: prompts.kind === "loaded" ? prompts.value.prompts : [],
+        ended: all,
+      }),
+    [listing, needs.records, prompts, all],
   );
+  const titles = prompts.kind === "loaded" ? prompts.value.titles : new Map<string, string>();
   // Only a terminal starting or running a session owns it — the rule re-attach records by — so one
   // whose program ended neither hides Resume nor claims a re-attach the next Build will not do.
   const owned = useMemo(() => owningTerminals(terminals.state.entries), [terminals.state.entries]);
@@ -103,6 +126,7 @@ export function SessionsTab(): React.JSX.Element {
   const refresh = (): void => {
     needs.refresh();
     void load(all);
+    void loadDesignPrompts();
   };
 
   return (
@@ -124,6 +148,11 @@ export function SessionsTab(): React.JSX.Element {
       {needs.problem !== undefined && (
         <p className="design-notice" role="status">
           {needs.problem}
+        </p>
+      )}
+      {prompts.kind === "failed" && (
+        <p className="design-notice" role="status">
+          Cannot list the designs' prompts: {prompts.message}
         </p>
       )}
       <div className="sessions-body">
@@ -156,7 +185,7 @@ export function SessionsTab(): React.JSX.Element {
                     {r.needsInput ? <span className="needs-dot" /> : <span className="live-dot" data-live={r.live ? "true" : "false"} />}
                   </span>
                   <span className="session-dir" title={r.cwd}>
-                    {shortDir(r.cwd)}
+                    {r.prompt !== null ? promptName(r.prompt, titles) : shortDir(r.cwd)}
                   </span>
                   <code className="session-id" title={r.session}>
                     {shortId(r.session)}
