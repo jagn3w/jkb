@@ -238,6 +238,9 @@ for (const { id, label, root, region, headers, tallIn = region, by } of [
         const scroller = pane.querySelector(region);
         const tall = document.createElement("div");
         tall.style.height = "5000px";
+        // Not shrinkable: in a flex column (the Design sidebar, the Workflows main column) an empty
+        // item's automatic minimum is 0, so it would shrink to fit and leave nothing to scroll.
+        tall.style.flex = "none";
         pane.querySelector(tallIn).append(tall);
         const before = headers.map((h) => pane.querySelector(h).getBoundingClientRect().top);
         scroller.scrollTop = by === null ? scroller.scrollHeight : by;
