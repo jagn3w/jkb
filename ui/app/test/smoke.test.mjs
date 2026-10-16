@@ -192,6 +192,7 @@ for (const [id, label] of [
   ["workflows", "Workflows"],
   ["container", "Container"],
   ["sessions", "Sessions"],
+  ["executions", "Executions"],
 ]) {
   test(`the ${label} tab opens its pane`, { skip }, async () => {
     const tab = page.getByRole("tab", { name: label, exact: true });
@@ -226,6 +227,7 @@ for (const { id, label, root, region, headers, tallIn = region, by } of [
   },
   { id: "container", label: "Container", root: ".container-tab", region: ".container-body", headers: [".container-tab > .design-bar"] },
   { id: "sessions", label: "Sessions", root: ".sessions-tab", region: ".sessions-list", headers: [".sessions-tab > .design-bar"] },
+  { id: "executions", label: "Executions", root: ".executions-tab", region: ".executions-body", headers: [".executions-tab > .design-bar"] },
 ]) {
   const how = by === undefined ? "to the end" : `${by}px within ${tallIn}`;
   test(`the ${label} tab fills the frame, which never scrolls, and ${headers.join(", ")} stay in view scrolled ${how}`, { skip }, async () => {
@@ -309,6 +311,14 @@ test("the Sessions tab says why it lists nothing when the daemon is unreachable"
   await pane.locator(".plan-hint", { hasText: "Cannot list sessions" }).waitFor();
   await pane.locator(".design-notice", { hasText: "claude/notify" }).first().waitFor();
   assert.equal(await page.locator(".tab .needs-dot").count(), 0, "no dot without a record of one");
+});
+
+// The Executions tab: with no daemon there is no timeline to read, and the pane says why.
+test("the Executions tab says why it shows no timeline when the daemon is unreachable", { skip }, async () => {
+  await page.getByRole("tab", { name: "Executions", exact: true }).click();
+  const pane = page.locator("#pane-executions");
+  await pane.locator(".plan-hint", { hasText: "Cannot read sessions" }).waitFor();
+  await pane.getByRole("radiogroup", { name: "Scope" }).waitFor();
 });
 
 // The Container tab (D53.8): a button per kit run.sh flag, and an answer from the kit -- on a CI

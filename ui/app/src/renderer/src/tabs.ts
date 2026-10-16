@@ -1,8 +1,8 @@
-//! The four tabs, as data: which exist, in what order, and how the keyboard moves between them.
+//! The five tabs, as data: which exist, in what order, and how the keyboard moves between them.
 //
 // Pure (no React, no DOM), so the shell's navigation rules are tested without a window.
 
-export type TabId = "design" | "workflows" | "container" | "sessions";
+export type TabId = "design" | "workflows" | "container" | "sessions" | "executions";
 
 export interface TabSpec {
   readonly id: TabId;
@@ -38,6 +38,12 @@ export const TABS: readonly TabSpec[] = [
     summary: "Claude Code sessions, which ones need you, and the context each was working in.",
     decision: "D53.9",
   },
+  {
+    id: "executions",
+    label: "Executions",
+    summary: "The lifecycle being applied: which sessions hold which tasks, each task's path, each plan's progress.",
+    decision: "Executions: sessions at work, and the commands they ask for",
+  },
 ];
 
 export const DEFAULT_TAB: TabId = "design";
@@ -48,7 +54,7 @@ export function isTabId(value: unknown): value is TabId {
 
 /**
  * The tab a key press moves to from `current`, or `undefined` when the key is not a tab key.
- * Arrows wrap (the WAI-ARIA tabs pattern), Home/End jump to the ends, and Cmd/Ctrl+1…4 picks a
+ * Arrows wrap (the WAI-ARIA tabs pattern), Home/End jump to the ends, and Cmd/Ctrl+1…5 picks a
  * tab by position from anywhere in the window.
  */
 export function tabForKey(

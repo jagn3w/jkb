@@ -1,7 +1,7 @@
 //! The tab shell without a window: its navigation rules, and what it renders.
 //
 // The renderer modules are bundled with esbuild (JSX included) and rendered to a string with
-// react-dom/server, so the four tabs and their panes are checked with neither Electron nor a DOM.
+// react-dom/server, so the five tabs and their panes are checked with neither Electron nor a DOM.
 // Clicking through them in the real app is `smoke.test.mjs`'s job.
 
 import assert from "node:assert/strict";
@@ -40,10 +40,10 @@ async function load(entry, contents) {
 const src = path.join(here, "..", "src", "renderer", "src");
 const { TABS, DEFAULT_TAB, isTabId, tabForKey } = await load(path.join(src, "tabs.ts"));
 
-test("four tabs, in the order the design names them", () => {
+test("five tabs, in the order the design names them, the newest last", () => {
   assert.deepEqual(
     TABS.map((t) => t.label),
-    ["Design", "Workflows", "Container", "Sessions"],
+    ["Design", "Workflows", "Container", "Sessions", "Executions"],
   );
   assert.equal(DEFAULT_TAB, "design");
   assert.equal(isTabId("sessions"), true);
@@ -53,18 +53,20 @@ test("four tabs, in the order the design names them", () => {
 
 test("arrows wrap, Home/End jump, and other keys are not tab keys", () => {
   assert.equal(tabForKey("design", "ArrowRight"), "workflows");
-  assert.equal(tabForKey("sessions", "ArrowRight"), "design", "wraps forward");
-  assert.equal(tabForKey("design", "ArrowLeft"), "sessions", "wraps back");
+  assert.equal(tabForKey("sessions", "ArrowRight"), "executions");
+  assert.equal(tabForKey("executions", "ArrowRight"), "design", "wraps forward");
+  assert.equal(tabForKey("design", "ArrowLeft"), "executions", "wraps back");
   assert.equal(tabForKey("container", "Home"), "design");
-  assert.equal(tabForKey("workflows", "End"), "sessions");
+  assert.equal(tabForKey("workflows", "End"), "executions");
   assert.equal(tabForKey("design", "a"), undefined);
   assert.equal(tabForKey("design", "2"), undefined, "a digit alone is typing, not navigation");
 });
 
-test("Cmd/Ctrl+1…4 picks a tab by position, and nothing past the last", () => {
+test("Cmd/Ctrl+1…5 picks a tab by position, and nothing past the last", () => {
   assert.equal(tabForKey("design", "1", { mod: true }), "design");
   assert.equal(tabForKey("design", "4", { mod: true }), "sessions");
-  assert.equal(tabForKey("design", "5", { mod: true }), undefined);
+  assert.equal(tabForKey("design", "5", { mod: true }), "executions");
+  assert.equal(tabForKey("design", "6", { mod: true }), undefined);
   assert.equal(tabForKey("design", "0", { mod: true }), undefined);
   assert.equal(tabForKey("design", "ArrowRight", { mod: true }), undefined);
 });
@@ -104,7 +106,7 @@ test("the shell renders every tab and pane, with only the active pane shown", as
   };
   try {
     const html = render();
-    for (const id of ["design", "workflows", "container", "sessions"]) {
+    for (const id of ["design", "workflows", "container", "sessions", "executions"]) {
       assert.match(html, new RegExp(`role="tab"[^>]*id="tab-${id}"`), `tab ${id}`);
       assert.match(html, new RegExp(`id="pane-${id}"`), `pane ${id}`);
     }
@@ -142,7 +144,110 @@ test("the shell renders every tab and pane, with only the active pane shown", as
     assert.match(html, /Loading sessions…/);
     assert.doesNotMatch(html, /needs-dot/, "no dot before the records are read");
     assert.doesNotMatch(html, /id="tab-sessions"[^>]*aria-describedby/);
+    // The Executions tab: the timeline's overview is asked for from an effect, never during render.
+    assert.match(html, /<section[^>]*class="timeline-pane"[^>]*aria-label="Timeline"/);
+    assert.match(html, /role="radiogroup" aria-label="Scope"/);
+    assert.match(html, /Loading…/);
   } finally {
     delete globalThis.window;
   }
+});
+
+// The Executions tab's timeline, rendered from a fixture of the answers `timeline.*` gives (the
+// decoders' half is ui/core's timeline.test.mjs; the joins are crates/jkb-core/src/timeline.rs's).
+test("the timeline renders a session's swimlanes, a task's path and a plan's chart from a fixture", async () => {
+  const { render } = await load(
+    path.join(src, "timeline-entry.tsx"),
+    `import { renderToString } from "react-dom/server";
+     import { PlanChart, SessionLanes, SessionsOverview, TaskTimelineView } from "./executions/TimelinePane";
+     export const render = (f) => ({
+       overview: renderToString(<SessionsOverview overview={f.overview} onOpen={() => {}} />),
+       session: renderToString(<SessionLanes timeline={f.session} nowMs={f.now} onTask={() => {}} />),
+       task: renderToString(<TaskTimelineView view={f.task} />),
+       plan: renderToString(<PlanChart plan={f.plan} nowMs={f.now} offsetMin={0} />),
+     });`,
+  );
+  const H = 3_600_000;
+  const T = 1_800_000_000_000;
+  const ev = (over) => ({ at_ms: T, source: "workflow", id: 1, task: "task:a", event: "submit_work", from: "implement", to: "review", actor: "swarm-implementer@agent-x", role: "implementer", reason: null, detail: null, ...over });
+  const summary = { session: "s-1", state: "live", cwd: "/w", started_at_ms: T - H, ended_at_ms: null, claims: 1, last_event_ms: T, stalled: true, stalled_for_ms: 31 * 60_000 };
+  const state = (name, initial = false) => ({ name, initial, settled: false, awaits_input: false, next_role: null, next_step: null });
+  const edge = (from, event, to) => ({ from, event, to, reconciled: false, guarded: false, planned: false, roles: [], fired_by: "implementer" });
+  const graph = {
+    strategy: "default:design-reviewed",
+    graph: "reviewed-design",
+    describe: "d",
+    task: "task:a",
+    phase: "review",
+    status: "needs_review",
+    workflow: {
+      states: [state("implement", true), state("review")],
+      transitions: [edge("implement", "submit_work", "review"), edge("review", "request_changes", "implement"), edge("review", "override", null)],
+    },
+    lifecycle: { states: [state("open", true)], transitions: [] },
+  };
+  const f = {
+    now: T + H,
+    overview: {
+      now_ms: T + H,
+      sessions: [summary],
+      unattributed: [{ uid: "task:b", title: "B", status: "in_progress", owner: "build-host:42", claimed_at_ms: null }],
+    },
+    session: {
+      summary,
+      tasks: [{ uid: "task:a", title: "Task A", status: "needs_review", holds_claim: true, claimed_at_ms: T - H, bound_agents: ["agent-x"] }],
+      events: [ev({ source: "session", task: null, event: "start", at_ms: T - H, from: null, to: null }), ev({})],
+      next: null,
+    },
+    task: {
+      timeline: {
+        uid: "task:a",
+        title: "Task A",
+        status: "needs_review",
+        strategy: null,
+        claim: null,
+        landing: { state: "none", branch: null, onto: null, pr: null, at_ms: null },
+        visited: [
+          { from: "implement", to: "review", count: 2, last_at_ms: T },
+          { from: "review", to: "design", count: 1, last_at_ms: T },
+        ],
+        visited_status: [],
+        events: [ev({})],
+        next: null,
+      },
+      graph,
+    },
+    plan: {
+      uid: "plan:p",
+      title: "The plan",
+      tasks: 2,
+      points: [
+        { at_ms: T - 2 * H, open: 2, in_progress: 0, done: 0, cancelled: 0 },
+        { at_ms: T - H, open: 1, in_progress: 1, done: 0, cancelled: 0 },
+        { at_ms: T, open: 0, in_progress: 1, done: 1, cancelled: 0 },
+      ],
+    },
+  };
+  // React marks where adjacent text nodes meet; the words are what is asserted.
+  const html = Object.fromEntries(Object.entries(render(f)).map(([k, v]) => [k, v.replaceAll("<!-- -->", "")]));
+  // The overview: the stalled session says for how long; the process's claim is listed, not dropped.
+  assert.match(html.overview, /data-stalled="true"/);
+  assert.match(html.overview, /stalled 31m/);
+  assert.match(html.overview, /Unattributed holders/);
+  assert.match(html.overview, /build-host:42/);
+  // A session: a lane for its own starts and one per task, and a tick per event.
+  assert.match(html.session, /aria-label="Swimlanes"/);
+  assert.equal((html.session.match(/class="lane-track"/g) ?? []).length, 2);
+  assert.equal((html.session.match(/class="lane-tick"/g) ?? []).length, 2);
+  assert.match(html.session, /data-holds="true"/);
+  // A task: its path inked and counted over its strategy's machine, and the override it took listed.
+  assert.match(html.task, /class="machine-edge"[^>]*data-visited="true"/);
+  assert.match(html.task, /submit_work ×2/);
+  assert.match(html.task, /data-visited="true"[^>]*transform/);
+  assert.match(html.task, /<th>taken<\/th>/);
+  assert.match(html.task, /review → design ×1/);
+  // A plan: hourly bins, stacked, through now.
+  assert.match(html.plan, /aria-label="Plan progress by hour"/);
+  assert.equal((html.plan.match(/<g transform="translate/g) ?? []).length, 4, "four hours, the last running to now");
+  assert.match(html.plan, /data-band="done"/);
 });

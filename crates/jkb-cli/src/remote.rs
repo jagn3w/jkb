@@ -98,6 +98,8 @@ pub const fn support(command: &Command) -> Support {
         | Command::Inv { .. }
         // Every design read and write is an op (D53.4); `--stdin` reads only this process's stdin.
         | Command::Design { .. }
+        // Reads over the transition logs, claims and the session registry.
+        | Command::Timeline { .. }
         // Every tool an op; a file or URL is read here and only its text sent (design-s6-4.md K).
         | Command::Mcp
         | Command::Ns {
@@ -245,6 +247,7 @@ pub fn beyond_rbac(command: &Command) -> bool {
         | Command::Related { .. }
         | Command::Inv { .. }
         | Command::Design { .. }
+        | Command::Timeline { .. }
         | Command::Blob { .. }
         | Command::History { .. } => false,
     }

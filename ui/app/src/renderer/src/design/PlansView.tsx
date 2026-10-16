@@ -2,6 +2,7 @@ import { useState } from "react";
 
 import { strategyLabel, strategyName, strategyOption, type ExecPlan, type PlanTask } from "@jkb/core";
 
+import { useNavigation } from "../navigation";
 import type { Plans } from "./usePlans";
 
 function StepSpans({ spans }: { readonly spans: ExecPlan["steps"][number]["spans"] }): React.JSX.Element | null {
@@ -63,10 +64,19 @@ function PlanCard({
   readonly onPlay?: (plan: ExecPlan) => void;
   readonly busy: boolean;
 }): React.JSX.Element {
+  const nav = useNavigation();
   return (
     <article className="plan-card" data-archived={plan.archived}>
       <header>
         <h3 title={plan.uid}>{plan.title}</h3>
+        <button
+          type="button"
+          className="bar-button"
+          onClick={() => nav.openTimeline("plan", plan.uid)}
+          title="Open, in progress and done over time, in the Executions tab"
+        >
+          Timeline
+        </button>
         {onPlay !== undefined && (
           <button type="button" className="bar-button play-button" disabled={busy} onClick={() => onPlay(plan)}>
             ▶ Play

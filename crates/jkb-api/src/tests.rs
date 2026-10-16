@@ -577,6 +577,18 @@ fn samples() -> Vec<Request> {
         Request::DesignPromptOf {
             session: "s".into(),
         },
+        Request::TimelineSessions {},
+        Request::TimelineSession {
+            session: "s".into(),
+            after: None,
+        },
+        Request::TimelineTask {
+            uid: "task:x".into(),
+            after: None,
+        },
+        Request::TimelinePlan {
+            uid: "plan:x".into(),
+        },
         Request::DesignCompact {
             uid: "design:x".into(),
         },
@@ -1966,6 +1978,10 @@ const READS: &[&str] = &[
     "design.prompt",
     "design.prompts",
     "design.prompt_of",
+    "timeline.sessions",
+    "timeline.session",
+    "timeline.task",
+    "timeline.plan",
 ];
 
 #[test]
@@ -3727,4 +3743,87 @@ fn mutates_names_the_writes_and_not_the_reads() {
     ] {
         assert!(op(write.clone()).mutates(), "{write}");
     }
+}
+
+#[test]
+fn the_timeline_ops_are_reads_anyone_may_ask_and_answer_through_the_wire() {
+    use crate::rbac::{OpPermission, Target};
+    let timeline = [
+        json!({"op": "timeline.sessions"}),
+        json!({"op": "timeline.session", "session": "s-1"}),
+        json!({"op": "timeline.task", "uid": "task:t", "after": "1.status.2"}),
+        json!({"op": "timeline.plan", "uid": "plan:p"}),
+    ];
+    for r in &timeline {
+        let request: Request = serde_json::from_value(r.clone()).unwrap();
+        assert_eq!(request.permission(), OpPermission::Read, "{}", request.op());
+        assert!(
+            request.is_agent_read(),
+            "{} is served on the reader",
+            request.op()
+        );
+        assert!(!request.mutates(), "{}", request.op());
+        assert!(matches!(request.target(), Target::Free), "{}", request.op());
+    }
+
+    let b = backend();
+    b.db.write_txn("t", |c, m| {
+        let mut t = jkb_core::task::NewTask::new("task:t", "the task");
+        t.home = "tasks/f".into();
+        jkb_core::task::create(c, m, &t)
+    })
+    .unwrap();
+    let Response::TimelineTask { task } =
+        call(&b, json!({"op": "timeline.task", "uid": "task:t"})).unwrap()
+    else {
+        panic!("not a timeline_task");
+    };
+    assert_eq!(task.timeline.uid, "task:t");
+    assert_eq!(task.timeline.title, "the task");
+    assert_eq!(
+        task.graph.task.as_deref(),
+        Some("task:t"),
+        "the graph is the task's own strategy"
+    );
+    let wire = serde_json::to_value(Response::TimelineTask { task }).unwrap();
+    assert_eq!(wire["result"], "timeline_task");
+    assert_eq!(wire["task"]["timeline"]["landing"]["state"], "none");
+
+    let Response::TimelineSessions { overview } =
+        call(&b, json!({"op": "timeline.sessions"})).unwrap()
+    else {
+        panic!("not timeline_sessions");
+    };
+    assert!(overview.sessions.is_empty() && overview.unattributed.is_empty());
+    assert_eq!(
+        call(
+            &b,
+            json!({"op": "timeline.session", "session": "not a session"})
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Invalid
+    );
+    assert_eq!(
+        call(&b, json!({"op": "timeline.task", "uid": "task:missing"}))
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        call(
+            &b,
+            json!({"op": "timeline.task", "uid": "task:t", "after": "garbage"})
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Invalid
+    );
+    assert!(
+        serde_json::from_value::<Request>(
+            json!({"op": "timeline.session", "session": "s", "extra": 1})
+        )
+        .is_err(),
+        "an unknown field is refused"
+    );
 }

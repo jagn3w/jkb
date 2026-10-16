@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { DaemonStatus } from "./DaemonStatus";
-import { NavigationContext, type DesignRequest, type Navigation } from "./navigation";
+import { NavigationContext, type DesignRequest, type Navigation, type TimelineRequest } from "./navigation";
 import { NeedsInputProvider, useNeedsInput } from "./sessions/NeedsInputProvider";
 import { DEFAULT_TAB, TABS, isTabId, tabForKey, type TabId } from "./tabs";
 import { TerminalDrawer } from "./terminal/TerminalDrawer";
@@ -9,6 +9,7 @@ import { TerminalPopover } from "./terminal/TerminalPopover";
 import { TerminalProvider } from "./terminal/TerminalProvider";
 import { ContainerTab } from "./tabs/ContainerTab";
 import { DesignTab } from "./tabs/DesignTab";
+import { ExecutionsTab } from "./tabs/ExecutionsTab";
 import { SessionsTab } from "./tabs/SessionsTab";
 import { WorkflowsTab } from "./tabs/WorkflowsTab";
 
@@ -37,6 +38,7 @@ const PANES: Record<TabId, () => React.JSX.Element> = {
   workflows: WorkflowsTab,
   container: ContainerTab,
   sessions: SessionsTab,
+  executions: ExecutionsTab,
 };
 
 export function App(): React.JSX.Element {
@@ -66,6 +68,7 @@ function TabDot({ tab }: { readonly tab: TabId }): React.JSX.Element | null {
 function Shell(): React.JSX.Element {
   const [active, setActive] = useState<TabId>(loadLastTab);
   const [designRequest, setDesignRequest] = useState<DesignRequest | undefined>(undefined);
+  const [timelineRequest, setTimelineRequest] = useState<TimelineRequest | undefined>(undefined);
   const { needing } = useNeedsInput();
   const tabRefs = useRef(new Map<TabId, HTMLButtonElement>());
 
@@ -83,11 +86,16 @@ function Shell(): React.JSX.Element {
         select("design", false);
       },
       designRequest,
+      openTimeline: (scope, id) => {
+        setTimelineRequest((r) => ({ scope, id, seq: (r?.seq ?? 0) + 1 }));
+        select("executions", false);
+      },
+      timelineRequest,
     }),
-    [select, designRequest],
+    [select, designRequest, timelineRequest],
   );
 
-  // Cmd/Ctrl+1…4 from anywhere in the window.
+  // Cmd/Ctrl+1…5 from anywhere in the window.
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
       if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;

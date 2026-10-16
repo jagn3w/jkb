@@ -329,6 +329,14 @@ function SessionPreview({ row, owner }: { readonly row: SessionRow; readonly own
           {prompt?.title ?? shortDir(row.cwd)}
         </h2>
         <span className="spacer" />
+        <button
+          type="button"
+          className="bar-button"
+          onClick={() => nav.openTimeline("session", row.session)}
+          title="The tasks this session holds and the events it fired, in the Executions tab"
+        >
+          Timeline
+        </button>
         {owner !== undefined ? (
           <button type="button" className="bar-button" onClick={() => showTerminal(owner.key)} title="The app's terminal running this session">
             Show terminal

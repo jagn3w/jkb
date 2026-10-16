@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 
-import { machineDrawing, machineLayout, markerSources, STATED, strategyLabel, type MachineTable, type WorkflowGraph } from "@jkb/core";
+import { machineDrawing, machineLayout, markerSources, STATED, strategyLabel, type MachineTable, type VisitedEdge, type WorkflowGraph } from "@jkb/core";
 
 const NODE_W = 150;
 const NODE_H = 46;
@@ -22,6 +22,14 @@ function firedBy(t: MachineTable["transitions"][number]): string {
   return t.fired_by;
 }
 
+/** The edges a task's history took, per machine: `timeline.task`'s `visited` and `visited_status`. */
+export interface VisitedOverlay {
+  readonly workflow: readonly VisitedEdge[];
+  readonly lifecycle: readonly VisitedEdge[];
+}
+
+const edgeKey = (from: string, to: string): string => `${from}\u0000${to}`;
+
 /**
  * The Lifecycle pane (D53.7): the task's state machines drawn from the compiled `jkb-fsm` tables
  * (`workflow.graph`, what `jkb workflow show --graph --json` prints) — never redrawn by hand. The
@@ -33,17 +41,30 @@ function firedBy(t: MachineTable["transitions"][number]): string {
  * list is the whole table.
  *
  * `role` highlights the states where that role acts next — the selected agent's place in the
- * strategy.
+ * strategy. `visited`, from the Executions tab, draws one task's path over the same table: each
+ * edge it took is inked and counted, and each state it stood in is marked. An edge it took that the
+ * table has no row for (an operator override, which names its own destination) is listed under it.
  */
 export function LifecyclePane({
   graph,
   role,
+  visited,
 }: {
   readonly graph: WorkflowGraph;
   readonly role: string | undefined;
+  readonly visited?: VisitedOverlay;
 }): React.JSX.Element {
   const [which, setWhich] = useState<Which>("workflow");
   const machine = which === "workflow" ? graph.workflow : graph.lifecycle;
+  const taken = useMemo(() => {
+    const edges = visited === undefined ? [] : which === "workflow" ? visited.workflow : visited.lifecycle;
+    return new Map(edges.map((v) => [edgeKey(v.from, v.to), v]));
+  }, [visited, which]);
+  const stood = useMemo(() => new Set([...taken.values()].flatMap((v) => [v.from, v.to])), [taken]);
+  const offTable = useMemo(
+    () => [...taken.values()].filter((v) => !machine.transitions.some((t) => t.from === v.from && t.to === v.to)),
+    [taken, machine],
+  );
   const drawing = useMemo(() => machineDrawing(machine), [machine]);
   const layout = useMemo(() => machineLayout(drawing), [drawing]);
   const states = useMemo(() => new Map(machine.states.map((s) => [s.name, s])), [machine]);
@@ -109,11 +130,18 @@ export function LifecyclePane({
                 lx = (x1 + x2) / 2;
                 ly = (y1 + y2) / 2 - 4;
               }
+              const went = taken.get(edgeKey(l.from, l.to));
               return (
-                <g key={`${l.from}-${l.label}`} className="machine-edge" data-reconciled={t.reconciled ? "true" : undefined}>
+                <g
+                  key={`${l.from}-${l.label}`}
+                  className="machine-edge"
+                  data-reconciled={t.reconciled ? "true" : undefined}
+                  data-visited={went !== undefined ? "true" : undefined}
+                >
                   <path d={d} className="graph-edge" markerEnd="url(#machine-arrow)" />
                   <text x={lx} y={ly} textAnchor="middle" className="graph-edge-label">
                     {l.label}
+                    {went !== undefined ? ` ×${went.count}` : ""}
                   </text>
                   <title>{`${l.from} --${l.label}--> ${l.to}${firedBy(t) ? ` (${firedBy(t)})` : ""}${t.guarded ? ", guarded" : ""}`}</title>
                 </g>
@@ -131,6 +159,7 @@ export function LifecyclePane({
                   data-initial={s?.initial ? "true" : undefined}
                   data-acts={acts ? "true" : undefined}
                   data-current={current ? "true" : undefined}
+                  data-visited={stood.has(n.id) ? "true" : undefined}
                   transform={`translate(${x(n.layer)},${y(n.row)})`}
                 >
                   <rect width={NODE_W} height={NODE_H} rx={NODE_H / 2} />
@@ -174,11 +203,16 @@ export function LifecyclePane({
               <th>event</th>
               <th>to</th>
               <th>{which === "workflow" ? "fired by" : "kind"}</th>
+              {visited !== undefined && <th>taken</th>}
             </tr>
           </thead>
           <tbody>
             {machine.transitions.map((t) => (
-              <tr key={`${t.from}-${t.event}`} data-reconciled={t.reconciled ? "true" : undefined}>
+              <tr
+                key={`${t.from}-${t.event}`}
+                data-reconciled={t.reconciled ? "true" : undefined}
+                data-visited={t.to !== null && taken.has(edgeKey(t.from, t.to)) ? "true" : undefined}
+              >
                 <td>{t.from}</td>
                 <td>
                   {t.event}
@@ -186,10 +220,20 @@ export function LifecyclePane({
                 </td>
                 <td>{t.to ?? STATED}</td>
                 <td>{firedBy(t)}</td>
+                {visited !== undefined && <td>{t.to !== null ? (taken.get(edgeKey(t.from, t.to))?.count ?? "") : ""}</td>}
               </tr>
             ))}
           </tbody>
         </table>
+        {offTable.length > 0 && (
+          <ul className="visited-off-table" aria-label="Moves with no row of their own">
+            {offTable.map((v) => (
+              <li key={edgeKey(v.from, v.to)}>
+                {v.from} → {v.to} ×{v.count} <span className="muted">(an override, or a row this table no longer has)</span>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </section>
   );

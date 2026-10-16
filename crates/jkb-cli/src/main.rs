@@ -36,6 +36,7 @@ mod session_cli;
 mod staging;
 mod stop;
 mod task_cli;
+mod timeline_cli;
 mod transcripts;
 
 use std::collections::BTreeMap;
@@ -390,6 +391,13 @@ enum Command {
         #[command(subcommand)]
         cmd: DesignCmd,
     },
+    /// The lifecycle timeline, read from the transition logs, claims, review rounds, landings and the
+    /// session registry: which sessions hold which tasks (and which have stalled), one task's path
+    /// through its strategy, one plan's progress over time. What Code Factory's Executions tab draws.
+    Timeline {
+        #[command(subcommand)]
+        cmd: TimelineCmd,
+    },
     /// The content-addressed blob archive. File sync stores the bytes of every version it
     /// settles and blobs are never deleted, so this is a complete history of every synced
     /// file — the recovery path when a sync has written a wrong version over your work.
@@ -423,6 +431,36 @@ enum BlobCmd {
     Cat {
         /// The blake3 hash (a unique prefix is enough).
         hash: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TimelineCmd {
+    /// Every live session and every session holding a claim: its claims, newest event, and whether
+    /// it has stalled (claims held, not ended, no event for 30 minutes); then the claims no session
+    /// is attributed (a process's `host:pid`, say).
+    Sessions,
+    /// One session's tasks and the events it fired, oldest first (500 a page).
+    Session {
+        /// The Claude Code session id.
+        session: String,
+        /// Continue after a page: the `next` it printed.
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// One task's workflow and status moves, claim and review rounds merged in time order (500 a
+    /// page), the phase edges it visited, and where its work landed.
+    Task {
+        /// The task.
+        uid: String,
+        /// Continue after a page: the `next` it printed.
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// A plan's open, in-progress, done and cancelled counts at each moment they changed.
+    Plan {
+        /// The plan.
+        uid: String,
     },
 }
 
@@ -1837,7 +1875,8 @@ fn run(cli: Cli) -> Result<()> {
         | Command::Blob { .. }
         | Command::History { .. }
         | Command::Inv { .. }
-        | Command::Design { .. } => {
+        | Command::Design { .. }
+        | Command::Timeline { .. } => {
             anyhow::bail!("internal: a command served as an op missed ops_cli's dispatch")
         }
         Command::Commands { cmd } => match cmd {

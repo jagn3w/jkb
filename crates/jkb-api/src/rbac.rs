@@ -231,7 +231,11 @@ impl Request {
             | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. }
             | Self::DesignPrompts { .. }
-            | Self::DesignPromptOf { .. } => OpPermission::Read,
+            | Self::DesignPromptOf { .. }
+            | Self::TimelineSessions {}
+            | Self::TimelineSession { .. }
+            | Self::TimelineTask { .. }
+            | Self::TimelinePlan { .. } => OpPermission::Read,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -470,6 +474,10 @@ impl Request {
             | Self::DesignPrompt { .. }
             | Self::DesignPrompts { .. }
             | Self::DesignPromptOf { .. }
+            | Self::TimelineSessions {}
+            | Self::TimelineSession { .. }
+            | Self::TimelineTask { .. }
+            | Self::TimelinePlan { .. }
             | Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }

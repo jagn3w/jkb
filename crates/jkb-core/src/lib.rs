@@ -42,6 +42,7 @@ pub mod sql;
 pub mod sync_state;
 pub mod tag;
 pub mod task;
+pub mod timeline;
 pub mod transition;
 pub mod undo;
 pub mod view;

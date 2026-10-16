@@ -10,6 +10,7 @@ import "./styles/prompts.css";
 import "./styles/workflows.css";
 import "./styles/container.css";
 import "./styles/sessions.css";
+import "./styles/executions.css";
 
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";

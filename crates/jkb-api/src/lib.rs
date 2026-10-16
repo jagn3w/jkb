@@ -44,6 +44,7 @@ pub mod review;
 pub mod sessions;
 pub mod staging;
 pub mod tasks;
+pub mod timeline;
 pub mod workflows;
 
 /// One operation. Serialized with an `"op"` tag, e.g. `{"op":"mq.send","topic":"t",…}`.
@@ -1109,6 +1110,36 @@ pub enum Request {
         /// The session id.
         session: String,
     },
+    /// The sessions at work: every live session and every session holding a claim, each with its
+    /// claim count, newest event and stalled flag, and the claims no session is attributed
+    /// ([`timeline::sessions`]).
+    #[serde(rename = "timeline.sessions")]
+    TimelineSessions {},
+    /// One session's tasks and the events it fired, one page ([`timeline::session`]).
+    #[serde(rename = "timeline.session")]
+    TimelineSession {
+        /// The Claude Code session id.
+        session: String,
+        /// The previous page's `next`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    /// One task's path through its strategy, its claim, review rounds and landing, one page, with
+    /// the strategy's graph ([`timeline::task`]).
+    #[serde(rename = "timeline.task")]
+    TimelineTask {
+        /// The task.
+        uid: String,
+        /// The previous page's `next`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    /// A plan's open, in-progress, done and cancelled counts over time ([`timeline::plan`]).
+    #[serde(rename = "timeline.plan")]
+    TimelinePlan {
+        /// The plan.
+        uid: String,
+    },
     /// Fold a design's updates into its snapshot (operator; [`jkb_core::design::compact`]).
     #[serde(rename = "design.compact")]
     DesignCompact {
@@ -1739,6 +1770,10 @@ impl Request {
         "design.prompt_record",
         "design.prompts",
         "design.prompt_of",
+        "timeline.sessions",
+        "timeline.session",
+        "timeline.task",
+        "timeline.plan",
         "design.compact",
         "attest.mint",
         "attest.release",
@@ -1884,6 +1919,10 @@ impl Request {
             Self::DesignPromptRecord { .. } => "design.prompt_record",
             Self::DesignPrompts { .. } => "design.prompts",
             Self::DesignPromptOf { .. } => "design.prompt_of",
+            Self::TimelineSessions {} => "timeline.sessions",
+            Self::TimelineSession { .. } => "timeline.session",
+            Self::TimelineTask { .. } => "timeline.task",
+            Self::TimelinePlan { .. } => "timeline.plan",
             Self::DesignCompact { .. } => "design.compact",
             Self::DesignRetire { .. } => "design.retire",
             Self::DesignRestore { .. } => "design.restore",
@@ -1976,7 +2015,11 @@ impl Request {
             | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. }
             | Self::DesignPrompts { .. }
-            | Self::DesignPromptOf { .. } => true,
+            | Self::DesignPromptOf { .. }
+            | Self::TimelineSessions {}
+            | Self::TimelineSession { .. }
+            | Self::TimelineTask { .. }
+            | Self::TimelinePlan { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -2737,6 +2780,26 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<Box<designs::prompts::DesignPrompt>>,
     },
+    /// A `timeline.sessions`.
+    TimelineSessions {
+        /// The sessions and the unattributed claims.
+        overview: Box<jkb_core::timeline::Overview>,
+    },
+    /// A `timeline.session`.
+    TimelineSession {
+        /// The session's timeline page.
+        timeline: Box<jkb_core::timeline::SessionTimeline>,
+    },
+    /// A `timeline.task`.
+    TimelineTask {
+        /// The task's timeline page and its strategy's graph.
+        task: Box<timeline::TaskView>,
+    },
+    /// A `timeline.plan`.
+    TimelinePlan {
+        /// The plan's change points.
+        plan: Box<jkb_core::timeline::PlanTimeline>,
+    },
     /// A `design.plan`, `design.plan_create` or `design.plan_step`.
     DesignPlan {
         /// The plan after it.
@@ -2861,6 +2924,10 @@ impl Response {
             | Self::DesignPromptRecorded { .. }
             | Self::DesignPrompts { .. }
             | Self::DesignPromptOf { .. }
+            | Self::TimelineSessions { .. }
+            | Self::TimelineSession { .. }
+            | Self::TimelineTask { .. }
+            | Self::TimelinePlan { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignCompacted { .. }
@@ -2982,6 +3049,10 @@ impl Response {
             | Self::DesignNewPrompt { .. }
             | Self::DesignPrompts { .. }
             | Self::DesignPromptOf { .. }
+            | Self::TimelineSessions { .. }
+            | Self::TimelineSession { .. }
+            | Self::TimelineTask { .. }
+            | Self::TimelinePlan { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignCompacted { .. }
@@ -4418,6 +4489,20 @@ impl LocalBackend {
                     prompt: prompt.map(Box::new),
                 }
             }
+            Request::TimelineSessions {} => Response::TimelineSessions {
+                overview: Box::new(db.read_with(move |c| timeline::sessions(c, now))?),
+            },
+            Request::TimelineSession { session, after } => Response::TimelineSession {
+                timeline: Box::new(
+                    db.read_with(move |c| timeline::session(c, &session, after.as_deref(), now))?,
+                ),
+            },
+            Request::TimelineTask { uid, after } => Response::TimelineTask {
+                task: Box::new(db.read_with(move |c| timeline::task(c, &uid, after.as_deref()))?),
+            },
+            Request::TimelinePlan { uid } => Response::TimelinePlan {
+                plan: Box::new(db.read_with(move |c| timeline::plan(c, &uid))?),
+            },
             Request::DesignCompact { uid } => {
                 let done = db.write_txn_with(actor, move |c, m| {
                     jkb_core::design::compact(c, m, &uid).map_err(ApiError::from)
