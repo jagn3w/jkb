@@ -6097,6 +6097,20 @@ fn a_session_is_recorded_from_where_it_starts_and_listed_with_its_resume() {
 /// `jkb workflow agent` (D53.7): a script reads a packaged template filled in; the operator copies
 /// and edits it, which the same read then answers; `export` writes it into a packaged-templates file
 /// as its next version.
+/// The version `crates/jkb-core/src/workflow/agents.json` packages `name` at — read, so a template's
+/// next version bump does not break the export tests that count from it.
+fn packaged_agent_version(name: &str) -> i64 {
+    let file: serde_json::Value =
+        serde_json::from_str(include_str!("../../jkb-core/src/workflow/agents.json")).unwrap();
+    file["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == name)
+        .and_then(|a| a["version"].as_i64())
+        .unwrap()
+}
+
 #[test]
 fn workflow_agent_copy_set_show_and_export() {
     let dir = TempDir::new().unwrap();
@@ -6174,7 +6188,10 @@ fn workflow_agent_copy_set_show_and_export() {
         .arg(&file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("swarm-coordinator packaged as v2"));
+        .stdout(predicate::str::contains(format!(
+            "swarm-coordinator packaged as v{}",
+            packaged_agent_version("swarm-coordinator") + 1
+        )));
     let text: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     let entry = text["agents"]
@@ -6242,12 +6259,13 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
     let file = dir.path().join("agents.json");
     let mut upstream: serde_json::Value =
         serde_json::from_str(include_str!("../../jkb-core/src/workflow/agents.json")).unwrap();
-    // Upstream moves on: the file packages a v2 of its own, and the copy is still built on v1.
-    // Exporting it would overwrite v2 with text that never saw it, so it is refused, naming both —
-    // unless overridden.
+    // Upstream moves on: the file packages the next version of its own, and the copy is still built
+    // on this jkb's. Exporting it would overwrite the next version with text that never saw it, so it
+    // is refused, naming both — unless overridden.
+    let pv = packaged_agent_version("swarm-coordinator");
     for a in upstream["agents"].as_array_mut().unwrap() {
         if a["name"] == "swarm-coordinator" {
-            a["version"] = serde_json::json!(2);
+            a["version"] = serde_json::json!(pv + 1);
             a["template"] = serde_json::json!(["Set {{status}} upstream."]);
         }
     }
@@ -6258,8 +6276,11 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("built on packaged v1")
-                .and(predicate::str::contains("the file packages v2"))
+            predicate::str::contains(format!("built on packaged v{pv}"))
+                .and(predicate::str::contains(format!(
+                    "the file packages v{}",
+                    pv + 1
+                )))
                 .and(predicate::str::contains("update jkb")),
         );
     jkb(&db)
@@ -6274,7 +6295,10 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
         .arg(&file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("swarm-coordinator packaged as v3"));
+        .stdout(predicate::str::contains(format!(
+            "swarm-coordinator packaged as v{}",
+            pv + 2
+        )));
 }
 
 /// The graph `design-gate` was `reviewed-design`: both names draw it, and a definition naming

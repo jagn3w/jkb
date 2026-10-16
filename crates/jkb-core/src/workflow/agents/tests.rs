@@ -94,6 +94,45 @@ fn the_packaged_templates_are_what_the_coordinators_fill() {
     }
 }
 
+/// The swarm drives the task's workflow: the reviewer files and records its round (so it writes the
+/// KB), and the coordinator fires `submit_work` before a review and observes after it, routing on the
+/// phase. The calls are the ones `jkb-api`'s swarm-loop test makes, as the same principals.
+#[test]
+fn the_swarm_templates_drive_the_workflow() {
+    let agents = packaged().unwrap();
+    let get = |n: &str| agents.iter().find(|a| a.name == n).unwrap();
+    let rev = get("swarm-reviewer");
+    assert_eq!(rev.def.role, Role::Reviewer);
+    assert_eq!(rev.def.permissions.writes, Writes::Kb);
+    for call in [
+        "jkb role bind {{lead_uid}}",
+        "jkb task review file --findings {{findings_ns}}",
+        "jkb task review record --branch {{branch}} --findings {{findings_ns}}",
+    ] {
+        assert!(rev.def.template.contains(call), "swarm-reviewer: {call}");
+    }
+    let coord = &get("swarm-coordinator").def.template;
+    for call in [
+        "jkb workflow fire <lead uid> submit_work",
+        "jkb workflow observe <lead uid>",
+    ] {
+        assert!(coord.contains(call), "swarm-coordinator: {call}");
+    }
+    // It routes on every phase an observation after a round can leave the lead in, and the submit
+    // comes before the reviewer starts, the observe after it reports.
+    for phase in [
+        "- implement:",
+        "- systemic_review:",
+        "- landable:",
+        "- review ",
+    ] {
+        assert!(coord.contains(phase), "swarm-coordinator routes {phase}");
+    }
+    let at = |s: &str| coord.find(s).unwrap_or_else(|| panic!("{s}"));
+    assert!(at("submit_work") < at("jkb workflow agent show swarm-reviewer"));
+    assert!(at("jkb workflow agent show swarm-reviewer") < at("jkb workflow observe"));
+}
+
 /// The workers' subagent types: rendered from the packaged file, prefixed like everything the
 /// installer writes, and holding nothing a coordinator would have to fill.
 #[test]

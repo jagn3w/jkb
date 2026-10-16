@@ -11,7 +11,14 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has four parts
 - **Implementer.** Each group gets one `jkb-implementer` subagent, which builds every task in the
   group on one branch. It stays with the group through every review and fix.
 - **Reviewer.** Each pass gets a fresh `jkb-reviewer` subagent, which checks the branch against
-  the whole group.
+  the whole group, then files its findings and records the round in jkb (`jkb role bind`, `jkb task
+  review file`, `jkb task review record`). Its role comes from the operator's agent-type map
+  (`jkb-reviewer` → `reviewer`), never from a grant the coordinator mints.
+- **Workflow.** The coordinator drives each group's task workflow through the group's lead (its
+  first task): `jkb workflow fire <lead> submit_work` when the implementer reports ready, and
+  `jkb workflow observe <lead>` after each review. It routes on the phase jkb reports, not on the
+  reviewer's verdict word: `implement` goes back to the implementer, `systemic_review` stops the
+  group for a systemic review, and `landable` goes to the merge queue.
 - **Merge queue.** `scripts/merge-queue.sh` is deterministic, not an agent. It runs the gate on the
   rebased branch, lands it on the feature branch, records the landing, and names its own outcome.
 

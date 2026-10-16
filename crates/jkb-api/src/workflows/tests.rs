@@ -350,3 +350,193 @@ fn the_lifecycle_names_who_lands_and_who_overrides() {
         assert_eq!(t.fired_by, want, "{} --{}-->", t.from, t.event);
     }
 }
+
+/// One swarm run's principals on one database: the main session (the container credential's ceiling,
+/// the coordinator), and attested subagents of the types `scripts/setup.sh` maps — `jkb-reviewer` to
+/// the reviewer, `jkb-implementer` to the implementer (pinned against the script by
+/// `setup_maps_every_subagent_type_to_its_templates_role` in `jkb-core`).
+struct Swarm {
+    kb: Kb,
+    hook: LocalBackend,
+    tool: std::cell::Cell<u32>,
+    lead: String,
+}
+
+const OWNER: &str = "box:1";
+const BRANCH: &str = "swarm-task/lead";
+const REPO: &str = "r";
+
+impl Swarm {
+    /// A task whose workflow is at `implement`: the operator approved its design.
+    fn new() -> Self {
+        let kb = Kb::new();
+        let lead = match ok(&kb.op, json!({ "op": "task.add", "text": "the lead" })) {
+            Response::Added { added } => added.uid,
+            other => panic!("{other:?}"),
+        };
+        for event in ["submit_design", "approve_design"] {
+            ok(
+                &kb.op,
+                json!({ "op": "workflow.fire", "uid": lead, "event": event }),
+            );
+        }
+        for (agent_type, role) in [
+            ("jkb-reviewer", "reviewer"),
+            ("jkb-implementer", "implementer"),
+        ] {
+            ok(
+                &kb.op,
+                json!({ "op": "role.map", "agent_type": agent_type, "role": role }),
+            );
+        }
+        let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+            Response::Granted { token, .. } => token,
+            other => panic!("{other:?}"),
+        };
+        let hook = LocalBackend::new(kb.db.clone())
+            .with_tickets(Arc::clone(&kb.tickets))
+            .with_caller(Caller::Token(container));
+        Self {
+            kb,
+            hook,
+            tool: std::cell::Cell::new(0),
+            lead,
+        }
+    }
+
+    /// The backend one tool call runs as: a fresh ticket the hook mints, as the harness does per call.
+    /// `None` is the main session — the coordinator.
+    fn as_agent(&self, agent: Option<(&str, &str)>) -> LocalBackend {
+        self.tool.set(self.tool.get() + 1);
+        let token = match ok(
+            &self.hook,
+            json!({ "op": "attest.mint", "session": "swarm",
+                    "agent_id": agent.map(|a| a.0), "agent_type": agent.map(|a| a.1),
+                    "tool_use_id": format!("tool-{}", self.tool.get()) }),
+        ) {
+            Response::Ticket { token } => token,
+            other => panic!("{other:?}"),
+        };
+        LocalBackend::new(self.kb.db.clone())
+            .with_tickets(Arc::clone(&self.kb.tickets))
+            .with_caller(Caller::Token(token))
+    }
+
+    fn coordinator(&self, r: Value) -> Response {
+        ok(&self.as_agent(None), r)
+    }
+
+    fn moved(r: Response) -> crate::rbac::WorkflowMove {
+        match r {
+            Response::WorkflowMoved { outcome } => outcome,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `swarm-coordinator` step 2: claim the lead (which starts it) and tag its repository.
+    fn start_group(&self) {
+        self.coordinator(json!({ "op": "task.claim", "uid": self.lead, "owner": OWNER }));
+        self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
+                                 "facet_value": format!("repo={REPO}"), "mode": "set" }));
+    }
+
+    /// The implementer's calls: it reads its task and design, and moves no workflow itself.
+    fn implementer_works(&self) {
+        let imp = self.as_agent(Some(("i1", "jkb-implementer")));
+        match ok(&imp, json!({ "op": "task.show", "uid": self.lead })) {
+            Response::Task { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `swarm-coordinator` step 3, on `RESULT: ready`: record the branch, `needs_review`, and fire
+    /// `submit_work` on the lead.
+    fn coordinator_submits(&self) {
+        self.coordinator(json!({ "op": "task.start", "uid": self.lead, "keep": OWNER,
+                                 "place": { "branch": BRANCH, "repo": REPO, "onto": "fleet/main" } }));
+        self.coordinator(json!({ "op": "task.set", "uid": self.lead, "status": "needs_review" }));
+        let m = Self::moved(self.coordinator(
+            json!({ "op": "workflow.fire", "uid": self.lead, "event": "submit_work" }),
+        ));
+        assert!(m.moved, "{m:?}");
+        assert_eq!(m.phase, "review");
+    }
+
+    /// `swarm-reviewer`'s filing and recording, as a fresh `jkb-reviewer` subagent `agent`.
+    fn reviewer_records(&self, agent: &str, pass: u32, must_fix_in: Option<&str>) {
+        let rev = || self.as_agent(Some((agent, "jkb-reviewer")));
+        ok(&rev(), json!({ "op": "role.bind", "uid": self.lead }));
+        let ns = format!("repos/{REPO}/codereviews/pass-{pass}");
+        let findings = must_fix_in.map_or_else(Vec::new, |file| {
+            vec![json!({ "severity": "must-fix", "summary": "it breaks", "file": file, "line": 3 })]
+        });
+        match ok(
+            &rev(),
+            json!({ "op": "task.review_file", "ns": ns,
+                    "run": { "reviewers": 1, "returned": 1 }, "findings": findings }),
+        ) {
+            Response::ReviewFiled { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        match ok(
+            &rev(),
+            json!({ "op": "task.review_record", "repo": REPO, "branch": BRANCH, "findings": ns }),
+        ) {
+            Response::ReviewRecorded { recording } => {
+                assert_eq!(recording.recorded.len(), 1, "{recording:?}");
+                assert_eq!(recording.recorded[0].uid, self.lead);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `swarm-coordinator` step 4: observe the lead and route on its phase.
+    fn coordinator_observes(&self) -> String {
+        let m =
+            Self::moved(self.coordinator(json!({ "op": "workflow.observe", "uid": self.lead })));
+        assert!(m.moved, "{m:?}");
+        if m.phase == "implement" {
+            // Sent back: the coordinator reopens the work for the implementer.
+            self.coordinator(
+                json!({ "op": "task.set", "uid": self.lead, "status": "in_progress" }),
+            );
+        }
+        m.phase
+    }
+}
+
+/// The swarm's review loop through the workflow, with exactly the calls the `swarm-coordinator` and
+/// `swarm-reviewer` templates make, each as the principal that makes it: a must-fix round sends the
+/// work back to `implement`, and a second round with must-fixes in the same file goes on to a
+/// systemic review rather than round the loop again.
+#[test]
+fn the_swarm_loop_reaches_a_systemic_review_when_must_fixes_repeat_an_area() {
+    let s = Swarm::new();
+    s.start_group();
+    s.implementer_works();
+    s.coordinator_submits();
+    s.reviewer_records("r1", 1, Some("src/lib.rs"));
+    assert_eq!(s.coordinator_observes(), "implement");
+    s.implementer_works();
+    s.coordinator_submits();
+    s.reviewer_records("r2", 2, Some("src/lib.rs"));
+    assert_eq!(s.coordinator_observes(), "systemic_review");
+}
+
+/// The same loop, with the second round clean: the work is `landable`.
+#[test]
+fn the_swarm_loop_reaches_landable_on_a_clean_round() {
+    let s = Swarm::new();
+    s.start_group();
+    s.implementer_works();
+    s.coordinator_submits();
+    s.reviewer_records("r1", 1, Some("src/lib.rs"));
+    assert_eq!(s.coordinator_observes(), "implement");
+    s.implementer_works();
+    s.coordinator_submits();
+    s.reviewer_records("r2", 2, None);
+    assert_eq!(s.coordinator_observes(), "landable");
+    // A coordinator observing again finds nothing new to act on.
+    let again = Swarm::moved(s.coordinator(json!({ "op": "workflow.observe", "uid": s.lead })));
+    assert!(!again.moved && again.phase == "landable", "{again:?}");
+}
