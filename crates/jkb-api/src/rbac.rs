@@ -1507,6 +1507,10 @@ pub struct StrategyInfo {
     pub describe: String,
     /// Its spec.
     pub spec: serde_json::Value,
+    /// When a definition's listed version was defined (RFC 3339, UTC); absent for a preset, and from
+    /// a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defined_at: Option<String>,
 }
 
 /// `workflow.strategies`: the presets, then the operator's definitions, and which is the default.
@@ -1524,15 +1528,17 @@ pub fn strategies(conn: &Connection) -> Result<(Vec<StrategyInfo>, String), ApiE
             preset: true,
             describe: p.describe.to_owned(),
             spec: json(&(p.spec)())?,
+            defined_at: None,
         });
     }
-    for (name, version, spec) in wf::definitions(conn)? {
-        let spec = StrategySpec::from_json(&spec)?;
+    for d in wf::definitions(conn)? {
+        let spec = StrategySpec::from_json(&d.spec)?;
         out.push(StrategyInfo {
-            name: format!("{name}@{version}"),
+            name: format!("{}@{}", d.name, d.version),
             preset: false,
             describe: spec.graph.describe().to_owned(),
             spec: json(&spec)?,
+            defined_at: Some(d.defined_at),
         });
     }
     Ok((out, wf::default_strategy(conn)?.0))

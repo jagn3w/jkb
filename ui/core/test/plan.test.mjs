@@ -13,7 +13,10 @@ import {
   partitionPlans,
   planOps,
   planTasks,
+  strategyLabel,
   strategyName,
+  strategyOption,
+  strategyParts,
   pickOf,
   playPins,
   rebaseDraft,
@@ -71,6 +74,10 @@ test("a work prompt, the strategies and a task decode", () => {
   const strategies = { result: "strategies", default: "design-reviewed", strategies: [{ name: "coordinated", preset: true, describe: "d", spec: {} }] };
   assert.equal(decodeStrategies(ok(strategies)).value.default, "design-reviewed");
   assert.equal(decodeStrategies(ok({ ...strategies, strategies: [{ name: 1 }] })).ok, false);
+  const defined = { name: "factory@1", preset: false, describe: "d", spec: {}, defined_at: "2026-10-16T06:50:14.473Z" };
+  const listed = decodeStrategies(ok({ ...strategies, strategies: [...strategies.strategies, defined] }));
+  assert.equal(listed.value.strategies[1].defined_at, "2026-10-16T06:50:14.473Z");
+  assert.equal(decodeStrategies(ok({ ...strategies, strategies: [{ ...defined, defined_at: 5 }] })).ok, false);
 
   const shown = {
     result: "task",
@@ -107,6 +114,38 @@ test("requests are the ops' own shapes, a definition resolved by its name", () =
   });
   assert.equal(strategyName("mine@12"), "mine");
   assert.equal(strategyName("autonomous"), "autonomous");
+});
+
+test("a strategy identity comes apart into name, version and whether it follows the default", () => {
+  const parts = (name, version, followsDefault = false) => ({ name, version, followsDefault });
+  assert.deepEqual(strategyParts("design-reviewed"), parts("design-reviewed", null));
+  assert.deepEqual(strategyParts("factory@1"), parts("factory", 1));
+  assert.deepEqual(strategyParts("default:factory@3"), parts("factory", 3, true));
+  assert.deepEqual(strategyParts("default:design-reviewed"), parts("design-reviewed", null, true));
+  assert.deepEqual(strategyParts("a-b_c@12"), parts("a-b_c", 12));
+  // The operator's own `default` definition, listed and followed.
+  assert.deepEqual(strategyParts("default@2"), parts("default", 2));
+  assert.deepEqual(strategyParts("default:default@2"), parts("default", 2, true));
+  assert.equal(strategyName("default:factory@3"), "factory");
+
+  assert.equal(strategyLabel("factory@1"), "factory · v1");
+  assert.equal(strategyLabel("design-reviewed"), "design-reviewed");
+  assert.equal(strategyLabel("default:factory@1"), "factory · v1 (following default)");
+  assert.equal(strategyLabel("default:design-reviewed"), "design-reviewed (following default)");
+});
+
+test("a picker option sets an operator definition apart and says when its version was defined", () => {
+  const at = (iso) => `at ${iso}`;
+  const preset = { name: "design-reviewed", preset: true, describe: "d" };
+  const mine = { name: "factory@1", preset: false, describe: "d", defined_at: "2026-10-16T06:50:14.473Z" };
+  assert.equal(strategyOption(preset, "design-reviewed", at), "design-reviewed (default)");
+  assert.equal(strategyOption(preset, "factory@1", at), "design-reviewed");
+  assert.equal(strategyOption(mine, "design-reviewed", at), "factory · v1 — operator-defined at 2026-10-16T06:50:14.473Z");
+  assert.equal(strategyOption(mine, "factory@1", at), "factory · v1 — operator-defined at 2026-10-16T06:50:14.473Z (default)");
+  // From a daemon that predates the field: still marked, with no time.
+  assert.equal(strategyOption({ ...mine, defined_at: undefined }, "x", at), "factory · v1 — operator-defined");
+  // The default formatter keeps text that is not a time as it is.
+  assert.equal(strategyOption({ ...mine, defined_at: "whenever" }, "x"), "factory · v1 — operator-defined whenever");
 });
 
 test("archived plans go to the drawer, and a Play pins only open tasks not already on its strategy", () => {

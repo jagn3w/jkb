@@ -7,6 +7,7 @@ import {
   decodeWorkflowGraph,
   planOps,
   strategyName,
+  strategyOption,
   workflowOps,
   type AgentList,
   type Strategies,
@@ -143,8 +144,7 @@ export function WorkflowsTab(): React.JSX.Element {
           >
             {(strategies?.strategies ?? []).map((s) => (
               <option key={s.name} value={s.name} title={s.describe}>
-                {s.name}
-                {strategyName(s.name) === strategyName(strategies?.default ?? "") ? " (default)" : ""}
+                {strategyOption(s, strategies?.default ?? "")}
               </option>
             ))}
           </select>

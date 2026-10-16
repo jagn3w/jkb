@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 
-import { machineDrawing, machineLayout, markerSources, STATED, type MachineTable, type WorkflowGraph } from "@jkb/core";
+import { machineDrawing, machineLayout, markerSources, STATED, strategyLabel, type MachineTable, type WorkflowGraph } from "@jkb/core";
 
 const NODE_W = 150;
 const NODE_H = 46;
@@ -72,7 +72,7 @@ export function LifecyclePane({
         </div>
         <span className="spacer" />
         <span className="muted lifecycle-note" title={graph.describe}>
-          {graph.strategy}
+          {strategyLabel(graph.strategy)}
         </span>
       </header>
       <div className="pane-body">

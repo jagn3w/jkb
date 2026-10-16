@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { strategyName, type ExecPlan, type PlanTask } from "@jkb/core";
+import { strategyLabel, strategyName, strategyOption, type ExecPlan, type PlanTask } from "@jkb/core";
 
 import type { Plans } from "./usePlans";
 
@@ -115,12 +115,11 @@ export function StrategyPicker({ plans }: { readonly plans: Plans }): React.JSX.
         aria-label="Strategy"
       >
         <option value="" title="Pins nothing: each task keeps its own strategy, the default when unpinned">
-          Each task's own{strategies === undefined ? "" : ` (default ${strategies.default})`}
+          Each task's own{strategies === undefined ? "" : ` (default ${strategyLabel(strategies.default)})`}
         </option>
         {(strategies?.strategies ?? []).map((s) => (
           <option key={s.name} value={strategyName(s.name)} title={s.describe}>
-            {s.name}
-            {s.name === strategies?.default ? " (default)" : ""}
+            {strategyOption(s, strategies?.default ?? "")}
           </option>
         ))}
       </select>

@@ -349,6 +349,30 @@ fn strategies_list_presets_then_definitions_and_name_the_default() {
                 names,
                 vec!["design-reviewed", "coordinated", "autonomous", "mine@1"]
             );
+            // A definition carries when its listed version was defined; a preset has no such time,
+            // and its JSON omits the field rather than printing `null`.
+            assert!(strategies[..3].iter().all(|s| s.defined_at.is_none()));
+            let at = strategies[3].defined_at.as_deref().unwrap();
+            assert!(at.ends_with('Z') && at.contains('T'), "{at}");
+            assert!(serde_json::to_value(&strategies[0])
+                .unwrap()
+                .get("defined_at")
+                .is_none());
+        }
+        other => panic!("{other:?}"),
+    }
+    // A redefinition is listed once, as its newest version.
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.define", "name": "mine",
+                "spec": { "graph": "direct", "toggles": { "lands": ["operator"] } } }),
+    );
+    match ok(&kb.op, json!({ "op": "workflow.strategies" })) {
+        Response::Strategies { strategies, .. } => {
+            let mine: Vec<_> = strategies.iter().filter(|s| !s.preset).collect();
+            assert_eq!(mine.len(), 1);
+            assert_eq!(mine[0].name, "mine@2");
+            assert!(mine[0].defined_at.is_some());
         }
         other => panic!("{other:?}"),
     }

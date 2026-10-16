@@ -146,17 +146,37 @@ pub fn resolve_strategy(conn: &Connection, name: &str) -> Result<(String, Strate
     )))
 }
 
+/// One operator definition's newest version, as [`definitions`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Definition {
+    /// Its name.
+    pub name: String,
+    /// Its newest version.
+    pub version: i64,
+    /// That version's spec, as stored.
+    pub spec: String,
+    /// When that version was defined (RFC 3339, UTC).
+    pub defined_at: String,
+}
+
 /// Every operator definition's newest version, by name.
 ///
 /// # Errors
 /// A database error.
-pub fn definitions(conn: &Connection) -> Result<Vec<(String, i64, String)>> {
+pub fn definitions(conn: &Connection) -> Result<Vec<Definition>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT name, max(version), (SELECT spec FROM workflow_strategies w2
-                                     WHERE w2.name = w.name ORDER BY version DESC LIMIT 1)
-         FROM workflow_strategies w GROUP BY name ORDER BY name",
+        "SELECT name, version, spec, defined_at FROM workflow_strategies w
+         WHERE version = (SELECT max(version) FROM workflow_strategies w2 WHERE w2.name = w.name)
+         ORDER BY name",
     )?;
-    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Definition {
+            name: r.get(0)?,
+            version: r.get(1)?,
+            spec: r.get(2)?,
+            defined_at: r.get(3)?,
+        })
+    })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
