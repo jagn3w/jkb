@@ -14,11 +14,16 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has four parts
   the whole group, then files its findings and records the round in jkb (`jkb role bind`, `jkb task
   review file`, `jkb task review record`). Its role comes from the operator's agent-type map
   (`jkb-reviewer` → `reviewer`), never from a grant the coordinator mints.
-- **Workflow.** The coordinator drives each group's task workflow through the group's lead (its
-  first task): `jkb workflow fire <lead> submit_work` when the implementer reports ready, and
-  `jkb workflow observe <lead>` after each review. It routes on the phase jkb reports, not on the
-  reviewer's verdict word: `implement` goes back to the implementer, `systemic_review` stops the
-  group for a systemic review, and `landable` goes to the merge queue.
+- **Workflow.** The coordinator builds only tasks whose workflow is past design: a task at
+  `design` or `design_review` is left out and reported as awaiting design approval. It drives each
+  group's workflow through the group's lead (its first task, recorded as `swarm-lead=<lead uid>`
+  on every task of the group). When the implementer reports ready it reads the lead's phase and
+  fires `submit_work` from `implement`, fires nothing from `review` (already submitted), fires
+  `rework` then `submit_work` from `landable`, and stalls the group from any other phase. After a
+  merge-queue eject it fires `rework`. After each review it runs `jkb workflow observe <lead>` and
+  routes on the phase jkb reports, never on the reviewer's verdict word: `implement` goes back to
+  the implementer, `systemic_review` stops the group for a systemic review, and `landable` goes to
+  the merge queue. A refused fire stalls the group and is reported.
 - **Merge queue.** `scripts/merge-queue.sh` is deterministic, not an agent. It runs the gate on the
   rebased branch, lands it on the feature branch, records the landing, and names its own outcome.
 

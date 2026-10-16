@@ -374,6 +374,11 @@ impl Swarm {
             Response::Added { added } => added.uid,
             other => panic!("{other:?}"),
         };
+        // Before that it is at `design`, which step 1 of the coordinator leaves out.
+        match ok(&kb.op, json!({ "op": "workflow.show", "uid": lead })) {
+            Response::Workflow { workflow } => assert_eq!(workflow.phase, "design"),
+            other => panic!("{other:?}"),
+        }
         for event in ["submit_design", "approve_design"] {
             ok(
                 &kb.op,
@@ -433,11 +438,27 @@ impl Swarm {
         }
     }
 
-    /// `swarm-coordinator` step 2: claim the lead (which starts it) and tag its repository.
+    /// The lead's phase, as `jkb workflow show` prints it to the coordinator.
+    fn phase(&self) -> String {
+        match self.coordinator(json!({ "op": "workflow.show", "uid": self.lead })) {
+            Response::Workflow { workflow } => workflow.phase,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `swarm-coordinator` step 1 builds only a task past design, and step 2 claims the lead (which
+    /// starts it), tags its repository and records it as the group's lead.
     fn start_group(&self) {
+        assert_eq!(
+            self.phase(),
+            "implement",
+            "step 1 leaves out a task awaiting design approval"
+        );
         self.coordinator(json!({ "op": "task.claim", "uid": self.lead, "owner": OWNER }));
         self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
                                  "facet_value": format!("repo={REPO}"), "mode": "set" }));
+        self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
+                                 "facet_value": format!("swarm-lead={}", self.lead), "mode": "set" }));
     }
 
     /// The implementer's calls: it reads its task and design, and moves no workflow itself.
@@ -449,17 +470,33 @@ impl Swarm {
         }
     }
 
-    /// `swarm-coordinator` step 3, on `RESULT: ready`: record the branch, `needs_review`, and fire
-    /// `submit_work` on the lead.
+    fn fire(&self, event: &str) -> crate::rbac::WorkflowMove {
+        let m = Self::moved(
+            self.coordinator(json!({ "op": "workflow.fire", "uid": self.lead, "event": event })),
+        );
+        assert!(m.moved, "{event}: {m:?}");
+        m
+    }
+
+    /// `swarm-coordinator` step 3, on `RESULT: ready`: record the branch, `needs_review`, and hand
+    /// the lead to review by its phase — `submit_work` from `implement`, `rework` first from
+    /// `landable`.
     fn coordinator_submits(&self) {
         self.coordinator(json!({ "op": "task.start", "uid": self.lead, "keep": OWNER,
                                  "place": { "branch": BRANCH, "repo": REPO, "onto": "fleet/main" } }));
         self.coordinator(json!({ "op": "task.set", "uid": self.lead, "status": "needs_review" }));
-        let m = Self::moved(self.coordinator(
-            json!({ "op": "workflow.fire", "uid": self.lead, "event": "submit_work" }),
-        ));
-        assert!(m.moved, "{m:?}");
-        assert_eq!(m.phase, "review");
+        match self.phase().as_str() {
+            "implement" => {}
+            "landable" => assert_eq!(self.fire("rework").phase, "implement"),
+            other => panic!("the template stalls the group at {other}"),
+        }
+        assert_eq!(self.fire("submit_work").phase, "review");
+    }
+
+    /// `swarm-coordinator` step 5's eject arm: rework the `landable` lead, and reopen the work.
+    fn coordinator_ejects(&self) {
+        assert_eq!(self.fire("rework").phase, "implement");
+        self.coordinator(json!({ "op": "task.set", "uid": self.lead, "status": "in_progress" }));
     }
 
     /// `swarm-reviewer`'s filing and recording, as a fresh `jkb-reviewer` subagent `agent`.
@@ -523,7 +560,8 @@ fn the_swarm_loop_reaches_a_systemic_review_when_must_fixes_repeat_an_area() {
     assert_eq!(s.coordinator_observes(), "systemic_review");
 }
 
-/// The same loop, with the second round clean: the work is `landable`.
+/// The same loop, with the second round clean: the work is `landable`. A merge-queue eject then
+/// reworks it, and the resubmitted work goes round the loop again.
 #[test]
 fn the_swarm_loop_reaches_landable_on_a_clean_round() {
     let s = Swarm::new();
@@ -539,4 +577,29 @@ fn the_swarm_loop_reaches_landable_on_a_clean_round() {
     // A coordinator observing again finds nothing new to act on.
     let again = Swarm::moved(s.coordinator(json!({ "op": "workflow.observe", "uid": s.lead })));
     assert!(!again.moved && again.phase == "landable", "{again:?}");
+    // Without the rework, the resubmission is refused: the graph has no `landable` submit.
+    let refused = Swarm::moved(
+        s.coordinator(json!({ "op": "workflow.fire", "uid": s.lead, "event": "submit_work" })),
+    );
+    assert!(!refused.moved && refused.phase == "landable", "{refused:?}");
+    s.coordinator_ejects();
+    s.implementer_works();
+    s.coordinator_submits();
+    s.reviewer_records("r3", 3, None);
+    assert_eq!(s.coordinator_observes(), "landable");
+}
+
+/// A coordinator that rebuilt after compaction and re-runs step 3 for a lead still at `landable`
+/// reworks it first, as the phase table says, rather than being refused.
+#[test]
+fn a_resubmission_from_landable_reworks_first() {
+    let s = Swarm::new();
+    s.start_group();
+    s.implementer_works();
+    s.coordinator_submits();
+    s.reviewer_records("r1", 1, None);
+    assert_eq!(s.coordinator_observes(), "landable");
+    s.coordinator(json!({ "op": "task.set", "uid": s.lead, "status": "in_progress" }));
+    s.coordinator_submits();
+    assert_eq!(s.phase(), "review");
 }

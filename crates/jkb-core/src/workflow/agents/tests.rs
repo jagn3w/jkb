@@ -131,6 +131,19 @@ fn the_swarm_templates_drive_the_workflow() {
     let at = |s: &str| coord.find(s).unwrap_or_else(|| panic!("{s}"));
     assert!(at("submit_work") < at("jkb workflow agent show swarm-reviewer"));
     assert!(at("jkb workflow agent show swarm-reviewer") < at("jkb workflow observe"));
+    // The lead survives a compaction, and the frontier leaves out work whose design is not through.
+    assert!(coord.contains("swarm-lead=<lead uid>"));
+    assert!(coord.contains("awaiting design approval"));
+    // An eject puts a `landable` lead back to `implement`, or the next submit is refused.
+    let arm = &coord[at("- eject:")..];
+    let rework = arm.find("jkb workflow fire <lead uid> rework").unwrap();
+    assert!(
+        rework < arm.find("Back to step 3").unwrap(),
+        "the eject arm fires rework before going back"
+    );
+    // A refusal stops the group: nothing routes on the reviewer's reply instead of the phase.
+    assert!(!coord.contains("route step 4 on the reviewer's VERDICT"));
+    assert!(coord.contains("If jkb refuses a fire, stall the group"));
 }
 
 /// The workers' subagent types: rendered from the packaged file, prefixed like everything the
