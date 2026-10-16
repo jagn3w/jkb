@@ -362,6 +362,26 @@ struct Swarm {
     lead: String,
 }
 
+/// The path `swarm-coordinator` builds a group on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Path {
+    /// The full workflow: `submit_work`, recorded rounds, `observe`, routing on the phase.
+    Workflow,
+    /// A task still at `design` that the run's design gate let through: routed on the verdict.
+    Legacy,
+}
+
+/// `swarm-coordinator` step 1's admission table, by the phase `jkb workflow show` prints. `None`
+/// leaves the task out. Pinned against the template's text by `jkb-core`'s agents tests, and against
+/// what jkb lets step 3 do by `step_one_admits_exactly_the_phases_step_three_can_drive`.
+fn admission(phase: &str) -> Option<Path> {
+    match phase {
+        "implement" | "review" | "landable" => Some(Path::Workflow),
+        "design" => Some(Path::Legacy),
+        _ => None,
+    }
+}
+
 const OWNER: &str = "box:1";
 const BRANCH: &str = "swarm-task/lead";
 const REPO: &str = "r";
@@ -369,22 +389,31 @@ const REPO: &str = "r";
 impl Swarm {
     /// A task whose workflow is at `implement`: the operator approved its design.
     fn new() -> Self {
+        let s = Self::at_design();
+        for event in ["submit_design", "approve_design"] {
+            s.operator_fires(event, None);
+        }
+        s
+    }
+
+    /// The operator moves the lead's workflow; `to` is an override's phase.
+    fn operator_fires(&self, event: &str, to: Option<&str>) {
+        let m = Self::moved(ok(
+            &self.kb.op,
+            json!({ "op": "workflow.fire", "uid": self.lead, "event": event, "to": to,
+                    "reason": to.map(|_| "the test puts it there") }),
+        ));
+        assert!(m.moved, "{event}: {m:?}");
+    }
+
+    /// A task with no workflow history, so at `design` — where nearly every task sits, since
+    /// `/design-pass` sets only the `design=approved` tag.
+    fn at_design() -> Self {
         let kb = Kb::new();
         let lead = match ok(&kb.op, json!({ "op": "task.add", "text": "the lead" })) {
             Response::Added { added } => added.uid,
             other => panic!("{other:?}"),
         };
-        // Before that it is at `design`, which step 1 of the coordinator leaves out.
-        match ok(&kb.op, json!({ "op": "workflow.show", "uid": lead })) {
-            Response::Workflow { workflow } => assert_eq!(workflow.phase, "design"),
-            other => panic!("{other:?}"),
-        }
-        for event in ["submit_design", "approve_design"] {
-            ok(
-                &kb.op,
-                json!({ "op": "workflow.fire", "uid": lead, "event": event }),
-            );
-        }
         for (agent_type, role) in [
             ("jkb-reviewer", "reviewer"),
             ("jkb-implementer", "implementer"),
@@ -446,14 +475,14 @@ impl Swarm {
         }
     }
 
-    /// `swarm-coordinator` step 1 builds only a task past design, and step 2 claims the lead (which
-    /// starts it), tags its repository and records it as the group's lead.
     fn start_group(&self) {
-        assert_eq!(
-            self.phase(),
-            "implement",
-            "step 1 leaves out a task awaiting design approval"
-        );
+        self.start_group_on(Path::Workflow);
+    }
+
+    /// `swarm-coordinator` step 1 admits the lead on `path`, and step 2 claims it (which starts it),
+    /// tags its repository and records it as the group's lead.
+    fn start_group_on(&self, path: Path) {
+        assert_eq!(admission(&self.phase()), Some(path));
         self.coordinator(json!({ "op": "task.claim", "uid": self.lead, "owner": OWNER }));
         self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
                                  "facet_value": format!("repo={REPO}"), "mode": "set" }));
@@ -479,18 +508,42 @@ impl Swarm {
     }
 
     /// `swarm-coordinator` step 3, on `RESULT: ready`: record the branch, `needs_review`, and hand
-    /// the lead to review by its phase — `submit_work` from `implement`, `rework` first from
-    /// `landable`.
+    /// the lead to review by its phase — `submit_work` from `implement`, nothing from `review`,
+    /// `rework` first from `landable`.
     fn coordinator_submits(&self) {
         self.coordinator(json!({ "op": "task.start", "uid": self.lead, "keep": OWNER,
                                  "place": { "branch": BRANCH, "repo": REPO, "onto": "fleet/main" } }));
         self.coordinator(json!({ "op": "task.set", "uid": self.lead, "status": "needs_review" }));
         match self.phase().as_str() {
             "implement" => {}
+            // Already submitted: fire nothing.
+            "review" => return,
             "landable" => assert_eq!(self.fire("rework").phase, "implement"),
             other => panic!("the template stalls the group at {other}"),
         }
         assert_eq!(self.fire("submit_work").phase, "review");
+    }
+
+    /// `swarm-coordinator` step 3 for a LEGACY group: record the branch and `needs_review`, and fire
+    /// nothing.
+    fn coordinator_submits_legacy(&self) {
+        self.coordinator(json!({ "op": "task.start", "uid": self.lead, "keep": OWNER,
+                                 "place": { "branch": BRANCH, "repo": REPO, "onto": "fleet/main" } }));
+        self.coordinator(json!({ "op": "task.set", "uid": self.lead, "status": "needs_review" }));
+    }
+
+    /// CLOSING FINDINGS: after a clean round the coordinator closes the earlier rounds' must-fixes.
+    fn coordinator_closes(&self, findings: &[String]) {
+        assert!(!findings.is_empty());
+        for uid in findings {
+            self.coordinator(json!({ "op": "task.set", "uid": uid, "status": "done" }));
+            match ok(&self.kb.op, json!({ "op": "task.show", "uid": uid })) {
+                Response::Task { task, .. } => {
+                    assert_eq!(task.item.status.as_deref(), Some("done"), "{uid}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     /// `swarm-coordinator` step 5's eject arm: rework the `landable` lead, and reopen the work.
@@ -500,21 +553,21 @@ impl Swarm {
     }
 
     /// `swarm-reviewer`'s filing and recording, as a fresh `jkb-reviewer` subagent `agent`.
-    fn reviewer_records(&self, agent: &str, pass: u32, must_fix_in: Option<&str>) {
+    fn reviewer_records(&self, agent: &str, pass: u32, must_fix_in: Option<&str>) -> Vec<String> {
         let rev = || self.as_agent(Some((agent, "jkb-reviewer")));
         ok(&rev(), json!({ "op": "role.bind", "uid": self.lead }));
         let ns = format!("repos/{REPO}/codereviews/pass-{pass}");
         let findings = must_fix_in.map_or_else(Vec::new, |file| {
             vec![json!({ "severity": "must-fix", "summary": "it breaks", "file": file, "line": 3 })]
         });
-        match ok(
+        let filed = match ok(
             &rev(),
             json!({ "op": "task.review_file", "ns": ns,
                     "run": { "reviewers": 1, "returned": 1 }, "findings": findings }),
         ) {
-            Response::ReviewFiled { .. } => {}
+            Response::ReviewFiled { filed } => filed,
             other => panic!("{other:?}"),
-        }
+        };
         match ok(
             &rev(),
             json!({ "op": "task.review_record", "repo": REPO, "branch": BRANCH, "findings": ns }),
@@ -525,6 +578,7 @@ impl Swarm {
             }
             other => panic!("{other:?}"),
         }
+        filed.uids
     }
 
     /// `swarm-coordinator` step 4: observe the lead and route on its phase.
@@ -568,12 +622,14 @@ fn the_swarm_loop_reaches_landable_on_a_clean_round() {
     s.start_group();
     s.implementer_works();
     s.coordinator_submits();
-    s.reviewer_records("r1", 1, Some("src/lib.rs"));
+    let round_1 = s.reviewer_records("r1", 1, Some("src/lib.rs"));
     assert_eq!(s.coordinator_observes(), "implement");
     s.implementer_works();
     s.coordinator_submits();
     s.reviewer_records("r2", 2, None);
     assert_eq!(s.coordinator_observes(), "landable");
+    // The clean round confirms round 1's must-fix fixed: the coordinator closes it.
+    s.coordinator_closes(&round_1);
     // A coordinator observing again finds nothing new to act on.
     let again = Swarm::moved(s.coordinator(json!({ "op": "workflow.observe", "uid": s.lead })));
     assert!(!again.moved && again.phase == "landable", "{again:?}");
@@ -602,4 +658,73 @@ fn a_resubmission_from_landable_reworks_first() {
     s.coordinator(json!({ "op": "task.set", "uid": s.lead, "status": "in_progress" }));
     s.coordinator_submits();
     assert_eq!(s.phase(), "review");
+}
+
+/// Step 1 admits exactly the phases step 3 can drive — from each WORKFLOW phase the template's calls
+/// reach `review` — and from every phase it leaves out, and from `design`, those calls are refused.
+/// So a task at `design_review` is excluded, a task at `systemic_review` is not rebuilt (and not
+/// landed past its systemic review as a non-lead), and a task at `design` can only go the legacy way.
+#[test]
+fn step_one_admits_exactly_the_phases_step_three_can_drive() {
+    let refused = |s: &Swarm, event: &str| {
+        let m = Swarm::moved(
+            s.coordinator(json!({ "op": "workflow.fire", "uid": s.lead, "event": event })),
+        );
+        assert!(!m.moved, "{event} from {}: {m:?}", s.phase());
+    };
+    for phase in [
+        "design",
+        "design_review",
+        "implement",
+        "review",
+        "landable",
+        "systemic_review",
+        "landed",
+        "cancelled",
+    ] {
+        let s = Swarm::at_design();
+        if phase != "design" {
+            s.operator_fires("override", Some(phase));
+        }
+        assert_eq!(s.phase(), phase);
+        match admission(phase) {
+            Some(Path::Workflow) => {
+                s.start_group();
+                s.coordinator_submits();
+                assert_eq!(s.phase(), "review", "from {phase}");
+            }
+            Some(Path::Legacy) | None => {
+                refused(&s, "submit_work");
+                refused(&s, "rework");
+            }
+        }
+    }
+    assert_eq!(admission("design_review"), None);
+    assert_eq!(admission("systemic_review"), None);
+}
+
+/// A task still at `design` that the design gate let through is built on the legacy path: the same
+/// reviewer files and records its rounds, the coordinator routes on the verdict, and its workflow is
+/// never driven. The clean round's findings are closed as on the workflow path.
+#[test]
+fn a_legacy_task_at_design_builds_on_the_verdict_path() {
+    let s = Swarm::at_design();
+    ok(
+        &s.kb.op,
+        json!({ "op": "task.tag", "uid": s.lead, "facet_value": "design=approved", "mode": "set" }),
+    );
+    s.start_group_on(Path::Legacy);
+    s.implementer_works();
+    s.coordinator_submits_legacy();
+    let round_1 = s.reviewer_records("r1", 1, Some("src/lib.rs"));
+    // `VERDICT: request_changes`: back to the implementer, with nothing for the workflow to observe.
+    let m = Swarm::moved(s.coordinator(json!({ "op": "workflow.observe", "uid": s.lead })));
+    assert!(!m.moved && m.phase == "design", "{m:?}");
+    s.coordinator(json!({ "op": "task.set", "uid": s.lead, "status": "in_progress" }));
+    s.implementer_works();
+    s.coordinator_submits_legacy();
+    s.reviewer_records("r2", 2, None);
+    // `VERDICT: approve`: the findings it confirms fixed are closed before the merge queue.
+    s.coordinator_closes(&round_1);
+    assert_eq!(s.phase(), "design");
 }

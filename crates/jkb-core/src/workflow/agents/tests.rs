@@ -131,9 +131,23 @@ fn the_swarm_templates_drive_the_workflow() {
     let at = |s: &str| coord.find(s).unwrap_or_else(|| panic!("{s}"));
     assert!(at("submit_work") < at("jkb workflow agent show swarm-reviewer"));
     assert!(at("jkb workflow agent show swarm-reviewer") < at("jkb workflow observe"));
-    // The lead survives a compaction, and the frontier leaves out work whose design is not through.
+    // The lead survives a compaction.
     assert!(coord.contains("swarm-lead=<lead uid>"));
-    assert!(coord.contains("awaiting design approval"));
+    // Step 1 admits exactly the phases step 3 drives, plus `design` on the legacy path; the rest are
+    // left out. `jkb-api`'s swarm-loop tests pin the same table against what jkb lets step 3 do.
+    for row in [
+        "  implement, review, landable   a WORKFLOW task",
+        "  design                        a LEGACY task",
+        "  design_review                 left out",
+        "  anything else                 left out (systemic_review, landed, cancelled)",
+    ] {
+        assert!(coord.contains(row), "step 1's admission table: {row}");
+    }
+    assert!(coord.contains("never a mix"));
+    // Whoever verifies a fix closes its finding: the coordinator, after a clean round.
+    let closing = at("CLOSING FINDINGS");
+    assert!(coord[closing..].contains("jkb task set <finding uid> --status done"));
+    assert!(closing < at("5. THE MERGE QUEUE"));
     // An eject puts a `landable` lead back to `implement`, or the next submit is refused.
     let arm = &coord[at("- eject:")..];
     let rework = arm.find("jkb workflow fire <lead uid> rework").unwrap();

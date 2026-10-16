@@ -4,7 +4,7 @@ argument-hint: "<jkb-path | task-uids...>  [--branch <name>]  [--dry-run]  [--no
 ---
 
 This session becomes the **coordinator** of a task swarm. It works inside the tasks' lifecycle
-and RBAC: jkb holds every rule the coordinator follows. The swarm has four parts:
+and RBAC: jkb holds every rule the coordinator follows. The swarm has these parts:
 
 - **Groups.** The coordinator reads the ready frontier and groups overlapping tasks, at most 4
   per group.
@@ -14,16 +14,24 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has four parts
   the whole group, then files its findings and records the round in jkb (`jkb role bind`, `jkb task
   review file`, `jkb task review record`). Its role comes from the operator's agent-type map
   (`jkb-reviewer` → `reviewer`), never from a grant the coordinator mints.
-- **Workflow.** The coordinator builds only tasks whose workflow is past design: a task at
-  `design` or `design_review` is left out and reported as awaiting design approval. It drives each
-  group's workflow through the group's lead (its first task, recorded as `swarm-lead=<lead uid>`
-  on every task of the group). When the implementer reports ready it reads the lead's phase and
-  fires `submit_work` from `implement`, fires nothing from `review` (already submitted), fires
-  `rework` then `submit_work` from `landable`, and stalls the group from any other phase. After a
-  merge-queue eject it fires `rework`. After each review it runs `jkb workflow observe <lead>` and
-  routes on the phase jkb reports, never on the reviewer's verdict word: `implement` goes back to
-  the implementer, `systemic_review` stops the group for a systemic review, and `landable` goes to
-  the merge queue. A refused fire stalls the group and is reported.
+- **Workflow.** The coordinator admits a task by its workflow phase, and a group only if every
+  task in it is admitted. A task at `implement`, `review` or `landable` is a *workflow* task. A
+  task still at `design` that the run's design gate let through (the `design=approved` tag, a
+  hand-pick by uid, or `--no-design-gate`) is a *legacy* task: its design was never approved in
+  jkb, so it is built on the legacy path, routed on the reviewer's verdict, and named as legacy in
+  the report. A task at `design_review` (awaiting the operator's approval) or any other phase is
+  left out and reported. A group never mixes legacy and workflow tasks. The workflow moves through
+  the group's lead (its first task, recorded as `swarm-lead=<lead uid>` on every task of the
+  group). For a workflow group, when the implementer reports ready the coordinator reads the lead's
+  phase and fires `submit_work` from `implement`, nothing from `review` (already submitted), and
+  `rework` then `submit_work` from `landable`; it stalls the group from any other phase, or on a
+  refused fire. After a merge-queue eject it fires `rework`. After each review it runs `jkb workflow
+  observe <lead>` and routes on the phase jkb reports, never on the reviewer's verdict word:
+  `implement` goes back to the implementer, `systemic_review` stops the group for a systemic
+  review, and `landable` goes to the merge queue.
+- **Findings.** Whoever verifies a fix closes its finding. When a round comes back clean, the
+  coordinator closes the must-fix findings of the group's earlier rounds (`jkb task set <finding>
+  --status done`) before the merge queue. Concerns and nits stay open as backlog.
 - **Merge queue.** `scripts/merge-queue.sh` is deterministic, not an agent. It runs the gate on the
   rebased branch, lands it on the feature branch, records the landing, and names its own outcome.
 
