@@ -859,10 +859,60 @@ fn a_run_whose_runner_went_quiet_ends_past_its_timeout_and_grace() {
         .find(|(k, _)| k == "exec.end")
         .unwrap();
     assert_eq!(end.1["outcome"], "interrupted");
-    // The runner that comes back late cannot finish it differently.
+    // Another runner cannot finish it.
     assert!(is_stale(
-        &try_finish(&db, id, "app", Outcome::Exited, Some(0), due + 1).unwrap_err()
+        &try_finish(&db, id, "other", Outcome::Exited, Some(0), due + 1).unwrap_err()
     ));
+}
+
+/// `settle` judges by wall-clock age alone, so its `interrupted` is provisional: a runner that was
+/// only paused (a host asleep) reports late, and its own output and ending are what is recorded.
+#[test]
+fn a_late_runner_s_own_report_replaces_a_settled_interrupt() {
+    let db = Db::open_in_memory().unwrap();
+    let id = req(&db, &who("s1"), &ask(&["make"], None), T0).row.id;
+    try_begin(&db, id, None, "app", T0).unwrap();
+    let late = T0 + DEFAULT_TIMEOUT_MS + super::RUN_GRACE_MS + 60_000;
+    // The runner wakes and reports: its output is still accepted…
+    let (seq, n) = db
+        .write_txn("t", move |c, m| {
+            output(c, m, id, "app", b"still here\n", late)
+        })
+        .unwrap();
+    assert!(seq.is_some());
+    assert_eq!(n, 0);
+    assert_eq!(
+        row(&db, id).outcome,
+        Some(Outcome::Interrupted),
+        "settle ended it first"
+    );
+    // …another runner's is not…
+    assert!(is_stale(
+        &db.write_txn("t", move |c, m| output(c, m, id, "other", b"x", late))
+            .unwrap_err()
+    ));
+    // …and its own ending replaces the assumed one.
+    let done = try_finish(&db, id, "app", Outcome::Exited, Some(3), late + 1).unwrap();
+    assert_eq!(
+        (done.outcome, done.exit_status),
+        (Some(Outcome::Exited), Some(3))
+    );
+    assert_eq!(done.note, None);
+    let ends: Vec<_> = messages(&db, id)
+        .into_iter()
+        .filter(|(k, _)| k == "exec.end")
+        .map(|(_, p)| p["outcome"].clone())
+        .collect();
+    assert_eq!(ends, vec!["interrupted", "exited"]);
+    // Once it reported, the ending is its own and is not replaced again.
+    assert!(is_stale(
+        &try_finish(&db, id, "app", Outcome::Exited, Some(0), late + 2).unwrap_err()
+    ));
+    assert_eq!(
+        try_finish(&db, id, "app", Outcome::Exited, Some(3), late + 3).unwrap(),
+        done,
+        "an identical retry is still idempotent"
+    );
 }
 
 #[test]

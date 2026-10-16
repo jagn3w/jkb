@@ -417,15 +417,17 @@ pub fn follow(
 }
 
 /// Whether an end reported for `session` by `principal` may expire that session's pending run
-/// requests: only the session's own attested tool call, or the operator. `session.ended` and
-/// `session.gone` are any hook's to send, naming any session, so a forged end must not cost another
-/// session its requests (it waits out their expiry instead).
+/// requests: the harness — the operator, or the dev container's own credential, which is what the
+/// container's `SessionEnd` hook and its gone-sweep authenticate with, and which the model's
+/// sandboxed tools cannot read — or the session's own attested tool call. Never another session's
+/// ticket, and never another grant: `session.ended` and `session.gone` name any session, so an end
+/// forged by a session must not cost another its requests.
 #[must_use]
 pub fn vouches_for_end(principal: &Principal, session: &str) -> bool {
     match &principal.kind {
         PrincipalKind::Operator => true,
+        PrincipalKind::Grant(g) => g.container,
         PrincipalKind::Ticket(t) => t.session == session,
-        PrincipalKind::Grant(_) => false,
     }
 }
 

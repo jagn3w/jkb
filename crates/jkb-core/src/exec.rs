@@ -19,7 +19,7 @@
 //! | `pending` → `refused` | [`refuse`] |
 //! | `pending` → `expired` | every function here, lazily, once `expires_at` has passed; [`expire_session`] when the requester's session ended |
 //! | `running` → `finished` | [`finish`], idempotent for identical values, refused to another runner |
-//! | `running` → `finished` (`interrupted`) | every function here, lazily, once `started_at + timeout + `[`RUN_GRACE_MS`] has passed with no end reported |
+//! | `running` → `finished` (`interrupted`) | every function here, lazily, once `started_at + timeout + `[`RUN_GRACE_MS`] has passed with no end reported — provisional: the recorded runner's own late [`output`] is accepted and its [`finish`] replaces the outcome ([`SETTLED_INTERRUPT`]) |
 //!
 //! **Who may call which** is `jkb-api`'s: [`request`] is any non-operator session's, the moves out of
 //! `pending` and the output are the operator's. The requester is the server-side principal, never a
@@ -89,6 +89,13 @@ pub const MAX_TIMEOUT_MS: i64 = 2 * 60 * 60 * 1000;
 /// A runner that crashed mid-run would otherwise leave the row `running` for ever, and the session
 /// waiting on it with it.
 pub const RUN_GRACE_MS: i64 = 5 * 60 * 1000;
+
+/// The note [`settle`] writes when it ends a quiet run as interrupted — and how [`finish`] and
+/// [`output`] recognise that ending as provisional. Wall-clock age is all `settle` has: a runner
+/// merely paused (a host asleep with its lid closed) is not dead, and its own report, when it comes,
+/// is the truth.
+pub const SETTLED_INTERRUPT: &str =
+    "interrupted: the runner never reported an end, past the timeout and its grace";
 
 /// The latest a request can still be answered, measured from its creation: unanswered past
 /// [`EXPIRES_AFTER_MS`] it expires, and begun at the last moment it ends within the longest timeout
@@ -749,8 +756,7 @@ fn settle(conn: &Connection, meta: &WriteMeta, now: i64) -> Result<Vec<i64>> {
         .query_map(params![now, RUN_GRACE_MS], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for id in overdue {
-        let note = "interrupted: the runner never reported an end, past the timeout and its grace"
-            .to_owned();
+        let note = SETTLED_INTERRUPT.to_owned();
         if let Some(row) = moved(
             conn,
             meta,
@@ -1023,7 +1029,10 @@ pub fn output(
     }
     settle(conn, meta, now)?;
     let row = must_get(conn, id)?;
-    held_by(&row, runner, "publish output for")?;
+    // A run `settle` ended by age is still its runner's to report on: the runner was only late.
+    if !settled_by_age(&row, runner) {
+        held_by(&row, runner, "publish output for")?;
+    }
     let n: i64 = conn
         .prepare_cached(
             "INSERT INTO exec_output (request_id, chunks) VALUES (?1, 1) \
@@ -1041,6 +1050,35 @@ pub fn output(
         false,
     )?;
     Ok((seq, n))
+}
+
+/// Whether `row` is a run [`settle`] ended by age alone, under `runner` — which that runner's own
+/// late report may still correct.
+fn settled_by_age(row: &ExecRow, runner: &str) -> bool {
+    row.state == ExecState::Finished
+        && row.outcome == Some(Outcome::Interrupted)
+        && row.note.as_deref() == Some(SETTLED_INTERRUPT)
+        && row.runner.as_deref() == Some(runner)
+}
+
+/// A finished run's tail, total and log path.
+fn store_output(conn: &Connection, id: i64, done: &Finished<'_>, tail_len: i64) -> Result<()> {
+    let truncated = done.total_bytes > tail_len;
+    conn.prepare_cached(
+        "INSERT INTO exec_output (request_id, tail, total_bytes, truncated, log_path) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(request_id) DO UPDATE SET tail = excluded.tail, \
+             total_bytes = excluded.total_bytes, truncated = excluded.truncated, \
+             log_path = excluded.log_path",
+    )?
+    .execute(params![
+        id,
+        done.tail,
+        done.total_bytes,
+        truncated,
+        done.log_path
+    ])?;
+    Ok(())
 }
 
 /// Refuse anyone but the runner of a running request.
@@ -1097,6 +1135,38 @@ pub fn finish(
     }
     settle(conn, meta, now)?;
     let row = must_get(conn, id)?;
+    if settled_by_age(&row, done.runner) {
+        // The recorded runner was only late: its own ending replaces the one `settle` assumed.
+        let finished = moved(
+            conn,
+            meta,
+            id,
+            "UPDATE exec_requests SET outcome = ?2, exit_status = ?3, ended_at = ?4, note = NULL \
+             WHERE id = ?1 AND state = 'finished' AND outcome = 'interrupted' AND note = ?5 \
+               AND runner = ?6",
+            &[
+                &id,
+                &done.outcome.as_str(),
+                &done.exit_status,
+                &now,
+                &SETTLED_INTERRUPT,
+                &done.runner,
+            ],
+            now,
+        )?
+        .ok_or_else(|| stale(format!("{} changed under its finish", row.wire_id())))?;
+        store_output(conn, id, done, tail_len)?;
+        publish(
+            conn,
+            meta,
+            id,
+            "exec.end",
+            end_payload(&finished),
+            now,
+            false,
+        )?;
+        return Ok(finished);
+    }
     if row.state == ExecState::Finished {
         let same = row.runner.as_deref() == Some(done.runner)
             && row.outcome == Some(done.outcome)
@@ -1127,21 +1197,7 @@ pub fn finish(
         now,
     )?
     .ok_or_else(|| not_pending(&row, "finish"))?;
-    let truncated = done.total_bytes > tail_len;
-    conn.prepare_cached(
-        "INSERT INTO exec_output (request_id, tail, total_bytes, truncated, log_path) \
-         VALUES (?1, ?2, ?3, ?4, ?5) \
-         ON CONFLICT(request_id) DO UPDATE SET tail = excluded.tail, \
-             total_bytes = excluded.total_bytes, truncated = excluded.truncated, \
-             log_path = excluded.log_path",
-    )?
-    .execute(params![
-        id,
-        done.tail,
-        done.total_bytes,
-        truncated,
-        done.log_path
-    ])?;
+    store_output(conn, id, done, tail_len)?;
     publish(
         conn,
         meta,

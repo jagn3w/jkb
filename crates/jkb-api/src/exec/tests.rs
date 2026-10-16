@@ -381,36 +381,50 @@ fn a_request_s_topic_is_followed_by_its_requester_alone() {
 }
 
 #[test]
-fn only_a_session_s_own_end_or_the_operator_s_expires_its_requests() {
+fn a_session_s_end_expires_its_requests_only_from_the_harness_or_itself() {
     let kb = Kb::new();
+    let end = |session: &str, pid: &str| {
+        json!({ "op": "session.ended", "session": session, "reason": "exit",
+                "pid": pid, "instance": "h" })
+    };
+    let state = |id: &str| view(ok(&kb.op, &json!({ "op": "exec.status", "id": id }))).state;
     let s1 = kb.ticket("s1", None, "t1");
     let (r, _) = requested(ok(&s1, &ask(&["make"])));
-    let end = json!({ "op": "session.ended", "session": "s1", "reason": "exit",
-                     "pid": "10", "instance": "h" });
-    // Another session, and the container credential's hook, can record an end for s1 — but it costs
-    // s1 nothing.
-    ok(&kb.ticket("s2", None, "t2"), &end);
-    ok(&kb.as_token(&kb.container), &end);
-    assert_eq!(
-        view(ok(&s1, &json!({ "op": "exec.status", "id": r.id }))).state,
-        "pending"
-    );
-    // Its own end does.
-    ok(&kb.ticket("s1", None, "t3"), &end);
-    assert_eq!(
-        view(ok(&kb.op, &json!({ "op": "exec.status", "id": r.id }))).state,
-        "expired"
-    );
-    // And the operator's.
-    let s3 = kb.ticket("s3", None, "t4");
+    // Another session's ticket, and an operator-minted grant that is not the container's, record an
+    // end for s1 — and cost it nothing.
+    ok(&kb.ticket("s2", None, "t2"), &end("s1", "10"));
+    let (_, other_grant) = match ok(
+        &kb.op,
+        &json!({ "op": "role.grant", "role": "coordinator", "agent": "someone" }),
+    ) {
+        Response::Granted { grant, token } => (grant.id, token),
+        other => panic!("{other:?}"),
+    };
+    ok(&kb.as_token(&other_grant), &end("s1", "10"));
+    assert_eq!(state(&r.id), "pending");
+    // The container's SessionEnd hook — the real producer, with the container credential — does.
+    ok(&kb.as_token(&kb.container), &end("s1", "10"));
+    assert_eq!(state(&r.id), "expired");
+    // So does the session's own tool call, and the operator.
+    let s3 = kb.ticket("s3", None, "t3");
     let (q, _) = requested(ok(&s3, &ask(&["make"])));
+    ok(&kb.ticket("s3", None, "t4"), &end("s3", "11"));
+    assert_eq!(state(&q.id), "expired");
+    let s4 = kb.ticket("s4", None, "t5");
+    let (w, _) = requested(ok(&s4, &ask(&["make"])));
+    ok(&kb.op, &end("s4", "12"));
+    assert_eq!(state(&w.id), "expired");
+    // The gone-sweep's `session.gone`, from the container credential, likewise.
+    let s5 = kb.ticket("s5", None, "t6");
+    let (g, _) = requested(ok(&s5, &ask(&["make"])));
     ok(
         &kb.op,
-        &json!({ "op": "session.ended", "session": "s3", "reason": "exit",
-                         "pid": "11", "instance": "h" }),
+        &json!({ "op": "session.started", "session": "s5", "source": "startup",
+                 "pid": "13", "instance": "h" }),
     );
-    assert_eq!(
-        view(ok(&kb.op, &json!({ "op": "exec.status", "id": q.id }))).state,
-        "expired"
+    ok(
+        &kb.as_token(&kb.container),
+        &json!({ "op": "session.gone", "session": "s5", "pid": "13", "instance": "h" }),
     );
+    assert_eq!(state(&g.id), "expired");
 }
