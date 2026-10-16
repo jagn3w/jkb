@@ -14,7 +14,9 @@ import {
   editBetween,
   isAgentName,
   layered,
+  machineDrawing,
   machineLayout,
+  markerSources,
   placeholdersOf,
   saveRequest,
   workflowOps,
@@ -187,8 +189,9 @@ const machine = {
   ],
 };
 
-test("a machine is laid out from its table, self-loops and overrides left to be listed", () => {
-  const l = machineLayout(machine);
+test("a machine is laid out from its drawing, self-loops and overrides left to be listed", () => {
+  const d = machineDrawing(machine);
+  const l = machineLayout(d);
   assert.deepEqual(
     l.nodes.map((n) => [n.id, n.layer]),
     [
@@ -201,6 +204,107 @@ test("a machine is laid out from its table, self-loops and overrides left to be 
     l.links.map((x) => x.label),
     ["submit_design", "observed_landed"],
   );
+  assert.deepEqual(
+    d.listed.map((t) => t.event),
+    ["reopen", "override"],
+  );
+});
+
+const st = (name, over = {}) => ({ name, initial: false, settled: false, awaits_input: false, next_role: "implementer", next_step: "s", ...over });
+const tr = (from, event, to, over = {}) => ({ from, event, to, reconciled: false, guarded: false, planned: false, roles: ["operator"], fired_by: "operator", ...over });
+const obs = (from, event, to, over = {}) => tr(from, event, to, { reconciled: true, guarded: true, roles: [], fired_by: "observed", ...over });
+
+// Shaped like `design-reviewed`: six live phases, each with an observed landing and cancelling.
+const PHASES = ["design", "design_review", "implement", "review", "landable", "changes_requested"];
+const sixPhase = {
+  states: [
+    ...PHASES.map((p, i) => st(p, { initial: i === 0 })),
+    st("landed", { settled: true, next_role: null, next_step: null }),
+    st("cancelled", { settled: true, next_role: null, next_step: null }),
+  ],
+  transitions: [
+    tr("design", "submit_design", "design_review"),
+    tr("design_review", "approve_design", "implement"),
+    tr("implement", "submit_work", "review"),
+    obs("review", "review_passed", "landable"),
+    tr("review", "request_changes", "changes_requested"),
+    tr("changes_requested", "submit_work", "review"),
+    ...PHASES.map((p) => obs(p, "observed_landed", "landed", { guarded: p !== "landable" })),
+    ...PHASES.map((p) => obs(p, "observed_cancelled", "cancelled")),
+    ...PHASES.map((p) => tr(p, "override", null)),
+    tr("implement", "note", "implement", { roles: [], fired_by: "applied" }),
+  ],
+};
+
+test("observations from two or more phases collapse into one marker per target", () => {
+  const d = machineDrawing(sixPhase);
+  assert.deepEqual(
+    d.markers.map((m) => [m.to, m.groups.map((g) => [g.event, g.rows.map((r) => r.from)])]),
+    [
+      ["landed", [["observed_landed", PHASES]]],
+      ["cancelled", [["observed_cancelled", PHASES]]],
+    ],
+  );
+  assert.equal(markerSources(d.markers[0]).length, 6, "every live phase is still counted, not hidden as 'from any'");
+  assert.deepEqual(
+    d.markers[0].groups[0].rows.map((r) => r.guarded),
+    PHASES.map((p) => p !== "landable"),
+    "a guarded and an unguarded row of one (to, event) share a group, each keeping its own flag",
+  );
+  assert.ok(d.edges.every((e) => e.event !== "observed_landed" && e.event !== "observed_cancelled"));
+  const l = machineLayout(d);
+  assert.deepEqual(
+    l.links.map((x) => x.label),
+    ["submit_design", "approve_design", "submit_work", "review_passed", "request_changes", "submit_work"],
+    "the graph draws only the real phase-to-phase edges",
+  );
+  assert.ok(l.nodes.some((n) => n.id === "landed") && l.nodes.some((n) => n.id === "cancelled"), "a state only markers reach is still placed");
+
+  // Two collapsed events reaching one target: one marker, two groups.
+  const two = {
+    ...sixPhase,
+    transitions: [...sixPhase.transitions, obs("design", "observed_merged", "landed"), obs("review", "observed_merged", "landed")],
+  };
+  const m = machineDrawing(two).markers.filter((x) => x.to === "landed");
+  assert.equal(m.length, 1);
+  assert.deepEqual(
+    m[0].groups.map((g) => g.event),
+    ["observed_landed", "observed_merged"],
+  );
+  assert.equal(markerSources(m[0]).length, 6, "N counts distinct source states, not rows");
+});
+
+test("a single-source observation stays an edge", () => {
+  const d = machineDrawing(sixPhase);
+  assert.ok(d.edges.some((e) => e.from === "review" && e.event === "review_passed" && e.to === "landable"));
+  assert.ok(!d.markers.some((m) => m.to === "landable"));
+  // One live phase collapses nothing.
+  const one = {
+    states: [st("implement", { initial: true }), st("landed", { settled: true })],
+    transitions: [obs("implement", "observed_landed", "landed"), tr("implement", "override", null)],
+  };
+  const o = machineDrawing(one);
+  assert.deepEqual(o.markers, []);
+  assert.deepEqual(
+    o.edges.map((e) => e.event),
+    ["observed_landed"],
+  );
+  // The same event from two states, but not observed: arrows, never a marker.
+  const fired = { ...one, states: [...one.states, st("review")], transitions: [tr("implement", "land", "landed"), tr("review", "land", "landed")] };
+  assert.deepEqual(machineDrawing(fired).markers, []);
+});
+
+test("every row is drawn, collapsed or listed, exactly once", () => {
+  for (const m of [machine, sixPhase]) {
+    const d = machineDrawing(m);
+    const seen = [...d.edges, ...d.markers.flatMap((x) => x.groups.flatMap((g) => g.rows)), ...d.listed];
+    assert.equal(seen.length, m.transitions.length);
+    assert.deepEqual(new Set(seen), new Set(m.transitions), "each row is the table's own object, none invented or lost");
+    assert.equal(new Set(d.markers.map((x) => x.to)).size, d.markers.length, "one marker per target");
+    assert.ok(d.listed.every((t) => t.to === null || t.to === t.from));
+    assert.ok(d.edges.every((t) => t.to !== null && t.to !== t.from));
+    assert.equal(d.states, m.states);
+  }
 });
 
 test("the graph answer decodes, with absent optionals as null", () => {

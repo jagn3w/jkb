@@ -467,16 +467,90 @@ export function agentGraph(agents: readonly AgentTemplate[], workflow: string): 
 /** The pseudo-state an override's edge runs to: a destination the operator names. */
 export const STATED = "(stated)";
 
+/** Rows of one observed event reaching one state, from two or more states: drawn as one marker. */
+export interface ObservedGroup {
+  readonly event: string;
+  /** The per-state rows, in table order; each keeps its own `guarded` flag. */
+  readonly rows: readonly GraphEdge[];
+}
+
+/** One marker on a target state: every collapsed observation that reaches it. */
+export interface ObservedMarker {
+  /** The target state. */
+  readonly to: string;
+  /** One per event that reaches it, in table order. */
+  readonly groups: readonly ObservedGroup[];
+}
+
+/** What the Lifecycle pane draws of a machine, and how. */
+export interface MachineDrawing {
+  readonly states: readonly GraphState[];
+  /** Drawn as arrows. */
+  readonly edges: readonly GraphEdge[];
+  /** Drawn as one marker per target state. */
+  readonly markers: readonly ObservedMarker[];
+  /** Self-loops and overrides (`to: null`): listed, never drawn, or they bury the graph. */
+  readonly listed: readonly GraphEdge[];
+}
+
+/** The distinct source states of a marker's rows: the `N` of `observed ×N`. */
+export function markerSources(m: ObservedMarker): string[] {
+  return [...new Set(m.groups.flatMap((g) => g.rows.map((r) => r.from)))];
+}
+
 /**
- * A machine laid out from its table: states by distance from the initial one. Self-loops and
- * overrides (`to: null`, every live state has one) are left to the caller to list rather than draw,
- * or they bury the graph.
+ * Split a machine's table into what is drawn. An observation (`reconciled`) that reaches one state
+ * by one event from two or more distinct states — `observed_landed` from every live phase — is one
+ * marker on that state rather than one arrow per phase, which would be most of the picture. One
+ * from a single state stays an arrow. Self-loops and overrides are listed. Every transition lands in
+ * exactly one of `edges`, `markers[].groups[].rows` or `listed`, each in table order.
  */
-export function machineLayout(m: MachineTable): Layout {
-  const ids = m.states.map((s) => s.name);
-  const edges = m.transitions
-    .filter((t) => t.to !== null && t.to !== t.from)
-    .map((t) => ({ from: t.from, to: t.to as string, label: t.event }));
-  const roots = m.states.filter((s) => s.initial).map((s) => s.name);
+export function machineDrawing(m: MachineTable): MachineDrawing {
+  const drawable = (t: GraphEdge): t is GraphEdge & { readonly to: string } => t.to !== null && t.to !== t.from;
+  const key = (to: string, event: string): string => JSON.stringify([to, event]);
+  const sources = new Map<string, Set<string>>();
+  for (const t of m.transitions) {
+    if (t.reconciled && drawable(t)) {
+      const k = key(t.to, t.event);
+      const s = sources.get(k) ?? new Set<string>();
+      s.add(t.from);
+      sources.set(k, s);
+    }
+  }
+  const edges: GraphEdge[] = [];
+  const listed: GraphEdge[] = [];
+  const markers = new Map<string, Map<string, GraphEdge[]>>();
+  for (const t of m.transitions) {
+    if (!drawable(t)) {
+      listed.push(t);
+    } else if (t.reconciled && (sources.get(key(t.to, t.event))?.size ?? 0) >= 2) {
+      const groups = markers.get(t.to) ?? new Map<string, GraphEdge[]>();
+      const rows = groups.get(t.event) ?? [];
+      rows.push(t);
+      groups.set(t.event, rows);
+      markers.set(t.to, groups);
+    } else {
+      edges.push(t);
+    }
+  }
+  return {
+    states: m.states,
+    edges,
+    markers: [...markers].map(([to, groups]) => ({
+      to,
+      groups: [...groups].map(([event, rows]) => ({ event, rows })),
+    })),
+    listed,
+  };
+}
+
+/**
+ * A machine laid out from what it draws: states by distance from the initial one, along its drawn
+ * `edges` only. A state only markers reach falls into a trailing layer.
+ */
+export function machineLayout(d: MachineDrawing): Layout {
+  const ids = d.states.map((s) => s.name);
+  const edges = d.edges.map((t) => ({ from: t.from, to: t.to as string, label: t.event }));
+  const roots = d.states.filter((s) => s.initial).map((s) => s.name);
   return layered(ids, edges, roots);
 }

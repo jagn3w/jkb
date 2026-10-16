@@ -1,12 +1,15 @@
 import { useMemo, useState } from "react";
 
-import { machineLayout, STATED, type MachineTable, type WorkflowGraph } from "@jkb/core";
+import { machineDrawing, machineLayout, markerSources, STATED, type MachineTable, type WorkflowGraph } from "@jkb/core";
 
 const NODE_W = 150;
 const NODE_H = 46;
 const GAP_X = 96;
 const GAP_Y = 26;
 const PAD = 16;
+/** The `observed ×N` pill sitting on a target node's top edge. */
+const MARKER_W = 86;
+const MARKER_H = 18;
 
 const x = (layer: number): number => PAD + layer * (NODE_W + GAP_X);
 const y = (row: number): number => PAD + row * (NODE_H + GAP_Y);
@@ -23,9 +26,11 @@ function firedBy(t: MachineTable["transitions"][number]): string {
  * The Lifecycle pane (D53.7): the task's state machines drawn from the compiled `jkb-fsm` tables
  * (`workflow.graph`, what `jkb workflow show --graph --json` prints) — never redrawn by hand. The
  * strategy's workflow (its phases, who acts next in each, and who may fire each event), or the task
- * lifecycle (its statuses). Observations are dashed. Self-loops and the operator's override, which
- * every live state has, are listed under the picture rather than drawn into it, with every other
- * row: the list is the whole table.
+ * lifecycle (its statuses). Observations are dashed. One observation reaching a state from several
+ * states (`observed_landed` from every live phase) is one dashed `observed ×N` pill on that state,
+ * not an arrow per phase (`machineDrawing`). Self-loops and the operator's override, which every
+ * live state has, are listed under the picture rather than drawn into it, with every other row: the
+ * list is the whole table.
  *
  * `role` highlights the states where that role acts next — the selected agent's place in the
  * strategy.
@@ -39,7 +44,8 @@ export function LifecyclePane({
 }): React.JSX.Element {
   const [which, setWhich] = useState<Which>("workflow");
   const machine = which === "workflow" ? graph.workflow : graph.lifecycle;
-  const layout = useMemo(() => machineLayout(machine), [machine]);
+  const drawing = useMemo(() => machineDrawing(machine), [machine]);
+  const layout = useMemo(() => machineLayout(drawing), [drawing]);
   const states = useMemo(() => new Map(machine.states.map((s) => [s.name, s])), [machine]);
   const at = new Map(layout.nodes.map((n) => [n.id, n]));
   const width = PAD * 2 + Math.max(1, layout.layers) * NODE_W + Math.max(0, layout.layers - 1) * GAP_X;
@@ -80,7 +86,7 @@ export function LifecyclePane({
             {layout.links.map((l, i) => {
               const from = at.get(l.from);
               const to = at.get(l.to);
-              const t = machine.transitions.find((r) => r.from === l.from && r.event === l.label);
+              const t = drawing.edges.find((r) => r.from === l.from && r.event === l.label);
               if (from === undefined || to === undefined || t === undefined) return null;
               let d: string;
               let lx: number;
@@ -137,6 +143,25 @@ export function LifecyclePane({
                     </text>
                   )}
                   <title>{s?.next_step ?? (s?.settled ? "settled" : n.id)}</title>
+                </g>
+              );
+            })}
+            {drawing.markers.map((m) => {
+              const n = at.get(m.to);
+              if (n === undefined) return null;
+              const left = x(n.layer) + (NODE_W - MARKER_W) / 2;
+              const top = y(n.row) - MARKER_H / 2;
+              return (
+                <g key={`marker-${m.to}`} className="machine-marker" transform={`translate(${left},${top})`}>
+                  <rect width={MARKER_W} height={MARKER_H} rx={MARKER_H / 2} />
+                  <text x={MARKER_W / 2} y={MARKER_H / 2 + 3.5} textAnchor="middle" className="machine-marker-label">
+                    {`observed ×${markerSources(m).length}`}
+                  </text>
+                  <title>
+                    {m.groups
+                      .map((g) => `${g.event} ← ${[...new Set(g.rows.map((r) => r.from))].join(", ")}`)
+                      .join("\n")}
+                  </title>
                 </g>
               );
             })}

@@ -96,6 +96,20 @@
   stroke-dasharray: 5 4;
 }
 
+/* One observation from several states, drawn once on its target: dashed like an observed edge. */
+.machine-marker rect {
+  fill: var(--bg);
+  stroke: var(--hairline-strong);
+  stroke-width: 1.25;
+  stroke-dasharray: 5 4;
+}
+
+.machine-marker-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  fill: var(--ink-muted);
+}
+
 .graph-arrowhead {
   fill: var(--ink-faint);
 }
