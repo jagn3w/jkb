@@ -462,9 +462,41 @@ pub fn group_count(conn: &Connection, topic: &str) -> Result<i64> {
 /// silently kept or overwritten, since both would leave a producer or consumer wrong about the caps.
 ///
 /// # Errors
-/// [`QueueError::Invalid`] for a bad name or spec, [`QueueError::TopicConflict`] for an existing
-/// topic with a different spec, or a database error.
+/// [`QueueError::Invalid`] for a bad name or spec or a reserved topic ([`RESERVED_PREFIXES`]),
+/// [`QueueError::TopicConflict`] for an existing topic with a different spec, or a database error.
 pub fn topic_create(
+    conn: &Connection,
+    meta: &WriteMeta,
+    name: &str,
+    spec: &TopicSpec,
+    now: i64,
+) -> Result<Created> {
+    check_unreserved(name)?;
+    topic_create_reserved(conn, meta, name, spec, now)
+}
+
+/// The topic prefixes whose topics one module of this crate owns: only it creates them or sends to
+/// them, through the crate-private [`topic_create_reserved`] and [`send_reserved`]. `exec/<id>` is a
+/// run request's topic ([`crate::exec`]), and its `exec.end` is what the requesting session exits
+/// with — so a `Hook` holder able to send there could forge another session's "finished 0".
+pub const RESERVED_PREFIXES: &[&str] = &["exec/"];
+
+/// Refuse a reserved topic ([`RESERVED_PREFIXES`]) to the public create and send.
+fn check_unreserved(topic: &str) -> std::result::Result<(), QueueError> {
+    match RESERVED_PREFIXES.iter().find(|p| topic.starts_with(**p)) {
+        Some(prefix) => Err(invalid(
+            "topic",
+            format!(
+                "{topic:?} is under `{prefix}`, which only jkb's own record writes (a run request's \
+                 topic) — it can be read and subscribed to, never created or sent to"
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// [`topic_create`] without the reserved-prefix refusal — for the module that owns the prefix.
+pub(crate) fn topic_create_reserved(
     conn: &Connection,
     _meta: &WriteMeta,
     name: &str,
@@ -509,9 +541,21 @@ pub fn topic_create(
 /// fits — and refuses with [`QueueError::QueueFull`] when that is not enough.
 ///
 /// # Errors
-/// [`QueueError::NoSuchTopic`], [`QueueError::TooLarge`] / [`QueueError::Invalid`] for the draft,
-/// [`QueueError::QueueFull`], or a database error.
+/// [`QueueError::NoSuchTopic`], [`QueueError::TooLarge`] / [`QueueError::Invalid`] for the draft or a
+/// reserved topic ([`RESERVED_PREFIXES`]), [`QueueError::QueueFull`], or a database error.
 pub fn send(
+    conn: &Connection,
+    meta: &WriteMeta,
+    topic: &str,
+    draft: &Draft,
+    now: i64,
+) -> Result<i64> {
+    check_unreserved(topic)?;
+    send_reserved(conn, meta, topic, draft, now)
+}
+
+/// [`send`] without the reserved-prefix refusal — for the module that owns the prefix.
+pub(crate) fn send_reserved(
     conn: &Connection,
     _meta: &WriteMeta,
     topic: &str,

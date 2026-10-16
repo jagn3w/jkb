@@ -171,6 +171,9 @@ entities! {
     DesignDocTargets => "design_doc_targets",
     /// A file a design was made from (D55.5), keyed by the row's `id`.
     DesignSources => "design_sources",
+    /// A run request (the Executions design), keyed by its `id`. Logged as the audit record of what
+    /// a session asked to run and what became of it; never undone ([`InsertInverse::Irreversible`]).
+    ExecRequests => "exec_requests",
     /// `undo` markers, whose `entity_id` is the reverted transaction's id.
     Changelog => "changelog",
 }
@@ -213,6 +216,14 @@ pub(crate) enum InsertInverse {
     /// Yjs `UndoManager` construction, in `design::revert_update` — keyed by the reverted row's
     /// `id`, which is AUTOINCREMENT so a compaction's deletions never hand it to another update.
     ForwardUpdate,
+    /// The insert is logged — it is the audit record — and `jkb undo` refuses it by name.
+    ///
+    /// For a record of something done outside the database: a run request asked the operator to
+    /// run a command, and deleting the row would neither un-run it nor un-ask it, only erase the
+    /// evidence that it was asked. Unlike [`InsertInverse::Never`], writing the insert is fine;
+    /// unlike [`InsertInverse::DeleteRow`], nothing inverts it, so [`crate::undo`] refuses the
+    /// transaction (its `inverse_for` takes the `DeleteRow` wildcard only for a `DeleteRow` table).
+    Irreversible,
 }
 
 impl Entity {
@@ -244,6 +255,7 @@ impl Entity {
             | Self::DesignDocTargets
             | Self::DesignSources => InsertInverse::DeleteRow,
             Self::DesignUpdates => InsertInverse::ForwardUpdate,
+            Self::ExecRequests => InsertInverse::Irreversible,
             // Keyed by a uri, a transaction id and a content hash respectively, so a rowid
             // delete would address some other row; none is ever logged with op `insert`.
             // A compaction is logged as an update, as bookkeeping (`undo::BOOKKEEPING`): it changes

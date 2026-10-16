@@ -62,6 +62,10 @@ pub enum OpPermission {
     Grant,
     /// Mint and release harness tickets — the container credential's own job.
     Attest,
+    /// Ask the operator to run one command (the Executions design). Held by every role but the
+    /// operator, statically; the op itself also needs an attested session ([`crate::exec::requester`]).
+    /// Approving, declining and running are [`OpPermission::Admin`], so no session approves its own.
+    ExecRequest,
     /// The operator's: reclaim, break leases, remove items, move namespaces, compact the queue,
     /// choose strategies, map agent types, rotate the container credential.
     Admin,
@@ -81,6 +85,7 @@ impl jkb_rbac::Permission for OpPermission {
         Self::DesignApprove,
         Self::Grant,
         Self::Attest,
+        Self::ExecRequest,
         Self::Admin,
     ];
 
@@ -98,6 +103,7 @@ impl jkb_rbac::Permission for OpPermission {
             Self::DesignApprove => "design_approve",
             Self::Grant => "grant",
             Self::Attest => "attest",
+            Self::ExecRequest => "exec_request",
             Self::Admin => "admin",
         }
     }
@@ -118,6 +124,7 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
             permits: &[
                 OpPermission::Read,
                 OpPermission::Hook,
+                OpPermission::ExecRequest,
                 OpPermission::TaskWrite,
                 OpPermission::TaskStatus,
                 OpPermission::TaskClaim,
@@ -135,6 +142,7 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
             permits: &[
                 OpPermission::Read,
                 OpPermission::Hook,
+                OpPermission::ExecRequest,
                 OpPermission::TaskWrite,
                 OpPermission::Workflow,
                 // The design is the designer's to write, and a span naming `claude` is a Claude
@@ -148,6 +156,7 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
             permits: &[
                 OpPermission::Read,
                 OpPermission::Hook,
+                OpPermission::ExecRequest,
                 OpPermission::TaskWrite,
                 OpPermission::TaskClaim,
                 OpPermission::Workflow,
@@ -158,6 +167,7 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
             permits: &[
                 OpPermission::Read,
                 OpPermission::Hook,
+                OpPermission::ExecRequest,
                 OpPermission::Review,
                 OpPermission::Workflow,
                 OpPermission::DesignApprove,
@@ -168,6 +178,7 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
             permits: &[
                 OpPermission::Read,
                 OpPermission::Hook,
+                OpPermission::ExecRequest,
                 OpPermission::TaskWrite,
                 OpPermission::Workflow,
             ],
@@ -235,7 +246,11 @@ impl Request {
             | Self::TimelineSessions {}
             | Self::TimelineSession { .. }
             | Self::TimelineTask { .. }
-            | Self::TimelinePlan { .. } => OpPermission::Read,
+            | Self::TimelinePlan { .. }
+            // Held to the reader's own session by the op ([`crate::exec::reader`]).
+            | Self::ExecStatus { .. }
+            | Self::ExecList { .. } => OpPermission::Read,
+            Self::ExecRequest(_) => OpPermission::ExecRequest,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -327,7 +342,13 @@ impl Request {
             | Self::DesignCompact { .. }
             // Hiding a design from every role is the operator's call, as deleting an item is.
             | Self::DesignRetire { .. }
-            | Self::DesignRestore { .. } => OpPermission::Admin,
+            | Self::DesignRestore { .. }
+            // Approving, declining and running a run request: never the session that asked.
+            | Self::ExecBegin { .. }
+            | Self::ExecDecline { .. }
+            | Self::ExecRefuse { .. }
+            | Self::ExecFinish { .. }
+            | Self::ExecOutput { .. } => OpPermission::Admin,
         }
     }
 
@@ -409,7 +430,13 @@ impl Request {
             | Self::DesignSources { .. }
             | Self::DesignCompact { .. }
             | Self::DesignRetire { .. }
-            | Self::DesignRestore { .. } => Target::Shared,
+            | Self::DesignRestore { .. }
+            // The runner's moves are the operator's alone.
+            | Self::ExecBegin { .. }
+            | Self::ExecDecline { .. }
+            | Self::ExecRefuse { .. }
+            | Self::ExecFinish { .. }
+            | Self::ExecOutput { .. } => Target::Shared,
             // An approval is held to the reviewer the span names by the engine (`design::approve`),
             // and is how a mapped `reviewer` subagent — attested, so held to one task for shared
             // writes — signs off a span naming `claude` (D53.5). Shared, it could never run.
@@ -493,7 +520,13 @@ impl Request {
             | Self::SessionEnded { .. }
             | Self::SessionGone { .. }
             | Self::SessionList { .. }
-            | Self::SessionState { .. } => Target::Free,
+            | Self::SessionState { .. }
+            // A run request is the asking session's own record, whatever task it is bound to — and a
+            // bound worker is exactly who asks. Its callee takes the requester from the principal
+            // and holds a reader to its own session.
+            | Self::ExecRequest(_)
+            | Self::ExecStatus { .. }
+            | Self::ExecList { .. } => Target::Free,
         }
     }
 }

@@ -675,6 +675,49 @@ fn samples() -> Vec<Request> {
             pr: None,
             dry_run: true,
         },
+        Request::ExecRequest(super::exec::ExecAsk {
+            target: "host".into(),
+            dir: "/w".into(),
+            dir_side: "host".into(),
+            argv: vec!["ls".into()],
+            reason: String::new(),
+            pin: None,
+            timeout_ms: None,
+        }),
+        Request::ExecStatus {
+            id: "exec-1".into(),
+        },
+        Request::ExecList {
+            state: None,
+            after: None,
+        },
+        Request::ExecBegin {
+            id: "exec-1".into(),
+            pin: None,
+            runner: "r".into(),
+        },
+        Request::ExecDecline {
+            id: "exec-1".into(),
+            note: "n".into(),
+        },
+        Request::ExecRefuse {
+            id: "exec-1".into(),
+            reason: "dir_gone".into(),
+        },
+        Request::ExecFinish {
+            id: "exec-1".into(),
+            runner: "r".into(),
+            outcome: "exited".into(),
+            exit_status: Some(0),
+            tail_b64: String::new(),
+            total_bytes: 0,
+            log_path: None,
+        },
+        Request::ExecOutput {
+            id: "exec-1".into(),
+            runner: "r".into(),
+            chunk_b64: "eA==".into(),
+        },
     ]
 }
 

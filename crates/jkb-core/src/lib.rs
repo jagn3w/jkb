@@ -20,6 +20,7 @@ pub mod containment;
 pub mod design;
 pub mod dsl;
 pub mod edge;
+pub mod exec;
 pub mod host;
 pub mod ingestion;
 pub mod investigation;

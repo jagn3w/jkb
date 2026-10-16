@@ -329,7 +329,7 @@ pub fn seen(
 /// A validation error for a malformed session, pid or instance; or a database error.
 pub fn ended(
     conn: &Connection,
-    _meta: &WriteMeta,
+    meta: &WriteMeta,
     p: &Process<'_>,
     reason: &str,
     now: i64,
@@ -345,7 +345,18 @@ pub fn ended(
              ended_at = excluded.ended_at, end_reason = excluded.end_reason",
     )?
     .execute(params![p.session, p.pid, p.instance, now, word(reason)])?;
+    expire_if_ended(conn, meta, p.session, now)?;
     Ok(Ended::Recorded)
+}
+
+/// Once `session` has [`SessionState::Ended`], its pending run requests expire
+/// ([`crate::exec::expire_session`]) — asked here, where a process's end is recorded, so every path
+/// that ends a session covers it.
+fn expire_if_ended(conn: &Connection, meta: &WriteMeta, session: &str, now: i64) -> Result<()> {
+    if state(conn, session)? == SessionState::Ended {
+        crate::exec::expire_session(conn, meta, session, now)?;
+    }
+    Ok(())
 }
 
 /// A producer proved `p` gone — no such process exists any more. Ends `p`'s row if it is live; a pid-less
@@ -353,7 +364,7 @@ pub fn ended(
 ///
 /// # Errors
 /// A validation error for a malformed session, pid or instance; or a database error.
-pub fn gone(conn: &Connection, _meta: &WriteMeta, p: &Process<'_>, now: i64) -> Result<bool> {
+pub fn gone(conn: &Connection, meta: &WriteMeta, p: &Process<'_>, now: i64) -> Result<bool> {
     p.check()?;
     if p.pid.is_empty() {
         return Ok(false);
@@ -364,6 +375,9 @@ pub fn gone(conn: &Connection, _meta: &WriteMeta, p: &Process<'_>, now: i64) -> 
              WHERE session = ?3 AND pid = ?4 AND instance = ?5 AND ended_at IS NULL",
         )?
         .execute(params![now, GONE, p.session, p.pid, p.instance])?;
+    if changed > 0 {
+        expire_if_ended(conn, meta, p.session, now)?;
+    }
     Ok(changed > 0)
 }
 
