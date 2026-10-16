@@ -39,6 +39,8 @@ export interface TimelineEvent {
   readonly role: string | null;
   readonly reason: string | null;
   readonly detail: string | null;
+  /** A status row recording an event a guard refused: it happened, and the task did not move. */
+  readonly refused: boolean;
 }
 
 /** `jkb_core::timeline::SessionSummary`. */
@@ -201,6 +203,8 @@ function event(v: unknown): TimelineEvent | undefined {
     role: nul(v["role"] as string | null | undefined),
     reason: nul(v["reason"] as string | null | undefined),
     detail: nul(v["detail"] as string | null | undefined),
+    // Absent from an older daemon: not refused.
+    refused: v["refused"] === true,
   };
 }
 

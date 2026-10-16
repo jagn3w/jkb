@@ -596,3 +596,102 @@ fn a_sessions_pages_read_each_source_to_a_page_and_lose_nothing_across_them() {
         Some(T0 + i64::try_from((n - 1) / 3).unwrap())
     );
 }
+
+#[test]
+fn a_tasks_reads_search_their_item_index_and_need_no_sort() {
+    use super::{review_sql, status_sql, workflow_sql, Rows};
+    let db = db();
+    let id = new_task(&db, "task:a");
+    let plans = db
+        .read(move |c| {
+            let mut out = Vec::new();
+            for (sql, index) in [
+                (status_sql(Rows::Task(id)), "idx_task_transitions_item"),
+                (
+                    workflow_sql(Rows::Task(id)),
+                    "idx_workflow_transitions_item",
+                ),
+                (review_sql(Rows::Task(id)), "idx_reviews_item"),
+            ] {
+                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let detail: Vec<String> = stmt
+                    .query_map([id.get()], |r| r.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<_>>()?;
+                out.push((index, detail.join(" | ")));
+            }
+            Ok(out)
+        })
+        .unwrap();
+    for (index, plan) in plans {
+        assert!(
+            plan.contains(&format!("USING INDEX {index} (item_id=?)")),
+            "the task read searches {index}: {plan}"
+        );
+        assert!(!plan.contains("TEMP B-TREE"), "and needs no sort: {plan}");
+    }
+}
+
+#[test]
+fn a_refused_observation_is_on_the_timeline_and_not_a_move_while_its_declared_self_loop_is() {
+    use crate::lifecycle::{apply, TaskEvent, TaskFacts};
+    use crate::transition::{observed, perform, Labels};
+    use jkb_fsm::Fact;
+    use jkb_types::TaskStatus;
+    let db = db();
+    let a = new_task(&db, "task:a");
+    db.write_txn("test", move |c, m| {
+        crate::task::set_status(c, m, a, TaskStatus::Done)?;
+        let done = TaskFacts {
+            status: TaskStatus::Done,
+            open_subtasks: Fact::No,
+            ..TaskFacts::default()
+        };
+        // The same landing seen again, proven: the declared done -> done row moves.
+        let proven = TaskFacts {
+            landed_elsewhere: Fact::Yes,
+            ..done.clone()
+        };
+        let moved = perform(
+            c,
+            m,
+            a,
+            &proven,
+            TaskEvent::ObservedLanded,
+            &Labels::default(),
+        )?;
+        assert!(matches!(moved, jkb_fsm::Outcome::Moved { .. }), "{moved:?}");
+        // Seen again, unproven: refused, and recorded under the same name and the same states.
+        let unproven = TaskFacts {
+            landed_elsewhere: Fact::Unknown,
+            ..done
+        };
+        let refused = apply(&unproven, TaskEvent::ObservedLanded);
+        assert!(observed(c, m, a, &unproven, &refused, &Labels::default())?);
+        Ok(())
+    })
+    .unwrap();
+    let t = db.read(|c| task(c, "task:a", None)).unwrap();
+    let rows: Vec<(&str, bool)> = t
+        .events
+        .iter()
+        .filter(|e| e.source == Source::Status && e.event == "observed_landed")
+        .map(|e| (e.event.as_str(), e.refused))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![("observed_landed", false), ("observed_landed", true)]
+    );
+    let moves: Vec<(&str, &str, &str, u32)> = t
+        .visited_status
+        .iter()
+        .map(|v| (v.from.as_str(), v.event.as_str(), v.to.as_str(), v.count))
+        .collect();
+    assert_eq!(
+        moves,
+        vec![
+            ("open", "override", "done", 1),
+            ("done", "observed_landed", "done", 1)
+        ],
+        "the refusal is not counted"
+    );
+}

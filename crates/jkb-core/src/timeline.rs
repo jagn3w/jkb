@@ -122,6 +122,10 @@ pub struct Event {
     /// A line of context: a status move's branch, destination and PR; a round's must-fix count; the
     /// strategy a workflow row pinned; how a session started or ended.
     pub detail: Option<String>,
+    /// A status row recording an event a guard refused: it happened, and the task did not move
+    /// (`transition::observed`). Absent from an older daemon, which reads as not refused.
+    #[serde(default)]
+    pub refused: bool,
 }
 
 impl Event {
@@ -142,6 +146,7 @@ impl Event {
             role: None,
             reason: None,
             detail: None,
+            refused: false,
         }
     }
 }
@@ -298,10 +303,11 @@ fn speaks_for(bindings: &Bindings, source: Source, actor: &str) -> Vec<String> {
 /// A page position: the key of the last event already shown.
 type Key = (i64, Source, i64);
 
-/// Which rows a source read takes.
+/// Which rows a source read takes. Each is its own statement, so each can use the index it needs:
+/// a task's rows are an indexed `item_id = ?` search; a session's are its actors' rows.
 #[derive(Debug, Clone, Copy)]
 enum Rows<'a> {
-    /// One task's whole history (bounded by that task, read by its index).
+    /// One task's whole history: a search of the source's `(item_id, id)` index, in id order.
     Task(ItemId),
     /// The rows a session's own actors wrote, after `after`, at most `limit` — the cursor and the cap
     /// are in the query, so a page reads a page. The actor test is a superset of [`speaks_for`],
@@ -311,81 +317,114 @@ enum Rows<'a> {
         after: Option<Key>,
         limit: i64,
     },
+    /// A session's newest rows first, at most `limit`: where its newest event is found.
+    Newest { session: &'a str, limit: i64 },
 }
 
-/// The parameters every source query binds, in order: `?1` session mode, `?2` item, `?3` session,
-/// `?4` has a cursor, `?5`–`?7` the cursor's time, source rank and id, `?8` the limit, `?9` this
-/// source's rank.
-type Bound<'a> = (bool, i64, &'a str, bool, i64, i64, i64, i64, i64);
-
-impl<'a> Rows<'a> {
-    fn bind(self, source: Source) -> Bound<'a> {
+impl Rows<'_> {
+    /// The `WHERE` and `ORDER BY` of this read, over a source's time expression `at`, row id `id`,
+    /// item column `item`, and session test `mine` (which reads the session as `?1`).
+    fn window(self, at: &str, id: &str, item: &str, mine: &str) -> String {
         match self {
-            Self::Task(id) => (false, id.get(), "", false, 0, 0, 0, -1, source.rank()),
+            Self::Task(_) => format!("WHERE {item} = ?1 AND {at} IS NOT NULL ORDER BY {id}"),
+            Self::Session { .. } => format!(
+                "WHERE ({mine}) AND {at} IS NOT NULL
+                   AND (NOT ?2 OR {at} > ?3 OR ({at} = ?3 AND (?7 > ?4 OR (?7 = ?4 AND {id} > ?5))))
+                 ORDER BY {at}, {id} LIMIT ?6"
+            ),
+            Self::Newest { .. } => format!(
+                "WHERE ({mine}) AND {at} IS NOT NULL ORDER BY {at} DESC, {id} DESC LIMIT ?2"
+            ),
+        }
+    }
+
+    /// The values [`Rows::window`]'s statement binds, for `source`.
+    fn bind(self, source: Source) -> Vec<rusqlite::types::Value> {
+        use rusqlite::types::Value;
+        match self {
+            Self::Task(id) => vec![Value::Integer(id.get())],
             Self::Session {
                 session,
                 after,
                 limit,
             } => {
                 let (at, rank, id) = after.map_or((0, 0, 0), |(a, s, i)| (a, s.rank(), i));
-                (
-                    true,
-                    -1,
-                    session,
-                    after.is_some(),
-                    at,
-                    rank,
-                    id,
-                    limit,
-                    source.rank(),
-                )
+                vec![
+                    Value::Text(session.to_owned()),
+                    Value::Integer(i64::from(after.is_some())),
+                    Value::Integer(at),
+                    Value::Integer(rank),
+                    Value::Integer(id),
+                    Value::Integer(limit),
+                    Value::Integer(source.rank()),
+                ]
+            }
+            Self::Newest { session, limit } => {
+                vec![Value::Text(session.to_owned()), Value::Integer(limit)]
             }
         }
     }
-}
-
-/// The `WHERE` and `ORDER BY … LIMIT` every source query shares, over its time expression `at`, its
-/// row id `id`, its item column `item` and the session test `mine` (over `?3`).
-fn window(at: &str, id: &str, item: &str, mine: &str) -> String {
-    format!(
-        "WHERE {at} IS NOT NULL
-           AND (CASE WHEN ?1 THEN ({mine}) ELSE {item} = ?2 END)
-           AND (NOT ?4 OR {at} > ?5 OR ({at} = ?5 AND (?9 > ?6 OR (?9 = ?6 AND {id} > ?7))))
-         ORDER BY {at}, {id} LIMIT ?8"
-    )
 }
 
 /// The session test on a principal column (`session:<id>`, or `<type>@<agent>` with the agent bound
 /// in the session).
 fn mine_principal(actor: &str) -> String {
     format!(
-        "{actor} = 'session:' || ?3
+        "{actor} = 'session:' || ?1
          OR (instr({actor}, '@') > 0
              AND substr({actor}, instr({actor}, '@') + 1)
-                 IN (SELECT b.agent_id FROM agent_bindings b WHERE b.session = ?3))"
+                 IN (SELECT b.agent_id FROM agent_bindings b WHERE b.session = ?1))"
+    )
+}
+
+/// The session test on a claimant column (an [`AgentId`]: a session worktree it opened, or a bound
+/// agent id).
+const MINE_CLAIMANT: &str =
+    "(t.agent_id LIKE 'session:%' AND instr(t.agent_id, '@' || ?1 || ':') > 0)
+             OR t.agent_id IN (SELECT 'agent:' || b.agent_id FROM agent_bindings b
+                               WHERE b.session = ?1)";
+
+fn status_sql(rows: Rows<'_>) -> String {
+    // A row whose time does not parse is not placeable on a timeline; jkb writes none.
+    let at = ms("t.at");
+    format!(
+        "SELECT t.id, {at}, i.uid, t.event, t.from_status, t.to_status, t.agent_id,
+                t.branch, t.onto, t.pr_number, coalesce(json_extract(t.evidence, '$.refused'), 0)
+           FROM task_transitions t JOIN items i ON i.id = t.item_id
+         {window}",
+        window = rows.window(&at, "t.id", "t.item_id", MINE_CLAIMANT)
+    )
+}
+
+fn workflow_sql(rows: Rows<'_>) -> String {
+    let at = ms("w.at");
+    format!(
+        "SELECT w.id, {at}, i.uid, w.event, w.from_phase, w.to_phase, w.role, w.actor, w.reason,
+                w.spec IS NOT NULL
+           FROM workflow_transitions w JOIN items i ON i.id = w.item_id
+         {window}",
+        window = rows.window(&at, "w.id", "w.item_id", &mine_principal("w.actor"))
+    )
+}
+
+fn review_sql(rows: Rows<'_>) -> String {
+    let at = review_at();
+    format!(
+        "SELECT v.id, {at}, i.uid, v.kind, v.ns, {REVIEW_ACTOR},
+                (SELECT count(*) FROM review_round_findings f
+                  WHERE f.round_id = rr.id AND f.must_fix = 1),
+                rr.id IS NOT NULL
+         {REVIEW_FROM}
+         {window}",
+        window = rows.window(&at, "v.id", "v.item_id", &mine_principal(REVIEW_ACTOR))
     )
 }
 
 fn status_rows(conn: &Connection, rows: Rows<'_>) -> Result<Vec<Event>> {
-    // A row whose time does not parse is not placeable on a timeline; jkb writes none.
-    let at = ms("t.at");
-    let sql = format!(
-        "SELECT t.id, {at}, i.uid, t.event, t.from_status, t.to_status, t.agent_id,
-                t.branch, t.onto, t.pr_number
-           FROM task_transitions t JOIN items i ON i.id = t.item_id
-         {window}",
-        window = window(
-            &at,
-            "t.id",
-            "t.item_id",
-            "(t.agent_id LIKE 'session:%' AND instr(t.agent_id, '@' || ?3 || ':') > 0)
-             OR t.agent_id IN (SELECT 'agent:' || b.agent_id FROM agent_bindings b
-                               WHERE b.session = ?3)"
-        )
-    );
+    let sql = status_sql(rows);
     let mut stmt = conn.prepare_cached(&sql)?;
     let out = stmt
-        .query_map(rows.bind(Source::Status), |r| {
+        .query_map(rusqlite::params_from_iter(rows.bind(Source::Status)), |r| {
             let mut e = Event::bare(r.get(1)?, Source::Status, r.get(0)?, r.get::<_, String>(3)?);
             e.task = Some(r.get(2)?);
             e.from = r.get(4)?;
@@ -401,6 +440,7 @@ fn status_rows(conn: &Connection, rows: Rows<'_>) -> Result<Vec<Event>> {
             .flatten()
             .collect();
             e.detail = (!labels.is_empty()).then(|| labels.join(", "));
+            e.refused = r.get::<_, i64>(10)? != 0;
             Ok(e)
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -408,35 +448,31 @@ fn status_rows(conn: &Connection, rows: Rows<'_>) -> Result<Vec<Event>> {
 }
 
 fn workflow_rows(conn: &Connection, rows: Rows<'_>) -> Result<Vec<Event>> {
-    let at = ms("w.at");
-    let sql = format!(
-        "SELECT w.id, {at}, i.uid, w.event, w.from_phase, w.to_phase, w.role, w.actor, w.reason,
-                w.spec IS NOT NULL
-           FROM workflow_transitions w JOIN items i ON i.id = w.item_id
-         {window}",
-        window = window(&at, "w.id", "w.item_id", &mine_principal("w.actor"))
-    );
+    let sql = workflow_sql(rows);
     let mut stmt = conn.prepare_cached(&sql)?;
     let out = stmt
-        .query_map(rows.bind(Source::Workflow), |r| {
-            let mut e = Event::bare(
-                r.get(1)?,
-                Source::Workflow,
-                r.get(0)?,
-                r.get::<_, String>(3)?,
-            );
-            e.task = Some(r.get(2)?);
-            e.from = r.get(4)?;
-            e.to = Some(r.get(5)?);
-            e.role = Some(r.get(6)?);
-            e.actor = Some(r.get(7)?);
-            e.reason = r.get(8)?;
-            // A row that pins a strategy records where it came from as its reason (`current`).
-            if r.get::<_, bool>(9)? {
-                e.detail = Some(format!("strategy {}", e.reason.clone().unwrap_or_default()));
-            }
-            Ok(e)
-        })?
+        .query_map(
+            rusqlite::params_from_iter(rows.bind(Source::Workflow)),
+            |r| {
+                let mut e = Event::bare(
+                    r.get(1)?,
+                    Source::Workflow,
+                    r.get(0)?,
+                    r.get::<_, String>(3)?,
+                );
+                e.task = Some(r.get(2)?);
+                e.from = r.get(4)?;
+                e.to = Some(r.get(5)?);
+                e.role = Some(r.get(6)?);
+                e.actor = Some(r.get(7)?);
+                e.reason = r.get(8)?;
+                // A row that pins a strategy records where it came from as its reason (`current`).
+                if r.get::<_, bool>(9)? {
+                    e.detail = Some(format!("strategy {}", e.reason.clone().unwrap_or_default()));
+                }
+                Ok(e)
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(out)
 }
@@ -454,19 +490,10 @@ fn review_at() -> String {
 
 /// Review facts (see [`REVIEW_FROM`]).
 fn review_rows(conn: &Connection, rows: Rows<'_>) -> Result<Vec<Event>> {
-    let at = review_at();
-    let sql = format!(
-        "SELECT v.id, {at}, i.uid, v.kind, v.ns, {REVIEW_ACTOR},
-                (SELECT count(*) FROM review_round_findings f
-                  WHERE f.round_id = rr.id AND f.must_fix = 1),
-                rr.id IS NOT NULL
-         {REVIEW_FROM}
-         {window}",
-        window = window(&at, "v.id", "v.item_id", &mine_principal(REVIEW_ACTOR))
-    );
+    let sql = review_sql(rows);
     let mut stmt = conn.prepare_cached(&sql)?;
     let out = stmt
-        .query_map(rows.bind(Source::Review), |r| {
+        .query_map(rusqlite::params_from_iter(rows.bind(Source::Review)), |r| {
             let kind: String = r.get(3)?;
             let ns: Option<String> = r.get(4)?;
             let has_round: bool = r.get(7)?;
@@ -608,6 +635,44 @@ fn last_events(
         }
     }
     Ok(last)
+}
+
+/// `session`'s newest attributed event (Unix ms): each source read newest first, from the session's
+/// own actors, to its first row [`speaks_for`] gives the session — the per-session form of
+/// [`last_events`], so a page of one session does not group every session's logs. The read stops at
+/// `NEWEST_PROBE` rows a source; the SQL test differs from [`speaks_for`] only on ids no jkb writes.
+fn newest_of(
+    conn: &Connection,
+    bindings: &Bindings,
+    held: &[Held],
+    session: &str,
+) -> Result<Option<i64>> {
+    const NEWEST_PROBE: i64 = 64;
+    let rows = Rows::Newest {
+        session,
+        limit: NEWEST_PROBE,
+    };
+    let ours = |source: Source, e: &Event| {
+        e.actor
+            .as_deref()
+            .is_some_and(|a| speaks_for(bindings, source, a).iter().any(|s| s == session))
+    };
+    let mut newest: Option<i64> = None;
+    for (source, read) in [
+        (Source::Status, status_rows(conn, rows)?),
+        (Source::Workflow, workflow_rows(conn, rows)?),
+        (Source::Review, review_rows(conn, rows)?),
+    ] {
+        if let Some(e) = read.iter().find(|e| ours(source, e)) {
+            newest = newest.max(Some(e.at_ms));
+        }
+    }
+    for e in held.iter().filter_map(claim_event) {
+        if ours(Source::Claim, &e) {
+            newest = newest.max(Some(e.at_ms));
+        }
+    }
+    Ok(newest)
 }
 
 /// One page of `session`'s events after `after`: each logged source read to at most a page past the
@@ -913,7 +978,7 @@ pub fn session(
     let bindings = Bindings::read(conn)?;
     let after = after.map(parse_cursor).transpose()?;
     let held = held_claims(conn, None)?;
-    let last = last_events(conn, &bindings, &held)?.get(session).copied();
+    let last = newest_of(conn, &bindings, &held, session)?;
     let (claims, _) = split_claims(&bindings, &held);
     let my_claims = claims.get(session).cloned().unwrap_or_default();
     let summary = summarize(conn, session, my_claims.len(), last, now_ms)?;
@@ -1062,13 +1127,18 @@ fn tables(source: Source) -> Vec<jkb_fsm::Table> {
 }
 
 /// Whether `e` records a move: a row of its machine with this `from` and event, and this
-/// destination (or one the caller names, an override). Not a move: a `note`, a guard's refusal the
-/// lifecycle records under the refused event's name with `from == to`, an undo marker, and a row
-/// that pins or sets a strategy — none of them is a row of any table.
+/// destination (or one the caller names, an override). Not a move: a guard's refusal the lifecycle
+/// records under the refused event's name (marked `refused` in its evidence, since a declared
+/// self-loop such as `done --observed_landed--> done` writes the same states when it moves), a
+/// `note`, an undo marker, and a row that pins or sets a strategy — none of those a row of any
+/// table. A refusal written before the mark existed cannot be told from the move, and counts.
 fn is_move(tables: &[jkb_fsm::Table], e: &Event) -> bool {
     let (Some(from), Some(to)) = (e.from.as_deref(), e.to.as_deref()) else {
         return false;
     };
+    if e.refused {
+        return false;
+    }
     tables.iter().any(|t| {
         t.transitions
             .iter()

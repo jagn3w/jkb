@@ -124,6 +124,9 @@ test("a field the decoder does not know is ignored at every level, and an unknow
   assert.equal(newer.value.events[0].source, "exec_request");
   assert.equal(knownSource("exec_request"), false);
   assert.equal(knownSource("workflow"), true);
+  // `refused` is read where sent, and absent (an older daemon) reads as not refused.
+  assert.equal(session({ ...page, events: [ev({ source: "status", refused: true })] }).value.events[0].refused, true);
+  assert.equal(session(page).value.events[0].refused, false);
 
   const task = (timeline) => decodeTaskTimeline(ok({ result: "timeline_task", task: { timeline, graph, extra: 1 } }));
   assert.equal(task(taskTimeline()).ok, true);

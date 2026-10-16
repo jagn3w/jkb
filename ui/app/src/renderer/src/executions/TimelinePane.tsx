@@ -461,7 +461,7 @@ export function EventList({ events }: { readonly events: readonly TimelineEvent[
               {e.actor ?? ""}
               {e.role !== null ? <span className="muted"> ({e.role})</span> : null}
             </td>
-            <td>{[e.reason, e.detail].filter((x) => x !== null).join(" · ")}</td>
+            <td>{[e.refused ? "refused" : null, e.reason, e.detail].filter((x) => x !== null).join(" · ")}</td>
           </tr>
         ))}
       </tbody>

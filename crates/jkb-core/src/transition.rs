@@ -222,6 +222,10 @@ fn record(
 /// point is to answer *why* this moved (or did not), and a field nothing reads is noise in a
 /// record a person is meant to read.
 fn evidence(facts: &TaskFacts) -> String {
+    evidence_value(facts).to_string()
+}
+
+fn evidence_value(facts: &TaskFacts) -> serde_json::Value {
     json!({
         "owner_alive": facts.owner_alive.as_str(),
         "claimant": facts.claimant.as_ref().map(AgentId::as_str),
@@ -236,7 +240,6 @@ fn evidence(facts: &TaskFacts) -> String {
         "open_subtasks": facts.open_subtasks.as_str(),
         "landed_elsewhere": facts.landed_elsewhere.as_str(),
     })
-    .to_string()
 }
 
 /// A task's history, oldest first.
@@ -587,7 +590,7 @@ pub fn no_pull_request(
         ref_commit: remote_head.map(str::to_owned),
         ..Labels::default()
     };
-    append(conn, meta, task, facts, NO_PULL_REQUEST, &labels)
+    append(conn, meta, task, facts, NO_PULL_REQUEST, &labels, false)
 }
 
 /// Append a fact to a task's history without moving it.
@@ -609,7 +612,7 @@ pub fn note(
     facts: &TaskFacts,
     labels: &Labels,
 ) -> Result<()> {
-    append(conn, meta, task, facts, "note", labels)
+    append(conn, meta, task, facts, "note", labels, false)
 }
 
 /// An event that **happened and did not move the task**, recorded under its own name.
@@ -647,11 +650,15 @@ pub fn observed(
     let Outcome::Refused { event, .. } = outcome else {
         return Ok(false);
     };
-    append(conn, meta, task, facts, event.name(), labels)?;
+    append(conn, meta, task, facts, event.name(), labels, true)?;
     Ok(true)
 }
 
-/// One row, `from_status == to_status`, under whatever name the caller gives the event.
+/// One row, `from_status == to_status`, under whatever name the caller gives the event. A `refused`
+/// row's evidence says so (`"refused": true`): it carries a real event's name, and a declared
+/// self-loop of that event (`done --observed_landed--> done`) writes the same states when it moves,
+/// so the mark is the only way a reader — the timeline's count of moves — tells the two apart.
+#[allow(clippy::too_many_arguments)]
 fn append(
     conn: &Connection,
     meta: &WriteMeta,
@@ -659,6 +666,7 @@ fn append(
     facts: &TaskFacts,
     event: &str,
     labels: &Labels,
+    refused: bool,
 ) -> Result<()> {
     conn.prepare_cached(
         "INSERT INTO task_transitions
@@ -676,9 +684,22 @@ fn append(
         labels.onto,
         labels.ref_commit,
         labels.pr_number,
-        evidence(facts),
+        if refused {
+            refused_evidence(facts)
+        } else {
+            evidence(facts)
+        },
     ])?;
     Ok(())
+}
+
+/// [`evidence`], marked as a guard's refusal.
+fn refused_evidence(facts: &TaskFacts) -> String {
+    let mut value = evidence_value(facts);
+    if let Some(map) = value.as_object_mut() {
+        map.insert("refused".to_owned(), json!(true));
+    }
+    value.to_string()
 }
 
 /// Free every claim whose owner is **proven** gone, one lifecycle transition each — a test helper
