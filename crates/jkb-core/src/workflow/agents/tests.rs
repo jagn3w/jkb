@@ -145,9 +145,13 @@ fn the_swarm_templates_drive_the_workflow() {
     }
     assert!(coord.contains("never a mix"));
     // Whoever verifies a fix closes its finding: the coordinator, after a clean round.
-    let closing = at("CLOSING FINDINGS");
+    let closing = at("CLOSING FINDINGS: ");
     assert!(coord[closing..].contains("jkb task set <finding uid> --status done"));
     assert!(closing < at("5. THE MERGE QUEUE"));
+    // No run builds a finding, and approval in jkb needs no tag.
+    assert!(coord.contains("First leave out every review finding"));
+    assert!(coord.contains("repos/<repo>/codereviews/"));
+    assert!(coord.contains("so it needs no `design=approved` tag"));
     // An eject puts a `landable` lead back to `implement`, or the next submit is refused.
     let arm = &coord[at("- eject:")..];
     let rework = arm.find("jkb workflow fire <lead uid> rework").unwrap();
@@ -158,6 +162,75 @@ fn the_swarm_templates_drive_the_workflow() {
     // A refusal stops the group: nothing routes on the reviewer's reply instead of the phase.
     assert!(!coord.contains("route step 4 on the reviewer's VERDICT"));
     assert!(coord.contains("If jkb refuses a fire, stall the group"));
+}
+
+/// CLOSING FINDINGS writes tasks outside SCOPE, so the NEVER rule that keeps the coordinator inside
+/// SCOPE must carve out exactly the findings CLOSING FINDINGS closes — or a coordinator that keeps
+/// both rules closes nothing. The two name the same set: the must-fixes under the lead's recorded
+/// rounds.
+#[test]
+fn the_scope_rule_carves_out_exactly_the_findings_the_coordinator_closes() {
+    let agents = packaged().unwrap();
+    let coord = &agents
+        .iter()
+        .find(|a| a.name == "swarm-coordinator")
+        .unwrap()
+        .def
+        .template;
+    let never = &coord[coord.find("\nNEVER\n").unwrap()..];
+    let scope_rule = never
+        .lines()
+        .skip_while(|l| !l.starts_with("- Touch a task outside SCOPE"))
+        .take_while(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        scope_rule.contains("the group's own findings, which CLOSING FINDINGS"),
+        "{scope_rule}"
+    );
+    for set in [
+        "must-fixes",
+        "rounds recorded against the group's lead",
+        "`round=`",
+    ] {
+        assert!(
+            scope_rule.contains(set),
+            "the scope rule names {set}: {scope_rule}"
+        );
+    }
+    assert!(scope_rule.contains("never another group's"), "{scope_rule}");
+    let closing = &coord[coord.find("CLOSING FINDINGS: ").unwrap()..];
+    let closing = &closing[..closing.find("\n\n").unwrap()];
+    for set in ["must-fix", "`round=<namespace>`", "jkb task show <lead"] {
+        assert!(
+            closing.contains(set),
+            "CLOSING FINDINGS names {set}: {closing}"
+        );
+    }
+    // ...and the done rule carves out the same.
+    assert!(never.contains("on any task but a finding you close as CLOSING FINDINGS says"));
+}
+
+/// `/task-swarm` no longer gates the frontier on the `design=approved` tag: a task approved in jkb
+/// carries no tag, and the query DSL cannot test a phase, so the coordinator's step 1 applies the
+/// gate and `scope_block` says whether it is on.
+#[test]
+fn the_slash_command_leaves_the_design_gate_to_step_one() {
+    let md = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.claude/commands/task-swarm.md"),
+    )
+    .unwrap();
+    assert!(
+        !md.contains("<GATE>"),
+        "a frontier query still gates on the tag"
+    );
+    assert!(
+        md.contains("Read the frontier with `jkb task next --global --json '<SCOPE>' --limit 100`")
+    );
+    assert!(md.contains("The design gate is ON"));
+    assert!(md.contains("The design gate is OFF"));
+    assert!(md.contains("no run builds a finding"));
 }
 
 /// The workers' subagent types: rendered from the packaged file, prefixed like everything the

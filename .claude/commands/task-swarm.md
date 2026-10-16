@@ -15,8 +15,8 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   review file`, `jkb task review record`). Its role comes from the operator's agent-type map
   (`jkb-reviewer` → `reviewer`), never from a grant the coordinator mints.
 - **Workflow.** The coordinator admits a task by its workflow phase, and a group only if every
-  task in it is admitted. A task at `implement`, `review` or `landable` is a *workflow* task. A
-  task still at `design` that the run's design gate let through (the `design=approved` tag, a
+  task in it is admitted, and never a review finding. A task at `implement`, `review` or
+  `landable` is a *workflow* task. A task still at `design` that the run's design gate let through (the `design=approved` tag, a
   hand-pick by uid, or `--no-design-gate`) is a *legacy* task: its design was never approved in
   jkb, so it is built on the legacy path, routed on the reviewer's verdict, and named as legacy in
   the report. A task at `design_review` (awaiting the operator's approval) or any other phase is
@@ -49,13 +49,23 @@ until after the cost preview and confirmation (steps 3–4).**
 - If `$ARGUMENTS` is empty, stop and ask for a jkb path or task uids.
 - `--dry-run` → steps 2–3 only.
 - `--branch <name>` → `<name>` is the integration branch (step 5).
-- `--no-design-gate` → `GATE=""`. Otherwise `GATE="tag:design=approved"`.
+- `--no-design-gate` → the design gate is off. Otherwise it is on.
 - The rest is either a **namespace path** (no spaces, no `#`), giving `SCOPE="ns:<path>/**"`, or
   one or more **task uids**, collected as `TASKS`.
 
-**The design gate.** In scope mode the swarm touches only tasks tagged `design=approved` by
-`/jkb-design-pass`, so implementers never invent architecture they cannot ask you about. Naming
-exact uids is a deliberate hand-pick, so the gate does not apply to them (but see step 3).
+**The design gate.** In scope mode the swarm builds only tasks whose design is approved, so
+implementers never invent architecture they cannot ask you about. A design is approved in one of
+two ways:
+- **In jkb.** The task's workflow phase is past design (`implement`, `review` or `landable`). It
+  needs no tag, and it goes on the full workflow path.
+- **By the tag (legacy).** The task is still at `design` but carries `design=approved` from
+  `/jkb-design-pass`. It goes on the legacy path, routed on the reviewer's verdict, until operator
+  approval in jkb is routine.
+
+The query DSL cannot test a workflow phase, so the gate is applied by the coordinator's step 1
+(its admission table), not by the frontier query. Naming exact uids is a deliberate hand-pick, so
+the tag gate does not apply to them (but see step 3). On every path the swarm leaves out review
+findings (tasks under `repos/<repo>/codereviews/`): no run builds a finding.
 
 ## 2. Preflight
 
@@ -66,15 +76,22 @@ not in it. Ask whether to continue.
 ## 3. Scout and preview
 
 ```sh
-jkb task next --global --json '<SCOPE> <GATE>' --limit 100        # ready and approved
-jkb query    --global --json 'kind:task <SCOPE> <GATE>' --limit 1000
-jkb task next --global --json '<SCOPE>' --limit 100               # ready, ungated
+jkb task next --global --json '<SCOPE>' --limit 100                         # ready
+jkb task next --global --json '<SCOPE> tag:design=approved' --limit 100     # ready and tagged
+jkb query    --global --json 'kind:task <SCOPE>' --limit 1000
 ```
+
+For each ready task, `jkb workflow show <uid>` gives its phase, and `jkb task show <uid>` its
+namespace. Admit it as the coordinator's step 1 will: a finding is left out; `implement`, `review`
+and `landable` are admitted; `design` is admitted when it is tagged, hand-picked, or the gate is off;
+everything else is left out.
 
 Print:
 - the ready tasks, and how many are not yet terminal;
-- how many ready tasks the gate holds back (if many, suggest `/jkb-design-pass <path>` first);
-- for named uids, any that lack `design=approved`;
+- how many ready tasks are admitted on the workflow path, and how many on the legacy path;
+- how many the gate holds back (if many, suggest `/jkb-design-pass <path>` first), how many await
+  the operator's approval (`design_review`), and how many are findings or at another phase;
+- for named uids, any still at `design`, which go on the legacy path;
 - a rough agent count: about two per group per attempt (an implementer and a reviewer), with up to
   3 attempts per group.
 
@@ -114,10 +131,13 @@ jkb workflow agent show swarm-coordinator \
 ```
 
 `scope_block` says how to read the frontier:
-- **scope mode:** "Read the frontier with `jkb task next --global --json '<SCOPE> <GATE>' --limit 100`.
-  Only tasks it returns are yours."
+- **scope mode:** "Read the frontier with `jkb task next --global --json '<SCOPE>' --limit 100`.
+  Only tasks it returns are yours. The design gate is ON: step 1 admits a task at `design` only if
+  it is tagged `design=approved`." With `--no-design-gate`, say instead "The design gate is OFF:
+  step 1 admits a task at `design` on the legacy path."
 - **uid mode:** "Your tasks are exactly: <uids>. A task is ready when `jkb task show <uid> --json`
-  shows it open, unblocked and unclaimed."
+  shows it open, unblocked and unclaimed. They are hand-picked: step 1 admits one at `design` on
+  the legacy path."
 
 ## 7. When it is done
 

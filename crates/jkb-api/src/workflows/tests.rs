@@ -371,13 +371,37 @@ enum Path {
     Legacy,
 }
 
-/// `swarm-coordinator` step 1's admission table, by the phase `jkb workflow show` prints. `None`
-/// leaves the task out. Pinned against the template's text by `jkb-core`'s agents tests, and against
-/// what jkb lets step 3 do by `step_one_admits_exactly_the_phases_step_three_can_drive`.
-fn admission(phase: &str) -> Option<Path> {
-    match phase {
+/// The run's design gate, as `scope_block` tells the coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Scope mode: a task at `design` must carry `design=approved`.
+    On,
+    /// `--no-design-gate`.
+    Off,
+    /// Uid mode: a deliberate hand-pick.
+    HandPicked,
+}
+
+/// What step 1 reads of a task: its namespace (`jkb task show`), its phase (`jkb workflow show`),
+/// and whether it carries `design=approved`.
+struct Seen {
+    namespace: String,
+    phase: String,
+    tagged: bool,
+}
+
+/// `swarm-coordinator` step 1's admission table. `None` leaves the task out. Pinned against the
+/// template's text by `jkb-core`'s agents tests, and against what jkb lets step 3 do by
+/// `step_one_admits_exactly_the_phases_step_three_can_drive`.
+fn admission(task: &Seen, gate: Gate) -> Option<Path> {
+    let finding = task.namespace.starts_with("repos/")
+        && task.namespace.split('/').nth(2) == Some("codereviews");
+    if finding {
+        return None;
+    }
+    match task.phase.as_str() {
         "implement" | "review" | "landable" => Some(Path::Workflow),
-        "design" => Some(Path::Legacy),
+        "design" if task.tagged || gate != Gate::On => Some(Path::Legacy),
         _ => None,
     }
 }
@@ -479,10 +503,33 @@ impl Swarm {
         self.start_group_on(Path::Workflow);
     }
 
-    /// `swarm-coordinator` step 1 admits the lead on `path`, and step 2 claims it (which starts it),
-    /// tags its repository and records it as the group's lead.
+    /// What step 1 reads of `uid`, through the coordinator's own calls.
+    fn seen(&self, uid: &str) -> Seen {
+        let (namespace, tagged) = match self.coordinator(json!({ "op": "task.show", "uid": uid })) {
+            Response::Task { task, .. } => (
+                task.item.namespace.unwrap_or_default(),
+                task.item
+                    .tags
+                    .iter()
+                    .any(|t| t.facet == "design" && t.value == "approved"),
+            ),
+            other => panic!("{other:?}"),
+        };
+        let phase = match self.coordinator(json!({ "op": "workflow.show", "uid": uid })) {
+            Response::Workflow { workflow } => workflow.phase,
+            other => panic!("{other:?}"),
+        };
+        Seen {
+            namespace,
+            phase,
+            tagged,
+        }
+    }
+
+    /// `swarm-coordinator` step 1 admits the lead on `path` in a scope-mode run (the gate on), and
+    /// step 2 claims it (which starts it), tags its repository and records it as the group's lead.
     fn start_group_on(&self, path: Path) {
-        assert_eq!(admission(&self.phase()), Some(path));
+        assert_eq!(admission(&self.seen(&self.lead), Gate::On), Some(path));
         self.coordinator(json!({ "op": "task.claim", "uid": self.lead, "owner": OWNER }));
         self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
                                  "facet_value": format!("repo={REPO}"), "mode": "set" }));
@@ -687,20 +734,81 @@ fn step_one_admits_exactly_the_phases_step_three_can_drive() {
             s.operator_fires("override", Some(phase));
         }
         assert_eq!(s.phase(), phase);
-        match admission(phase) {
+        // Ungated, so `design` is admitted at all: the table by phase alone.
+        match admission(&s.seen(&s.lead), Gate::Off) {
             Some(Path::Workflow) => {
                 s.start_group();
                 s.coordinator_submits();
                 assert_eq!(s.phase(), "review", "from {phase}");
             }
             Some(Path::Legacy) | None => {
+                assert!([
+                    "design",
+                    "design_review",
+                    "systemic_review",
+                    "landed",
+                    "cancelled"
+                ]
+                .contains(&phase));
                 refused(&s, "submit_work");
                 refused(&s, "rework");
             }
         }
     }
-    assert_eq!(admission("design_review"), None);
-    assert_eq!(admission("systemic_review"), None);
+}
+
+/// The design gate is one rule: approved in jkb (a phase past design, no tag needed) takes the
+/// workflow path on a gated run; still at `design`, the tag, a hand-pick or no gate takes the legacy
+/// path, and the gate holds back the rest. A review finding — at `design`, under the repository's
+/// `codereviews/` — is never admitted, on any path, so no run builds a must-fix another implementer
+/// is fixing.
+#[test]
+fn step_one_admits_by_phase_or_tag_and_never_a_finding() {
+    let gates = [Gate::On, Gate::Off, Gate::HandPicked];
+    // Approved in jkb, untagged: the gated frontier no longer filters on the tag, and step 1 admits it.
+    let approved = Swarm::new();
+    let seen = approved.seen(&approved.lead);
+    assert!(!seen.tagged);
+    for gate in gates {
+        assert_eq!(admission(&seen, gate), Some(Path::Workflow), "{gate:?}");
+    }
+    // At `design`, untagged: held back by the gate only.
+    let untagged = Swarm::at_design();
+    let seen = untagged.seen(&untagged.lead);
+    assert_eq!(admission(&seen, Gate::On), None);
+    assert_eq!(admission(&seen, Gate::Off), Some(Path::Legacy));
+    assert_eq!(admission(&seen, Gate::HandPicked), Some(Path::Legacy));
+    // ...and tagged: legacy on a gated run too.
+    ok(
+        &untagged.kb.op,
+        json!({ "op": "task.tag", "uid": untagged.lead, "facet_value": "design=approved", "mode": "set" }),
+    );
+    let seen = untagged.seen(&untagged.lead);
+    assert_eq!(admission(&seen, Gate::On), Some(Path::Legacy));
+
+    // A finding the swarm's reviewer filed: an ordinary open task at `design`, which only its
+    // namespace tells apart — left out on every path, even tagged.
+    let s = Swarm::new();
+    s.start_group();
+    s.implementer_works();
+    s.coordinator_submits();
+    let findings = s.reviewer_records("r1", 1, Some("src/lib.rs"));
+    let finding = &findings[0];
+    ok(
+        &s.kb.op,
+        json!({ "op": "task.tag", "uid": finding, "facet_value": "design=approved", "mode": "set" }),
+    );
+    let seen = s.seen(finding);
+    assert_eq!(seen.phase, "design");
+    assert!(
+        seen.namespace
+            .starts_with(&format!("repos/{REPO}/codereviews/")),
+        "{}",
+        seen.namespace
+    );
+    for gate in gates {
+        assert_eq!(admission(&seen, gate), None, "{gate:?}");
+    }
 }
 
 /// A task still at `design` that the design gate let through is built on the legacy path: the same
