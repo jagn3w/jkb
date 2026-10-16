@@ -20,7 +20,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use jkb_types::{is_session_id, AgentId, Error as TypeError, ItemId};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::claude_session::{self, SessionState};
@@ -76,6 +76,11 @@ impl Source {
             Self::Workflow => "workflow",
             Self::Review => "review",
         }
+    }
+
+    /// Its place in the tie-break order (the declaration order).
+    const fn rank(self) -> i64 {
+        self as i64
     }
 
     fn parse(s: &str) -> Option<Self> {
@@ -290,41 +295,97 @@ fn speaks_for(bindings: &Bindings, source: Source, actor: &str) -> Vec<String> {
 // Reading the sources
 // -------------------------------------------------------------------------------------------
 
-/// Which rows a source read takes: one task's, or every row an actor could attribute to a session.
+/// A page position: the key of the last event already shown.
+type Key = (i64, Source, i64);
+
+/// Which rows a source read takes.
 #[derive(Debug, Clone, Copy)]
-enum Rows {
+enum Rows<'a> {
+    /// One task's whole history (bounded by that task, read by its index).
     Task(ItemId),
-    Attributable,
+    /// The rows a session's own actors wrote, after `after`, at most `limit` — the cursor and the cap
+    /// are in the query, so a page reads a page. The actor test is a superset of [`speaks_for`],
+    /// which decides each row.
+    Session {
+        session: &'a str,
+        after: Option<Key>,
+        limit: i64,
+    },
 }
 
-impl Rows {
-    const fn item(self) -> i64 {
+/// The parameters every source query binds, in order: `?1` session mode, `?2` item, `?3` session,
+/// `?4` has a cursor, `?5`–`?7` the cursor's time, source rank and id, `?8` the limit, `?9` this
+/// source's rank.
+type Bound<'a> = (bool, i64, &'a str, bool, i64, i64, i64, i64, i64);
+
+impl<'a> Rows<'a> {
+    fn bind(self, source: Source) -> Bound<'a> {
         match self {
-            Self::Task(id) => id.get(),
-            Self::Attributable => -1,
+            Self::Task(id) => (false, id.get(), "", false, 0, 0, 0, -1, source.rank()),
+            Self::Session {
+                session,
+                after,
+                limit,
+            } => {
+                let (at, rank, id) = after.map_or((0, 0, 0), |(a, s, i)| (a, s.rank(), i));
+                (
+                    true,
+                    -1,
+                    session,
+                    after.is_some(),
+                    at,
+                    rank,
+                    id,
+                    limit,
+                    source.rank(),
+                )
+            }
         }
     }
-
-    const fn all(self) -> bool {
-        matches!(self, Self::Attributable)
-    }
 }
 
-fn status_rows(conn: &Connection, rows: Rows) -> Result<Vec<Event>> {
+/// The `WHERE` and `ORDER BY … LIMIT` every source query shares, over its time expression `at`, its
+/// row id `id`, its item column `item` and the session test `mine` (over `?3`).
+fn window(at: &str, id: &str, item: &str, mine: &str) -> String {
+    format!(
+        "WHERE {at} IS NOT NULL
+           AND (CASE WHEN ?1 THEN ({mine}) ELSE {item} = ?2 END)
+           AND (NOT ?4 OR {at} > ?5 OR ({at} = ?5 AND (?9 > ?6 OR (?9 = ?6 AND {id} > ?7))))
+         ORDER BY {at}, {id} LIMIT ?8"
+    )
+}
+
+/// The session test on a principal column (`session:<id>`, or `<type>@<agent>` with the agent bound
+/// in the session).
+fn mine_principal(actor: &str) -> String {
+    format!(
+        "{actor} = 'session:' || ?3
+         OR (instr({actor}, '@') > 0
+             AND substr({actor}, instr({actor}, '@') + 1)
+                 IN (SELECT b.agent_id FROM agent_bindings b WHERE b.session = ?3))"
+    )
+}
+
+fn status_rows(conn: &Connection, rows: Rows<'_>) -> Result<Vec<Event>> {
     // A row whose time does not parse is not placeable on a timeline; jkb writes none.
+    let at = ms("t.at");
     let sql = format!(
         "SELECT t.id, {at}, i.uid, t.event, t.from_status, t.to_status, t.agent_id,
                 t.branch, t.onto, t.pr_number
            FROM task_transitions t JOIN items i ON i.id = t.item_id
-          WHERE {at} IS NOT NULL
-            AND (CASE WHEN ?1 THEN t.agent_id LIKE 'session:%' OR t.agent_id LIKE 'agent:%'
-                      ELSE t.item_id = ?2 END)
-          ORDER BY t.id",
-        at = ms("t.at")
+         {window}",
+        window = window(
+            &at,
+            "t.id",
+            "t.item_id",
+            "(t.agent_id LIKE 'session:%' AND instr(t.agent_id, '@' || ?3 || ':') > 0)
+             OR t.agent_id IN (SELECT 'agent:' || b.agent_id FROM agent_bindings b
+                               WHERE b.session = ?3)"
+        )
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let out = stmt
-        .query_map(params![rows.all(), rows.item()], |r| {
+        .query_map(rows.bind(Source::Status), |r| {
             let mut e = Event::bare(r.get(1)?, Source::Status, r.get(0)?, r.get::<_, String>(3)?);
             e.task = Some(r.get(2)?);
             e.from = r.get(4)?;
@@ -346,20 +407,18 @@ fn status_rows(conn: &Connection, rows: Rows) -> Result<Vec<Event>> {
     Ok(out)
 }
 
-fn workflow_rows(conn: &Connection, rows: Rows) -> Result<Vec<Event>> {
+fn workflow_rows(conn: &Connection, rows: Rows<'_>) -> Result<Vec<Event>> {
+    let at = ms("w.at");
     let sql = format!(
         "SELECT w.id, {at}, i.uid, w.event, w.from_phase, w.to_phase, w.role, w.actor, w.reason,
                 w.spec IS NOT NULL
            FROM workflow_transitions w JOIN items i ON i.id = w.item_id
-          WHERE {at} IS NOT NULL
-            AND (CASE WHEN ?1 THEN w.actor LIKE 'session:%' OR instr(w.actor, '@') > 0
-                      ELSE w.item_id = ?2 END)
-          ORDER BY w.id",
-        at = ms("w.at")
+         {window}",
+        window = window(&at, "w.id", "w.item_id", &mine_principal("w.actor"))
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let out = stmt
-        .query_map(params![rows.all(), rows.item()], |r| {
+        .query_map(rows.bind(Source::Workflow), |r| {
             let mut e = Event::bare(
                 r.get(1)?,
                 Source::Workflow,
@@ -382,37 +441,40 @@ fn workflow_rows(conn: &Connection, rows: Rows) -> Result<Vec<Event>> {
     Ok(out)
 }
 
-/// Review facts: a recorded round carries its round's actor, time and must-fix count; a waiver or a
-/// host gate its own row's.
-fn review_rows(conn: &Connection, rows: Rows) -> Result<Vec<Event>> {
+/// The time, actor and joins of a review event, shared by its rows and by the newest-event read: a
+/// recorded round carries its round's actor and time; a waiver or a host gate its own row's.
+const REVIEW_FROM: &str = "FROM reviews v
+           JOIN items i ON i.id = v.item_id
+           LEFT JOIN review_rounds rr ON v.kind = 'recorded' AND rr.ns = v.ns";
+const REVIEW_ACTOR: &str = "CASE WHEN rr.id IS NOT NULL THEN rr.actor ELSE v.actor END";
+
+fn review_at() -> String {
+    format!("coalesce({}, {})", ms("rr.recorded_at"), ms("v.at"))
+}
+
+/// Review facts (see [`REVIEW_FROM`]).
+fn review_rows(conn: &Connection, rows: Rows<'_>) -> Result<Vec<Event>> {
+    let at = review_at();
     let sql = format!(
-        "SELECT v.id, {rr_at}, {v_at}, i.uid, v.kind, v.ns, rr.actor, v.actor,
+        "SELECT v.id, {at}, i.uid, v.kind, v.ns, {REVIEW_ACTOR},
                 (SELECT count(*) FROM review_round_findings f
                   WHERE f.round_id = rr.id AND f.must_fix = 1),
                 rr.id IS NOT NULL
-           FROM reviews v
-           JOIN items i ON i.id = v.item_id
-           LEFT JOIN review_rounds rr ON v.kind = 'recorded' AND rr.ns = v.ns
-          WHERE coalesce({rr_at}, {v_at}) IS NOT NULL
-            AND (CASE WHEN ?1 THEN 1 ELSE v.item_id = ?2 END)
-          ORDER BY v.id",
-        rr_at = ms("rr.recorded_at"),
-        v_at = ms("v.at"),
+         {REVIEW_FROM}
+         {window}",
+        window = window(&at, "v.id", "v.item_id", &mine_principal(REVIEW_ACTOR))
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let out = stmt
-        .query_map(params![rows.all(), rows.item()], |r| {
-            let round_at: Option<i64> = r.get(1)?;
-            let own_at: Option<i64> = r.get(2)?;
-            let kind: String = r.get(4)?;
-            let ns: Option<String> = r.get(5)?;
-            let has_round: bool = r.get(9)?;
-            let at = round_at.or(own_at).unwrap_or_default();
-            let mut e = Event::bare(at, Source::Review, r.get(0)?, kind);
-            e.task = Some(r.get(3)?);
-            e.actor = if has_round { r.get(6)? } else { r.get(7)? };
+        .query_map(rows.bind(Source::Review), |r| {
+            let kind: String = r.get(3)?;
+            let ns: Option<String> = r.get(4)?;
+            let has_round: bool = r.get(7)?;
+            let mut e = Event::bare(r.get(1)?, Source::Review, r.get(0)?, kind);
+            e.task = Some(r.get(2)?);
+            e.actor = r.get(5)?;
             if has_round {
-                let must_fix: i64 = r.get(8)?;
+                let must_fix: i64 = r.get(6)?;
                 e.detail = Some(format!("{}: {must_fix} must-fix", ns.unwrap_or_default()));
             } else {
                 e.detail = ns;
@@ -487,37 +549,128 @@ fn registry_events(rows: &[claude_session::HolderRow]) -> Vec<Event> {
     out
 }
 
-/// Every attributable event, grouped by the sessions it speaks for (one event can speak for two,
-/// when a subagent id is bound in both). Each session's list is in timeline order.
-fn attributed(
+/// Each session's newest attributed event (Unix ms), from one grouped read per source — what the
+/// overview and a session's summary judge stalled by. The registry's starts and ends are added per
+/// session by [`summarize`].
+fn last_events(
     conn: &Connection,
     bindings: &Bindings,
     held: &[Held],
-) -> Result<HashMap<String, Vec<Event>>> {
-    let mut by: HashMap<String, Vec<Event>> = HashMap::new();
-    let mut add = |source: Source, e: Event| {
-        if let Some(actor) = e.actor.as_deref() {
-            for s in speaks_for(bindings, source, actor) {
-                by.entry(s).or_default().push(e.clone());
-            }
+) -> Result<HashMap<String, i64>> {
+    let mut last: HashMap<String, i64> = HashMap::new();
+    let mut note = |source: Source, actor: &str, at: i64| {
+        for s in speaks_for(bindings, source, actor) {
+            let v = last.entry(s).or_insert(at);
+            *v = (*v).max(at);
         }
     };
-    for e in status_rows(conn, Rows::Attributable)? {
-        add(Source::Status, e);
+    let reads = [
+        (
+            Source::Status,
+            format!(
+                "SELECT t.agent_id, max({at}) FROM task_transitions t JOIN items i ON i.id = t.item_id
+                  WHERE t.agent_id LIKE 'session:%' OR t.agent_id LIKE 'agent:%'
+                  GROUP BY t.agent_id",
+                at = ms("t.at")
+            ),
+        ),
+        (
+            Source::Workflow,
+            format!(
+                "SELECT w.actor, max({at}) FROM workflow_transitions w JOIN items i ON i.id = w.item_id
+                  WHERE w.actor LIKE 'session:%' OR instr(w.actor, '@') > 0
+                  GROUP BY w.actor",
+                at = ms("w.at")
+            ),
+        ),
+        (
+            Source::Review,
+            format!(
+                "SELECT {REVIEW_ACTOR}, max({at}) {REVIEW_FROM} GROUP BY 1",
+                at = review_at()
+            ),
+        ),
+    ];
+    for (source, sql) in reads {
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?))
+        })?;
+        for row in rows {
+            if let (Some(actor), Some(at)) = row? {
+                note(source, &actor, at);
+            }
+        }
     }
-    for e in workflow_rows(conn, Rows::Attributable)? {
-        add(Source::Workflow, e);
+    for h in held {
+        if let Some(at) = h.at_ms {
+            note(Source::Claim, &h.owner, at);
+        }
     }
-    for e in review_rows(conn, Rows::Attributable)? {
-        add(Source::Review, e);
+    Ok(last)
+}
+
+/// One page of `session`'s events after `after`: each logged source read to at most a page past the
+/// cursor, its claims and registry rows added, merged in timeline order. A source that filled its
+/// read bounds the page at its last row, past which it may hold more, so nothing is skipped.
+fn session_page(
+    conn: &Connection,
+    bindings: &Bindings,
+    held: &[Held],
+    session: &str,
+    after: Option<Key>,
+) -> Result<(Vec<Event>, Option<String>)> {
+    let cap = PAGE_CAP + 1;
+    let rows = Rows::Session {
+        session,
+        after,
+        limit: i64::try_from(cap).unwrap_or(i64::MAX),
+    };
+    let ours = |source: Source, e: &Event| {
+        e.actor
+            .as_deref()
+            .is_some_and(|a| speaks_for(bindings, source, a).iter().any(|s| s == session))
+    };
+    let mut merged = Vec::new();
+    let mut bound: Option<Key> = None;
+    for (source, read) in [
+        (Source::Status, status_rows(conn, rows)?),
+        (Source::Workflow, workflow_rows(conn, rows)?),
+        (Source::Review, review_rows(conn, rows)?),
+    ] {
+        if read.len() >= cap {
+            if let Some(last) = read.last() {
+                bound = Some(bound.map_or(last.key(), |b| b.min(last.key())));
+            }
+        }
+        merged.extend(read.into_iter().filter(|e| ours(source, e)));
     }
-    for e in held.iter().filter_map(claim_event) {
-        add(Source::Claim, e);
+    let past = |e: &Event| after.is_none_or(|c| e.key() > c);
+    merged.extend(
+        held.iter()
+            .filter_map(claim_event)
+            .filter(|e| ours(Source::Claim, e) && past(e)),
+    );
+    merged.extend(
+        registry_events(&claude_session::holders(conn, session)?)
+            .into_iter()
+            .filter(|e| past(e)),
+    );
+    sort(&mut merged);
+    if let Some(b) = bound {
+        merged.retain(|e| e.key() <= b);
     }
-    for list in by.values_mut() {
-        sort(list);
-    }
-    Ok(by)
+    let more = bound.is_some() || merged.len() > PAGE_CAP;
+    merged.truncate(PAGE_CAP);
+    let next = if more {
+        merged
+            .last()
+            .map(cursor_of)
+            .or_else(|| bound.map(|(a, s, i)| format!("{a}.{}.{i}", s.as_str())))
+    } else {
+        None
+    };
+    Ok((merged, next))
 }
 
 // -------------------------------------------------------------------------------------------
@@ -596,7 +749,8 @@ pub struct SessionTask {
 pub struct SessionTimeline {
     /// The session at a glance.
     pub summary: SessionSummary,
-    /// The tasks it holds, acted on, or is bound to: held first, then by first event, then bound.
+    /// The tasks it holds, acted on in this page, or is bound to: held first, then by first event,
+    /// then bound. A client showing several pages unions them.
     pub tasks: Vec<SessionTask>,
     /// One page of its events, oldest first.
     pub events: Vec<Event>,
@@ -634,14 +788,18 @@ fn summarize(
     conn: &Connection,
     session: &str,
     claims: usize,
-    events: &[Event],
+    attributed_last: Option<i64>,
     now_ms: i64,
 ) -> Result<SessionSummary> {
     let rows = claude_session::holders(conn, session)?;
     let state = claude_session::state(conn, session)?;
     let newest_seen = rows.iter().max_by_key(|r| r.seen_at);
     let registry = registry_events(&rows);
-    let last_event_ms = events.iter().chain(registry.iter()).map(|e| e.at_ms).max();
+    let last_event_ms = registry
+        .iter()
+        .map(|e| e.at_ms)
+        .chain(attributed_last)
+        .max();
     let quiet_for = last_event_ms.map(|at| now_ms.saturating_sub(at));
     let stalled = claims > 0
         && state != SessionState::Ended
@@ -689,7 +847,7 @@ fn split_claims<'h>(
 pub fn sessions(conn: &Connection, now_ms: i64) -> Result<Overview> {
     let bindings = Bindings::read(conn)?;
     let held = held_claims(conn, None)?;
-    let events = attributed(conn, &bindings, &held)?;
+    let last = last_events(conn, &bindings, &held)?;
     let (claims, nobody) = split_claims(&bindings, &held);
     let mut names: BTreeSet<String> = claims.keys().cloned().collect();
     // The live page holds up to `LIST_CAP` processes, far beyond any real fleet.
@@ -703,7 +861,7 @@ pub fn sessions(conn: &Connection, now_ms: i64) -> Result<Overview> {
                 conn,
                 s,
                 claims.get(s).map_or(0, Vec::len),
-                events.get(s).map_or(&[][..], Vec::as_slice),
+                last.get(s).copied(),
                 now_ms,
             )
         })
@@ -753,14 +911,16 @@ pub fn session(
         )));
     }
     let bindings = Bindings::read(conn)?;
+    let after = after.map(parse_cursor).transpose()?;
     let held = held_claims(conn, None)?;
-    let mut all = attributed(conn, &bindings, &held)?;
-    let mine = all.remove(session).unwrap_or_default();
+    let last = last_events(conn, &bindings, &held)?.get(session).copied();
     let (claims, _) = split_claims(&bindings, &held);
     let my_claims = claims.get(session).cloned().unwrap_or_default();
-    let summary = summarize(conn, session, my_claims.len(), &mine, now_ms)?;
+    let summary = summarize(conn, session, my_claims.len(), last, now_ms)?;
+    let (mine, next) = session_page(conn, &bindings, &held, session, after)?;
 
-    // The swimlanes: held claims first, then tasks it acted on by first event, then bound tasks.
+    // The swimlanes: held claims first, then tasks this page acted on by first event, then bound
+    // tasks.
     let mut lanes = Lanes::default();
     for h in &my_claims {
         let t = lanes.lane(&h.uid);
@@ -809,14 +969,10 @@ pub fn session(
         })
         .collect();
 
-    let mut events = mine;
-    events.extend(registry_events(&claude_session::holders(conn, session)?));
-    sort(&mut events);
-    let (events, next) = page(events, after)?;
     Ok(SessionTimeline {
         summary,
         tasks,
-        events,
+        events: mine,
         next,
     })
 }
@@ -825,11 +981,14 @@ pub fn session(
 // A task
 // -------------------------------------------------------------------------------------------
 
-/// An edge a task's history has taken, and how often.
+/// A transition a task's history has taken, and how often: one per (from, event, to), so an
+/// override's destinations are counted apart, and two events between the same states are too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Visited {
     /// From.
     pub from: String,
+    /// The event: what the machine's table keys a row by, with `from`.
+    pub event: String,
     /// To.
     pub to: String,
     /// How many times.
@@ -889,19 +1048,55 @@ pub struct TaskTimeline {
     pub next: Option<String>,
 }
 
-/// The edges `events` of one source took, counted, in first-taken order.
+/// The rows of the machines a source's events can be moves of: the task lifecycle for status rows,
+/// every workflow graph for phase rows (a task can change graph with its strategy).
+fn tables(source: Source) -> Vec<jkb_fsm::Table> {
+    match source {
+        Source::Status => vec![crate::lifecycle::machine().table()],
+        Source::Workflow => crate::workflow::GraphId::ALL
+            .iter()
+            .map(|g| g.machine().table())
+            .collect(),
+        Source::Session | Source::Claim | Source::Review => Vec::new(),
+    }
+}
+
+/// Whether `e` records a move: a row of its machine with this `from` and event, and this
+/// destination (or one the caller names, an override). Not a move: a `note`, a guard's refusal the
+/// lifecycle records under the refused event's name with `from == to`, an undo marker, and a row
+/// that pins or sets a strategy — none of them is a row of any table.
+fn is_move(tables: &[jkb_fsm::Table], e: &Event) -> bool {
+    let (Some(from), Some(to)) = (e.from.as_deref(), e.to.as_deref()) else {
+        return false;
+    };
+    tables.iter().any(|t| {
+        t.transitions
+            .iter()
+            .any(|r| r.from == from && r.event == e.event && r.to.is_none_or(|dest| dest == to))
+    })
+}
+
+/// The moves `events` of one source took, counted, in first-taken order.
 fn visited(events: &[Event], source: Source) -> Vec<Visited> {
+    let tables = tables(source);
     let mut out: Vec<Visited> = Vec::new();
-    for e in events.iter().filter(|e| e.source == source) {
+    for e in events
+        .iter()
+        .filter(|e| e.source == source && is_move(&tables, e))
+    {
         let (Some(from), Some(to)) = (&e.from, &e.to) else {
             continue;
         };
-        if let Some(v) = out.iter_mut().find(|v| &v.from == from && &v.to == to) {
+        if let Some(v) = out
+            .iter_mut()
+            .find(|v| &v.from == from && v.event == e.event && &v.to == to)
+        {
             v.count += 1;
             v.last_at_ms = v.last_at_ms.max(e.at_ms);
         } else {
             out.push(Visited {
                 from: from.clone(),
+                event: e.event.clone(),
                 to: to.clone(),
                 count: 1,
                 last_at_ms: e.at_ms,

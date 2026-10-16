@@ -194,7 +194,7 @@ fn task(ops: &Ops<'_>, uid: String, after: Option<String>) -> Result<()> {
         );
     }
     for v in &t.visited {
-        println!("  visited {} -> {}  x{}", v.from, v.to, v.count);
+        println!("  took {} --{}--> {}  x{}", v.from, v.event, v.to, v.count);
     }
     println!();
     for e in &t.events {

@@ -355,32 +355,64 @@ fn a_tasks_four_sources_merge_in_one_stable_order() {
 }
 
 #[test]
-fn a_reentered_phase_counts_each_visit() {
+fn visited_counts_only_moves_through_the_real_verbs_and_a_reentered_phase_each_time() {
+    use crate::workflow::store::{fire, Actor};
+    use crate::workflow::{Phase, WorkflowEvent};
+    use jkb_types::TaskStatus;
     let db = db();
     let a = new_task(&db, "task:a");
-    with(&db, move |c| {
-        phase_move(c, a, T0, Some("design"), "implement", "operator");
-        phase_move(c, a, T0 + MIN, Some("implement"), "review", "operator");
-        phase_move(c, a, T0 + 2 * MIN, Some("review"), "implement", "operator");
-        phase_move(c, a, T0 + 3 * MIN, Some("implement"), "review", "operator");
-    });
+    db.write_txn("test", move |c, m| {
+        let op = Actor::operator();
+        // The first fire pins the strategy (a `pin_strategy` row, design -> design) before it moves.
+        for (event, reason, stated) in [
+            (WorkflowEvent::SubmitDesign, None, None),
+            (WorkflowEvent::ApproveDesign, None, None),
+            (WorkflowEvent::SubmitWork, None, None),
+            (
+                WorkflowEvent::Override,
+                Some("again"),
+                Some(Phase::Implement),
+            ),
+            (WorkflowEvent::SubmitWork, None, None),
+        ] {
+            fire(c, m, a, event, &op, reason, stated)?;
+        }
+        crate::task::set_status(c, m, a, TaskStatus::InProgress)?;
+        // A note (`jkb task start --onto`) is a row, never a move.
+        let facts = crate::task::observe(c, a)?;
+        crate::transition::note(c, m, a, &facts, &crate::transition::Labels::default())?;
+        Ok(())
+    })
+    .unwrap();
     let t = db.read(|c| task(c, "task:a", None)).unwrap();
-    let v: Vec<(&str, &str, u32, i64)> = t
+    let phases: Vec<(&str, &str, &str, u32)> = t
         .visited
         .iter()
-        .map(|v| (v.from.as_str(), v.to.as_str(), v.count, v.last_at_ms))
+        .map(|v| (v.from.as_str(), v.event.as_str(), v.to.as_str(), v.count))
         .collect();
+    let statuses: Vec<(&str, &str, &str, u32)> = t
+        .visited_status
+        .iter()
+        .map(|v| (v.from.as_str(), v.event.as_str(), v.to.as_str(), v.count))
+        .collect();
+    assert!(
+        t.events.iter().any(|e| e.event == "pin_strategy"),
+        "the pin is on the timeline"
+    );
+    assert!(t.events.iter().any(|e| e.event == "note"), "and the note");
     assert_eq!(
-        v,
+        phases,
         vec![
-            ("design", "implement", 1, T0),
-            ("implement", "review", 2, T0 + 3 * MIN),
-            ("review", "implement", 1, T0 + 2 * MIN),
+            ("design", "submit_design", "design_review", 1),
+            ("design_review", "approve_design", "implement", 1),
+            ("implement", "submit_work", "review", 2),
+            ("review", "override", "implement", 1),
         ]
     );
-    assert!(
-        t.visited_status.is_empty(),
-        "no status history: its status path only is empty"
+    assert_eq!(
+        statuses,
+        vec![("open", "override", "in_progress", 1)],
+        "the note is not a move"
     );
 }
 
@@ -454,10 +486,11 @@ fn a_long_history_pages_by_cursor_and_loses_nothing() {
     ids.dedup();
     assert_eq!(ids.len(), n);
     assert_eq!(n, PAGE_CAP + 20);
-    // A self-loop is a visited edge too.
-    assert_eq!(
-        first.visited_status[0].count,
-        u32::try_from(PAGE_CAP + 20).unwrap()
+    // A row no machine has (`move`, open -> open) is on the timeline but is not a move.
+    assert!(
+        first.visited_status.is_empty(),
+        "{:?}",
+        first.visited_status
     );
 }
 
@@ -494,4 +527,72 @@ fn a_registry_events_id_does_not_move_when_another_process_is_seen() {
             .collect::<Vec<_>>()
     };
     assert_eq!(ids(&before), ids(&after));
+}
+
+#[test]
+fn a_sessions_pages_read_each_source_to_a_page_and_lose_nothing_across_them() {
+    let db = db();
+    let a = new_task(&db, "task:a");
+    let b = new_task(&db, "task:b");
+    let n = PAGE_CAP + 150;
+    with(&db, move |c| {
+        registry(c, S1, T0 - MIN, None);
+        bind(c, S1, "agent-x", b);
+        let owner = format!("session:12@{S1}:/tmp/wt");
+        for i in 0..n {
+            let at = T0 + i64::try_from(i / 3).unwrap();
+            // Two sources interleaved in time, with ties, and the other session's rows between.
+            status_move(c, a, at, Some("open"), "open", Some(&owner));
+            phase_move(
+                c,
+                b,
+                at,
+                Some("implement"),
+                "review",
+                "swarm-implementer@agent-x",
+            );
+            status_move(
+                c,
+                a,
+                at,
+                Some("open"),
+                "open",
+                Some(&format!("session:3@{S2}:/w")),
+            );
+        }
+    });
+    let mut seen = Vec::new();
+    let mut after: Option<String> = None;
+    let mut pages = 0;
+    loop {
+        let cursor = after.clone();
+        let p = db
+            .read(move |c| session(c, S1, cursor.as_deref(), T0))
+            .unwrap();
+        assert!(p.events.len() <= PAGE_CAP);
+        pages += 1;
+        seen.extend(p.events.iter().map(|e| (e.at_ms, e.source, e.id)));
+        // Every page heads with the session's whole summary, not the page's.
+        assert_eq!(
+            p.summary.last_event_ms,
+            Some(T0 + i64::try_from((n - 1) / 3).unwrap())
+        );
+        match p.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert!(pages >= 3, "{pages}");
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(seen, sorted, "in order, and nothing twice");
+    // The registry start, and both of S1's sources in full; none of S2's.
+    assert_eq!(seen.len(), 1 + 2 * n);
+    let overview = db.read(|c| sessions(c, T0)).unwrap();
+    let s1 = overview.sessions.iter().find(|s| s.session == S1).unwrap();
+    assert_eq!(
+        s1.last_event_ms,
+        Some(T0 + i64::try_from((n - 1) / 3).unwrap())
+    );
 }

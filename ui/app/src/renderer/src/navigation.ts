@@ -23,6 +23,8 @@ export interface TimelineRequest {
 }
 
 export interface Navigation {
+  /** The tab on screen: a pane stays mounted when hidden, so one that re-reads on show asks this. */
+  readonly active: TabId | undefined;
   goTo(tab: TabId): void;
   /** Show the Design tab with this design open. */
   openDesign(uid: string): void;
@@ -35,6 +37,7 @@ export interface Navigation {
 }
 
 export const NavigationContext = createContext<Navigation>({
+  active: undefined,
   goTo: () => undefined,
   openDesign: () => undefined,
   designRequest: undefined,

@@ -80,6 +80,7 @@ function Shell(): React.JSX.Element {
 
   const navigation = useMemo<Navigation>(
     () => ({
+      active,
       goTo: (tab) => select(tab, false),
       openDesign: (uid) => {
         setDesignRequest((r) => ({ uid, seq: (r?.seq ?? 0) + 1 }));
@@ -92,7 +93,7 @@ function Shell(): React.JSX.Element {
       },
       timelineRequest,
     }),
-    [select, designRequest, timelineRequest],
+    [active, select, designRequest, timelineRequest],
   );
 
   // Cmd/Ctrl+1…5 from anywhere in the window.

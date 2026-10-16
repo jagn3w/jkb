@@ -182,7 +182,13 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
     status: "needs_review",
     workflow: {
       states: [state("implement", true), state("review")],
-      transitions: [edge("implement", "submit_work", "review"), edge("review", "request_changes", "implement"), edge("review", "override", null)],
+      transitions: [
+        edge("implement", "submit_work", "review"),
+        // A second row between the same two states: never taken, so never inked.
+        edge("implement", "submit_systemic", "review"),
+        edge("review", "request_changes", "implement"),
+        edge("review", "override", null),
+      ],
     },
     lifecycle: { states: [state("open", true)], transitions: [] },
   };
@@ -196,7 +202,11 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
     session: {
       summary,
       tasks: [{ uid: "task:a", title: "Task A", status: "needs_review", holds_claim: true, claimed_at_ms: T - H, bound_agents: ["agent-x"] }],
-      events: [ev({ source: "session", task: null, event: "start", at_ms: T - H, from: null, to: null }), ev({})],
+      events: [
+        ev({ source: "session", task: null, event: "start", at_ms: T - H, from: null, to: null }),
+        ev({}),
+        ev({ source: "exec_request", id: 9, at_ms: T + 1 }),
+      ],
       next: null,
     },
     task: {
@@ -208,8 +218,10 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
         claim: null,
         landing: { state: "none", branch: null, onto: null, pr: null, at_ms: null },
         visited: [
-          { from: "implement", to: "review", count: 2, last_at_ms: T },
-          { from: "review", to: "design", count: 1, last_at_ms: T },
+          { from: "implement", event: "submit_work", to: "review", count: 2, last_at_ms: T },
+          { from: "review", event: "override", to: "design", count: 1, last_at_ms: T },
+          { from: "review", event: "override", to: "implement", count: 2, last_at_ms: T },
+          { from: "design", event: "approve_design", to: "implement", count: 1, last_at_ms: T },
         ],
         visited_status: [],
         events: [ev({})],
@@ -238,16 +250,63 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
   // A session: a lane for its own starts and one per task, and a tick per event.
   assert.match(html.session, /aria-label="Swimlanes"/);
   assert.equal((html.session.match(/class="lane-track"/g) ?? []).length, 2);
-  assert.equal((html.session.match(/class="lane-tick"/g) ?? []).length, 2);
+  assert.equal((html.session.match(/class="lane-tick"/g) ?? []).length, 3);
+  // A source this app does not know (a newer jkb serve's) is drawn, neutrally.
+  assert.match(html.session, /class="lane-tick" data-source="other"/);
   assert.match(html.session, /data-holds="true"/);
   // A task: its path inked and counted over its strategy's machine, and the override it took listed.
   assert.match(html.task, /class="machine-edge"[^>]*data-visited="true"/);
   assert.match(html.task, /submit_work ×2/);
   assert.match(html.task, /data-visited="true"[^>]*transform/);
   assert.match(html.task, /<th>taken<\/th>/);
-  assert.match(html.task, /review → design ×1/);
+  // Keyed by (from, event): the untaken row between the same states is not inked.
+  assert.match(html.task, /<g class="machine-edge"><path [^>]*><\/path><text [^>]*>submit_systemic</);
+  assert.match(html.task, /<tr data-visited="true"><td>implement<\/td><td>submit_work<\/td>/);
+  assert.match(html.task, /<tr><td>implement<\/td><td>submit_systemic<\/td>/);
+  // An override is one row whatever its destination: its count is summed.
+  assert.match(html.task, /<td>review<\/td><td>override<\/td><td>\(stated\)<\/td><td>[^<]*<\/td><td>3<\/td>/);
+  // A move this graph has no row for is listed, not dropped.
+  assert.match(html.task, /design --approve_design--&gt; implement ×1/);
   // A plan: hourly bins, stacked, through now.
   assert.match(html.plan, /aria-label="Plan progress by hour"/);
   assert.equal((html.plan.match(/<g transform="translate/g) ?? []).length, 4, "four hours, the last running to now");
   assert.match(html.plan, /data-band="done"/);
+});
+
+// Which answer may land (the Timeline pane's `asks.ts`), without a window.
+test("asks are numbered per scope, a stale page is dropped, and showing the tab re-reads unless a link shows it", async () => {
+  const { ask, latest, newAsks, onLinked, onShown, pageApplies } = await load(path.join(src, "executions", "asks.ts"));
+  // An overview in flight, then a task asked for: the overview's answer still lands.
+  const asks = newAsks();
+  const overview = ask(asks, "sessions");
+  const task = ask(asks, "task");
+  assert.equal(latest(asks, "sessions", overview), true, "another scope's ask does not strand it");
+  assert.equal(latest(asks, "task", task), true);
+  assert.equal(latest(asks, "task", ask(asks, "task") - 1), false, "a newer ask in the same scope does");
+
+  // A page asked for session A lands on A at the end it was asked from, and nowhere else.
+  assert.equal(pageApplies({ id: "a", next: "c1" }, "a", "c1"), true);
+  assert.equal(pageApplies({ id: "b", next: "c9" }, "a", "c1"), false, "the operator opened B meanwhile");
+  assert.equal(pageApplies({ id: "a", next: "c2" }, "a", "c1"), false, "A was re-read meanwhile");
+  assert.equal(pageApplies(undefined, "a", "c1"), false);
+
+  // Hidden at start; shown: re-read. Hidden and shown again: re-read again.
+  let st = { wasShown: false, linked: false };
+  let r = onShown(st, false);
+  assert.equal(r.reRead, false);
+  r = onShown(r.next, true);
+  assert.equal(r.reRead, true, "first shown");
+  r = onShown(r.next, true);
+  assert.equal(r.reRead, false, "still shown: no re-read");
+  r = onShown(r.next, false);
+  r = onShown(r.next, true);
+  assert.equal(r.reRead, true, "shown again");
+  // A link that shows the tab names what to read: no second read.
+  st = onLinked(onShown(r.next, false).next);
+  r = onShown(st, true);
+  assert.equal(r.reRead, false);
+  // A link followed while the tab is already shown leaves the next showing's re-read alone.
+  st = onLinked(r.next);
+  r = onShown(onShown(st, false).next, true);
+  assert.equal(r.reRead, true);
 });

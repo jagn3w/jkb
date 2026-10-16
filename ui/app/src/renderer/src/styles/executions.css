@@ -181,3 +181,14 @@
   font-family: var(--font-mono);
   padding-left: var(--space-4);
 }
+
+.timeline-asof {
+  font-size: var(--text-sm);
+  margin-right: var(--space-2);
+}
+
+/* A source this app does not know (a newer jkb serve's): drawn, neutrally. */
+.lane-tick[data-source="other"] {
+  stroke: var(--ink-faint);
+  stroke-dasharray: 1 2;
+}

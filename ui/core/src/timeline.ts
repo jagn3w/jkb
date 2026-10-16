@@ -6,17 +6,25 @@
 // and `crates/jkb-api/src/timeline.rs` carries it. Nothing here re-decides any of it: the renderer
 // draws what was derived once, in Rust.
 //
-// The decoders refuse a field they do not know (the timeline design's rule for these answers): an
-// answer with a field this app cannot read is reported, never half-drawn. The one exception is the
-// strategy's graph, which is `workflow.graph`'s answer and decoded by its own decoder.
+// The decoders follow the wire's version-skew rule: response fields are only ever added, so a field
+// this app does not know is ignored, and a source it does not know is kept as an opaque name and
+// drawn neutrally. A newer `jkb serve` never blanks the timeline. The strategy's graph is
+// `workflow.graph`'s answer, decoded by its own decoder.
 
 import type { OpResponse, Outcome } from "./daemon.js";
 import { failed } from "./daemon.js";
 import { decodeWorkflowGraph, type WorkflowGraph } from "./workflows.js";
 
-/** `jkb_core::timeline::Source`: which record an event came from. */
-export type TimelineSource = "session" | "claim" | "status" | "workflow" | "review";
-export const TIMELINE_SOURCES: readonly TimelineSource[] = ["session", "claim", "status", "workflow", "review"];
+/** `jkb_core::timeline::Source`s this app knows how to draw; any other is drawn neutrally. */
+export const TIMELINE_SOURCES = ["session", "claim", "status", "workflow", "review"] as const;
+
+/** Which record an event came from: one of [`TIMELINE_SOURCES`], or a newer one kept by name. */
+export type TimelineSource = string;
+
+/** Whether this app draws `source` as its own kind, rather than neutrally. */
+export function knownSource(source: string): source is (typeof TIMELINE_SOURCES)[number] {
+  return (TIMELINE_SOURCES as readonly string[]).includes(source);
+}
 
 /** `jkb_core::timeline::Event`. */
 export interface TimelineEvent {
@@ -82,9 +90,11 @@ export interface SessionTimeline {
   readonly next: string | null;
 }
 
-/** `jkb_core::timeline::Visited`: an edge a task's history took. */
+/** `jkb_core::timeline::Visited`: a transition a task's history took — a row of its machine, keyed
+ * as the table keys rows, by `from` and `event`. */
 export interface VisitedEdge {
   readonly from: string;
+  readonly event: string;
   readonly to: string;
   readonly count: number;
   readonly last_at_ms: number;
@@ -168,19 +178,11 @@ const optString = (v: unknown): v is string | null | undefined => v === null || 
 const optNumber = (v: unknown): v is number | null | undefined => v === null || v === undefined || isNumber(v);
 const nul = <T>(v: T | null | undefined): T | null => (v === undefined ? null : v);
 
-/** Every key of `v` is one of `keys`: an unknown field refuses the answer. */
-function only(v: Rec, keys: readonly string[]): boolean {
-  return Object.keys(v).every((k) => keys.includes(k));
-}
-
-const EVENT_KEYS = ["at_ms", "source", "id", "task", "event", "from", "to", "actor", "role", "reason", "detail"];
-
 function event(v: unknown): TimelineEvent | undefined {
   if (
     !isObject(v) ||
-    !only(v, EVENT_KEYS) ||
     !isNumber(v["at_ms"]) ||
-    !(TIMELINE_SOURCES as readonly unknown[]).includes(v["source"]) ||
+    !isString(v["source"]) ||
     !isNumber(v["id"]) ||
     !isString(v["event"]) ||
     !["task", "from", "to", "actor", "role", "reason", "detail"].every((k) => optString(v[k]))
@@ -189,7 +191,7 @@ function event(v: unknown): TimelineEvent | undefined {
   }
   return {
     at_ms: v["at_ms"],
-    source: v["source"] as TimelineSource,
+    source: v["source"],
     id: v["id"],
     task: nul(v["task"] as string | null | undefined),
     event: v["event"],
@@ -214,22 +216,9 @@ function all<T>(v: unknown, one: (x: unknown) => T | undefined): T[] | undefined
   return out;
 }
 
-const SUMMARY_KEYS = [
-  "session",
-  "state",
-  "cwd",
-  "started_at_ms",
-  "ended_at_ms",
-  "claims",
-  "last_event_ms",
-  "stalled",
-  "stalled_for_ms",
-];
-
 function summary(v: unknown): SessionSummary | undefined {
   if (
     !isObject(v) ||
-    !only(v, SUMMARY_KEYS) ||
     !isString(v["session"]) ||
     !isString(v["state"]) ||
     !optString(v["cwd"]) ||
@@ -258,7 +247,6 @@ function summary(v: unknown): SessionSummary | undefined {
 function heldClaim(v: unknown): HeldClaim | undefined {
   if (
     !isObject(v) ||
-    !only(v, ["uid", "title", "status", "owner", "claimed_at_ms"]) ||
     !isString(v["uid"]) ||
     !isString(v["title"]) ||
     !optString(v["status"]) ||
@@ -273,7 +261,6 @@ function heldClaim(v: unknown): HeldClaim | undefined {
 function sessionTask(v: unknown): SessionTask | undefined {
   if (
     !isObject(v) ||
-    !only(v, ["uid", "title", "status", "holds_claim", "claimed_at_ms", "bound_agents"]) ||
     !isString(v["uid"]) ||
     !isString(v["title"]) ||
     !optString(v["status"]) ||
@@ -297,21 +284,20 @@ function sessionTask(v: unknown): SessionTask | undefined {
 function visited(v: unknown): VisitedEdge | undefined {
   if (
     !isObject(v) ||
-    !only(v, ["from", "to", "count", "last_at_ms"]) ||
     !isString(v["from"]) ||
+    !isString(v["event"]) ||
     !isString(v["to"]) ||
     !isNumber(v["count"]) ||
     !isNumber(v["last_at_ms"])
   ) {
     return undefined;
   }
-  return { from: v["from"], to: v["to"], count: v["count"], last_at_ms: v["last_at_ms"] };
+  return { from: v["from"], event: v["event"], to: v["to"], count: v["count"], last_at_ms: v["last_at_ms"] };
 }
 
 function landing(v: unknown): TaskLanding | undefined {
   if (
     !isObject(v) ||
-    !only(v, ["state", "branch", "onto", "pr", "at_ms"]) ||
     !isString(v["state"]) ||
     !optString(v["branch"]) ||
     !optString(v["onto"]) ||
@@ -325,7 +311,7 @@ function landing(v: unknown): TaskLanding | undefined {
 
 function taskClaim(v: unknown): TaskClaim | null | undefined {
   if (v === null || v === undefined) return null;
-  if (!isObject(v) || !only(v, ["owner", "claimed_at_ms"]) || !isString(v["owner"]) || !optNumber(v["claimed_at_ms"])) {
+  if (!isObject(v) || !isString(v["owner"]) || !optNumber(v["claimed_at_ms"])) {
     return undefined;
   }
   return { owner: v["owner"], claimed_at_ms: nul(v["claimed_at_ms"]) };
@@ -334,7 +320,6 @@ function taskClaim(v: unknown): TaskClaim | null | undefined {
 function planPoint(v: unknown): PlanPoint | undefined {
   if (
     !isObject(v) ||
-    !only(v, ["at_ms", "open", "in_progress", "done", "cancelled"]) ||
     !isNumber(v["at_ms"]) ||
     !isNumber(v["open"]) ||
     !isNumber(v["in_progress"]) ||
@@ -348,7 +333,7 @@ function planPoint(v: unknown): PlanPoint | undefined {
 
 /** The `field` of a `result` answer, or `undefined` when the answer is another. */
 function field(o: OpResponse, result: string, name: string): unknown {
-  if (o.result !== result || !only(o as Rec, ["result", name])) return undefined;
+  if (o.result !== result) return undefined;
   return o[name];
 }
 
@@ -358,7 +343,7 @@ const malformed = <T>(result: string): Outcome<T> => failed("internal", `jkb ser
 export function decodeTimelineOverview(o: Outcome<OpResponse>): Outcome<TimelineOverview> {
   if (!o.ok) return o;
   const v = field(o.value, "timeline_sessions", "overview");
-  if (!isObject(v) || !only(v, ["now_ms", "sessions", "unattributed"]) || !isNumber(v["now_ms"])) {
+  if (!isObject(v) || !isNumber(v["now_ms"])) {
     return malformed("timeline_sessions");
   }
   const sessions = all(v["sessions"], summary);
@@ -371,7 +356,7 @@ export function decodeTimelineOverview(o: Outcome<OpResponse>): Outcome<Timeline
 export function decodeSessionTimeline(o: Outcome<OpResponse>): Outcome<SessionTimeline> {
   if (!o.ok) return o;
   const v = field(o.value, "timeline_session", "timeline");
-  if (!isObject(v) || !only(v, ["summary", "tasks", "events", "next"]) || !optString(v["next"])) {
+  if (!isObject(v) || !optString(v["next"])) {
     return malformed("timeline_session");
   }
   const s = summary(v["summary"]);
@@ -381,17 +366,14 @@ export function decodeSessionTimeline(o: Outcome<OpResponse>): Outcome<SessionTi
   return { ok: true, value: { summary: s, tasks, events, next: nul(v["next"]) } };
 }
 
-const TASK_KEYS = ["uid", "title", "status", "strategy", "claim", "landing", "visited", "visited_status", "events", "next"];
-
 /** `timeline.task`'s answer. */
 export function decodeTaskTimeline(o: Outcome<OpResponse>): Outcome<TaskView> {
   if (!o.ok) return o;
   const view = field(o.value, "timeline_task", "task");
-  if (!isObject(view) || !only(view, ["timeline", "graph"])) return malformed("timeline_task");
+  if (!isObject(view)) return malformed("timeline_task");
   const t = view["timeline"];
   if (
     !isObject(t) ||
-    !only(t, TASK_KEYS) ||
     !isString(t["uid"]) ||
     !isString(t["title"]) ||
     !optString(t["status"]) ||
@@ -433,7 +415,7 @@ export function decodeTaskTimeline(o: Outcome<OpResponse>): Outcome<TaskView> {
 export function decodePlanTimeline(o: Outcome<OpResponse>): Outcome<PlanTimeline> {
   if (!o.ok) return o;
   const v = field(o.value, "timeline_plan", "plan");
-  if (!isObject(v) || !only(v, ["uid", "title", "tasks", "points"]) || !isString(v["uid"]) || !isString(v["title"]) || !isNumber(v["tasks"])) {
+  if (!isObject(v) || !isString(v["uid"]) || !isString(v["title"]) || !isNumber(v["tasks"])) {
     return malformed("timeline_plan");
   }
   const points = all(v["points"], planPoint);

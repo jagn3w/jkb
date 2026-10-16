@@ -4,6 +4,7 @@ import {
   binPlan,
   binUnitFor,
   decodePlanTimeline,
+  knownSource,
   decodeSessionTimeline,
   decodeTaskTimeline,
   decodeTimelineOverview,
@@ -19,6 +20,7 @@ import {
 
 import { useNavigation, type TimelineScope } from "../navigation";
 import { LifecyclePane } from "../workflows/LifecyclePane";
+import { ask, latest, newAsks, onLinked, onShown, pageApplies, type ShowState } from "./asks";
 
 const op = (request: Parameters<typeof window.jkb.op>[0]) => window.jkb.op(request);
 
@@ -49,6 +51,16 @@ function appended<T extends { readonly events: readonly TimelineEvent[]; readonl
   return { ...page, events: [...was.events, ...page.events] };
 }
 
+/** A session's next page added to what is shown: its events after, its lanes unioned in order. */
+function appendedSession(was: SessionTimeline, page: SessionTimeline): SessionTimeline {
+  const known = new Set(was.tasks.map((t) => t.uid));
+  return { ...appended(was, page), tasks: [...was.tasks, ...page.tasks.filter((t) => !known.has(t.uid))] };
+}
+
+/** How a source is drawn: as its own kind, or neutrally when this app does not know it. */
+const drawn = (source: string): string => (knownSource(source) ? source : "other");
+
+
 /**
  * The Timeline section of the Executions tab: the lifecycle being applied, read from facts jkb
  * already records (`timeline.*`, the Executions design). Sessions at work (and which have stalled),
@@ -58,7 +70,7 @@ function appended<T extends { readonly events: readonly TimelineEvent[]; readonl
  * — never polled: no topic carries transitions.
  */
 export function TimelinePane(): React.JSX.Element {
-  const { timelineRequest } = useNavigation();
+  const { timelineRequest, active } = useNavigation();
   const [scope, setScope] = useState<Picked>("sessions");
   const [session, setSession] = useState<string | undefined>(undefined);
   const [taskUid, setTaskUid] = useState("");
@@ -67,49 +79,49 @@ export function TimelinePane(): React.JSX.Element {
   const [sessionView, setSessionView] = useState<Loaded<SessionTimeline>>({ kind: "idle" });
   const [taskView, setTaskView] = useState<Loaded<TaskView>>({ kind: "idle" });
   const [planView, setPlanView] = useState<Loaded<PlanTimeline>>({ kind: "idle" });
-  // Each ask is numbered and only the latest answer is kept, so a slow earlier one cannot land last.
-  const asked = useRef(0);
+  // Each ask is numbered within its scope and only the latest answer is kept, so a slow earlier one
+  // cannot land last, and an ask in one scope never strands another's.
+  const asked = useRef(newAsks());
 
   const show = useCallback(async (what: TimelineScope, id: string) => {
-    const mine = ++asked.current;
+    const mine = ask(asked.current, what);
+    const current = (): boolean => latest(asked.current, what, mine);
     const now = Date.now();
     const fail = (message: string) => ({ kind: "failed" as const, message });
     switch (what) {
       case "sessions": {
         setOverview({ kind: "loading" });
         const a = decodeTimelineOverview(await op(timelineOps.sessions()));
-        if (mine === asked.current) setOverview(a.ok ? { kind: "loaded", value: a.value, at: a.value.now_ms } : fail(a.error.message));
+        if (current()) setOverview(a.ok ? { kind: "loaded", value: a.value, at: a.value.now_ms } : fail(a.error.message));
         return;
       }
       case "session": {
         setSessionView({ kind: "loading" });
         const a = decodeSessionTimeline(await op(timelineOps.session(id)));
-        if (mine === asked.current) setSessionView(a.ok ? { kind: "loaded", value: a.value, at: now } : fail(a.error.message));
+        if (current()) setSessionView(a.ok ? { kind: "loaded", value: a.value, at: now } : fail(a.error.message));
         return;
       }
       case "task": {
         setTaskView({ kind: "loading" });
         const a = decodeTaskTimeline(await op(timelineOps.task(id)));
-        if (mine === asked.current) setTaskView(a.ok ? { kind: "loaded", value: a.value, at: now } : fail(a.error.message));
+        if (current()) setTaskView(a.ok ? { kind: "loaded", value: a.value, at: now } : fail(a.error.message));
         return;
       }
       case "plan": {
         setPlanView({ kind: "loading" });
         const a = decodePlanTimeline(await op(timelineOps.plan(id)));
-        if (mine === asked.current) setPlanView(a.ok ? { kind: "loaded", value: a.value, at: now } : fail(a.error.message));
+        if (current()) setPlanView(a.ok ? { kind: "loaded", value: a.value, at: now } : fail(a.error.message));
         return;
       }
     }
   }, []);
 
-  // The overview on first show.
-  useEffect(() => {
-    void show("sessions", "");
-  }, [show]);
-
-  // A link from another tab.
+  // A link from another tab. Declared before the re-read on show, which it pre-empts: both run in
+  // the commit that shows the tab, and the link names what to show.
+  const showing = useRef<ShowState>({ wasShown: false, linked: false });
   useEffect(() => {
     if (timelineRequest === undefined) return;
+    showing.current = onLinked(showing.current);
     const { scope: s, id } = timelineRequest;
     if (s === "sessions" || s === "session") {
       setScope("sessions");
@@ -130,6 +142,20 @@ export function TimelinePane(): React.JSX.Element {
     else if (scope === "plan" && planUid.trim() !== "") void show("plan", planUid.trim());
   };
 
+  // Re-read what is shown each time the tab is shown: every pane is mounted at start, and a list read
+  // hours ago would show no session as stalled that has gone quiet since.
+  const refreshNow = useRef(refresh);
+  refreshNow.current = refresh;
+  const shown = active === "executions";
+  useEffect(() => {
+    const { reRead, next } = onShown(showing.current, shown);
+    showing.current = next;
+    if (reRead) refreshNow.current();
+  }, [shown]);
+
+  const view: Loaded<unknown> =
+    scope === "sessions" ? (session === undefined ? overview : sessionView) : scope === "task" ? taskView : planView;
+
   const openSession = (id: string): void => {
     setSession(id);
     void show("session", id);
@@ -140,14 +166,29 @@ export function TimelinePane(): React.JSX.Element {
     void show("task", uid);
   };
 
+  // The next page, numbered with its scope's asks and applied only to the view it was asked from: a
+  // page that arrives after the operator opened another session or task is dropped.
   const more = async (): Promise<void> => {
-    if (scope === "sessions" && sessionView.kind === "loaded" && sessionView.value.next !== null && session !== undefined) {
-      const a = decodeSessionTimeline(await op(timelineOps.session(session, sessionView.value.next)));
-      if (a.ok) setSessionView({ ...sessionView, value: appended(sessionView.value, a.value) });
+    if (scope === "sessions" && session !== undefined && sessionView.kind === "loaded" && sessionView.value.next !== null) {
+      const cursor = sessionView.value.next;
+      const mine = ask(asked.current, "session");
+      const a = decodeSessionTimeline(await op(timelineOps.session(session, cursor)));
+      if (!a.ok || !latest(asked.current, "session", mine)) return;
+      setSessionView((was) =>
+        was.kind === "loaded" && pageApplies({ id: was.value.summary.session, next: was.value.next }, session, cursor)
+          ? { ...was, value: appendedSession(was.value, a.value) }
+          : was,
+      );
     } else if (scope === "task" && taskView.kind === "loaded" && taskView.value.timeline.next !== null) {
-      const was = taskView.value;
-      const a = decodeTaskTimeline(await op(timelineOps.task(was.timeline.uid, was.timeline.next ?? undefined)));
-      if (a.ok) setTaskView({ ...taskView, value: { ...a.value, timeline: appended(was.timeline, a.value.timeline) } });
+      const { uid, next: cursor } = taskView.value.timeline;
+      const mine = ask(asked.current, "task");
+      const a = decodeTaskTimeline(await op(timelineOps.task(uid, cursor)));
+      if (!a.ok || !latest(asked.current, "task", mine)) return;
+      setTaskView((was) =>
+        was.kind === "loaded" && pageApplies({ id: was.value.timeline.uid, next: was.value.timeline.next }, uid, cursor)
+          ? { ...was, value: { ...a.value, timeline: appended(was.value.timeline, a.value.timeline) } }
+          : was,
+      );
     }
   };
 
@@ -195,6 +236,11 @@ export function TimelinePane(): React.JSX.Element {
           </form>
         )}
         <span className="spacer" />
+        {view.kind === "loaded" && (
+          <span className="muted timeline-asof" title="When this was read; Refresh, or showing the tab again, reads it anew">
+            as of {clock(view.at)}
+          </span>
+        )}
         <button type="button" className="bar-button" onClick={refresh} aria-label="Refresh timeline">
           Refresh
         </button>
@@ -363,7 +409,7 @@ export function SessionLanes({
               <title>{r.uid ?? "the session's own starts and ends"}</title>
             </text>
             {r.events.map((e) => (
-              <line key={`${e.source}-${e.id}`} x1={xOf(e.at_ms)} x2={xOf(e.at_ms)} y1={5} y2={LANE_H - 5} className="lane-tick" data-source={e.source}>
+              <line key={`${e.source}-${e.id}`} x1={xOf(e.at_ms)} x2={xOf(e.at_ms)} y1={5} y2={LANE_H - 5} className="lane-tick" data-source={drawn(e.source)}>
                 <title>{eventText(e)}</title>
               </line>
             ))}
@@ -405,7 +451,7 @@ export function EventList({ events }: { readonly events: readonly TimelineEvent[
       </thead>
       <tbody>
         {events.map((e) => (
-          <tr key={`${e.source}-${e.id}-${e.at_ms}`} data-source={e.source}>
+          <tr key={`${e.source}-${e.id}-${e.at_ms}`} data-source={drawn(e.source)}>
             <td>{clock(e.at_ms)}</td>
             <td>{e.source}</td>
             <td>{e.event}</td>

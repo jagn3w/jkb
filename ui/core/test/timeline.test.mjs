@@ -12,6 +12,7 @@ import {
   decodeSessionTimeline,
   decodeTaskTimeline,
   decodeTimelineOverview,
+  knownSource,
   spanText,
   swimlanes,
   timelineOps,
@@ -71,7 +72,7 @@ const taskTimeline = (over = {}) => ({
   strategy: null,
   claim: { owner: "session:1@s-1:/w", claimed_at_ms: MIDNIGHT },
   landing: { state: "none", branch: null, onto: null, pr: null, at_ms: null },
-  visited: [{ from: "implement", to: "review", count: 2, last_at_ms: MIDNIGHT }],
+  visited: [{ from: "implement", event: "submit_work", to: "review", count: 2, last_at_ms: MIDNIGHT }],
   visited_status: [],
   events: [ev()],
   next: null,
@@ -107,28 +108,38 @@ test("the overview decodes as the daemon writes it", () => {
   assert.equal(decodeTimelineOverview(ok({ result: "workflow_graph", graph })).ok, false);
 });
 
-test("a field the decoder does not know refuses the answer, at every level", () => {
-  const session = (timeline) => decodeSessionTimeline(ok({ result: "timeline_session", timeline }));
+test("a field the decoder does not know is ignored at every level, and an unknown source kept by name", () => {
+  // The wire's version-skew rule: a newer jkb serve adds fields, and an older app still draws.
+  const session = (timeline, extra = {}) => decodeSessionTimeline(ok({ result: "timeline_session", timeline, ...extra }));
   const page = { summary: summary(), tasks: [], events: [ev()], next: null };
   assert.equal(session(page).ok, true);
-  assert.equal(session({ ...page, extra: 1 }).ok, false, "on the page");
-  assert.equal(session({ ...page, summary: { ...summary(), extra: 1 } }).ok, false, "on the summary");
-  assert.equal(session({ ...page, events: [{ ...ev(), extra: 1 }] }).ok, false, "on an event");
-  assert.equal(session({ ...page, events: [ev({ source: "telepathy" })] }).ok, false, "an unknown source");
-  assert.equal(decodeSessionTimeline(ok({ result: "timeline_session", timeline: page, extra: 1 })).ok, false, "on the answer");
+  assert.equal(session({ ...page, extra: 1 }).ok, true, "on the page");
+  assert.equal(session({ ...page, summary: { ...summary(), pending_requests: 2 } }).ok, true, "on the summary");
+  const added = session({ ...page, events: [{ ...ev(), extra: 1 }] });
+  assert.equal(added.ok, true, "on an event");
+  assert.equal("extra" in added.value.events[0], false, "and not carried into the model");
+  assert.equal(session(page, { extra: 1 }).ok, true, "on the answer");
+  const newer = session({ ...page, events: [ev({ source: "exec_request" })] });
+  assert.equal(newer.ok, true, "a newer source");
+  assert.equal(newer.value.events[0].source, "exec_request");
+  assert.equal(knownSource("exec_request"), false);
+  assert.equal(knownSource("workflow"), true);
 
-  const task = (timeline) => decodeTaskTimeline(ok({ result: "timeline_task", task: { timeline, graph } }));
+  const task = (timeline) => decodeTaskTimeline(ok({ result: "timeline_task", task: { timeline, graph, extra: 1 } }));
   assert.equal(task(taskTimeline()).ok, true);
-  assert.equal(task({ ...taskTimeline(), extra: 1 }).ok, false);
-  assert.equal(task(taskTimeline({ landing: { state: "none", branch: null, onto: null, pr: null, at_ms: null, extra: 1 } })).ok, false);
-  assert.equal(task(taskTimeline({ visited: [{ from: "a", to: "b", count: 1, last_at_ms: 0, extra: 1 }] })).ok, false);
-  assert.equal(task(taskTimeline({ claim: { owner: "x", claimed_at_ms: null, extra: 1 } })).ok, false);
+  assert.equal(task({ ...taskTimeline(), extra: 1 }).ok, true);
+  assert.equal(task(taskTimeline({ landing: { state: "none", branch: null, onto: null, pr: null, at_ms: null, extra: 1 } })).ok, true);
+  assert.equal(task(taskTimeline({ visited: [{ from: "a", event: "e", to: "b", count: 1, last_at_ms: 0, extra: 1 }] })).ok, true);
+  assert.equal(task(taskTimeline({ claim: { owner: "x", claimed_at_ms: null, extra: 1 } })).ok, true);
 
   const plan = (p) => decodePlanTimeline(ok({ result: "timeline_plan", plan: p }));
   const p = { uid: "plan:p", title: "P", tasks: 1, points: [{ at_ms: 0, open: 1, in_progress: 0, done: 0, cancelled: 0 }] };
-  assert.equal(plan(p).ok, true);
-  assert.equal(plan({ ...p, points: [{ ...p.points[0], extra: 1 }] }).ok, false);
-  assert.equal(plan({ ...p, extra: 1 }).ok, false);
+  assert.equal(plan({ ...p, points: [{ ...p.points[0], extra: 1 }], extra: 1 }).ok, true);
+
+  // What is required still is: a missing or mistyped field refuses the answer.
+  assert.equal(session({ ...page, events: [{ ...ev(), at_ms: "soon" }] }).ok, false);
+  assert.equal(task(taskTimeline({ visited: [{ from: "a", to: "b", count: 1, last_at_ms: 0 }] })).ok, false, "a visited row names its event");
+  assert.equal(plan({ ...p, tasks: undefined }).ok, false);
 });
 
 test("a task's timeline carries its strategy's graph, decoded by workflow.graph's own decoder", () => {
