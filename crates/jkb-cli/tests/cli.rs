@@ -6277,8 +6277,6 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
         .stdout(predicate::str::contains("swarm-coordinator packaged as v3"));
 }
 
-/// `jkb workflow show --graph` prints the machines from the compiled tables, for a named strategy or
-/// the default; without `--graph` a task is required.
 /// The graph `design-gate` was `reviewed-design`: both names draw it, and a definition naming
 /// either is accepted and stored under the new name.
 #[test]
@@ -6321,6 +6319,8 @@ fn the_design_gate_graph_answers_to_its_former_name() {
     }
 }
 
+/// `jkb workflow show --graph` prints the machines from the compiled tables, for a named strategy or
+/// the default; without `--graph` a task is required.
 #[test]
 fn workflow_show_graph_prints_the_machines() {
     let dir = TempDir::new().unwrap();

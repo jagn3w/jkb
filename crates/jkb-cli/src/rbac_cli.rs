@@ -461,18 +461,18 @@ pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()>
             lands,
             repeated_area,
         } => {
-            let mut spec = match &from {
-                Some(base) => {
-                    let (list, _) = strategies(b)?;
-                    list.into_iter()
-                        .find(|s| {
-                            s.name == *base || s.name.split('@').next() == Some(base.as_str())
-                        })
-                        .with_context(|| format!("no strategy `{base}` to start from"))?
-                        .spec
-                }
-                None => json!({ "graph": jkb_core::workflow::GraphId::DesignGate.as_str() }),
-            };
+            // With no `--from`, start from the default preset as the daemon spells it. The client
+            // never writes a graph name of its own: the daemon may be an older or newer jkb than
+            // this binary, and a graph name one of them does not know is refused.
+            let base = from
+                .as_deref()
+                .unwrap_or(jkb_core::workflow::strategy::DEFAULT_PRESET);
+            let (list, _) = strategies(b)?;
+            let mut spec = list
+                .into_iter()
+                .find(|s| s.name == base || s.name.split('@').next() == Some(base))
+                .with_context(|| format!("no strategy `{base}` to start from"))?
+                .spec;
             if let Some(g) = graph {
                 spec["graph"] = json!(g);
             }
@@ -1139,9 +1139,69 @@ pub fn attest(cmd: &AttestCmd) {
 mod tests {
     use super::{
         attestation, driven, failure_line, is_blank, pre_tool_use, runs_jkb, shell_commands,
-        Attestation, Drive, BREAKS, FATAL, HARMLESS, SEPARATORS, UNQUOTABLE,
+        workflow, Attestation, Drive, WorkflowCmd, BREAKS, FATAL, HARMLESS, SEPARATORS, UNQUOTABLE,
     };
-    use serde_json::json;
+    use jkb_api::{rbac::StrategyInfo, ApiError, Backend, Request, Response};
+    use serde_json::{json, Value};
+    use std::cell::RefCell;
+
+    /// A daemon whose default preset runs a graph this binary has never heard of, recording the
+    /// spec each `workflow.define` sends.
+    struct Daemon {
+        defined: RefCell<Vec<Value>>,
+    }
+
+    const DAEMONS_GRAPH: &str = "a-graph-only-the-daemon-knows";
+
+    impl Backend for Daemon {
+        fn call(&self, request: Request) -> Result<Response, ApiError> {
+            match request {
+                Request::WorkflowStrategies {} => Ok(Response::Strategies {
+                    strategies: vec![StrategyInfo {
+                        name: jkb_core::workflow::strategy::DEFAULT_PRESET.to_owned(),
+                        preset: true,
+                        describe: String::new(),
+                        spec: json!({ "graph": DAEMONS_GRAPH }),
+                    }],
+                    default: jkb_core::workflow::strategy::DEFAULT_PRESET.to_owned(),
+                }),
+                Request::WorkflowDefine { spec, .. } => {
+                    self.defined.borrow_mut().push(spec);
+                    Ok(Response::Defined { version: 1 })
+                }
+                other => panic!("unexpected request {other:?}"),
+            }
+        }
+    }
+
+    /// With no `--from` and no `--graph`, `workflow define` sends the daemon's own default preset
+    /// spec, so an older or newer daemon is never handed a graph name this client made up.
+    #[test]
+    fn define_without_a_graph_sends_the_daemon_s_own_graph_name() {
+        let b = Daemon {
+            defined: RefCell::new(Vec::new()),
+        };
+        workflow(
+            &b,
+            WorkflowCmd::Define {
+                name: "mine".into(),
+                from: None,
+                graph: None,
+                approves_design: Some("operator,coordinator".into()),
+                lands: None,
+                repeated_area: None,
+            },
+            true,
+        )
+        .unwrap();
+        let sent = b.defined.borrow();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["graph"], DAEMONS_GRAPH, "{}", sent[0]);
+        assert_eq!(
+            sent[0]["toggles"]["approves_design"],
+            json!(["operator", "coordinator"])
+        );
+    }
 
     /// A line of `attest-hook.log` can be dated: it opens with the RFC 3339 UTC stamp and pid that
     /// `serve.log` lines carry, then names the failed call and why.
