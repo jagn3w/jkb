@@ -197,10 +197,8 @@ fn the_graph_is_the_compiled_table_with_the_strategys_permissions() {
     };
     let g = graph(json!({ "op": "workflow.graph" }));
     assert_eq!(g.strategy, "design-reviewed", "the default");
-    assert_eq!(g.graph, "reviewed-design");
-    let table = jkb_core::workflow::GraphId::ReviewedDesign
-        .machine()
-        .table();
+    assert_eq!(g.graph, "design-gate");
+    let table = jkb_core::workflow::GraphId::DesignGate.machine().table();
     assert_eq!(g.workflow.transitions.len(), table.transitions.len());
     assert_eq!(g.workflow.states.len(), table.states.len());
     let design = &g.workflow.states[0];
@@ -267,7 +265,7 @@ fn the_graph_is_the_compiled_table_with_the_strategys_permissions() {
     assert_eq!(t.phase.as_deref(), Some("design"));
     assert_eq!(t.status.as_deref(), Some("open"));
     assert_eq!(t.strategy, "coordinated");
-    assert_eq!(t.graph, "reviewed-design");
+    assert_eq!(t.graph, "design-gate");
     assert_eq!(
         edge(&t, "design_review", "approve_design").roles,
         vec!["operator", "coordinator"]

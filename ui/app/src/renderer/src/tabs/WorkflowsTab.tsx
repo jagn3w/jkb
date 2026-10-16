@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
+  agentSetsOf,
   decodeAgents,
   decodeStrategies,
   decodeWorkflowGraph,
   planOps,
   strategyName,
   workflowOps,
-  workflowsOf,
   type AgentList,
   type Strategies,
   type WorkflowGraph,
@@ -17,7 +17,8 @@ import { AgentGraphView } from "../workflows/AgentGraphView";
 import { AgentPanel } from "../workflows/AgentPanel";
 import { LifecyclePane } from "../workflows/LifecyclePane";
 
-/** The last workflow and agent, per-window conveniences (D53.1): the only state the tab keeps itself. */
+/** The last agent set and agent, per-window conveniences (D53.1): the only state the tab keeps itself. */
+// The key predates the name "agent set" and keeps its old spelling so a remembered pick survives.
 const LAST_WORKFLOW_KEY = "jkb.app.workflows.workflow";
 const LAST_AGENT_KEY = "jkb.app.workflows.agent";
 
@@ -60,7 +61,7 @@ export function WorkflowsTab(): React.JSX.Element {
   const [strategies, setStrategies] = useState<Strategies | undefined>(undefined);
   const [strategy, setStrategy] = useState<string | undefined>(undefined);
   const [graph, setGraph] = useState<Loaded<WorkflowGraph>>({ kind: "loading" });
-  const [workflow, setWorkflow] = useState<string | undefined>(() => remembered(LAST_WORKFLOW_KEY));
+  const [agentSet, setAgentSet] = useState<string | undefined>(() => remembered(LAST_WORKFLOW_KEY));
   const [selected, setSelected] = useState<string | undefined>(() => remembered(LAST_AGENT_KEY));
   const [notice, setNotice] = useState<{ readonly text: string; readonly failed: boolean } | undefined>(undefined);
 
@@ -95,13 +96,13 @@ export function WorkflowsTab(): React.JSX.Element {
 
   const list = useMemo(() => (agents.kind === "loaded" ? agents.value.agents : []), [agents]);
   const roles = agents.kind === "loaded" ? agents.value.roles : [];
-  const workflows = useMemo(() => workflowsOf(list), [list]);
-  const activeWorkflow = workflow !== undefined && workflows.includes(workflow) ? workflow : workflows[0];
-  const agent = list.find((a) => a.name === selected && a.workflow === activeWorkflow);
-  const fragments = list.filter((a) => a.workflow === activeWorkflow && a.fragment);
+  const agentSets = useMemo(() => agentSetsOf(list), [list]);
+  const activeAgentSet = agentSet !== undefined && agentSets.includes(agentSet) ? agentSet : agentSets[0];
+  const agent = list.find((a) => a.name === selected && a.workflow === activeAgentSet);
+  const fragments = list.filter((a) => a.workflow === activeAgentSet && a.fragment);
 
-  const pickWorkflow = (w: string): void => {
-    setWorkflow(w);
+  const pickAgentSet = (w: string): void => {
+    setAgentSet(w);
     remember(LAST_WORKFLOW_KEY, w);
   };
   const pick = (name: string): void => {
@@ -123,9 +124,9 @@ export function WorkflowsTab(): React.JSX.Element {
       <header className="design-bar">
         <h1>Workflows</h1>
         <label className="picker">
-          <span>Workflow</span>
-          <select value={activeWorkflow ?? ""} disabled={workflows.length === 0} onChange={(e) => pickWorkflow(e.target.value)} aria-label="Workflow">
-            {workflows.map((w) => (
+          <span>Agent set</span>
+          <select value={activeAgentSet ?? ""} disabled={agentSets.length === 0} onChange={(e) => pickAgentSet(e.target.value)} aria-label="Agent set">
+            {agentSets.map((w) => (
               <option key={w} value={w}>
                 {w}
               </option>
@@ -192,10 +193,10 @@ export function WorkflowsTab(): React.JSX.Element {
                 <p className="muted plan-hint">Cannot list agent templates: {agents.message}</p>
               ) : agents.kind === "loading" ? (
                 <p className="muted plan-hint">Loading agents…</p>
-              ) : activeWorkflow === undefined ? (
+              ) : activeAgentSet === undefined ? (
                 <p className="muted plan-hint">No agent templates.</p>
               ) : (
-                <AgentGraphView agents={list} workflow={activeWorkflow} selected={agent?.name} onSelect={pick} />
+                <AgentGraphView agents={list} workflow={activeAgentSet} selected={agent?.name} onSelect={pick} />
               )}
             </div>
           </section>

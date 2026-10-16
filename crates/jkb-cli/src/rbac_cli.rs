@@ -138,7 +138,7 @@ pub enum WorkflowCmd {
         /// Start from this preset or definition.
         #[arg(long)]
         from: Option<String>,
-        /// reviewed-design or direct.
+        /// The graph: design-gate or direct (the former name reviewed-design is still accepted).
         #[arg(long)]
         graph: Option<String>,
         /// Who approves designs, comma-separated (operator, coordinator).
@@ -155,7 +155,7 @@ pub enum WorkflowCmd {
     Strategies,
     /// Print a graph as Graphviz dot.
     Dot {
-        /// reviewed-design or direct.
+        /// The graph: design-gate or direct (the former name reviewed-design is still accepted).
         graph: String,
     },
     /// The agent templates the coordinator sessions give themselves and their workers (design D53.7): packaged ones
@@ -471,7 +471,7 @@ pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()>
                         .with_context(|| format!("no strategy `{base}` to start from"))?
                         .spec
                 }
-                None => json!({ "graph": "reviewed-design" }),
+                None => json!({ "graph": jkb_core::workflow::GraphId::DesignGate.as_str() }),
             };
             if let Some(g) = graph {
                 spec["graph"] = json!(g);
@@ -531,7 +531,7 @@ pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()>
         WorkflowCmd::Agent { cmd } => crate::agent_cli::run(b, cmd, json_out),
         WorkflowCmd::Dot { graph } => {
             let g = jkb_core::workflow::GraphId::parse(&graph)
-                .with_context(|| format!("no graph `{graph}` (reviewed-design, direct)"))?;
+                .with_context(|| format!("no graph `{graph}` (design-gate, direct)"))?;
             print!("{}", g.machine().dot(g.as_str()));
             Ok(())
         }
@@ -549,7 +549,7 @@ fn show_graph(
         return unexpected("workflow.graph", &r);
     };
     print(json_out, &json!(graph), || {
-        println!("strategy:  {} ({})", graph.strategy, graph.graph);
+        println!("strategy:  {} ({} graph)", graph.strategy, graph.graph);
         if let Some(task) = &graph.task {
             println!(
                 "task:      {task} — phase {}, status {}",

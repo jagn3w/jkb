@@ -137,7 +137,7 @@ export function AgentPanel({
       </header>
       <div className="pane-body agent-fields">
         <p className="muted plan-hint">
-          {agent.workflow}
+          agent set: {agent.workflow}
           {agent.based_on !== null ? ` · copied from ${agent.based_on}` : ""}
           {agent.overrides_packaged && agent.packaged_version !== null ? ` · overrides packaged v${agent.packaged_version}` : ""}
         </p>

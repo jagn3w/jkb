@@ -295,7 +295,9 @@ test("the Workflows tab says why it has no agents when the daemon is unreachable
   await page.getByRole("tab", { name: "Workflows", exact: true }).click();
   const pane = page.locator("#pane-workflows");
   await pane.locator(".plan-hint", { hasText: "Cannot list agent templates" }).waitFor();
-  assert.equal(await pane.getByRole("combobox", { name: "Workflow" }).isDisabled(), true);
+  assert.equal(await pane.getByRole("combobox", { name: "Agent set" }).isDisabled(), true);
+  // "Workflow" no longer names the agent set: the picker is the only header control it could be.
+  assert.equal(await pane.getByRole("combobox", { name: "Workflow", exact: true }).count(), 0);
 });
 
 // The Sessions tab (D53.9): with no daemon there is no registry to list and no notification to dot,

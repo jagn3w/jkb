@@ -57,9 +57,9 @@ fn the_two_graphs_differ_in_exactly_where_a_design_goes() {
         Outcome::Moved { to, .. } => to,
         other => panic!("{other:?}"),
     };
-    assert_eq!(to(GraphId::ReviewedDesign), Phase::DesignReview);
+    assert_eq!(to(GraphId::DesignGate), Phase::DesignReview);
     assert_eq!(to(GraphId::Direct), Phase::Implement);
-    assert!(GraphId::ReviewedDesign.reaches_unforced(Phase::DesignReview));
+    assert!(GraphId::DesignGate.reaches_unforced(Phase::DesignReview));
     assert!(
         !GraphId::Direct.reaches_unforced(Phase::DesignReview),
         "only an override reaches it"
@@ -78,7 +78,7 @@ fn review(new_round: Fact, must_fix: Fact, repeated: Fact) -> WorkflowFacts {
 }
 
 fn reconciled(f: &WorkflowFacts) -> Option<(WorkflowEvent, Phase)> {
-    match GraphId::ReviewedDesign.machine().reconcile(f) {
+    match GraphId::DesignGate.machine().reconcile(f) {
         Reconciliation::Fired(Outcome::Moved { event, to, .. }) => Some((event, to)),
         Reconciliation::Settled => None,
         other => panic!("{other:?}"),
@@ -134,7 +134,7 @@ fn a_done_checkbox_is_not_a_landing() {
 #[test]
 fn systemic_review_goes_back_to_design_or_to_implementation_by_what_it_found() {
     let f = WorkflowFacts::at(Phase::SystemicReview);
-    let m = GraphId::ReviewedDesign.machine();
+    let m = GraphId::DesignGate.machine();
     assert!(matches!(
         m.apply(&f, WorkflowEvent::SubmitSystemic),
         Outcome::Moved {
@@ -163,7 +163,7 @@ fn every_preset_validates_and_design_reviewed_is_the_default() {
     }
     assert_eq!(super::strategy::DEFAULT_PRESET, "design-reviewed");
     let d = preset("design-reviewed").unwrap();
-    assert_eq!(d.graph, GraphId::ReviewedDesign);
+    assert_eq!(d.graph, GraphId::DesignGate);
     assert_eq!(d.toggles, Toggles::default());
     assert_eq!(BASE.check(), vec![], "the shared base table is sound");
 }
@@ -273,6 +273,34 @@ fn a_spec_round_trips_and_an_unknown_field_is_refused_not_ignored() {
     let e = StrategySpec::from_json(newer).unwrap_err().to_string();
     assert!(e.contains("a newer jkb"), "{e}");
     assert!(StrategySpec::from_json(r#"{"graph":"sideways"}"#).is_err());
+}
+
+/// `design-gate` was `reviewed-design`; the old name is read, never written.
+#[test]
+fn the_graph_s_former_name_is_read_and_its_new_name_written() {
+    assert_eq!(GraphId::parse("design-gate"), Some(GraphId::DesignGate));
+    assert_eq!(GraphId::parse("reviewed-design"), Some(GraphId::DesignGate));
+    assert_eq!(GraphId::parse("direct"), Some(GraphId::Direct));
+    assert_eq!(
+        GraphId::parse("design-reviewed"),
+        None,
+        "a preset is not a graph"
+    );
+    let old = StrategySpec::from_json(r#"{"graph":"reviewed-design"}"#).unwrap();
+    assert_eq!(old.graph, GraphId::DesignGate);
+    assert!(old.to_json().unwrap().contains(r#""graph":"design-gate""#));
+    for &(name, g) in GraphId::LEGACY_ALIASES {
+        assert!(
+            GraphId::ALL.iter().all(|c| c.as_str() != name),
+            "an alias never shadows a current name"
+        );
+        let json = format!(r#"{{"graph":"{name}"}}"#);
+        assert_eq!(
+            StrategySpec::from_json(&json).unwrap().graph,
+            g,
+            "serde agrees with parse"
+        );
+    }
 }
 
 #[test]

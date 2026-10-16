@@ -91,7 +91,9 @@ pub struct AgentPermissions {
 /// What one version of a template says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDef {
-    /// The workflow it belongs to (`task-swarm`, `code-review`, or [`SUBAGENTS_WORKFLOW`]).
+    /// The agent set it belongs to (`task-swarm`, `code-review`, or [`SUBAGENTS_WORKFLOW`]): the
+    /// templates one coordinator script runs. Named `workflow` on the wire, in `agents.json` and in
+    /// the `workflow_agents` column, which keep that name to spare a migration and a wire break.
     pub workflow: String,
     /// The role its calls act as.
     pub role: Role,

@@ -36,7 +36,8 @@ pub struct AgentView {
     pub version: i64,
     /// `packaged` (read-only) or `operator` (an editable copy).
     pub source: Source,
-    /// The workflow it belongs to.
+    /// The agent set it belongs to (`task-swarm`, `code-review`, `subagents`). The field keeps the
+    /// name `workflow` so the wire does not break between app and daemon.
     pub workflow: String,
     /// The D52 role its calls act as.
     pub role: String,

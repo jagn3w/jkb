@@ -30,6 +30,7 @@ export interface AgentTemplate {
   readonly version: number;
   /** `packaged` is read-only; `operator` is an editable copy. */
   readonly source: "packaged" | "operator";
+  /** The agent set it belongs to (`task-swarm`, …). The wire keeps the name `workflow`. */
   readonly workflow: string;
   readonly role: string;
   /** The jkb op classes the role may run. */
@@ -439,14 +440,14 @@ export function layered(
   };
 }
 
-/** The workflows the templates belong to, in first-seen order. */
-export function workflowsOf(agents: readonly AgentTemplate[]): string[] {
+/** The agent sets the templates belong to (each template's `workflow` field), in first-seen order. */
+export function agentSetsOf(agents: readonly AgentTemplate[]): string[] {
   return [...new Set(agents.map((a) => a.workflow))];
 }
 
-/** A workflow's agent graph: its agents (fragments are not agents) and their hand-offs. */
+/** An agent set's agent graph: its agents (fragments are not agents) and their hand-offs. */
 export interface AgentGraph extends Layout {
-  /** Hand-offs naming an agent that is not in this workflow: drawn nowhere, so said aloud. */
+  /** Hand-offs naming an agent that is not in this agent set: drawn nowhere, so said aloud. */
   readonly dangling: readonly { readonly from: string; readonly to: string }[];
 }
 

@@ -66,7 +66,7 @@ export function LifecyclePane({
               data-active={which === w ? "true" : undefined}
               onClick={() => setWhich(w)}
             >
-              {w === "workflow" ? `Workflow · ${graph.graph}` : "Task status"}
+              {w === "workflow" ? `Phases · ${graph.graph} graph` : "Task status"}
             </button>
           ))}
         </div>

@@ -202,7 +202,7 @@ pub const PRESETS: &[Preset] = &[
         name: "design-reviewed",
         describe: "the operator approves each design and lands (the default)",
         spec: || StrategySpec {
-            graph: GraphId::ReviewedDesign,
+            graph: GraphId::DesignGate,
             toggles: Toggles::default(),
             attributes: Attributes::default(),
         },
@@ -211,7 +211,7 @@ pub const PRESETS: &[Preset] = &[
         name: "coordinated",
         describe: "the coordinator may approve designs; the operator lands",
         spec: || StrategySpec {
-            graph: GraphId::ReviewedDesign,
+            graph: GraphId::DesignGate,
             toggles: Toggles {
                 approves_design: vec![Role::Operator, Role::Coordinator],
                 lands: vec![Role::Operator],

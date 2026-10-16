@@ -240,7 +240,7 @@ fn print_agent(a: &AgentView) {
         agents::Source::Operator => "operator's own".to_owned(),
     };
     println!("{} v{} — {source}", a.name, a.version);
-    println!("workflow:     {}", a.workflow);
+    println!("agent set:    {}", a.workflow);
     println!("role:         {} ({})", a.role, a.role_ops.join(", "));
     println!(
         "permissions:  isolation {}, model {}, writes {}",

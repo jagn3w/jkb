@@ -569,9 +569,9 @@ macro_rules! graph {
     };
 }
 
-/// `reviewed-design`: a written design waits in `design_review` for whoever the strategy's
+/// `design-gate`: a written design waits in `design_review` for whoever the strategy's
 /// `approves_design` toggle names.
-static REVIEWED_DESIGN: &[Row] = graph!(row(
+static DESIGN_GATE: &[Row] = graph!(row(
     Phase::Design,
     WorkflowEvent::SubmitDesign,
     Phase::DesignReview
@@ -586,39 +586,59 @@ static DIRECT: &[Row] = graph!(row(
 ));
 
 /// Which execution graph a strategy runs.
+///
+/// A graph is always named with the word "graph" (`design-gate graph`), so it cannot be read as the
+/// preset strategy of a similar name. `design-gate` was called `reviewed-design` until it was renamed
+/// for being a near-anagram of the `design-reviewed` preset: stored pins and definitions still hold
+/// the old name and are never rewritten, so it is read forever — by the serde alias here and by
+/// [`GraphId::parse`] through [`GraphId::LEGACY_ALIASES`] — while every new write stores the new one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GraphId {
     /// A design is reviewed before implementation starts.
-    ReviewedDesign,
+    #[serde(rename = "design-gate", alias = "reviewed-design")]
+    DesignGate,
     /// A design goes straight to implementation.
     Direct,
 }
 
 impl GraphId {
     /// Every graph, for the checks and for listing.
-    pub const ALL: &'static [Self] = &[Self::ReviewedDesign, Self::Direct];
+    pub const ALL: &'static [Self] = &[Self::DesignGate, Self::Direct];
+
+    /// Former names still accepted on read, each with the graph it now means. Never written.
+    pub const LEGACY_ALIASES: &'static [(&'static str, Self)] =
+        &[("reviewed-design", Self::DesignGate)];
 
     /// The stored and typed name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::ReviewedDesign => "reviewed-design",
+            Self::DesignGate => "design-gate",
             Self::Direct => "direct",
         }
     }
 
-    /// Parse a name.
+    /// Parse a name: the current one, or a former one in [`Self::LEGACY_ALIASES`].
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|g| g.as_str() == name)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|g| g.as_str() == name)
+            .or_else(|| {
+                Self::LEGACY_ALIASES
+                    .iter()
+                    .find(|(old, _)| *old == name)
+                    .map(|&(_, g)| g)
+            })
     }
 
     /// One line on what it is.
     #[must_use]
     pub const fn describe(self) -> &'static str {
         match self {
-            Self::ReviewedDesign => {
+            Self::DesignGate => {
                 "design → design review → implement ⇄ review (⇄ systemic review) → landable"
             }
             Self::Direct => "design → implement ⇄ review (⇄ systemic review) → landable",
@@ -630,7 +650,7 @@ impl GraphId {
     pub fn machine(self) -> WorkflowMachine {
         Machine {
             transitions: match self {
-                Self::ReviewedDesign => REVIEWED_DESIGN,
+                Self::DesignGate => DESIGN_GATE,
                 Self::Direct => DIRECT,
             },
             initial: Phase::Design,

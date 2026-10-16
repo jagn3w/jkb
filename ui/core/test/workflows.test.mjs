@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   agentGraph,
+  agentSetsOf,
   canContribute,
   decodeAgent,
   decodeAgents,
@@ -20,7 +21,6 @@ import {
   placeholdersOf,
   saveRequest,
   workflowOps,
-  workflowsOf,
 } from "../dist/index.js";
 
 const ok = (value) => ({ ok: true, value });
@@ -134,7 +134,7 @@ test("names and placeholders follow jkb's rules", () => {
   assert.deepEqual(placeholdersOf("{{b}} {{a}} {{b}} {{Not}}"), ["a", "b"]);
 });
 
-test("the agent graph is a workflow's agents and their hand-offs, fragments left out", () => {
+test("the agent graph is an agent set's agents and their hand-offs, fragments left out", () => {
   const agents = [
     agent({ name: "a", hands_off_to: ["b", "c"] }),
     agent({ name: "b", hands_off_to: ["c", "gone"] }),
@@ -142,7 +142,7 @@ test("the agent graph is a workflow's agents and their hand-offs, fragments left
     agent({ name: "frag", fragment: true }),
     agent({ name: "other", workflow: "code-review" }),
   ];
-  assert.deepEqual(workflowsOf(agents), ["task-swarm", "code-review"]);
+  assert.deepEqual(agentSetsOf(agents), ["task-swarm", "code-review"]);
   const g = agentGraph(agents, "task-swarm");
   assert.deepEqual(
     g.nodes.map((n) => [n.id, n.layer, n.row]),

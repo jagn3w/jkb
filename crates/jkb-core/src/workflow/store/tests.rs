@@ -672,3 +672,57 @@ fn a_round_holds_under_every_name_the_mirror_gives_it() {
     );
     assert!(inside("jkb/codereviews/f/nit").is_some());
 }
+
+/// The graph `design-gate` was stored as `reviewed-design` before its rename. Nothing rewrites a
+/// stored row, so a pin and a definition naming the old graph must still resolve — to the renamed
+/// graph — and new writes must store the new name.
+#[test]
+fn a_stored_spec_naming_the_graph_s_former_name_still_resolves() {
+    use crate::workflow::GraphId;
+    let db = Db::open_in_memory().unwrap();
+    let id = a_task(&db);
+    db.write_txn("test", move |c, _| {
+        c.execute(
+            "INSERT INTO workflow_transitions
+                 (txn_id, item_id, at, event, from_phase, to_phase, role, actor, reason, spec)
+             VALUES ('old', ?1, 'then', 'set_strategy', 'design', 'design', 'operator',
+                     'operator', 'old-pin', '{\"graph\":\"reviewed-design\"}')",
+            [id.get()],
+        )?;
+        c.execute(
+            "INSERT INTO workflow_strategies (name, version, spec, defined_at)
+             VALUES ('legacy', 1, '{\"graph\":\"reviewed-design\"}', 'then')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let cur = db.read(move |c| current(c, id)).unwrap();
+    assert_eq!(cur.spec.graph, GraphId::DesignGate);
+    assert_eq!(cur.source, "old-pin");
+    let (name, spec) = db.read(|c| super::resolve_strategy(c, "legacy")).unwrap();
+    assert_eq!(name, "legacy@1");
+    assert_eq!(spec.graph, GraphId::DesignGate);
+    // The stored rows are left as they were.
+    let stored: String = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT spec FROM workflow_strategies WHERE name = 'legacy'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(stored, r#"{"graph":"reviewed-design"}"#);
+    // A redefinition writes the new name.
+    db.write_txn("test", move |c, m| define(c, m, "legacy", &spec))
+        .unwrap();
+    let (_, json) = db
+        .read(super::definitions)
+        .unwrap()
+        .into_iter()
+        .map(|(n, _, j)| (n, j))
+        .find(|(n, _)| n == "legacy")
+        .unwrap();
+    assert!(json.contains(r#""graph":"design-gate""#), "{json}");
+}

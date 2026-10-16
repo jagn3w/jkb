@@ -5441,7 +5441,7 @@ fn a_workflow_walks_from_the_cli_and_the_stop_hook_asks_only_when_the_session_dr
     assert!(block.contains("reviewer"), "{block}");
 
     jkb(&db)
-        .args(["workflow", "dot", "reviewed-design"])
+        .args(["workflow", "dot", "direct"])
         .assert()
         .success()
         .stdout(predicate::str::contains("digraph"));
@@ -6279,6 +6279,48 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
 
 /// `jkb workflow show --graph` prints the machines from the compiled tables, for a named strategy or
 /// the default; without `--graph` a task is required.
+/// The graph `design-gate` was `reviewed-design`: both names draw it, and a definition naming
+/// either is accepted and stored under the new name.
+#[test]
+fn the_design_gate_graph_answers_to_its_former_name() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let dot_new = jkb(&db)
+        .args(["workflow", "dot", "design-gate"])
+        .output()
+        .unwrap();
+    assert!(dot_new.status.success());
+    let dot_new = String::from_utf8(dot_new.stdout).unwrap();
+    assert!(dot_new.contains("digraph"), "{dot_new}");
+    jkb(&db)
+        .args(["workflow", "dot", "reviewed-design"])
+        .assert()
+        .success()
+        .stdout(predicate::eq(dot_new.as_str()));
+    for (name, graph) in [("gate-new", "design-gate"), ("gate-old", "reviewed-design")] {
+        jkb(&db)
+            .args(["workflow", "define", name, "--graph", graph])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!("defined {name}@1")));
+    }
+    let listed = jkb(&db)
+        .args(["--json", "workflow", "strategies"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    for name in ["gate-new@1", "gate-old@1"] {
+        let s = listed["strategies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("{name} in {listed}"));
+        assert_eq!(s["spec"]["graph"], "design-gate", "{name}");
+    }
+}
+
 #[test]
 fn workflow_show_graph_prints_the_machines() {
     let dir = TempDir::new().unwrap();
@@ -6315,7 +6357,10 @@ fn workflow_show_graph_prints_the_machines() {
         .unwrap();
     assert!(text.status.success());
     let text = String::from_utf8(text.stdout).unwrap();
-    assert!(text.contains("strategy:  design-reviewed"), "{text}");
+    assert!(
+        text.contains("strategy:  design-reviewed (design-gate graph)"),
+        "{text}"
+    );
     let lifecycle = text.split("\nlifecycle:\n").nth(1).unwrap();
     for row in lifecycle.lines().filter(|l| !l.trim().is_empty()) {
         let event = row.split_whitespace().nth(1).unwrap();

@@ -126,7 +126,9 @@ test("the shell renders every tab and pane, with only the active pane shown", as
     assert.match(html, /Loading designs…/);
     // The Workflows tab (D53.7): its pickers wait for the agents and strategies, asked for from
     // effects, never during render.
-    assert.match(html, /<select(?=[^>]*aria-label="Workflow")(?=[^>]*disabled)/, "the workflow picker waits for the agents");
+    assert.match(html, /<select(?=[^>]*aria-label="Agent set")(?=[^>]*disabled)/, "the agent-set picker waits for the agents");
+    assert.doesNotMatch(html, /aria-label="Workflow"/, "no control is labelled Workflow: that names a task's progress");
+    assert.doesNotMatch(html, /<span>Workflow<\/span>/, "nor is the picker's visible label");
     assert.match(html, /<select(?=[^>]*aria-label="Strategy")(?=[^>]*disabled)/, "the strategy picker waits for the strategies");
     assert.match(html, /Loading agents…/);
     // The Container tab (D53.8): a button per kit run.sh flag, and the status asked for from an
