@@ -691,9 +691,14 @@ fn samples() -> Vec<Request> {
             state: None,
             after: None,
         },
+        Request::ExecFollow {
+            id: "exec-1".into(),
+            after: None,
+            max: 10,
+        },
         Request::ExecBegin {
             id: "exec-1".into(),
-            pin: None,
+            recomputed_pin: None,
             runner: "r".into(),
         },
         Request::ExecDecline {
@@ -2025,6 +2030,7 @@ const READS: &[&str] = &[
     "timeline.session",
     "timeline.task",
     "timeline.plan",
+    "exec.follow",
 ];
 
 #[test]

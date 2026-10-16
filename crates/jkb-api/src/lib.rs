@@ -548,15 +548,32 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after: Option<i64>,
     },
-    /// Start running a pending request — the operator's runner, with the pin it recomputed
-    /// (`jkb_core::exec::begin`).
+    /// A run request's messages after seq `after` — how its requester follows it. The topic is
+    /// reserved: no `mq.*` op reads it ([`exec::follow`]).
+    #[serde(rename = "exec.follow")]
+    ExecFollow {
+        /// `exec-<n>`.
+        id: String,
+        /// Continue after this seq: the last one already read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<i64>,
+        /// At most this many (at most 256).
+        max: usize,
+    },
+    /// Start running a pending request — the operator's runner (`jkb_core::exec::begin`).
+    ///
+    /// `recomputed_pin` is **not an echo of the request's pin**: the runner computes it itself, on
+    /// the host, at the moment of Run, with `jkb-cli`'s `gitrepo::tree_pin` over the request's
+    /// directory. `begin` refuses the request (`tree_changed`) when it differs from the stored one —
+    /// which is the only thing standing between what was reviewed and what runs, so sending back
+    /// the pin `exec.status` reported would wave every change through.
     #[serde(rename = "exec.begin")]
     ExecBegin {
         /// `exec-<n>`.
         id: String,
-        /// The pin recomputed at Run; absent for a directory outside any repository.
+        /// The pin the runner computed at Run; absent for a directory outside any repository.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pin: Option<exec::Pin>,
+        recomputed_pin: Option<exec::Pin>,
         /// Who runs it.
         runner: String,
     },
@@ -1787,6 +1804,7 @@ impl Request {
         "exec.request",
         "exec.status",
         "exec.list",
+        "exec.follow",
         "exec.begin",
         "exec.decline",
         "exec.refuse",
@@ -2040,6 +2058,7 @@ impl Request {
             Self::ExecRequest(_) => "exec.request",
             Self::ExecStatus { .. } => "exec.status",
             Self::ExecList { .. } => "exec.list",
+            Self::ExecFollow { .. } => "exec.follow",
             Self::ExecBegin { .. } => "exec.begin",
             Self::ExecDecline { .. } => "exec.decline",
             Self::ExecRefuse { .. } => "exec.refuse",
@@ -2114,7 +2133,9 @@ impl Request {
             | Self::TimelineSessions {}
             | Self::TimelineSession { .. }
             | Self::TimelineTask { .. }
-            | Self::TimelinePlan { .. } => true,
+            | Self::TimelinePlan { .. }
+            // A plain read of the request's own topic, with no group to touch.
+            | Self::ExecFollow { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -2529,8 +2550,10 @@ pub enum Response {
     },
     /// An `exec.output`.
     ExecOutputSent {
-        /// The chunk's seq on the request's topic.
-        seq: i64,
+        /// The chunk's seq on the request's topic; absent when the topic was full and the chunk was
+        /// dropped (the row's tail and the log are the record, and a follower sees the gap).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<i64>,
         /// Its 0-based number.
         n: i64,
     },
@@ -3810,32 +3833,45 @@ impl LocalBackend {
                 pid,
                 instance,
             } => Response::SessionEnd {
-                outcome: db
-                    .write_txn(actor, move |c, m| {
+                outcome: {
+                    let vouched = exec::vouches_for_end(principal, &session);
+                    db.write_txn(actor, move |c, m| {
                         let process = claude_session::Process {
                             session: &session,
                             pid: &pid,
                             instance: &instance,
                         };
-                        claude_session::ended(c, m, &process, &reason, now)
+                        let ended = claude_session::ended(c, m, &process, &reason, now)?;
+                        if vouched {
+                            jkb_core::exec::expire_if_ended(c, m, &session, now)?;
+                        }
+                        Ok(ended)
                     })?
-                    .as_str()
-                    .to_owned(),
+                }
+                .as_str()
+                .to_owned(),
             },
             Request::SessionGone {
                 session,
                 pid,
                 instance,
-            } => Response::SessionGone {
-                ended: db.write_txn(actor, move |c, m| {
-                    let process = claude_session::Process {
-                        session: &session,
-                        pid: &pid,
-                        instance: &instance,
-                    };
-                    claude_session::gone(c, m, &process, now)
-                })?,
-            },
+            } => {
+                let vouched = exec::vouches_for_end(principal, &session);
+                Response::SessionGone {
+                    ended: db.write_txn(actor, move |c, m| {
+                        let process = claude_session::Process {
+                            session: &session,
+                            pid: &pid,
+                            instance: &instance,
+                        };
+                        let ended = claude_session::gone(c, m, &process, now)?;
+                        if ended && vouched {
+                            jkb_core::exec::expire_if_ended(c, m, &session, now)?;
+                        }
+                        Ok(ended)
+                    })?,
+                }
+            }
             Request::SessionList { all, after } => {
                 let after = after.as_deref().map(SessionCursor::decode).transpose()?;
                 let page = db.read(move |c| claude_session::list(c, all, after.as_ref()))?;
@@ -4183,9 +4219,19 @@ impl LocalBackend {
                     exec::list(db, actor, principal, state.as_deref(), after, now)?;
                 Response::ExecRequests { requests, next }
             }
-            Request::ExecBegin { id, pin, runner } => {
+            Request::ExecFollow { id, after, max } => Response::Messages {
+                messages: exec::follow(db, principal, &id, after.unwrap_or(0), max, now)?
+                    .into_iter()
+                    .map(Message::from)
+                    .collect(),
+            },
+            Request::ExecBegin {
+                id,
+                recomputed_pin,
+                runner,
+            } => {
                 let n = exec::id(&id)?;
-                let pin = pin.map(jkb_core::exec::TreePin::from);
+                let pin = recomputed_pin.map(jkb_core::exec::TreePin::from);
                 db.write_txn_with(actor, move |c, m| {
                     let (begun, row) =
                         match jkb_core::exec::begin(c, m, n, pin.as_ref(), &runner, now)? {

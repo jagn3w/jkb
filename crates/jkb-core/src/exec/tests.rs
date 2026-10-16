@@ -4,9 +4,9 @@
 use proptest::prelude::*;
 
 use super::{
-    begin, decline, expire_session, finish, get, list, output, output_of, parse_id, refuse,
-    request, status, topic, Ask, Begun, ExecState, ExecTarget, Filter, Finished, Outcome,
-    RefuseReason, Requested, Requester, TreePin, DEFAULT_TIMEOUT_MS, EXPIRES_AFTER_MS,
+    begin, decline, expire_if_ended, expire_session, finish, get, list, output, output_of,
+    parse_id, refuse, request, status, topic, Ask, Begun, ExecState, ExecTarget, Filter, Finished,
+    Outcome, RefuseReason, Requested, Requester, TreePin, DEFAULT_TIMEOUT_MS, EXPIRES_AFTER_MS,
     MAX_ARGV_BYTES, MAX_CHUNK_BYTES, MAX_TIMEOUT_MS,
 };
 use crate::claude_session::{self, Process};
@@ -89,7 +89,7 @@ fn row(db: &Db, id: i64) -> super::ExecRow {
 }
 
 fn messages(db: &Db, id: i64) -> Vec<(String, serde_json::Value)> {
-    db.read(move |c| mq::tail(c, &topic(id), 256, T0))
+    db.read(move |c| super::follow(c, id, 0, 256, T0))
         .unwrap()
         .into_iter()
         .map(|m| (m.kind, m.payload))
@@ -299,7 +299,8 @@ fn a_session_s_end_expires_its_pending_requests_only() {
             instance: "h",
         };
         claude_session::started(c, m, &p, "/w", "startup", T0)?;
-        claude_session::ended(c, m, &p, "exit", T0 + 2)
+        claude_session::ended(c, m, &p, "exit", T0 + 2)?;
+        expire_if_ended(c, m, "s1", T0 + 2)
     })
     .unwrap();
     let r = row(&db, pending);
@@ -340,7 +341,7 @@ fn a_session_still_held_by_another_process_keeps_its_requests() {
         claude_session::started(c, m, &a, "/w", "startup", T0)?;
         claude_session::started(c, m, &b, "/w", "startup", T0)?;
         claude_session::ended(c, m, &a, "exit", T0 + 1)?;
-        Ok(())
+        expire_if_ended(c, m, "s1", T0 + 1)
     })
     .unwrap();
     assert_eq!(row(&db, id).state, ExecState::Pending);
@@ -351,7 +352,8 @@ fn a_session_still_held_by_another_process_keeps_its_requests() {
             pid: "11",
             instance: "h",
         };
-        claude_session::gone(c, m, &b, T0 + 2)
+        claude_session::gone(c, m, &b, T0 + 2)?;
+        expire_if_ended(c, m, "s1", T0 + 2)
     })
     .unwrap();
     assert_eq!(row(&db, id).state, ExecState::Expired);
@@ -509,8 +511,9 @@ fn output_is_the_running_runner_s_and_numbered_from_zero() {
     assert!(is_invalid(
         &out("app", vec![0; MAX_CHUNK_BYTES + 1]).unwrap_err()
     ));
-    let (_, n0) = out("app", b"hello ".to_vec()).unwrap();
-    let (_, n1) = out("app", vec![0xff; MAX_CHUNK_BYTES]).unwrap();
+    let (s0, n0) = out("app", b"hello ".to_vec()).unwrap();
+    let (s1, n1) = out("app", vec![0xff; MAX_CHUNK_BYTES]).unwrap();
+    assert!(s0.is_some() && s1.is_some(), "both were published");
     assert_eq!((n0, n1), (0, 1));
     let chunks: Vec<_> = messages(&db, id)
         .into_iter()
@@ -579,15 +582,55 @@ fn a_malformed_ask_is_refused() {
     assert_eq!(parse_id("7").unwrap(), 7);
 }
 
+/// A bare `jkb undo` reaches past run-request entries to the user's last real change — they are
+/// written by transactions the user did not choose — while naming one explicitly refuses it by name.
 #[test]
-fn undo_refuses_every_exec_entry_by_name() {
+fn a_bare_undo_reaches_past_exec_entries_and_an_explicit_one_refuses_them() {
+    use crate::item::{self, upsert, NewItem};
     let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        upsert(
+            c,
+            m,
+            &NewItem {
+                uid: "target".to_owned(),
+                kind: "note".to_owned(),
+                content: None,
+                content_hash: None,
+                mime: None,
+            },
+        )
+    })
+    .unwrap();
     let id = req(&db, &who("s1"), &ask(&["make"], None), T0).row.id;
-    let e = db.write_txn("t", crate::undo::undo_last).unwrap_err();
-    assert!(e.to_string().contains("exec_requests"), "{e}");
     db.write_txn("t", move |c, m| decline(c, m, id, "no", T0 + 1))
         .unwrap();
-    let e = db.write_txn("t", crate::undo::undo_last).unwrap_err();
+    let exec_txn: i64 = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT MAX(txn_id) FROM changelog WHERE entity_type = 'exec_requests'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+
+    db.write_txn("t", crate::undo::undo_last).unwrap();
+    assert!(
+        db.read(|c| item::id_for_uid(c, "target"))
+            .unwrap()
+            .is_none(),
+        "the bare undo did not reach the user's last real change"
+    );
+    assert_eq!(
+        row(&db, id).state,
+        ExecState::Declined,
+        "the request was not touched"
+    );
+
+    let e = db
+        .write_txn("t", move |c, m| crate::undo::undo(c, m, exec_txn))
+        .unwrap_err();
     assert!(e.to_string().contains("exec_requests"), "{e}");
     assert_eq!(
         row(&db, id).state,
@@ -619,11 +662,45 @@ fn a_queue_client_cannot_create_or_send_to_a_request_s_topic() {
         })
         .unwrap_err();
     assert!(matches!(e, Error::Queue(QueueError::Invalid { .. })), "{e}");
-    // Reading and subscribing are open: that is how the requester waits.
-    db.write_txn("t", move |c, m| {
-        mq::group_create(c, m, &t, "wait-1", mq::Start::FromStart, T0)
-    })
-    .unwrap();
+    // Nor read it, subscribe to it, ack in it or list it: the topic is the requester's, read only
+    // through `follow`, which `jkb-api` holds to the requester's session.
+    let refused = |e: Error| assert!(matches!(e, Error::Queue(QueueError::Invalid { .. })), "{e}");
+    let t3 = t.clone();
+    refused(
+        db.write_txn("t", move |c, m| {
+            mq::group_create(c, m, &t3, "wait-1", mq::Start::FromStart, T0)
+        })
+        .unwrap_err(),
+    );
+    let t3 = t.clone();
+    refused(
+        db.write_txn("t", move |c, m| mq::group_delete(c, m, &t3, "g"))
+            .unwrap_err(),
+    );
+    let t3 = t.clone();
+    refused(
+        db.write_txn("t", move |c, m| mq::poll(c, m, &t3, "g", 10, None, T0))
+            .unwrap_err(),
+    );
+    let t3 = t.clone();
+    refused(
+        db.write_txn("t", move |c, m| mq::ack(c, m, &t3, "g", 1, T0))
+            .unwrap_err(),
+    );
+    let t3 = t.clone();
+    refused(db.read(move |c| mq::tail(c, &t3, 10, T0)).unwrap_err());
+    let t3 = t.clone();
+    refused(
+        db.read(move |c| mq::poll_needed(c, &t3, "g", 10, None, T0))
+            .unwrap_err(),
+    );
+    let t3 = t.clone();
+    refused(db.read(move |c| mq::group_count(c, &t3)).unwrap_err());
+    let listed = db.read(mq::inspect).unwrap();
+    assert!(
+        listed.iter().all(|r| !r.name.starts_with("exec/")),
+        "inspect lists a request's topic"
+    );
     // A name that merely contains the prefix is not reserved.
     db.write_txn("t", |c, m| {
         mq::topic_create(c, m, "x/exec/1", &TopicSpec::default(), T0)
@@ -753,4 +830,109 @@ proptest! {
         let (rows, _) = db.write_txn("t", move |c, m| list(c, m, Filter { state: Some(ExecState::Pending), session: None }, None, now)).unwrap();
         prop_assert_eq!(rows.len(), pending.len());
     }
+}
+
+#[test]
+fn a_run_whose_runner_went_quiet_ends_past_its_timeout_and_grace() {
+    let db = Db::open_in_memory().unwrap();
+    let id = req(&db, &who("s1"), &ask(&["make"], None), T0).row.id;
+    try_begin(&db, id, None, "app", T0).unwrap();
+    let due = T0 + DEFAULT_TIMEOUT_MS + super::RUN_GRACE_MS;
+    let (r, _) = db
+        .write_txn("t", move |c, m| status(c, m, id, due - 1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        r.state,
+        ExecState::Running,
+        "still within its timeout and grace"
+    );
+    let (r, _) = db
+        .write_txn("t", move |c, m| status(c, m, id, due))
+        .unwrap()
+        .unwrap();
+    assert_eq!(r.state, ExecState::Finished);
+    assert_eq!(r.outcome, Some(Outcome::Interrupted));
+    assert!(r.note.unwrap().contains("never reported an end"));
+    let end = messages(&db, id)
+        .into_iter()
+        .find(|(k, _)| k == "exec.end")
+        .unwrap();
+    assert_eq!(end.1["outcome"], "interrupted");
+    // The runner that comes back late cannot finish it differently.
+    assert!(is_stale(
+        &try_finish(&db, id, "app", Outcome::Exited, Some(0), due + 1).unwrap_err()
+    ));
+}
+
+#[test]
+fn a_re_ask_with_another_timeout_or_side_does_not_fold() {
+    let db = Db::open_in_memory().unwrap();
+    let a = ask(&["cargo", "test"], None);
+    let first = req(&db, &who("s1"), &a, T0);
+    let longer = Ask {
+        timeout_ms: Some(MAX_TIMEOUT_MS),
+        ..a.clone()
+    };
+    let got = req(&db, &who("s1"), &longer, T0 + 1);
+    assert!(
+        !got.folded,
+        "a longer timeout folded into the shorter request"
+    );
+    assert_eq!(got.row.ask.timeout_ms, Some(MAX_TIMEOUT_MS));
+    let side = Ask {
+        dir_side: ExecTarget::Container,
+        ..a.clone()
+    };
+    assert!(!req(&db, &who("s1"), &side, T0 + 1).folded);
+    // The reason is not part of the fold.
+    let reworded = Ask {
+        reason: "in other words".to_owned(),
+        ..a
+    };
+    let again = req(&db, &who("s1"), &reworded, T0 + 2);
+    assert!(again.folded);
+    assert_eq!(again.row.id, first.row.id);
+}
+
+#[test]
+fn a_full_topic_drops_output_and_its_number_shows_the_gap() {
+    let db = Db::open_in_memory().unwrap();
+    let id = req(&db, &who("s1"), &ask(&["make"], None), T0).row.id;
+    try_begin(&db, id, None, "app", T0).unwrap();
+    let mut dropped = None;
+    for i in 0..400 {
+        let (seq, n) = db
+            .write_txn("t", move |c, m| {
+                output(c, m, id, "app", &vec![b'x'; MAX_CHUNK_BYTES], T0 + 1)
+            })
+            .unwrap();
+        assert_eq!(n, i);
+        if seq.is_none() {
+            dropped = Some(n);
+            break;
+        }
+    }
+    let dropped = dropped.expect("an 8 MiB topic took 400 chunks of 47 KiB");
+    // The run still finishes, and the end is recorded on the row.
+    let done = try_finish(&db, id, "app", Outcome::Exited, Some(0), T0 + 2).unwrap();
+    assert_eq!(done.state, ExecState::Finished);
+    let out = db.read(move |c| output_of(c, id)).unwrap().unwrap();
+    assert_eq!(out.chunks, dropped + 1, "the dropped chunk is counted");
+}
+
+#[test]
+fn compaction_reaps_a_request_topic_s_expired_messages_with_no_group() {
+    let db = Db::open_in_memory().unwrap();
+    let id = req(&db, &who("s1"), &ask(&["make"], None), T0).row.id;
+    db.write_txn("t", move |c, m| decline(c, m, id, "no", T0))
+        .unwrap();
+    assert_eq!(messages(&db, id).len(), 1);
+    let report = db
+        .write_txn("t", |c, m| {
+            mq::compact(c, m, T0 + 2 * 24 * 60 * 60 * 1000, true)
+        })
+        .unwrap();
+    assert!(report.messages_reaped >= 1);
+    assert!(messages(&db, id).is_empty());
 }

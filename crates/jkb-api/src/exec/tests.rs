@@ -149,7 +149,7 @@ fn an_implementer_asks_in_its_own_name_and_cannot_answer_itself() {
     let id = r.id.clone();
     for op in [
         json!({ "op": "exec.begin", "id": id, "runner": "me",
-                "pin": { "head": "ab".repeat(20), "changes": "cd".repeat(32) } }),
+                "recomputed_pin": { "head": "ab".repeat(20), "changes": "cd".repeat(32) } }),
         json!({ "op": "exec.decline", "id": id, "note": "n" }),
         json!({ "op": "exec.refuse", "id": id, "reason": "dir_gone" }),
         json!({ "op": "exec.finish", "id": id, "runner": "me", "outcome": "exited",
@@ -244,7 +244,7 @@ fn the_operator_runs_a_request_and_the_session_reads_how_it_ended() {
     let pin = json!({ "head": "ab".repeat(20), "changes": "cd".repeat(32) });
     match ok(
         &kb.op,
-        &json!({ "op": "exec.begin", "id": r.id, "runner": "app:1", "pin": pin }),
+        &json!({ "op": "exec.begin", "id": r.id, "runner": "app:1", "recomputed_pin": pin }),
     ) {
         Response::ExecBegun { begun, request } => {
             assert_eq!(begun, "running");
@@ -255,7 +255,7 @@ fn the_operator_runs_a_request_and_the_session_reads_how_it_ended() {
     assert_eq!(
         code(
             &kb.op,
-            &json!({ "op": "exec.begin", "id": r.id, "runner": "app:1", "pin": pin })
+            &json!({ "op": "exec.begin", "id": r.id, "runner": "app:1", "recomputed_pin": pin })
         ),
         ErrorCode::Stale,
         "a request runs once"
@@ -292,7 +292,7 @@ fn a_begin_with_another_pin_refuses_and_a_decline_carries_its_note() {
     match ok(
         &kb.op,
         &json!({ "op": "exec.begin", "id": a.id, "runner": "app",
-                 "pin": { "head": "ab".repeat(20), "changes": "00".repeat(32) } }),
+                 "recomputed_pin": { "head": "ab".repeat(20), "changes": "00".repeat(32) } }),
     ) {
         Response::ExecBegun { begun, request } => {
             assert_eq!(begun, "refused");
@@ -333,5 +333,84 @@ fn a_malformed_request_is_invalid_and_an_unknown_field_is_refused() {
     assert!(
         serde_json::from_value::<crate::Request>(bad).is_err(),
         "the requester is never a request field"
+    );
+}
+
+#[test]
+fn a_request_s_topic_is_followed_by_its_requester_alone() {
+    let kb = Kb::new();
+    let s1 = kb.ticket("s1", None, "t1");
+    let s2 = kb.ticket("s2", None, "t2");
+    let (r, _) = requested(ok(&s1, &ask(&["make"])));
+    ok(
+        &kb.op,
+        &json!({ "op": "exec.decline", "id": r.id, "note": "ask for `make check`" }),
+    );
+    let follow = json!({ "op": "exec.follow", "id": r.id, "max": 10 });
+    match ok(&s1, &follow) {
+        Response::Messages { messages } => {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].payload["note"], "ask for `make check`");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(ok(&kb.op, &follow), Response::Messages { .. }));
+    assert_eq!(
+        code(&s2, &follow),
+        ErrorCode::NotFound,
+        "another session's stream"
+    );
+    // No queue operation reaches the topic, for a session or for the operator.
+    for who in [&s1, &s2, &kb.op] {
+        for op in [
+            json!({ "op": "mq.tail", "topic": r.topic, "limit": 10 }),
+            json!({ "op": "mq.group_create", "topic": r.topic, "group": "g" }),
+            json!({ "op": "mq.poll", "topic": r.topic, "group": "g", "max": 10 }),
+            json!({ "op": "mq.ack", "topic": r.topic, "group": "g", "seq": 1 }),
+            json!({ "op": "mq.group_delete", "topic": r.topic, "group": "g" }),
+        ] {
+            assert_eq!(code(who, &op), ErrorCode::Invalid, "{op}");
+        }
+    }
+    match ok(&kb.op, &json!({ "op": "mq.inspect" })) {
+        Response::Topics { topics } => {
+            assert!(topics.iter().all(|t| !t.name.starts_with("exec/")));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn only_a_session_s_own_end_or_the_operator_s_expires_its_requests() {
+    let kb = Kb::new();
+    let s1 = kb.ticket("s1", None, "t1");
+    let (r, _) = requested(ok(&s1, &ask(&["make"])));
+    let end = json!({ "op": "session.ended", "session": "s1", "reason": "exit",
+                     "pid": "10", "instance": "h" });
+    // Another session, and the container credential's hook, can record an end for s1 — but it costs
+    // s1 nothing.
+    ok(&kb.ticket("s2", None, "t2"), &end);
+    ok(&kb.as_token(&kb.container), &end);
+    assert_eq!(
+        view(ok(&s1, &json!({ "op": "exec.status", "id": r.id }))).state,
+        "pending"
+    );
+    // Its own end does.
+    ok(&kb.ticket("s1", None, "t3"), &end);
+    assert_eq!(
+        view(ok(&kb.op, &json!({ "op": "exec.status", "id": r.id }))).state,
+        "expired"
+    );
+    // And the operator's.
+    let s3 = kb.ticket("s3", None, "t4");
+    let (q, _) = requested(ok(&s3, &ask(&["make"])));
+    ok(
+        &kb.op,
+        &json!({ "op": "session.ended", "session": "s3", "reason": "exit",
+                         "pid": "11", "instance": "h" }),
+    );
+    assert_eq!(
+        view(ok(&kb.op, &json!({ "op": "exec.status", "id": q.id }))).state,
+        "expired"
     );
 }

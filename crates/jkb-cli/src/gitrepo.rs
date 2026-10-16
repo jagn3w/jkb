@@ -101,6 +101,11 @@ const SAFE_SUBCOMMANDS: &[&str] = &[
     // `jkb_s_git_does_not_run_a_submodule_s_config`: the planted filter did not run, and an
     // untracked file inside the submodule survived while the superproject's own was removed.
     "clean",
+    // Only into a throwaway `GIT_INDEX_FILE` and with no `-u`, as `tree_pin` runs it: it reads tree
+    // objects into an index and touches no work tree, so it has nothing of a submodule's to enter.
+    // Measured on git 2.51.1 by `jkb_s_git_does_not_run_a_submodule_s_config`: the planted filter
+    // did not run, nor during the pin's listings against that index.
+    "read-tree",
 ];
 
 /// Where the subcommand is in `args`: past any leading `-c <key>=<value>` pairs, the one global
@@ -2475,85 +2480,173 @@ fn exists(dir: &Path, reference: &str) -> Result<bool> {
 
 /// The `-c` settings a tree pin's git runs with, beyond [`NEUTRALIZERS`]: the pin is computed by the
 /// requesting CLI (in the dev container) and recomputed by the runner (on the host), each under its
-/// own global config, so nothing a user's config chooses may change what is listed. A global
-/// excludes file differs between the two sides, so neither reads one: a file only a user's global
-/// ignore hides is pinned as untracked on both. Line endings are never converted while listing.
+/// own global config, so nothing a user's config chooses may change what is listed. Line endings are
+/// never converted while listing, and no sparse-checkout pattern shapes the throwaway index.
 const PIN_SETTINGS: &[&str] = &[
-    "-c",
-    "core.excludesFile=/dev/null",
     "-c",
     "core.autocrlf=false",
     "-c",
     "diff.relative=false",
+    "-c",
+    "core.sparseCheckout=false",
 ];
+
+/// The only ignore rules a tree pin honours: the repository's own `.gitignore` files, which are in
+/// the tree the operator reviews. Never `--exclude-standard`, which adds `$GIT_DIR/info/exclude` —
+/// writable from the dev container and never shown to the operator — and the user's global
+/// excludes file, which differs between the two sides.
+const PIN_EXCLUDES: &str = "--exclude-per-directory=.gitignore";
 
 /// The framing version a tree pin's hash starts with ([`tree_pin`]).
 const PIN_FRAMING: &[u8] = b"jkb-tree-pin/v1\n";
 
-/// `git` in `dir` for its raw stdout, `None` when it exits non-zero — [`git`] for output that is not
-/// one trimmed line (a `-z` listing).
-fn git_bytes(dir: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
-    checked(dir, args)?;
-    let out = git_cmd(dir, args)
+/// A throwaway index for one tree pin, built from `HEAD` and deleted with the guard.
+struct PinIndex {
+    dir: PathBuf,
+}
+
+impl PinIndex {
+    /// A fresh private directory under the temp dir; `read-tree` creates the index file in it.
+    fn new() -> Result<Self> {
+        let token = jkb_core::roles::fresh_token().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let name: String = token
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(24)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("jkb-pin-{name}"));
+        fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        Ok(Self { dir })
+    }
+
+    fn file(&self) -> PathBuf {
+        self.dir.join("index")
+    }
+}
+
+impl Drop for PinIndex {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `git` in `dir` against the throwaway `index`, for its raw stdout; an error carrying git's message
+/// when it exits non-zero. Audited and hooks-off like every jkb git call ([`git_cmd`]);
+/// `GIT_INDEX_FILE` is set after the repository selection is scrubbed, so it names this index and no
+/// other.
+fn git_pin(dir: &Path, index: &PinIndex, args: &[&str]) -> Result<Vec<u8>> {
+    let mut all: Vec<&str> = PIN_SETTINGS.to_vec();
+    all.extend_from_slice(args);
+    checked(dir, &all)?;
+    let out = git_cmd(dir, &all)
+        .env("GIT_INDEX_FILE", index.file())
         .output()
         .with_context(|| format!("running `git {}`", args.join(" ")))?;
-    Ok(out.status.success().then_some(out.stdout))
+    anyhow::ensure!(
+        out.status.success(),
+        "`git {}` failed in {}: {}",
+        args.join(" "),
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(out.stdout)
+}
+
+/// NUL-separated output as its entries.
+fn nul_list(out: &[u8]) -> Vec<Vec<u8>> {
+    out.split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
 }
 
 /// The tree pin of the repository containing `dir` (the Executions design), or `None` when `dir` is
 /// in no repository: its `HEAD` commit, and the blake3 of its working-tree changes.
 ///
+/// **Nothing the repository's own index says is trusted.** The index is writable from the dev
+/// container, and `update-index --skip-worktree` or `--assume-unchanged` hides an edited tracked
+/// file from `git diff` and `git status` alike (measured, git 2.51.1); its untracked cache could
+/// hide an untracked file the same way. So the pin builds a throwaway index from `HEAD` (`read-tree`
+/// into a private `GIT_INDEX_FILE`: no flags, no untracked cache) and lists against that, so every
+/// tracked path is compared with `HEAD` by its content.
+///
 /// **What is pinned is the work tree, not a diff's text.** The requester computes the pin in the dev
 /// container and the runner recomputes it on the host, under two git versions and two global
-/// configs; a diff's text depends on both (prefixes, colour, rename detection, the diff algorithm,
-/// context lines), so hashing it would refuse unchanged trees. So the changed paths are listed —
-/// tracked paths that differ from `HEAD` (`diff --name-only --no-renames HEAD`, staged or not:
-/// what runs is the work tree) and untracked ones (`ls-files --others --exclude-standard`) — and
-/// each is hashed as it is on disk, read without following a link.
+/// configs; a diff's text depends on both, so hashing it would refuse unchanged trees. So the
+/// changed paths are listed — tracked paths that differ from `HEAD` (`diff --name-only --no-renames
+/// HEAD`) and untracked ones (`ls-files --others`, honouring only the tree's own `.gitignore` files,
+/// [`PIN_EXCLUDES`]) — and each is hashed as it is on disk, read without following a link.
 ///
 /// **The framing, version 1** — main and the CLI run this same function, and a change to it is a
 /// new version: blake3 over `jkb-tree-pin/v1\n`, then for each path in byte order, once, three
 /// frames — the path's bytes, its kind, its content — where a frame is the length as a
 /// little-endian `u64` followed by the bytes. The kinds: `file` and `exec` (a regular file, and
-/// one with any execute bit; content its bytes), `link` (content the link's target), `dir` (an
-/// untracked nested repository, or a submodule whose commit moved; no content), `missing` (a
+/// one with any execute bit; content its bytes), `link` (content the link's target), `missing` (a
 /// tracked file deleted; no content), `other` (a FIFO, a socket; no content).
 ///
-/// **What it does not cover**, stated by the design: files git ignores (`target/`, build output),
-/// a nested repository's or submodule's own work tree, and a change made between the pin check and
-/// the moment a run reads the file.
+/// **Not pinnable — refused rather than pinned in part:** a directory `.gitignore` covers (nothing
+/// in it would be pinned); an untracked nested repository; and a populated submodule, whose own
+/// work tree jkb's git never enters (running git there runs the submodule's own config), so a dirty
+/// or moved one could not be told from a clean one.
 ///
-/// Through jkb's git, so hooks-off and audited: a repository whose own config names a program is
-/// refused, as for every jkb git call.
+/// **What it does not cover**, stated by the design: files git ignores elsewhere in the tree
+/// (`target/`, build output), and a change made between the pin check and the moment a run reads
+/// the file.
 ///
 /// # Errors
-/// The audit's refusal; a repository with no commit; an unreadable changed file (one over
+/// "not pinnable" for the cases above; the audit's refusal (a repository whose own config names a
+/// program); a repository with no commit; an unreadable changed file (one over
 /// [`jkb_core::nofollow::MAX_READ_BYTES`] among them); or `git` failing to run.
 pub fn tree_pin(dir: &Path) -> Result<Option<jkb_core::exec::TreePin>> {
+    use std::os::unix::ffi::OsStrExt as _;
     let Some(top) = root(dir)? else {
         return Ok(None);
     };
     let head = git(&top, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])?
         .filter(|h| !h.is_empty())
         .with_context(|| format!("{} has no commit to pin", top.display()))?;
-    let listing = |args: &[&str]| -> Result<Vec<Vec<u8>>> {
-        let mut all: Vec<&str> = PIN_SETTINGS.to_vec();
-        all.extend_from_slice(args);
-        let out = git_bytes(&top, &all)?
-            .with_context(|| format!("`git {}` failed in {}", args.join(" "), top.display()))?;
-        Ok(out
-            .split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect())
-    };
-    let mut paths = listing(&["diff", "--name-only", "-z", "--no-renames", "HEAD"])?;
-    paths.extend(listing(&[
-        "ls-files",
-        "-z",
-        "--others",
-        "--exclude-standard",
-    ])?);
+    let index = PinIndex::new()?;
+    git_pin(&top, &index, &["read-tree", &head])?;
+    refuse_ignored_dir(dir, &top, &index)?;
+
+    // Submodules: their work trees are never entered, so a populated one cannot be judged.
+    for entry in nul_list(&git_pin(&top, &index, &["ls-files", "-z", "--stage"])?) {
+        let Some(rest) = entry.strip_prefix(b"160000 ") else {
+            continue;
+        };
+        let Some(tab) = rest.iter().position(|b| *b == b'\t') else {
+            continue;
+        };
+        let sub = top.join(std::ffi::OsStr::from_bytes(&rest[tab + 1..]));
+        if fs::read_dir(&sub).is_ok_and(|mut d| d.next().is_some()) {
+            anyhow::bail!(
+                "not pinnable: {} holds a populated submodule, {}, whose own work tree jkb's git \
+                 does not enter (that would run the submodule's config), so a dirty or moved one \
+                 could not be told from a clean one",
+                top.display(),
+                sub.display()
+            );
+        }
+    }
+
+    let mut paths = nul_list(&git_pin(
+        &top,
+        &index,
+        &["diff", "--name-only", "-z", "--no-renames", "HEAD"],
+    )?);
+    let untracked = nul_list(&git_pin(
+        &top,
+        &index,
+        &["ls-files", "-z", "--others", PIN_EXCLUDES],
+    )?);
+    if let Some(nested) = untracked.iter().find(|p| p.ends_with(b"/")) {
+        anyhow::bail!(
+            "not pinnable: {} is an untracked nested repository, whose files the pin cannot see — \
+             make it a submodule, move it out of the repository, or remove it",
+            top.join(std::ffi::OsStr::from_bytes(nested)).display()
+        );
+    }
+    paths.extend(untracked);
     paths.sort();
     paths.dedup();
     let mut hasher = blake3::Hasher::new();
@@ -2571,12 +2664,51 @@ pub fn tree_pin(dir: &Path) -> Result<Option<jkb_core::exec::TreePin>> {
     }))
 }
 
+/// Refuse a request directory the repository's `.gitignore` covers: nothing in it would be pinned.
+/// Asked with `--directory`, which lists an ignored directory once — even an empty one, so a session
+/// cannot ask in an empty ignored directory and fill it after approval.
+fn refuse_ignored_dir(dir: &Path, top: &Path, index: &PinIndex) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(rel) = dir.strip_prefix(top) else {
+        return Ok(());
+    };
+    let rel = rel.as_os_str().as_bytes();
+    if rel.is_empty() {
+        return Ok(());
+    }
+    let rel_text = String::from_utf8_lossy(rel).into_owned();
+    let ignored = nul_list(&git_pin(
+        top,
+        index,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--directory",
+            PIN_EXCLUDES,
+            "--",
+            &rel_text,
+        ],
+    )?);
+    let covers = |e: &Vec<u8>| {
+        let e = e.strip_suffix(b"/").unwrap_or(e);
+        rel == e || (rel.starts_with(e) && rel.get(e.len()) == Some(&b'/'))
+    };
+    if ignored.iter().any(covers) {
+        anyhow::bail!(
+            "not pinnable: {} is ignored by the repository's .gitignore, so nothing in it would be \
+             pinned — run from a directory the repository tracks",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// One changed path's kind and content, for [`tree_pin`]'s framing.
 fn pinned_entry(top: &Path, rel: &[u8]) -> Result<(&'static str, Vec<u8>)> {
     use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::unix::fs::PermissionsExt as _;
-    // An untracked nested repository is listed with a trailing slash.
-    let rel = rel.strip_suffix(b"/").unwrap_or(rel);
     let path = top.join(std::ffi::OsStr::from_bytes(rel));
     let meta = match fs::symlink_metadata(&path) {
         Ok(m) => m,
@@ -2589,7 +2721,11 @@ fn pinned_entry(top: &Path, rel: &[u8]) -> Result<(&'static str, Vec<u8>)> {
         return Ok(("link", target.into_os_string().into_vec()));
     }
     if ty.is_dir() {
-        return Ok(("dir", Vec::new()));
+        // A directory where the listing named a path: a submodule's, or a tree swapped in for a file.
+        anyhow::bail!(
+            "not pinnable: {} is a directory the pin cannot see into",
+            path.display()
+        );
     }
     if !ty.is_file() {
         return Ok(("other", Vec::new()));
@@ -4893,6 +5029,12 @@ mod tests {
         std::fs::write(sup.join("sub/f"), "eeee\n").unwrap();
         assert!(super::delete_branch_at(&sup, "tidied", &tip).unwrap());
         assert!(!marker.exists(), "update-ref entered the submodule");
+        // The tree pin's `read-tree` into a throwaway index, and its listings against it, refuse a
+        // populated submodule without entering it.
+        std::fs::write(sup.join("sub/f"), "gggg\n").unwrap();
+        let e = format!("{:#}", super::tree_pin(&sup).unwrap_err());
+        assert!(e.contains("populated submodule"), "{e}");
+        assert!(!marker.exists(), "the tree pin entered the submodule");
         // The graft tree's `clean -fd` removes the superproject's untracked file and neither enters
         // the submodule nor deletes inside it.
         std::fs::write(sup.join("stray.txt"), "x").unwrap();
@@ -5192,8 +5334,7 @@ mod tests {
         let committed = pin_of(&dir);
         assert_ne!(committed.head, clean.head);
         assert_eq!(
-            committed.changes,
-            pin_of(&dir).changes,
+            committed.changes, clean.changes,
             "a clean tree hashes the same whatever HEAD is"
         );
     }
@@ -5243,5 +5384,92 @@ mod tests {
         );
         let e = format!("{:#}", super::tree_pin(&dir).unwrap_err());
         assert!(e.contains("filter.x.clean"), "{e}");
+    }
+
+    /// The repository's own index is writable from the container: an entry marked skip-worktree or
+    /// assume-unchanged hides an edit from `git diff` and `git status`. The pin lists against an
+    /// index of its own, so the edit still moves it.
+    #[test]
+    fn the_tree_pin_sees_an_edit_the_index_was_told_to_hide() {
+        for flag in ["--skip-worktree", "--assume-unchanged"] {
+            let (_t, dir) = pin_repo();
+            let clean = pin_of(&dir);
+            assert!(fixture_git(&dir, &["update-index", flag, "run.sh"])
+                .status()
+                .unwrap()
+                .success());
+            std::fs::write(dir.join("run.sh"), "echo evil\n").unwrap();
+            let porcelain = fixture_git(&dir, &["status", "--porcelain"])
+                .output()
+                .unwrap();
+            assert!(
+                porcelain.stdout.is_empty(),
+                "{flag}: git itself does not see the edit, which is the hole"
+            );
+            assert_ne!(pin_of(&dir), clean, "{flag} hid an edit from the pin");
+        }
+    }
+
+    /// An untracked nested repository is refused, never pinned as a contentless directory whose
+    /// files could change after approval.
+    #[test]
+    fn the_tree_pin_refuses_an_untracked_nested_repository() {
+        let (_t, dir) = pin_repo();
+        let tools = dir.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        assert!(fixture_git(&tools, &["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(tools.join("run.sh"), "echo v1\n").unwrap();
+        let e = format!("{:#}", super::tree_pin(&dir).unwrap_err());
+        assert!(
+            e.contains("not pinnable") && e.contains("nested repository"),
+            "{e}"
+        );
+    }
+
+    /// `.git/info/exclude` is the container's to write and the operator never sees it: the pin does
+    /// not honour it, so a file listed there is pinned like any untracked file.
+    #[test]
+    fn the_tree_pin_does_not_honour_info_exclude() {
+        let (_t, dir) = pin_repo();
+        let clean = pin_of(&dir);
+        let exclude = dir.join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "helper.sh\n").unwrap();
+        std::fs::write(dir.join("helper.sh"), "echo hidden\n").unwrap();
+        let hidden = pin_of(&dir);
+        assert_ne!(
+            hidden, clean,
+            "a file in info/exclude was left out of the pin"
+        );
+        std::fs::write(dir.join("helper.sh"), "echo changed\n").unwrap();
+        assert_ne!(pin_of(&dir), hidden, "a change to it did not move the pin");
+    }
+
+    /// A request directory the repository ignores has nothing in it pinned, so it is refused —
+    /// an empty one too, which a session could fill after approval.
+    #[test]
+    fn the_tree_pin_refuses_a_directory_the_repository_ignores() {
+        let (_t, dir) = pin_repo();
+        let tools = dir.join("target/tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let e = format!("{:#}", super::tree_pin(&tools).unwrap_err());
+        assert!(
+            e.contains("not pinnable") && e.contains(".gitignore"),
+            "{e}"
+        );
+        std::fs::write(tools.join("gen.sh"), "echo hi\n").unwrap();
+        let e = format!("{:#}", super::tree_pin(&tools).unwrap_err());
+        assert!(e.contains("not pinnable"), "{e}");
+        assert!(
+            format!("{:#}", super::tree_pin(&dir.join("target")).unwrap_err())
+                .contains("not pinnable")
+        );
+        // A tracked directory beside it is pinned as usual.
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "x").unwrap();
+        assert!(super::tree_pin(&dir.join("src")).unwrap().is_some());
     }
 }

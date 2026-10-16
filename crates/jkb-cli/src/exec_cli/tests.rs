@@ -167,17 +167,84 @@ fn a_signal_and_a_timeout_map_as_a_shell_would() {
     assert_eq!(waited(&db, &vb).0, super::EXIT_TIMED_OUT);
 }
 
+/// A full topic drops chunks; the waiter says so, naming the log, rather than passing the run off
+/// as complete.
 #[test]
-fn the_wait_leaves_no_consumer_group_behind() {
+fn output_the_topic_dropped_is_reported_as_a_gap() {
     let db = Db::open_in_memory().unwrap();
     let (id, view) = requested(&db, "make");
-    ran(&db, id, &[b"x"], Outcome::Exited, Some(0));
-    waited(&db, &view);
-    let topic = exec::topic(id);
-    let groups = db
-        .read(move |c| jkb_core::mq::group_count(c, &topic))
+    db.write_txn("t", move |c, m| {
+        let now = jkb_core::mq::now_ms();
+        exec::begin(c, m, id, None, "app", now)?;
+        let chunk = vec![b'x'; exec::MAX_CHUNK_BYTES];
+        // Fill the topic, then one more chunk that is dropped.
+        while exec::output(c, m, id, "app", &chunk, now)?.0.is_some() {}
+        exec::finish(
+            c,
+            m,
+            id,
+            &Finished {
+                runner: "app",
+                outcome: Outcome::Exited,
+                exit_status: Some(0),
+                tail: b"",
+                total_bytes: 0,
+                log_path: Some("/logs/x.log"),
+            },
+            now,
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let (code, out, err) = waited(&db, &view);
+    assert_eq!(code, 0);
+    assert!(!out.is_empty(), "what reached the stream is printed");
+    assert!(err.contains("did not reach this stream"), "{err}");
+    assert!(
+        err.contains("output missing") && err.contains("/logs/x.log"),
+        "{err}"
+    );
+}
+
+/// A gap in the middle of the stream is reported where it happens.
+#[test]
+fn a_missing_chunk_number_is_reported() {
+    let mut f = super::Follow {
+        after: 0,
+        next_n: 0,
+        printed: 0,
+        gaps: Vec::new(),
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    for n in [0, 3, 3, 4] {
+        f.chunk(
+            &serde_json::json!({ "n": n, "b64": "eA==" }),
+            &mut out,
+            &mut err,
+        )
         .unwrap();
-    assert_eq!(groups, 0);
+    }
+    assert_eq!(out, b"xxx", "a repeated chunk is printed once");
+    assert_eq!(f.gaps, vec![(1, 2)]);
+    assert!(String::from_utf8(err).unwrap().contains("chunks 1–2"));
+}
+
+/// A waiter gives up once nothing it waits for can still arrive.
+#[test]
+fn a_wait_past_the_latest_end_gives_up() {
+    let db = Db::open_in_memory().unwrap();
+    let (_, mut view) = requested(&db, "make");
+    view.created_at = 0;
+    let b = LocalBackend::new(db.clone());
+    let e = wait(
+        &b,
+        &view,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        Duration::from_millis(1),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("latest a request can end"), "{e}");
 }
 
 #[test]

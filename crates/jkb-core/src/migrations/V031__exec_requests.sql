@@ -10,7 +10,9 @@
 --   * the columns a state implies are tied to it (`running`/`finished` have a start, `finished` an
 --     outcome, `refused` a reason);
 --   * an identical pending request from the same session folds into the existing one through the
---     partial unique index, never queues twice.
+--     partial unique index, never queues twice;
+--   * a running request whose runner never reports an end is ended by the callee past its timeout
+--     and a grace (`exec::RUN_GRACE_MS`).
 --
 -- `exec_requests` is changelogged (it is the audit record of what ran and who asked), and `jkb undo`
 -- refuses every entry of it by name: undo cannot un-run a command or un-ask a request. `exec_output`
@@ -56,9 +58,10 @@ CREATE TABLE exec_requests (
     CHECK (state <> 'pending' OR (started_at IS NULL AND ended_at IS NULL))
 );
 
--- The fold: at most one pending request per (session, argv, dir, target, pin).
+-- The fold: at most one pending request per (session, argv, dir and its side, target, pin,
+-- timeout). The reason is not part of it: a re-ask in other words is the same request.
 CREATE UNIQUE INDEX exec_requests_pending_fold ON exec_requests (
-    session, argv, dir, target, ifnull(pin_head, ''), ifnull(pin_changes, '')
+    session, argv, dir, dir_side, target, ifnull(pin_head, ''), ifnull(pin_changes, ''), timeout_ms
 ) WHERE state = 'pending';
 
 -- Lazy expiry and the per-session sweep read pending rows only.

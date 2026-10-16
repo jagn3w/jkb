@@ -6,8 +6,8 @@
 //! directory's repository, computed here with jkb's hooks-off git ([`crate::gitrepo::tree_pin`]).
 //! Nothing here runs the command — the operator's runner does, after reading exactly what would run.
 //!
-//! `jkb exec request` waits by default: it follows the request's topic, writes the output to stdout
-//! as it arrives, and exits with the run's status. The topic is a hint; the answer is always
+//! `jkb exec request` waits by default: it follows the request's topic (`exec.follow`), writes the
+//! output to stdout as it arrives, and exits with the run's status. The topic is a hint; the answer is always
 //! confirmed with `exec.status` before it is acted on.
 
 use std::io::Write;
@@ -224,7 +224,7 @@ pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
                 &view,
                 &mut stdout.lock(),
                 &mut stderr.lock(),
-                Duration::from_millis(250),
+                Duration::from_millis(500),
             )
             .with_context(|| {
                 format!(
@@ -410,35 +410,6 @@ fn transient(e: &ApiError) -> bool {
     matches!(e.code, ErrorCode::Busy | ErrorCode::Unavailable)
 }
 
-/// Follow `request`'s topic until it is answered: output to `out` as it arrives, the decision to
-/// `err`, and the exit status the request ended with. Confirms every ending with `exec.status`, and
-/// reads the topic to its end before returning, so no output published before the end is missed.
-///
-/// # Errors
-/// A refusal that is not transient.
-pub fn wait(
-    backend: &dyn Backend,
-    request: &ExecView,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-    interval: Duration,
-) -> Result<i32> {
-    let group = format!(
-        "wait-{}",
-        jkb_core::roles::fresh_token()
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .take(16)
-            .collect::<String>()
-    );
-    let topic = request.topic.clone();
-    let result = follow(backend, request, &topic, &group, out, err, interval);
-    // A consumer that knows it is leaving removes its own group.
-    let _ = backend.call(Request::MqGroupDelete { topic, group });
-    result
-}
-
 /// Retry `f` while it is refused transiently.
 fn retrying<T>(interval: Duration, mut f: impl FnMut() -> Result<T, ApiError>) -> Result<T> {
     let mut pause = interval;
@@ -454,70 +425,63 @@ fn retrying<T>(interval: Duration, mut f: impl FnMut() -> Result<T, ApiError>) -
     }
 }
 
-#[allow(clippy::too_many_lines)] // one loop, with its terminal drain
-fn follow(
+/// Follow `request` until it is answered: output to `out` as it arrives, the decision to `err`, and
+/// the exit status the request ended with. The topic is read through `exec.follow` (it is reserved:
+/// no queue operation reads it, so there is no consumer group to leave behind). Every ending is
+/// confirmed with `exec.status`, and the topic is read to its end before returning, so no output
+/// published before the end is missed. A chunk the topic dropped (it was full) shows as a gap in the
+/// chunk numbers and is reported, naming the log that holds everything.
+///
+/// Gives up at the latest a request can still end ([`jkb_core::exec::LATEST_END_MS`] after it was
+/// made, and a minute): past that, nothing it waits for can arrive.
+///
+/// # Errors
+/// A refusal that is not transient, or the deadline.
+pub fn wait(
     backend: &dyn Backend,
     request: &ExecView,
-    topic: &str,
-    group: &str,
     out: &mut dyn Write,
     err: &mut dyn Write,
     interval: Duration,
 ) -> Result<i32> {
-    let create = || {
-        backend.call(Request::MqGroupCreate {
-            topic: topic.to_owned(),
-            group: group.to_owned(),
-            from_start: true,
-        })
+    let latest = request
+        .created_at
+        .saturating_add(jkb_core::exec::LATEST_END_MS)
+        .saturating_add(60_000);
+    let mut s = Follow {
+        after: 0,
+        next_n: 0,
+        printed: 0,
+        gaps: Vec::new(),
     };
-    retrying(interval, create)?;
-    let mut after: Option<i64> = None;
-    let mut printed: Option<i64> = None;
     let mut ended: Option<ExecView> = None;
     loop {
+        if jkb_core::mq::now_ms() > latest {
+            bail!(
+                "{} has not ended by the latest a request can end — the record is unreachable or \
+                 stuck",
+                request.id
+            );
+        }
         let polled = retrying(interval, || {
-            match backend.call(Request::MqPoll {
-                topic: topic.to_owned(),
-                group: group.to_owned(),
+            backend.call(Request::ExecFollow {
+                id: request.id.clone(),
+                after: (s.after > 0).then_some(s.after),
                 max: jkb_core::mq::MAX_BATCH,
-                after,
-            }) {
-                // Removed while idle: recreate from the start; chunks already printed are skipped.
-                Err(e) if e.code == ErrorCode::NoSuchGroup => {
-                    create()?;
-                    after = None;
-                    Ok(Response::Messages {
-                        messages: Vec::new(),
-                    })
-                }
-                other => other,
-            }
+            })
         })?;
         let Response::Messages { messages } = polled else {
-            bail!("unexpected response to mq.poll: {polled:?}");
+            bail!("unexpected response to exec.follow: {polled:?}");
         };
         let got = !messages.is_empty();
         let mut announced_end = false;
         for m in &messages {
-            after = Some(m.seq);
+            s.after = m.seq;
             match m.kind.as_str() {
-                "exec.output" => {
-                    let n = m.payload["n"].as_i64().unwrap_or(-1);
-                    if printed.is_some_and(|p| n <= p) {
-                        continue;
-                    }
-                    let b64 = m.payload["b64"].as_str().unwrap_or_default();
-                    if let Ok(bytes) = jkb_api::exec::bytes("chunk", b64) {
-                        out.write_all(&bytes)?;
-                        out.flush()?;
-                    }
-                    printed = Some(n);
-                }
+                "exec.output" => s.chunk(&m.payload, out, err)?,
                 "exec.end" => announced_end = true,
                 "exec.decision" => {
-                    let state = m.payload["state"].as_str().unwrap_or_default();
-                    if state == "running" {
+                    if m.payload["state"].as_str() == Some("running") {
                         writeln!(err, "jkb exec: the operator is running it")?;
                     } else {
                         announced_end = true;
@@ -526,22 +490,15 @@ fn follow(
                 _ => {}
             }
         }
-        if let Some(seq) = after {
-            let _ = backend.call(Request::MqAck {
-                topic: topic.to_owned(),
-                group: group.to_owned(),
-                seq,
-            });
-        }
         if let Some(view) = ended.take() {
             if !got {
                 // Drained after the end: report it.
-                return finish(&view, printed.is_some(), out, err);
+                return finish(&view, &s, out, err);
             }
             ended = Some(view);
             continue;
         }
-        // Confirm with the row: on an announced ending, and on every idle poll — a decision that
+        // Confirm with the row: on an announced ending, and on every idle read — a decision that
         // could not be published (a full topic) is still a fact the row holds.
         if announced_end || !got {
             let view = retrying(interval, || {
@@ -555,21 +512,78 @@ fn follow(
                 continue;
             }
         }
-        if !got && backend.in_process() {
+        if !got {
             std::thread::sleep(interval);
         }
     }
 }
 
+/// Where a [`wait`] is in a request's stream.
+struct Follow {
+    /// The last seq read.
+    after: i64,
+    /// The chunk number expected next.
+    next_n: i64,
+    /// How many chunks were printed.
+    printed: i64,
+    /// Ranges of chunk numbers that never arrived.
+    gaps: Vec<(i64, i64)>,
+}
+
+impl Follow {
+    fn chunk(
+        &mut self,
+        payload: &serde_json::Value,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> Result<()> {
+        let Some(n) = payload["n"].as_i64() else {
+            return Ok(());
+        };
+        if n < self.next_n {
+            return Ok(());
+        }
+        if n > self.next_n {
+            self.gap(self.next_n, n - 1, err)?;
+        }
+        let b64 = payload["b64"].as_str().unwrap_or_default();
+        if let Ok(bytes) = jkb_api::exec::bytes("chunk", b64) {
+            out.write_all(&bytes)?;
+            out.flush()?;
+        }
+        self.printed += 1;
+        self.next_n = n + 1;
+        Ok(())
+    }
+
+    fn gap(&mut self, from: i64, to: i64, err: &mut dyn Write) -> Result<()> {
+        self.gaps.push((from, to));
+        let what = if from == to {
+            format!("chunk {from}")
+        } else {
+            format!("chunks {from}–{to}")
+        };
+        writeln!(
+            err,
+            "jkb exec: output {what} did not reach this stream (its topic was full); the run's log \
+             holds all of it"
+        )?;
+        Ok(())
+    }
+}
+
 /// Report a terminal request and return its exit status.
-fn finish(
-    view: &ExecView,
-    printed_any: bool,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> Result<i32> {
-    // Nothing reached the topic (it was full, or reaped): the row's tail is what there is.
-    if !printed_any {
+fn finish(view: &ExecView, s: &Follow, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
+    let mut s = Follow {
+        gaps: s.gaps.clone(),
+        ..*s
+    };
+    let published = view.output.as_ref().map_or(0, |o| o.chunks);
+    if s.next_n < published {
+        s.gap(s.next_n, published - 1, err)?;
+    }
+    // Nothing reached this stream: the row's tail is what there is.
+    if s.printed == 0 {
         if let Some(o) = &view.output {
             let tail = jkb_api::exec::bytes("tail", &o.tail_b64).unwrap_or_default();
             out.write_all(&tail)?;
@@ -577,6 +591,7 @@ fn finish(
         }
     }
     let code = exit_code(view).unwrap_or(1);
+    let log = view.output.as_ref().and_then(|o| o.log_path.as_deref());
     match view.state.as_str() {
         "declined" => writeln!(
             err,
@@ -597,7 +612,18 @@ fn finish(
             view.note.as_deref().unwrap_or("expired")
         )?,
         _ => {
-            if let Some(p) = view.output.as_ref().and_then(|o| o.log_path.as_deref()) {
+            if let Some(note) = &view.note {
+                writeln!(err, "jkb exec: {} {note}", view.id)?;
+            }
+            if !s.gaps.is_empty() {
+                writeln!(
+                    err,
+                    "jkb exec: {} ended ({code}) with output missing from this stream; the full \
+                     output is in {}",
+                    view.id,
+                    log.unwrap_or("the runner's log")
+                )?;
+            } else if let Some(p) = log {
                 writeln!(
                     err,
                     "jkb exec: {} ended ({code}); full output in {p}",

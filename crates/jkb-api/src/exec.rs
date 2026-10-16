@@ -13,7 +13,8 @@
 //! own request, and nothing can ask in another session's name.
 //!
 //! **Who reads what.** The operator reads every request; an attested session reads only its own
-//! session's (another's is `not_found`); a grant's holder reads none.
+//! session's (another's is `not_found`); a grant's holder reads none. The same holds for a request's
+//! topic, which only `exec.follow` reads: the queue's own ops refuse `exec/` topics outright.
 
 use base64::Engine as _;
 use jkb_core::exec::{self, Ask, ExecRow, ExecState, ExecTarget, Outcome, RefuseReason, TreePin};
@@ -385,6 +386,47 @@ pub fn list(
             .collect::<Result<Vec<_>, _>>()?;
         Ok((views, next))
     })
+}
+
+/// `exec.follow`: request `wire`'s topic after seq `after`, held to whose requests `principal` may
+/// read — the requester's session, or the operator.
+///
+/// # Errors
+/// [`ErrorCode::NotFound`] for no such request, or another session's; [`ErrorCode::Forbidden`] for a
+/// grant's holder; a database error.
+pub fn follow(
+    db: &Db,
+    principal: &Principal,
+    wire: &str,
+    after: i64,
+    max: usize,
+    now: i64,
+) -> Result<Vec<jkb_core::mq::Delivered>, ApiError> {
+    let reader = reader(principal)?;
+    let n = id(wire)?;
+    let wire = wire.to_owned();
+    db.read_with(move |c| {
+        let Some(row) = exec::get(c, n)? else {
+            return Err(not_found(&wire));
+        };
+        if reader.as_ref().is_some_and(|s| *s != row.requester.session) {
+            return Err(not_found(&wire));
+        }
+        Ok(exec::follow(c, n, after, max, now)?)
+    })
+}
+
+/// Whether an end reported for `session` by `principal` may expire that session's pending run
+/// requests: only the session's own attested tool call, or the operator. `session.ended` and
+/// `session.gone` are any hook's to send, naming any session, so a forged end must not cost another
+/// session its requests (it waits out their expiry instead).
+#[must_use]
+pub fn vouches_for_end(principal: &Principal, session: &str) -> bool {
+    match &principal.kind {
+        PrincipalKind::Operator => true,
+        PrincipalKind::Ticket(t) => t.session == session,
+        PrincipalKind::Grant(_) => false,
+    }
 }
 
 #[cfg(test)]

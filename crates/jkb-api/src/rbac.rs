@@ -249,7 +249,8 @@ impl Request {
             | Self::TimelinePlan { .. }
             // Held to the reader's own session by the op ([`crate::exec::reader`]).
             | Self::ExecStatus { .. }
-            | Self::ExecList { .. } => OpPermission::Read,
+            | Self::ExecList { .. }
+            | Self::ExecFollow { .. } => OpPermission::Read,
             Self::ExecRequest(_) => OpPermission::ExecRequest,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
@@ -526,7 +527,8 @@ impl Request {
             // and holds a reader to its own session.
             | Self::ExecRequest(_)
             | Self::ExecStatus { .. }
-            | Self::ExecList { .. } => Target::Free,
+            | Self::ExecList { .. }
+            | Self::ExecFollow { .. } => Target::Free,
         }
     }
 }

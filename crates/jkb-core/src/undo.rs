@@ -657,6 +657,18 @@ const BOOKKEEPING: &[(Op, Entity)] = &[
     (Op::Undo, Entity::Changelog),
 ];
 
+/// Tables a bare `jkb undo` reaches **past** when choosing the last change, although each entry is
+/// still work: an explicit `jkb undo <txn>` naming such a transaction refuses it by name, because
+/// nothing inverts it.
+///
+/// Not [`BOOKKEEPING`], which is skipped by the selection *and* by [`undo`] itself (inverted as
+/// zero rows). A run request (`exec_requests`) is the audit record of something done outside the
+/// database — undo cannot un-run a command or un-ask a request — and it is written by transactions
+/// the user did not choose: any session's `exec.status` that expires an overdue request, a session's
+/// end. Were it selectable, each would become "the last change" and a bare `jkb undo` would refuse
+/// it over and over while the user's real last change stood behind it.
+const PASSED_OVER: &[Entity] = &[Entity::ExecRequests];
+
 /// The inversion for a changelog entry, or `None` if this module cannot reverse it.
 ///
 /// The wildcard `insert` entry is narrowed here rather than in the list: an insert is only
@@ -1137,9 +1149,13 @@ fn work_txn_after(conn: &Connection, below: i64, after: i64) -> Result<Option<i6
     // from `BOOKKEEPING`, the same list `is_work` answers from, and every op and table name is
     // *bound* rather than interpolated — so this stays a parameterized query and cannot come to
     // disagree with the predicate about which entries are the user's work.
-    let mut args: Vec<SqlValue> = Vec::with_capacity(BOOKKEEPING.len() * 2 + 2);
+    let mut args: Vec<SqlValue> = Vec::with_capacity(BOOKKEEPING.len() * 2 + PASSED_OVER.len() + 2);
     for (op, table) in BOOKKEEPING {
         args.push(SqlValue::Text(op.as_str().to_owned()));
+        args.push(SqlValue::Text(table.as_str().to_owned()));
+    }
+    // …and the entries of the tables a bare undo reaches past ([`PASSED_OVER`]).
+    for table in PASSED_OVER {
         args.push(SqlValue::Text(table.as_str().to_owned()));
     }
     args.push(SqlValue::Integer(below));
@@ -1153,6 +1169,7 @@ fn work_txn_after(conn: &Connection, below: i64, after: i64) -> Result<Option<i6
         BOOKKEEPING
             .iter()
             .map(|_| "NOT (c.op = ? AND c.entity_type = ?)".to_owned())
+            .chain(PASSED_OVER.iter().map(|_| "c.entity_type <> ?".to_owned()))
             .collect::<Vec<_>>()
             .join(" AND "),
         undone_sql("c.txn_id")
@@ -1647,13 +1664,20 @@ fn snapshot_row_id(what: &str, row: &Value) -> Result<Option<i64>> {
 /// say — is therefore still selected, because it is still the user's last change; reaching past
 /// it to revert unrelated earlier work is exactly the behaviour being removed.
 ///
+/// **The one table it reaches past is [`PASSED_OVER`]: run requests.** Their entries are written by
+/// transactions the user did not choose — another session's `exec.status` expiring an overdue
+/// request, a session's end — so they are never "the user's last change", and selecting them would
+/// make a bare `jkb undo` refuse the same transaction over and over. Naming one explicitly
+/// (`jkb undo <txn>`) still refuses it by name: nothing un-runs a command.
+///
 /// **The claim is about transactions that logged something, and only those.** A transaction that
 /// writes no changelog entry does not even take a transaction id (`write_txn` numbers from the
 /// changelog), so nothing here could see it; the guarantee rests on every *content* mutation
 /// logging. The writers that still log nothing are bookkeeping: the derived-index ones (the ingest
 /// embed stage, `index_pending` and `jkb index --sweep` write vectors, rebuildable from the VFS),
 /// the sync engine's archive of a file's bytes into the blob store before it overwrites them, and
-/// the message queue, Claude-session registry and notification writers. None is a change the user
+/// the message queue, Claude-session registry and notification writers (a session's end that
+/// expires its pending run requests logs those, and is reached past as above). None is a change the user
 /// would take back, so reaching past them to the user's last change is the right answer. `ns::ensure`
 /// was the content writer that did not: `jkb ns mk` logged nothing, and a bare `jkb undo` after it
 /// reverted the change before it. It now logs every namespace it creates.

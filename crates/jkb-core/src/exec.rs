@@ -19,6 +19,7 @@
 //! | `pending` → `refused` | [`refuse`] |
 //! | `pending` → `expired` | every function here, lazily, once `expires_at` has passed; [`expire_session`] when the requester's session ended |
 //! | `running` → `finished` | [`finish`], idempotent for identical values, refused to another runner |
+//! | `running` → `finished` (`interrupted`) | every function here, lazily, once `started_at + timeout + `[`RUN_GRACE_MS`] has passed with no end reported |
 //!
 //! **Who may call which** is `jkb-api`'s: [`request`] is any non-operator session's, the moves out of
 //! `pending` and the output are the operator's. The requester is the server-side principal, never a
@@ -26,9 +27,11 @@
 //!
 //! **The topic is a hint.** Each request has a message-queue topic `exec/<id>` (created with it) on
 //! which this module — and only this module ([`mq::RESERVED_PREFIXES`]) — publishes `exec.decision`,
-//! `exec.output` and `exec.end`. A waiter always confirms the terminal state with a read of the row.
-//! A decision or an end that cannot be published because the topic is full is dropped rather than
-//! failing the state move it announces.
+//! `exec.output` and `exec.end`, and which only [`follow`] reads. A waiter always confirms the
+//! terminal state with a read of the row. A message that cannot be published because the topic is
+//! full is dropped rather than failing what it announces — an output chunk too: chunks are numbered
+//! whether published or not, so a reader sees the gap, and the row's tail and the runner's log are
+//! the record.
 //!
 //! **Audit.** `exec_requests` is changelogged; `jkb undo` refuses every entry of it by name
 //! ([`crate::changelog`]'s `InsertInverse::Irreversible`, and no `update` inverse): undo cannot
@@ -80,6 +83,17 @@ pub const DEFAULT_TIMEOUT_MS: i64 = 15 * 60 * 1000;
 
 /// The longest timeout a request may ask for: two hours (operator, 2026-10-16).
 pub const MAX_TIMEOUT_MS: i64 = 2 * 60 * 60 * 1000;
+
+/// How long past its timeout a running request may go without its runner reporting an end before
+/// [`settle`] ends it as [`Outcome::Interrupted`]: the callee bounds a run, not the runner's survival.
+/// A runner that crashed mid-run would otherwise leave the row `running` for ever, and the session
+/// waiting on it with it.
+pub const RUN_GRACE_MS: i64 = 5 * 60 * 1000;
+
+/// The latest a request can still be answered, measured from its creation: unanswered past
+/// [`EXPIRES_AFTER_MS`] it expires, and begun at the last moment it ends within the longest timeout
+/// and its grace. A waiter that has heard nothing by then has lost its way to the record.
+pub const LATEST_END_MS: i64 = EXPIRES_AFTER_MS + MAX_TIMEOUT_MS + RUN_GRACE_MS;
 
 /// The shortest timeout a request may ask for.
 pub const MIN_TIMEOUT_MS: i64 = 1000;
@@ -726,11 +740,44 @@ fn settle(conn: &Connection, meta: &WriteMeta, now: i64) -> Result<Vec<i64>> {
             expired.push(id);
         }
     }
+    // A run whose runner went quiet past its timeout and grace: ended here, as interrupted.
+    let overdue: Vec<i64> = conn
+        .prepare_cached(
+            "SELECT id FROM exec_requests WHERE state = 'running' \
+               AND started_at + timeout_ms + ?2 <= ?1 ORDER BY id",
+        )?
+        .query_map(params![now, RUN_GRACE_MS], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in overdue {
+        let note = "interrupted: the runner never reported an end, past the timeout and its grace"
+            .to_owned();
+        if let Some(row) = moved(
+            conn,
+            meta,
+            id,
+            "UPDATE exec_requests SET state = 'finished', outcome = 'interrupted', \
+                 ended_at = ?2, note = ?3 WHERE id = ?1 AND state = 'running'",
+            &[&id, &now, &note],
+            now,
+        )? {
+            publish(conn, meta, id, "exec.end", end_payload(&row), now, false)?;
+        }
+    }
     Ok(expired)
 }
 
-/// Ask for a run. An identical pending request from the same session — same argv, directory, target
-/// and pin — is returned instead (`folded`), so a session that asks twice is answered once.
+fn end_payload(row: &ExecRow) -> Value {
+    json!({
+        "id": row.wire_id(),
+        "state": row.state.as_str(),
+        "outcome": row.outcome.map(Outcome::as_str),
+        "exit_status": row.exit_status,
+    })
+}
+
+/// Ask for a run. An identical pending request from the same session — same argv, directory and its
+/// side, target, pin and timeout — is returned instead (`folded`), so a session that asks twice is
+/// answered once. The reason is not part of the fold: a re-ask in other words is the same request.
 ///
 /// # Errors
 /// A validation error for a malformed requester or ask (an empty argv, an option as `argv[0]`, a NUL
@@ -803,7 +850,7 @@ pub fn request(
         .prepare_cached(
             "SELECT id FROM exec_requests WHERE state = 'pending' AND session = ?1 AND argv = ?2 \
                AND dir = ?3 AND target = ?4 AND ifnull(pin_head, '') = ifnull(?5, '') \
-               AND ifnull(pin_changes, '') = ifnull(?6, '')",
+               AND ifnull(pin_changes, '') = ifnull(?6, '') AND dir_side = ?7 AND timeout_ms = ?8",
         )?
         .query_row(
             params![
@@ -812,7 +859,9 @@ pub fn request(
                 ask.dir,
                 ask.target.as_str(),
                 pin_head,
-                pin_changes
+                pin_changes,
+                ask.dir_side.as_str(),
+                timeout,
             ],
             |r| r.get(0),
         )
@@ -949,12 +998,15 @@ pub fn refuse(
     .ok_or_else(|| not_pending(&row, "refuse"))
 }
 
-/// Publish one chunk of `id`'s output, as its runner. Returns the chunk's seq on the topic and its
-/// 0-based number.
+/// Publish one chunk of `id`'s output, as its runner. Returns the chunk's seq on the topic — `None`
+/// when the topic is full and the chunk was dropped — and its 0-based number, which counts every
+/// chunk whether published or not, so a reader sees a dropped one as a gap. The row's tail and the
+/// runner's log are the record; the stream is a hint, and a full topic must not stop a run's
+/// output being recorded.
 ///
 /// # Errors
 /// [`crate::Error::Stale`] unless `id` is running under `runner`; not found; a validation error for an
-/// empty chunk or one over [`MAX_CHUNK_BYTES`]; a queue error (a full topic) or a database error.
+/// empty chunk or one over [`MAX_CHUNK_BYTES`]; a database error.
 pub fn output(
     conn: &Connection,
     meta: &WriteMeta,
@@ -962,7 +1014,7 @@ pub fn output(
     runner: &str,
     chunk: &[u8],
     now: i64,
-) -> Result<(i64, i64)> {
+) -> Result<(Option<i64>, i64)> {
     if chunk.is_empty() || chunk.len() > MAX_CHUNK_BYTES {
         return Err(validation(format!(
             "an output chunk is 1..={MAX_CHUNK_BYTES} bytes; this one is {}",
@@ -986,9 +1038,8 @@ pub fn output(
         "exec.output",
         json!({ "n": n, "b64": b64 }),
         now,
-        true,
-    )?
-    .ok_or_else(|| validation("the output was not published"))?;
+        false,
+    )?;
     Ok((seq, n))
 }
 
@@ -1096,12 +1147,7 @@ pub fn finish(
         meta,
         id,
         "exec.end",
-        json!({
-            "id": finished.wire_id(),
-            "state": finished.state.as_str(),
-            "outcome": done.outcome.as_str(),
-            "exit_status": done.exit_status,
-        }),
+        end_payload(&finished),
         now,
         false,
     )?;
@@ -1198,9 +1244,48 @@ pub fn list(
     Ok((rows, next))
 }
 
+/// Up to `max` messages of request `id`'s topic after seq `after` — how its requester follows it. The
+/// topic is reserved ([`mq::RESERVED_PREFIXES`]): no queue operation reads it, and who may call this
+/// is `jkb-api`'s (the requester's session, or the operator).
+///
+/// # Errors
+/// Not found; [`QueueError::Invalid`] for a `max` over [`mq::MAX_BATCH`]; a database error.
+pub fn follow(
+    conn: &Connection,
+    id: i64,
+    after: i64,
+    max: usize,
+    now: i64,
+) -> Result<Vec<mq::Delivered>> {
+    must_get(conn, id)?;
+    match mq::read_reserved(conn, &topic(id), after, max, now) {
+        Err(crate::Error::Queue(QueueError::NoSuchTopic(_))) => Ok(Vec::new()),
+        other => other,
+    }
+}
+
+/// Expire `session`'s pending requests if the session registry now says it has ended. For a caller
+/// that has just recorded an end **the session itself reported** (or the operator did): an end any
+/// queue client can forge for another session must not cost that session its pending requests.
+///
+/// # Errors
+/// A database error.
+pub fn expire_if_ended(
+    conn: &Connection,
+    meta: &WriteMeta,
+    session: &str,
+    now: i64,
+) -> Result<usize> {
+    if crate::claude_session::state(conn, session)? == crate::claude_session::SessionState::Ended {
+        expire_session(conn, meta, session, now)
+    } else {
+        Ok(0)
+    }
+}
+
 /// The requester's session ended: expire its pending requests (a running one runs on — the operator
-/// already approved it). Returns how many expired. Called by [`crate::claude_session`] once the
-/// session's state is `Ended`.
+/// already approved it). Returns how many expired. Through [`expire_if_ended`], whose caller vouches
+/// the end came from the session itself.
 ///
 /// # Errors
 /// A database error.
