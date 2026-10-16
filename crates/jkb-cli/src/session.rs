@@ -504,7 +504,7 @@ pub const CONTAINER_NAME: &str = "jkb-dev";
 pub const CONTAINER_REPOS: &str = "/home/vscode/repos";
 
 /// Whether this process is inside the dev container: remote mode, or Docker's marker file.
-fn in_container() -> bool {
+pub(crate) fn in_container() -> bool {
     crate::remote::target().is_some() || Path::new("/.dockerenv").exists()
 }
 

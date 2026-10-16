@@ -14,6 +14,7 @@ mod commands;
 mod design_cli;
 mod design_export;
 mod doctor;
+mod exec_cli;
 mod git_audit;
 mod gitrepo;
 mod inv_cli;
@@ -248,6 +249,13 @@ enum Command {
     Attest {
         #[command(subcommand)]
         cmd: rbac_cli::AttestCmd,
+    },
+    /// Run requests: ask the operator to run one command where this session's sandbox cannot
+    /// reach — on the host, or in the dev container outside the agent's sandbox — and wait for its
+    /// output and exit status (the Executions design).
+    Exec {
+        #[command(subcommand)]
+        cmd: exec_cli::ExecCmd,
     },
     /// The message queue: topics, sends, NDJSON subscriptions (design r3.2 Q6).
     Mq {
@@ -1727,6 +1735,14 @@ fn run(cli: Cli) -> Result<()> {
         return design_export::check_files(repo.as_deref(), cli.json);
     }
 
+    // `jkb exec pin` is git and a hash: no database, no daemon, in any mode.
+    if let Command::Exec {
+        cmd: exec_cli::ExecCmd::Pin { dir },
+    } = &cli.command
+    {
+        return exec_cli::pin(dir, cli.json);
+    }
+
     // (2) With JKB_REMOTE set this process must never open a database — on the dev container's
     // kernel that is the host's `jkb.db`, which a process on each side of the bind corrupts — so
     // every other command either goes to the daemon or is refused here, at dispatch, before it has
@@ -1913,6 +1929,9 @@ fn run(cli: Cli) -> Result<()> {
         }),
         Command::Mq { cmd } => {
             mq_cli::run(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
+        }
+        Command::Exec { cmd } => {
+            exec_cli::run(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
         }
         Command::Role { cmd } => {
             rbac_cli::role(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)

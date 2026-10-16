@@ -1,0 +1,613 @@
+//! `jkb exec`: a session asks the operator to run one command for it, somewhere its own sandbox
+//! cannot reach, and waits for the answer (the Executions design).
+//!
+//! The request is a record ([`jkb_core::exec`]), made through the `exec.*` ops: the argv as a list
+//! (run without a shell), the directory's real path, the target, a reason, and the tree pin of the
+//! directory's repository, computed here with jkb's hooks-off git ([`crate::gitrepo::tree_pin`]).
+//! Nothing here runs the command — the operator's runner does, after reading exactly what would run.
+//!
+//! `jkb exec request` waits by default: it follows the request's topic, writes the output to stdout
+//! as it arrives, and exits with the run's status. The topic is a hint; the answer is always
+//! confirmed with `exec.status` before it is acted on.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{bail, Context as _, Result};
+use clap::{Subcommand, ValueEnum};
+use jkb_api::exec::{ExecAsk, ExecView, Pin};
+use jkb_api::{ApiError, Backend, ErrorCode, Request, Response};
+
+/// Exit status for a declined request.
+pub const EXIT_DECLINED: i32 = 77;
+/// Exit status for a refused request.
+pub const EXIT_REFUSED: i32 = 78;
+/// Exit status for an expired request.
+pub const EXIT_EXPIRED: i32 = 79;
+/// Exit status for a run that timed out or was interrupted (as `timeout(1)`).
+pub const EXIT_TIMED_OUT: i32 = 124;
+
+/// Where a request runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TargetArg {
+    /// On the host.
+    Host,
+    /// In the dev container, outside the agent's sandbox.
+    Container,
+}
+
+impl TargetArg {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Container => "container",
+        }
+    }
+}
+
+/// `jkb exec …`.
+#[derive(Debug, Subcommand)]
+pub enum ExecCmd {
+    /// Ask the operator to run one command, and wait for its output and exit status.
+    ///
+    /// The command is argv, run without a shell: a pipeline names `sh -c '<script>'` explicitly, so
+    /// the operator sees a shell is involved. Exits with the command's status (128+n for a signal,
+    /// 124 for a timeout); 77 if the operator declined (the note is printed), 78 if it was refused,
+    /// 79 if it expired.
+    Request {
+        /// Where it runs: `host`, or `container` (outside the agent's sandbox).
+        #[arg(long, value_enum)]
+        target: TargetArg,
+        /// The directory it runs in.
+        #[arg(long)]
+        dir: PathBuf,
+        /// How long it may run: `90s`, `15m`, `2h` (default 15m, at most 2h).
+        #[arg(long, value_parser = parse_timeout)]
+        timeout: Option<i64>,
+        /// One sentence for the operator: why the session needs this.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Print the request id and return at once; read the outcome with `jkb exec status`.
+        #[arg(long)]
+        no_wait: bool,
+        /// The program and its arguments, after `--`.
+        #[arg(last = true, required = true, num_args = 1..)]
+        argv: Vec<String>,
+    },
+    /// A request's state, and its output once it ran.
+    Status {
+        /// `exec-<n>`.
+        id: String,
+    },
+    /// Decline a pending request, with a note saying what to ask for instead (the operator's).
+    Decline {
+        /// `exec-<n>`.
+        id: String,
+        /// What the session should ask for instead.
+        #[arg(long)]
+        note: String,
+    },
+    /// Run requests: every session's for the operator, a session's own for it.
+    List {
+        /// Only requests in this state (`pending`, `running`, `finished`, …).
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// The tree pin of the repository containing a directory — what a request would record. Opens no
+    /// database.
+    Pin {
+        /// The directory.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+}
+
+/// `90s`, `15m`, `2h`, or bare seconds, as milliseconds.
+fn parse_timeout(s: &str) -> Result<i64, String> {
+    let (digits, unit) = match s.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => s.split_at(i),
+        None => (s, "s"),
+    };
+    let n: i64 = digits
+        .parse()
+        .map_err(|_| format!("{s:?} is not a duration like 90s, 15m or 2h"))?;
+    let scale = match unit {
+        "s" => 1000,
+        "m" => 60 * 1000,
+        "h" => 60 * 60 * 1000,
+        _ => return Err(format!("{s:?}: the unit is s, m or h")),
+    };
+    n.checked_mul(scale)
+        .ok_or_else(|| format!("{s:?} is too long"))
+}
+
+/// Whether this process runs in the dev container — so the paths it names are the container's.
+fn dir_side() -> TargetArg {
+    if crate::session::in_container() {
+        TargetArg::Container
+    } else {
+        TargetArg::Host
+    }
+}
+
+/// Refuse a host run of a container directory the host cannot see: only `~/repos` is shared.
+fn check_visible(dir: &Path, side: TargetArg, target: TargetArg) -> Result<()> {
+    if side != TargetArg::Container || target != TargetArg::Host {
+        return Ok(());
+    }
+    let repos = Path::new(crate::session::CONTAINER_REPOS);
+    if !dir.starts_with(repos) {
+        bail!(
+            "{} is not under {}: the host sees only the container's ~/repos, so it cannot run a \
+             command in this directory — ask for --target container, or use a directory under ~/repos",
+            dir.display(),
+            repos.display()
+        );
+    }
+    Ok(())
+}
+
+fn call(backend: &dyn Backend, request: Request) -> Result<Response> {
+    backend.call(request).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn expect_view(r: Response) -> Result<ExecView> {
+    match r {
+        Response::ExecRequest { request } => Ok(request),
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Run `cmd`.
+///
+/// # Errors
+/// A refused op, an unreadable directory, or a pin that cannot be computed.
+#[allow(clippy::too_many_lines)] // one arm per verb, like `mq_cli::run`
+pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
+    match cmd {
+        ExecCmd::Pin { dir } => pin(&dir, json),
+        ExecCmd::Request {
+            target,
+            dir,
+            timeout,
+            reason,
+            no_wait,
+            argv,
+        } => {
+            let dir = std::fs::canonicalize(&dir)
+                .with_context(|| format!("resolving {}", dir.display()))?;
+            let side = dir_side();
+            check_visible(&dir, side, target)?;
+            let pin = crate::gitrepo::tree_pin(&dir)?;
+            let dir_text = dir
+                .to_str()
+                .with_context(|| format!("{} is not valid UTF-8", dir.display()))?
+                .to_owned();
+            let ask = ExecAsk {
+                target: target.as_str().to_owned(),
+                dir: dir_text,
+                dir_side: side.as_str().to_owned(),
+                argv,
+                reason,
+                pin: pin.map(Pin::from),
+                timeout_ms: timeout,
+            };
+            let (view, folded) = match call(backend, Request::ExecRequest(ask))? {
+                Response::ExecRequested { request, folded } => (request, folded),
+                other => bail!("unexpected response: {other:?}"),
+            };
+            if no_wait {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "request": view, "folded": folded })
+                    );
+                } else {
+                    println!("{}{}", view.id, if folded { " (folded)" } else { "" });
+                }
+                return Ok(());
+            }
+            eprintln!(
+                "jkb exec: asked the operator to run this ({}{}); waiting for the answer",
+                view.id,
+                if folded {
+                    ", folded into an identical pending request"
+                } else {
+                    ""
+                }
+            );
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let code = wait(
+                backend,
+                &view,
+                &mut stdout.lock(),
+                &mut stderr.lock(),
+                Duration::from_millis(250),
+            )
+            .with_context(|| {
+                format!(
+                    "stopped waiting for {id}; it is still recorded — read its outcome with `jkb \
+                     exec status {id}`",
+                    id = view.id
+                )
+            })?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        ExecCmd::Status { id } => {
+            let view = expect_view(call(backend, Request::ExecStatus { id })?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&view)?);
+            } else {
+                print_view(&view, &mut std::io::stdout().lock())?;
+            }
+            Ok(())
+        }
+        ExecCmd::Decline { id, note } => {
+            let view = expect_view(call(backend, Request::ExecDecline { id, note })?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&view)?);
+            } else {
+                println!("{} declined", view.id);
+            }
+            Ok(())
+        }
+        ExecCmd::List { state } => {
+            let mut after = None;
+            let mut all = Vec::new();
+            loop {
+                match call(
+                    backend,
+                    Request::ExecList {
+                        state: state.clone(),
+                        after,
+                    },
+                )? {
+                    Response::ExecRequests { requests, next } => {
+                        all.extend(requests);
+                        match next {
+                            Some(n) => after = Some(n),
+                            None => break,
+                        }
+                    }
+                    other => bail!("unexpected response: {other:?}"),
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&all)?);
+            } else if all.is_empty() {
+                println!("no run requests");
+            } else {
+                for v in &all {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        v.id,
+                        v.state,
+                        v.target,
+                        v.session,
+                        v.argv
+                            .iter()
+                            .map(|a| format!("{a:?}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `jkb exec pin`: run before any database or daemon is reached.
+///
+/// # Errors
+/// An unreadable directory, or a pin that cannot be computed.
+pub fn pin(dir: &Path, json: bool) -> Result<()> {
+    let dir = std::fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
+    let pin = crate::gitrepo::tree_pin(&dir)?.map(Pin::from);
+    if json {
+        println!("{}", serde_json::json!({ "dir": dir, "pin": pin }));
+    } else {
+        match pin {
+            Some(p) => println!("head {}\nchanges {}", p.head, p.changes),
+            None => println!("{} is in no repository: no pin", dir.display()),
+        }
+    }
+    Ok(())
+}
+
+/// A request, for a person: every argument on its own line, escaped.
+fn print_view(v: &ExecView, out: &mut dyn Write) -> Result<()> {
+    writeln!(out, "{}  {}", v.id, v.state)?;
+    writeln!(out, "target   {} (dir is the {}'s)", v.target, v.dir_side)?;
+    writeln!(out, "dir      {:?}", v.dir)?;
+    writeln!(out, "argv")?;
+    for a in &v.argv {
+        writeln!(out, "  {a:?}")?;
+    }
+    if !v.reason.is_empty() {
+        writeln!(out, "reason   {:?}", v.reason)?;
+    }
+    writeln!(
+        out,
+        "asked by {} ({}{}){}",
+        v.session,
+        v.role,
+        v.agent_type
+            .as_deref()
+            .map(|t| format!(", {t}"))
+            .unwrap_or_default(),
+        v.task
+            .as_deref()
+            .map(|t| format!(" for {t}"))
+            .unwrap_or_default()
+    )?;
+    match &v.pin {
+        Some(p) => writeln!(out, "pin      {} + {}", p.head, p.changes)?,
+        None => writeln!(out, "pin      none (the directory is in no repository)")?,
+    }
+    writeln!(out, "timeout  {}s", v.timeout_ms / 1000)?;
+    if let Some(r) = &v.refuse_reason {
+        writeln!(out, "refused  {r}")?;
+    }
+    if let Some(n) = &v.note {
+        writeln!(out, "note     {n}")?;
+    }
+    if let Some(o) = &v.outcome {
+        writeln!(
+            out,
+            "outcome  {o}{}",
+            v.exit_status.map(|s| format!(" {s}")).unwrap_or_default()
+        )?;
+    }
+    if let Some(o) = &v.output {
+        if let Some(p) = &o.log_path {
+            writeln!(out, "log      {p}")?;
+        }
+        let tail = jkb_api::exec::bytes("tail", &o.tail_b64).unwrap_or_default();
+        if !tail.is_empty() {
+            writeln!(
+                out,
+                "output{}",
+                if o.truncated {
+                    " (the last 256 KiB)"
+                } else {
+                    ""
+                }
+            )?;
+            out.write_all(&tail)?;
+            if !tail.ends_with(b"\n") {
+                writeln!(out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The exit status a terminal request makes `jkb exec request` exit with.
+#[must_use]
+pub fn exit_code(v: &ExecView) -> Option<i32> {
+    let status = || v.exit_status.and_then(|s| i32::try_from(s).ok());
+    match v.state.as_str() {
+        "finished" => Some(match v.outcome.as_deref() {
+            Some("exited") => status().unwrap_or(1),
+            Some("signalled") => 128 + status().unwrap_or(0),
+            _ => EXIT_TIMED_OUT,
+        }),
+        "declined" => Some(EXIT_DECLINED),
+        "refused" => Some(EXIT_REFUSED),
+        "expired" => Some(EXIT_EXPIRED),
+        _ => None,
+    }
+}
+
+/// Whether a refusal is worth waiting out.
+fn transient(e: &ApiError) -> bool {
+    matches!(e.code, ErrorCode::Busy | ErrorCode::Unavailable)
+}
+
+/// Follow `request`'s topic until it is answered: output to `out` as it arrives, the decision to
+/// `err`, and the exit status the request ended with. Confirms every ending with `exec.status`, and
+/// reads the topic to its end before returning, so no output published before the end is missed.
+///
+/// # Errors
+/// A refusal that is not transient.
+pub fn wait(
+    backend: &dyn Backend,
+    request: &ExecView,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interval: Duration,
+) -> Result<i32> {
+    let group = format!(
+        "wait-{}",
+        jkb_core::roles::fresh_token()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(16)
+            .collect::<String>()
+    );
+    let topic = request.topic.clone();
+    let result = follow(backend, request, &topic, &group, out, err, interval);
+    // A consumer that knows it is leaving removes its own group.
+    let _ = backend.call(Request::MqGroupDelete { topic, group });
+    result
+}
+
+/// Retry `f` while it is refused transiently.
+fn retrying<T>(interval: Duration, mut f: impl FnMut() -> Result<T, ApiError>) -> Result<T> {
+    let mut pause = interval;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if transient(&e) => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_secs(5));
+            }
+            Err(e) => bail!("{e}"),
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one loop, with its terminal drain
+fn follow(
+    backend: &dyn Backend,
+    request: &ExecView,
+    topic: &str,
+    group: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    interval: Duration,
+) -> Result<i32> {
+    let create = || {
+        backend.call(Request::MqGroupCreate {
+            topic: topic.to_owned(),
+            group: group.to_owned(),
+            from_start: true,
+        })
+    };
+    retrying(interval, create)?;
+    let mut after: Option<i64> = None;
+    let mut printed: Option<i64> = None;
+    let mut ended: Option<ExecView> = None;
+    loop {
+        let polled = retrying(interval, || {
+            match backend.call(Request::MqPoll {
+                topic: topic.to_owned(),
+                group: group.to_owned(),
+                max: jkb_core::mq::MAX_BATCH,
+                after,
+            }) {
+                // Removed while idle: recreate from the start; chunks already printed are skipped.
+                Err(e) if e.code == ErrorCode::NoSuchGroup => {
+                    create()?;
+                    after = None;
+                    Ok(Response::Messages {
+                        messages: Vec::new(),
+                    })
+                }
+                other => other,
+            }
+        })?;
+        let Response::Messages { messages } = polled else {
+            bail!("unexpected response to mq.poll: {polled:?}");
+        };
+        let got = !messages.is_empty();
+        let mut announced_end = false;
+        for m in &messages {
+            after = Some(m.seq);
+            match m.kind.as_str() {
+                "exec.output" => {
+                    let n = m.payload["n"].as_i64().unwrap_or(-1);
+                    if printed.is_some_and(|p| n <= p) {
+                        continue;
+                    }
+                    let b64 = m.payload["b64"].as_str().unwrap_or_default();
+                    if let Ok(bytes) = jkb_api::exec::bytes("chunk", b64) {
+                        out.write_all(&bytes)?;
+                        out.flush()?;
+                    }
+                    printed = Some(n);
+                }
+                "exec.end" => announced_end = true,
+                "exec.decision" => {
+                    let state = m.payload["state"].as_str().unwrap_or_default();
+                    if state == "running" {
+                        writeln!(err, "jkb exec: the operator is running it")?;
+                    } else {
+                        announced_end = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(seq) = after {
+            let _ = backend.call(Request::MqAck {
+                topic: topic.to_owned(),
+                group: group.to_owned(),
+                seq,
+            });
+        }
+        if let Some(view) = ended.take() {
+            if !got {
+                // Drained after the end: report it.
+                return finish(&view, printed.is_some(), out, err);
+            }
+            ended = Some(view);
+            continue;
+        }
+        // Confirm with the row: on an announced ending, and on every idle poll — a decision that
+        // could not be published (a full topic) is still a fact the row holds.
+        if announced_end || !got {
+            let view = retrying(interval, || {
+                backend.call(Request::ExecStatus {
+                    id: request.id.clone(),
+                })
+            })
+            .and_then(expect_view)?;
+            if exit_code(&view).is_some() {
+                ended = Some(view);
+                continue;
+            }
+        }
+        if !got && backend.in_process() {
+            std::thread::sleep(interval);
+        }
+    }
+}
+
+/// Report a terminal request and return its exit status.
+fn finish(
+    view: &ExecView,
+    printed_any: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<i32> {
+    // Nothing reached the topic (it was full, or reaped): the row's tail is what there is.
+    if !printed_any {
+        if let Some(o) = &view.output {
+            let tail = jkb_api::exec::bytes("tail", &o.tail_b64).unwrap_or_default();
+            out.write_all(&tail)?;
+            out.flush()?;
+        }
+    }
+    let code = exit_code(view).unwrap_or(1);
+    match view.state.as_str() {
+        "declined" => writeln!(
+            err,
+            "jkb exec: {} was declined: {}",
+            view.id,
+            view.note.as_deref().unwrap_or("(no note)")
+        )?,
+        "refused" => writeln!(
+            err,
+            "jkb exec: {} was refused ({}); ask again — a new request is reviewed fresh",
+            view.id,
+            view.refuse_reason.as_deref().unwrap_or("unknown")
+        )?,
+        "expired" => writeln!(
+            err,
+            "jkb exec: {} {}",
+            view.id,
+            view.note.as_deref().unwrap_or("expired")
+        )?,
+        _ => {
+            if let Some(p) = view.output.as_ref().and_then(|o| o.log_path.as_deref()) {
+                writeln!(
+                    err,
+                    "jkb exec: {} ended ({code}); full output in {p}",
+                    view.id
+                )?;
+            }
+        }
+    }
+    Ok(code)
+}
+
+#[cfg(test)]
+mod tests;

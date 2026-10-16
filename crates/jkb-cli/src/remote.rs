@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 
+use super::exec_cli::ExecCmd;
 use super::rbac_cli::RoleCmd;
 use super::{Cli, Command, CommandsCmd, DesignCmd, NsCmd, TaskCmd, TaskReviewCmd};
 
@@ -41,7 +42,10 @@ pub const fn support(command: &Command) -> Support {
         Command::Notify { .. }
         | Command::Guide
         | Command::Commands { .. }
-        | Command::Attest { .. } => Support::NoDatabase,
+        | Command::Attest { .. }
+        | Command::Exec {
+            cmd: ExecCmd::Pin { .. },
+        } => Support::NoDatabase,
         Command::Serve { .. } => {
             Support::Refused("the daemon runs on the host, next to the database")
         }
@@ -73,6 +77,9 @@ pub const fn support(command: &Command) -> Support {
         // The queue, and the agent read set (tasks S6.1). `ops_cli::handles` names the same reads for
         // dispatch; `the_ported_reads_are_the_ones_ops_cli_handles` holds the two together.
         Command::Mq { .. }
+        // A run request is a record: the daemon takes the requester from the caller's ticket, and
+        // runs nothing (the Executions design).
+        | Command::Exec { .. }
         // Roles and workflows are ops; the daemon enforces who may run which.
         | Command::Role { .. }
         | Command::Workflow { .. }
@@ -235,6 +242,9 @@ pub fn beyond_rbac(command: &Command) -> bool {
         | Command::Workflow { .. }
         | Command::Attest { .. }
         | Command::Mq { .. }
+        // Hashes the files of the repository it names, and sends only the digest; what runs is
+        // decided by the operator, who reads the request.
+        | Command::Exec { .. }
         | Command::Ls { .. }
         | Command::Grep { .. }
         | Command::Cat { .. }
@@ -492,6 +502,9 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
                 super::rbac_cli::attest(&cmd);
                 Ok(())
             }
+            Command::Exec {
+                cmd: ExecCmd::Pin { dir },
+            } => super::exec_cli::pin(&dir, cli.json),
             _ => bail!("internal: a NoDatabase command with no remote dispatch"),
         },
         Support::Ported => {
@@ -513,6 +526,7 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
             };
             match cli.command {
                 Command::Mq { cmd } => super::mq_cli::run(&backend, cmd, cli.json),
+                Command::Exec { cmd } => super::exec_cli::run(&backend, cmd, cli.json),
                 Command::Role { cmd } => super::rbac_cli::role(&backend, cmd, cli.json),
                 Command::Workflow { cmd } => super::rbac_cli::workflow(&backend, cmd, cli.json),
                 Command::Mcp => jkb_mcp::run_stdio(jkb_mcp::Tools {

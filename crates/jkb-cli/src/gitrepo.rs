@@ -2473,6 +2473,138 @@ fn exists(dir: &Path, reference: &str) -> Result<bool> {
     Ok(rev_commit(dir, reference)?.is_some())
 }
 
+/// The `-c` settings a tree pin's git runs with, beyond [`NEUTRALIZERS`]: the pin is computed by the
+/// requesting CLI (in the dev container) and recomputed by the runner (on the host), each under its
+/// own global config, so nothing a user's config chooses may change what is listed. A global
+/// excludes file differs between the two sides, so neither reads one: a file only a user's global
+/// ignore hides is pinned as untracked on both. Line endings are never converted while listing.
+const PIN_SETTINGS: &[&str] = &[
+    "-c",
+    "core.excludesFile=/dev/null",
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "diff.relative=false",
+];
+
+/// The framing version a tree pin's hash starts with ([`tree_pin`]).
+const PIN_FRAMING: &[u8] = b"jkb-tree-pin/v1\n";
+
+/// `git` in `dir` for its raw stdout, `None` when it exits non-zero — [`git`] for output that is not
+/// one trimmed line (a `-z` listing).
+fn git_bytes(dir: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
+    checked(dir, args)?;
+    let out = git_cmd(dir, args)
+        .output()
+        .with_context(|| format!("running `git {}`", args.join(" ")))?;
+    Ok(out.status.success().then_some(out.stdout))
+}
+
+/// The tree pin of the repository containing `dir` (the Executions design), or `None` when `dir` is
+/// in no repository: its `HEAD` commit, and the blake3 of its working-tree changes.
+///
+/// **What is pinned is the work tree, not a diff's text.** The requester computes the pin in the dev
+/// container and the runner recomputes it on the host, under two git versions and two global
+/// configs; a diff's text depends on both (prefixes, colour, rename detection, the diff algorithm,
+/// context lines), so hashing it would refuse unchanged trees. So the changed paths are listed —
+/// tracked paths that differ from `HEAD` (`diff --name-only --no-renames HEAD`, staged or not:
+/// what runs is the work tree) and untracked ones (`ls-files --others --exclude-standard`) — and
+/// each is hashed as it is on disk, read without following a link.
+///
+/// **The framing, version 1** — main and the CLI run this same function, and a change to it is a
+/// new version: blake3 over `jkb-tree-pin/v1\n`, then for each path in byte order, once, three
+/// frames — the path's bytes, its kind, its content — where a frame is the length as a
+/// little-endian `u64` followed by the bytes. The kinds: `file` and `exec` (a regular file, and
+/// one with any execute bit; content its bytes), `link` (content the link's target), `dir` (an
+/// untracked nested repository, or a submodule whose commit moved; no content), `missing` (a
+/// tracked file deleted; no content), `other` (a FIFO, a socket; no content).
+///
+/// **What it does not cover**, stated by the design: files git ignores (`target/`, build output),
+/// a nested repository's or submodule's own work tree, and a change made between the pin check and
+/// the moment a run reads the file.
+///
+/// Through jkb's git, so hooks-off and audited: a repository whose own config names a program is
+/// refused, as for every jkb git call.
+///
+/// # Errors
+/// The audit's refusal; a repository with no commit; an unreadable changed file (one over
+/// [`jkb_core::nofollow::MAX_READ_BYTES`] among them); or `git` failing to run.
+pub fn tree_pin(dir: &Path) -> Result<Option<jkb_core::exec::TreePin>> {
+    let Some(top) = root(dir)? else {
+        return Ok(None);
+    };
+    let head = git(&top, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])?
+        .filter(|h| !h.is_empty())
+        .with_context(|| format!("{} has no commit to pin", top.display()))?;
+    let listing = |args: &[&str]| -> Result<Vec<Vec<u8>>> {
+        let mut all: Vec<&str> = PIN_SETTINGS.to_vec();
+        all.extend_from_slice(args);
+        let out = git_bytes(&top, &all)?
+            .with_context(|| format!("`git {}` failed in {}", args.join(" "), top.display()))?;
+        Ok(out
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect())
+    };
+    let mut paths = listing(&["diff", "--name-only", "-z", "--no-renames", "HEAD"])?;
+    paths.extend(listing(&[
+        "ls-files",
+        "-z",
+        "--others",
+        "--exclude-standard",
+    ])?);
+    paths.sort();
+    paths.dedup();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(PIN_FRAMING);
+    for path in &paths {
+        let (kind, content) = pinned_entry(&top, path)?;
+        for part in [path.as_slice(), kind.as_bytes(), content.as_slice()] {
+            hasher.update(&u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
+            hasher.update(part);
+        }
+    }
+    Ok(Some(jkb_core::exec::TreePin {
+        head,
+        changes: hasher.finalize().to_hex().to_string(),
+    }))
+}
+
+/// One changed path's kind and content, for [`tree_pin`]'s framing.
+fn pinned_entry(top: &Path, rel: &[u8]) -> Result<(&'static str, Vec<u8>)> {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    use std::os::unix::fs::PermissionsExt as _;
+    // An untracked nested repository is listed with a trailing slash.
+    let rel = rel.strip_suffix(b"/").unwrap_or(rel);
+    let path = top.join(std::ffi::OsStr::from_bytes(rel));
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(("missing", Vec::new())),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let ty = meta.file_type();
+    if ty.is_symlink() {
+        let target = fs::read_link(&path).with_context(|| format!("reading {}", path.display()))?;
+        return Ok(("link", target.into_os_string().into_vec()));
+    }
+    if ty.is_dir() {
+        return Ok(("dir", Vec::new()));
+    }
+    if !ty.is_file() {
+        return Ok(("other", Vec::new()));
+    }
+    let bytes = jkb_core::nofollow::read(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .unwrap_or_default();
+    let kind = if meta.permissions().mode() & 0o111 == 0 {
+        "file"
+    } else {
+        "exec"
+    };
+    Ok((kind, bytes))
+}
+
 /// Which ref to ask about when a branch exists both locally and on the remote. They can
 /// disagree, and which answer is right depends on the question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4948,5 +5080,168 @@ mod tests {
                 .any(|w| w[0] == "-c" && w[1] == "core.fsmonitor=false"),
             "{args:?}"
         );
+    }
+
+    /// A small repository for the tree pin: `fixture`'s history, plus a tracked script and an
+    /// ignore rule.
+    fn pin_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(dir.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(dir.join("run.sh"), "echo hi\n").unwrap();
+        std::os::unix::fs::symlink("base.txt", dir.join("link")).unwrap();
+        for args in [&["add", "-A"][..], &["commit", "-qm", "pin"][..]] {
+            assert!(fixture_git(&dir, args).status().unwrap().success());
+        }
+        (t, dir)
+    }
+
+    fn pin_of(dir: &Path) -> jkb_core::exec::TreePin {
+        super::tree_pin(dir)
+            .unwrap()
+            .expect("a repository has a pin")
+    }
+
+    /// The pin moves with every change that runs, and comes back when the change is undone.
+    #[test]
+    fn the_tree_pin_moves_with_each_change_to_the_work_tree() {
+        let (_t, dir) = pin_repo();
+        let clean = pin_of(&dir);
+        assert_eq!(clean.head.len(), 40);
+        assert_eq!(clean.changes.len(), 64);
+        // Asked from a subdirectory, the pin is the whole repository's.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert_eq!(pin_of(&dir.join("sub")), clean);
+
+        let changed = |what: &str, change: &dyn Fn(), undo: &dyn Fn()| {
+            change();
+            let p = pin_of(&dir);
+            assert_eq!(p.head, clean.head, "{what}: HEAD did not move");
+            assert_ne!(p.changes, clean.changes, "{what} did not move the pin");
+            undo();
+            assert_eq!(pin_of(&dir), clean, "{what} undone did not restore the pin");
+        };
+        let file = dir.join("base.txt");
+        changed(
+            "a tracked edit",
+            &|| std::fs::write(&file, "edited").unwrap(),
+            &|| std::fs::write(&file, "base").unwrap(),
+        );
+        changed(
+            "a staged edit",
+            &|| {
+                std::fs::write(&file, "staged").unwrap();
+                assert!(fixture_git(&dir, &["add", "base.txt"])
+                    .status()
+                    .unwrap()
+                    .success());
+            },
+            &|| {
+                std::fs::write(&file, "base").unwrap();
+                assert!(fixture_git(&dir, &["add", "base.txt"])
+                    .status()
+                    .unwrap()
+                    .success());
+            },
+        );
+        let new = dir.join("new.txt");
+        changed(
+            "a new untracked file",
+            &|| std::fs::write(&new, "x").unwrap(),
+            &|| std::fs::remove_file(&new).unwrap(),
+        );
+        let link = dir.join("link");
+        changed(
+            "a symlink retarget",
+            &|| {
+                std::fs::remove_file(&link).unwrap();
+                std::os::unix::fs::symlink("run.sh", &link).unwrap();
+            },
+            &|| {
+                std::fs::remove_file(&link).unwrap();
+                std::os::unix::fs::symlink("base.txt", &link).unwrap();
+            },
+        );
+        let script = dir.join("run.sh");
+        let mode = |m: u32| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        changed("an execute bit", &|| mode(0o755), &|| mode(0o644));
+        changed(
+            "a deleted tracked file",
+            &|| std::fs::remove_file(&script).unwrap(),
+            &|| std::fs::write(&script, "echo hi\n").unwrap(),
+        );
+
+        // Two different untracked contents are two different pins.
+        std::fs::write(&new, "one").unwrap();
+        let one = pin_of(&dir);
+        std::fs::write(&new, "two").unwrap();
+        assert_ne!(pin_of(&dir), one);
+        std::fs::remove_file(&new).unwrap();
+
+        // A commit moves HEAD.
+        std::fs::write(&file, "committed").unwrap();
+        for args in [&["add", "-A"][..], &["commit", "-qm", "c"][..]] {
+            assert!(fixture_git(&dir, args).status().unwrap().success());
+        }
+        let committed = pin_of(&dir);
+        assert_ne!(committed.head, clean.head);
+        assert_eq!(
+            committed.changes,
+            pin_of(&dir).changes,
+            "a clean tree hashes the same whatever HEAD is"
+        );
+    }
+
+    /// The stated gap: what git ignores is outside the pin.
+    #[test]
+    fn the_tree_pin_does_not_see_an_ignored_file() {
+        let (_t, dir) = pin_repo();
+        let clean = pin_of(&dir);
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("target/build.sh"), "rm -rf ~").unwrap();
+        assert_eq!(
+            pin_of(&dir),
+            clean,
+            "an ignored file is not pinned (the design's stated gap)"
+        );
+    }
+
+    /// A directory in no repository has no pin; a repository with no commit, or one whose own config
+    /// names a program, is refused.
+    #[test]
+    fn the_tree_pin_is_absent_outside_a_repository_and_refused_for_a_planted_config() {
+        let t = tempfile::tempdir().unwrap();
+        let plain = std::fs::canonicalize(t.path()).unwrap().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        // A temp dir can sit inside some repository on a developer's machine; only assert absence
+        // when git agrees there is none.
+        if super::root(&plain).unwrap().is_none() {
+            assert_eq!(super::tree_pin(&plain).unwrap(), None);
+        }
+
+        let empty = t.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(fixture_git(&empty, &["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        let e = super::tree_pin(&empty).unwrap_err().to_string();
+        assert!(e.contains("no commit"), "{e}");
+
+        let (_t, dir) = pin_repo();
+        assert!(
+            fixture_git(&dir, &["config", "filter.x.clean", "touch /tmp/x"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let e = format!("{:#}", super::tree_pin(&dir).unwrap_err());
+        assert!(e.contains("filter.x.clean"), "{e}");
     }
 }
