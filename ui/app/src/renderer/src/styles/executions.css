@@ -171,6 +171,11 @@
   stroke: var(--ink);
 }
 
+.machine-marker[data-visited="true"] rect {
+  stroke: var(--ink);
+  stroke-width: 2.25;
+}
+
 .machine-table tr[data-visited="true"] td {
   color: var(--ink);
   font-weight: 600;

@@ -189,8 +189,16 @@ export function LifecyclePane({
               if (n === undefined) return null;
               const left = x(n.layer) + (NODE_W - MARKER_W) / 2;
               const top = y(n.row) - MARKER_H / 2;
+              // The task's path can run through a row folded into this marker; ink the marker then,
+              // or the step would show in the table below but vanish from the picture.
+              const went = m.groups.flatMap((g) => g.rows).reduce((sum, r) => sum + (taken.get(rowKey(r.from, r.event)) ?? 0), 0);
               return (
-                <g key={`marker-${m.to}`} className="machine-marker" transform={`translate(${left},${top})`}>
+                <g
+                  key={`marker-${m.to}`}
+                  className="machine-marker"
+                  data-visited={went > 0 ? "true" : undefined}
+                  transform={`translate(${left},${top})`}
+                >
                   <rect width={MARKER_W} height={MARKER_H} rx={MARKER_H / 2} />
                   <text x={MARKER_W / 2} y={MARKER_H / 2 + 3.5} textAnchor="middle" className="machine-marker-label">
                     {`observed ×${markerSources(m).length}`}
@@ -198,6 +206,7 @@ export function LifecyclePane({
                   <title>
                     {m.groups
                       .map((g) => `${g.event} ← ${[...new Set(g.rows.map((r) => r.from))].join(", ")}`)
+                      .concat(went > 0 ? [`taken ×${went}`] : [])
                       .join("\n")}
                   </title>
                 </g>

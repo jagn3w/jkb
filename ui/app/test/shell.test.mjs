@@ -181,13 +181,16 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
     phase: "review",
     status: "needs_review",
     workflow: {
-      states: [state("implement", true), state("review")],
+      states: [state("implement", true), state("review"), state("landed")],
       transitions: [
         edge("implement", "submit_work", "review"),
         // A second row between the same two states: never taken, so never inked.
         edge("implement", "submit_systemic", "review"),
         edge("review", "request_changes", "implement"),
         edge("review", "override", null),
+        // One observation from two phases: drawn as one marker on `landed`, not two arrows.
+        { ...edge("implement", "observed_landed", "landed"), reconciled: true },
+        { ...edge("review", "observed_landed", "landed"), reconciled: true },
       ],
     },
     lifecycle: { states: [state("open", true)], transitions: [] },
@@ -222,6 +225,7 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
           { from: "review", event: "override", to: "design", count: 1, last_at_ms: T },
           { from: "review", event: "override", to: "implement", count: 2, last_at_ms: T },
           { from: "design", event: "approve_design", to: "implement", count: 1, last_at_ms: T },
+          { from: "review", event: "observed_landed", to: "landed", count: 1, last_at_ms: T },
         ],
         visited_status: [],
         events: [ev({})],
@@ -267,6 +271,9 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
   assert.match(html.task, /<td>review<\/td><td>override<\/td><td>\(stated\)<\/td><td>[^<]*<\/td><td>3<\/td>/);
   // A move this graph has no row for is listed, not dropped.
   assert.match(html.task, /design --approve_design--&gt; implement ×1/);
+  // A step folded into an observed marker is inked on the marker, not lost from the picture.
+  assert.match(html.task, /class="machine-marker" data-visited="true"/);
+  assert.match(html.task, /observed_landed ← implement, review\ntaken ×1/);
   // A plan: hourly bins, stacked, through now.
   assert.match(html.plan, /aria-label="Plan progress by hour"/);
   assert.equal((html.plan.match(/<g transform="translate/g) ?? []).length, 4, "four hours, the last running to now");
