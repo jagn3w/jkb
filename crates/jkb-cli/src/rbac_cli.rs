@@ -1162,6 +1162,7 @@ mod tests {
                         preset: true,
                         describe: String::new(),
                         spec: json!({ "graph": DAEMONS_GRAPH }),
+                        defined_at: None,
                     }],
                     default: jkb_core::workflow::strategy::DEFAULT_PRESET.to_owned(),
                 }),

@@ -717,12 +717,12 @@ fn a_stored_spec_naming_the_graph_s_former_name_still_resolves() {
     // A redefinition writes the new name.
     db.write_txn("test", move |c, m| define(c, m, "legacy", &spec))
         .unwrap();
-    let (_, json) = db
+    let json = db
         .read(super::definitions)
         .unwrap()
         .into_iter()
-        .map(|(n, _, j)| (n, j))
-        .find(|(n, _)| n == "legacy")
-        .unwrap();
+        .find(|d| d.name == "legacy")
+        .unwrap()
+        .spec;
     assert!(json.contains(r#""graph":"design-gate""#), "{json}");
 }
