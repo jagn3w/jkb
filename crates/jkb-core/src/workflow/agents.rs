@@ -431,7 +431,19 @@ impl PackagedEntry {
 }
 
 fn parse_file(json: &str) -> Result<PackagedFile> {
-    let file: PackagedFile = serde_json::from_str(json)
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| invalid(format!("the packaged-templates file does not parse: {e}")))?;
+    // `agent_sets` stays required. A file without it is one written before agent sets existed, most
+    // often the target of an export (`jkb workflow agent export` into a branch this change has not
+    // reached), so the refusal names that skew and its remedy instead of serde's bare missing field.
+    if value.is_object() && value.get("agent_sets").is_none() {
+        return Err(invalid(
+            "the packaged-templates file has no `agent_sets`: it predates agent sets, so it is \
+             older than this jkb. Nothing was written. Export from a jkb built from that file's \
+             commit, or wait until agent sets reach the branch it was read from",
+        ));
+    }
+    let file: PackagedFile = serde_json::from_value(value)
         .map_err(|e| invalid(format!("the packaged-templates file does not parse: {e}")))?;
     let mut sets = BTreeSet::new();
     for set in &file.agent_sets {

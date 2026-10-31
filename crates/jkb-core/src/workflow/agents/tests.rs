@@ -105,8 +105,34 @@ fn the_packaged_file_refuses_an_undescribed_empty_duplicate_or_unnamed_agent_set
         &|v| {
             v.as_object_mut().unwrap().remove("agent_sets");
         },
-        "missing field `agent_sets`",
+        "it predates agent sets, so it is older than this jkb",
     );
+}
+
+/// Exporting into a packaged-templates file written before agent sets (a branch this change has not
+/// reached) is a named refusal with its remedy, not serde's bare missing field, and adds nothing.
+#[test]
+fn exporting_into_a_file_without_agent_sets_names_the_skew() {
+    let mut old: serde_json::Value = serde_json::from_str(PACKAGED_JSON).unwrap();
+    old.as_object_mut().unwrap().remove("agent_sets");
+    let old = serde_json::to_string_pretty(&old).unwrap() + "\n";
+    let agent = packaged()
+        .unwrap()
+        .iter()
+        .find(|a| a.name == "swarm-implementer")
+        .unwrap()
+        .clone();
+    let mut edited = agent.clone();
+    edited.def.describe = "The operator's.".into();
+    let e = export(&old, &edited, installed_at(Some(agent.version)), false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("has no `agent_sets`: it predates agent sets, so it is older than this jkb")
+            && e.contains("Export from a jkb built from that file's commit"),
+        "{e}"
+    );
+    assert!(!e.contains("missing field"), "{e}");
 }
 
 #[test]
