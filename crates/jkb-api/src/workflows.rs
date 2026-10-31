@@ -549,7 +549,6 @@ pub fn graph(
     uid: Option<&str>,
     strategy: Option<&str>,
 ) -> Result<GraphView, ApiError> {
-    let (default, default_spec) = wf::default_strategy(conn)?;
     let (source, spec, task, phase, status): (String, StrategySpec, _, _, _) = match (uid, strategy)
     {
         (Some(_), Some(_)) => {
@@ -577,9 +576,20 @@ pub fn graph(
             let (source, spec) = wf::resolve_strategy(conn, name)?;
             (source, spec, None, None, None)
         }
-        (None, None) => (default.clone(), default_spec.clone(), None, None, None),
+        (None, None) => {
+            let (source, spec) = wf::default_strategy(conn)?;
+            (source, spec, None, None, None)
+        }
     };
-    let changes_from_default = spec.changes_from(&default_spec);
+    // The diff against the default is a gloss on the graph, not something it needs: a stored
+    // `default` this jkb cannot read (a newer jkb's) leaves it unknown — what an older daemon
+    // answers — rather than refusing a named or pinned strategy's machines. Where the graph itself
+    // is the default's, its resolution above has already refused. Any other error is still one.
+    let (default, changes_from_default) = match wf::default_strategy(conn) {
+        Ok((default, default_spec)) => (default, spec.changes_from(&default_spec)),
+        Err(jkb_core::Error::Types(_)) => (String::new(), Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
     let workflow = workflow_view(&spec);
     let lifecycle = lifecycle_view(&spec);
     Ok(GraphView {

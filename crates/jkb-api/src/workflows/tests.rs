@@ -347,6 +347,52 @@ fn the_graph_says_what_its_strategy_changes_from_the_default() {
     assert_eq!(default.changes_from_default, Vec::<String>::new());
 }
 
+/// A stored `default` this jkb cannot read (a newer jkb's spec) leaves the diff unknown for a named
+/// strategy and a pinned task, whose machines do not need it; the default's own graph is refused.
+#[test]
+fn an_unreadable_default_leaves_the_diff_unknown_but_draws_named_and_pinned_graphs() {
+    let kb = Kb::new();
+    kb.db
+        .write_txn("test", |c, m| {
+            jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:p", "P"))
+        })
+        .unwrap();
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.set", "uid": "task:p", "strategy": "autonomous" }),
+    );
+    kb.db
+        .write_txn("test", |c, _| {
+            c.execute(
+                "INSERT INTO workflow_strategies (name, version, spec, defined_at, describe)
+                 VALUES ('default', 1, ?1, '2026-10-31T00:00:00Z', 'From a newer jkb.')",
+                [r#"{"graph":"design-gate","a_field_from_a_newer_jkb":true}"#],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let graph = |r: Value| match ok(&kb.op, r) {
+        Response::WorkflowGraph { graph } => *graph,
+        other => panic!("{other:?}"),
+    };
+    let named = graph(json!({ "op": "workflow.graph", "strategy": "autonomous" }));
+    assert_eq!(named.graph, "direct");
+    assert_eq!(
+        (named.default.as_str(), named.changes_from_default.len()),
+        ("", 0)
+    );
+    let pinned = graph(json!({ "op": "workflow.graph", "uid": "task:p" }));
+    assert_eq!(pinned.strategy, "autonomous");
+    assert_eq!(
+        (pinned.default.as_str(), pinned.changes_from_default.len()),
+        ("", 0)
+    );
+    // The timeline draws a task's graph through the same read.
+    ok(&kb.op, json!({ "op": "timeline.task", "uid": "task:p" }));
+    let e = call(&kb.op, json!({ "op": "workflow.graph" })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+}
+
 /// The variable that makes [`graph_fixture_matches_presets`] rewrite the fixture instead of failing.
 const WRITE_FIXTURE: &str = "JKB_WRITE_GRAPH_FIXTURE";
 
