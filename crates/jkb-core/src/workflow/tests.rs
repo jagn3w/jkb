@@ -401,18 +401,32 @@ fn next_actor_names_a_role_for_every_live_phase() {
 #[test]
 fn the_coordinator_s_base_permits_are_exactly_these() {
     // Pinned whole, so a widening is a visible edit here rather than an unnoticed row: `reopen`
-    // (picking up what the operator landed or cancelled) and `override` stay the operator's.
+    // (picking up what the operator landed or cancelled) and `override` stay the operator's, and
+    // the design and systemic events are their workers' (and the operator's), never the
+    // scheduler's.
     assert_eq!(
         BASE.permissions_of(Role::Coordinator),
         vec![
-            WorkflowEvent::SubmitDesign,
             WorkflowEvent::SubmitWork,
-            WorkflowEvent::SubmitSystemic,
-            WorkflowEvent::SystemicRedesign,
             WorkflowEvent::Rework,
             WorkflowEvent::Cancel,
         ]
     );
+    for e in [
+        WorkflowEvent::SubmitDesign,
+        WorkflowEvent::SubmitSystemic,
+        WorkflowEvent::SystemicRedesign,
+    ] {
+        assert!(BASE.permits(Role::Operator, e), "the operator keeps {e:?}");
+        for p in PRESETS {
+            let spec = (p.spec)();
+            assert!(
+                !spec.permissions().permits(Role::Coordinator, e),
+                "{}: no toggle gives the coordinator {e:?}",
+                p.name
+            );
+        }
+    }
 }
 
 /// A verdict as something comparable: `None` to allow, the denial's sentence to refuse.

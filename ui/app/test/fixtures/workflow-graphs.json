@@ -666,7 +666,7 @@
         {
           "command": "jkb workflow fire <uid> submit_design",
           "event": "submit_design",
-          "fired_by": "operator, coordinator, designer",
+          "fired_by": "operator, designer",
           "from": "design",
           "guard": null,
           "guarded": false,
@@ -674,7 +674,6 @@
           "reconciled": false,
           "roles": [
             "operator",
-            "coordinator",
             "designer"
           ],
           "to": "implement"
@@ -762,7 +761,7 @@
         {
           "command": "jkb workflow fire <uid> submit_systemic --reason <why>",
           "event": "submit_systemic",
-          "fired_by": "operator, coordinator, systemic_reviewer",
+          "fired_by": "operator, systemic_reviewer",
           "from": "systemic_review",
           "guard": null,
           "guarded": false,
@@ -770,7 +769,6 @@
           "reconciled": false,
           "roles": [
             "operator",
-            "coordinator",
             "systemic_reviewer"
           ],
           "to": "implement"
@@ -778,7 +776,7 @@
         {
           "command": "jkb workflow fire <uid> systemic_redesign --reason <why>",
           "event": "systemic_redesign",
-          "fired_by": "operator, coordinator, systemic_reviewer",
+          "fired_by": "operator, systemic_reviewer",
           "from": "systemic_review",
           "guard": null,
           "guarded": false,
@@ -786,7 +784,6 @@
           "reconciled": false,
           "roles": [
             "operator",
-            "coordinator",
             "systemic_reviewer"
           ],
           "to": "design"
@@ -1859,7 +1856,7 @@
         {
           "command": "jkb workflow fire <uid> submit_design",
           "event": "submit_design",
-          "fired_by": "operator, coordinator, designer",
+          "fired_by": "operator, designer",
           "from": "design",
           "guard": null,
           "guarded": false,
@@ -1867,7 +1864,6 @@
           "reconciled": false,
           "roles": [
             "operator",
-            "coordinator",
             "designer"
           ],
           "to": "design_review"
@@ -1957,7 +1953,7 @@
         {
           "command": "jkb workflow fire <uid> submit_systemic --reason <why>",
           "event": "submit_systemic",
-          "fired_by": "operator, coordinator, systemic_reviewer",
+          "fired_by": "operator, systemic_reviewer",
           "from": "systemic_review",
           "guard": null,
           "guarded": false,
@@ -1965,7 +1961,6 @@
           "reconciled": false,
           "roles": [
             "operator",
-            "coordinator",
             "systemic_reviewer"
           ],
           "to": "implement"
@@ -1973,7 +1968,7 @@
         {
           "command": "jkb workflow fire <uid> systemic_redesign --reason <why>",
           "event": "systemic_redesign",
-          "fired_by": "operator, coordinator, systemic_reviewer",
+          "fired_by": "operator, systemic_reviewer",
           "from": "systemic_review",
           "guard": null,
           "guarded": false,
@@ -1981,7 +1976,6 @@
           "reconciled": false,
           "roles": [
             "operator",
-            "coordinator",
             "systemic_reviewer"
           ],
           "to": "design"
@@ -3051,7 +3045,7 @@
         {
           "command": "jkb workflow fire <uid> submit_design",
           "event": "submit_design",
-          "fired_by": "operator, coordinator, designer",
+          "fired_by": "operator, designer",
           "from": "design",
           "guard": null,
           "guarded": false,
@@ -3059,7 +3053,6 @@
           "reconciled": false,
           "roles": [
             "operator",
-            "coordinator",
             "designer"
           ],
           "to": "design_review"
@@ -3147,7 +3140,7 @@
         {
           "command": "jkb workflow fire <uid> submit_systemic --reason <why>",
           "event": "submit_systemic",
-          "fired_by": "operator, coordinator, systemic_reviewer",
+          "fired_by": "operator, systemic_reviewer",
           "from": "systemic_review",
           "guard": null,
           "guarded": false,
@@ -3155,7 +3148,6 @@
           "reconciled": false,
           "roles": [
             "operator",
-            "coordinator",
             "systemic_reviewer"
           ],
           "to": "implement"
@@ -3163,7 +3155,7 @@
         {
           "command": "jkb workflow fire <uid> systemic_redesign --reason <why>",
           "event": "systemic_redesign",
-          "fired_by": "operator, coordinator, systemic_reviewer",
+          "fired_by": "operator, systemic_reviewer",
           "from": "systemic_review",
           "guard": null,
           "guarded": false,
@@ -3171,7 +3163,6 @@
           "reconciled": false,
           "roles": [
             "operator",
-            "coordinator",
             "systemic_reviewer"
           ],
           "to": "design"

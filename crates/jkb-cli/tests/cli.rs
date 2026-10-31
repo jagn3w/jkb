@@ -6652,7 +6652,7 @@ fn the_attest_hook_installs_the_subagent_types() {
         "the install wrote to the hook's stdout: {}",
         String::from_utf8_lossy(&out.stdout)
     );
-    for name in ["jkb-implementer", "jkb-reviewer"] {
+    for name in ["jkb-designer", "jkb-implementer", "jkb-reviewer"] {
         let def = std::fs::read_to_string(claude.join("agents").join(format!("{name}.md")))
             .unwrap_or_else(|e| panic!("{name} was not installed: {e}"));
         assert!(def.starts_with(&format!("---\nname: {name}\n")), "{def}");

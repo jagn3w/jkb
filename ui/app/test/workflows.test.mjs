@@ -452,3 +452,22 @@ test("switching back to Agents gives the side panel back to the agent; nothing e
   assert.equal(side.machinePart(pick), undefined);
   assert.equal(side.machinePart(part), part);
 });
+
+const { agentGraph } = await load(path.join(here, "..", "..", "core", "src", "workflows.ts"));
+const packagedAgents = JSON.parse(fs.readFileSync(path.join(here, "..", "..", "..", PACKAGED_FILE), "utf8")).agents;
+
+test("the packaged swarm's Agents graph draws the designer its coordinator starts", () => {
+  const g = agentGraph(packagedAgents, "task-swarm");
+  assert.deepEqual(
+    g.nodes.map((n) => n.id).sort(),
+    ["swarm-coordinator", "swarm-designer", "swarm-implementer", "swarm-reviewer"],
+  );
+  const at = (id) => g.nodes.find((n) => n.id === id);
+  assert.equal(at("swarm-coordinator").layer, 0, "the coordinator is the graph's root");
+  assert.ok(
+    g.links.some((l) => l.from === "swarm-coordinator" && l.to === "swarm-designer"),
+    "the coordinator hands a held-back task to a designer",
+  );
+  assert.ok(at("swarm-designer").layer > 0);
+  assert.deepEqual(g.dangling, []);
+});

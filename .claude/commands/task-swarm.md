@@ -1,11 +1,17 @@
 ---
-description: Make this session the COORDINATOR of a task swarm. It groups overlapping ready jkb tasks, starts one jkb-implementer per group and a fresh jkb-reviewer per pass, and runs the deterministic merge queue (no agent), which lands approved branches on one feature branch and records each landing. Claim-guarded, and it keeps going as dependents unblock.
+description: Make this session the COORDINATOR of a task swarm. It starts a jkb-designer for each ready task still awaiting a design, groups overlapping ready jkb tasks, starts one jkb-implementer per group and a fresh jkb-reviewer per pass, and runs the deterministic merge queue (no agent), which lands approved branches on one feature branch and records each landing. Claim-guarded, and it keeps going as dependents unblock.
 argument-hint: "<jkb-path | task-uids...>  [--branch <name>]  [--dry-run]  [--no-design-gate]"
 ---
 
 This session becomes the **coordinator** of a task swarm. It works inside the tasks' lifecycle
 and RBAC: jkb holds every rule the coordinator follows. The swarm has these parts:
 
+- **Designer.** A task at `design` that the run's design gate holds back gets one `jkb-designer`
+  subagent, which writes the task's design into it, with its open questions, and fires
+  `submit_design`. The task then waits at `design_review` for your approval: it is *parked*, never
+  built and never settled, so a design you approve during the run is built by a later frontier.
+  Its role comes from the operator's agent-type map (`jkb-designer` → `designer`). The coordinator
+  cannot submit a design itself: jkb gives it no `submit_design`.
 - **Groups.** The coordinator reads the ready frontier and groups overlapping tasks, at most 4
   per group.
 - **Implementer.** Each group gets one `jkb-implementer` subagent, which builds every task in the
@@ -14,13 +20,14 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   the whole group, then files its findings and records the round in jkb (`jkb role bind`, `jkb task
   review file`, `jkb task review record`). Its role comes from the operator's agent-type map
   (`jkb-reviewer` → `reviewer`), never from a grant the coordinator mints.
-- **Workflow.** The coordinator admits a task by its workflow phase, and a group only if every
-  task in it is admitted, and never a review finding. A task at `implement`, `review` or
+- **Workflow.** The coordinator routes a task by its workflow phase, and admits a group only if
+  every task in it is admitted, and never a review finding. A task at `implement`, `review` or
   `landable` is a *workflow* task. A task still at `design` that the run's design gate let through (the `design=approved` tag, a
   hand-pick by uid, or `--no-design-gate`) is a *legacy* task: its design was never approved in
   jkb, so it is built on the legacy path, routed on the reviewer's verdict, and named as legacy in
-  the report. A task at `design_review` (awaiting the operator's approval) or any other phase is
-  left out and reported. A group never mixes legacy and workflow tasks. The workflow moves through
+  the report. A task at `design` that the gate holds back goes to a designer. A task at
+  `design_review` is parked, and the report lists it as awaiting your design approval. A task at
+  any other phase is left out and reported. A group never mixes legacy and workflow tasks. The workflow moves through
   the group's lead (its first task, recorded as `swarm-lead=<lead uid>` on every task of the
   group). For a workflow group, when the implementer reports ready the coordinator reads the lead's
   phase and fires `submit_work` from `implement`, nothing from `review` (already submitted), and
@@ -54,16 +61,17 @@ until after the cost preview and confirmation (steps 3–4).**
   one or more **task uids**, collected as `TASKS`.
 
 **The design gate.** In scope mode the swarm builds only tasks whose design is approved, so
-implementers never invent architecture they cannot ask you about. A design is approved in one of
-two ways:
+implementers never invent architecture they cannot ask you about. A task at `design` without an
+approved design is not skipped: a designer writes its design, and you approve or reject it at
+`design_review`. A design is approved in one of two ways:
 - **In jkb.** The task's workflow phase is past design (`implement`, `review` or `landable`). It
   needs no tag, and it goes on the full workflow path.
 - **By the tag (legacy).** The task is still at `design` but carries `design=approved` from
   `/jkb-design-pass`. It goes on the legacy path, routed on the reviewer's verdict, until operator
   approval in jkb is routine.
 
-The query DSL cannot test a workflow phase, so the gate is applied by the coordinator's step 1
-(its admission table), not by the frontier query. Naming exact uids is a deliberate hand-pick, so
+The query DSL cannot test a workflow phase, so the gate is applied by the coordinator's step 1b
+(ROUTE BY PHASE), not by the frontier query. Naming exact uids is a deliberate hand-pick, so
 the tag gate does not apply to them (but see step 3). On every path the swarm leaves out review
 findings (tasks under `repos/<repo>/codereviews/`): no run builds a finding.
 
@@ -82,18 +90,20 @@ jkb query    --global --json 'kind:task <SCOPE>' --limit 1000
 ```
 
 For each ready task, `jkb workflow show <uid>` gives its phase, and `jkb task show <uid>` its
-namespace. Admit it as the coordinator's step 1 will: a finding is left out; `implement`, `review`
-and `landable` are admitted; `design` is admitted when it is tagged, hand-picked, or the gate is off;
-everything else is left out.
+namespace. Route it as the coordinator's step 1b will: a finding is left out; `implement`, `review`
+and `landable` are built; `design` is built when it is tagged, hand-picked, or the gate is off, and
+otherwise goes to a designer; `design_review` is parked; everything else is left out.
 
 Print:
 - the ready tasks, and how many are not yet terminal;
 - how many ready tasks are admitted on the workflow path, and how many on the legacy path;
-- how many the gate holds back (if many, suggest `/jkb-design-pass <path>` first), how many await
-  the operator's approval (`design_review`), and how many are findings or at another phase;
+- how many the gate holds back, each of which gets a designer, and how many are findings or at
+  another phase;
+- the parked tasks, awaiting your design approval (`design_review`), one `<uid> — <title>` line
+  each: approving them before the run lets it build them;
 - for named uids, any still at `design`, which go on the legacy path;
-- a rough agent count: about two per group per attempt (an implementer and a reviewer), with up to
-  3 attempts per group.
+- a rough agent count: one designer per task the gate holds back, plus about two per group per
+  attempt (an implementer and a reviewer), with up to 3 attempts per group.
 
 With `--dry-run`, stop here.
 
@@ -132,17 +142,20 @@ jkb workflow agent show swarm-coordinator \
 
 `scope_block` says how to read the frontier:
 - **scope mode:** "Read the frontier with `jkb task next --global --json '<SCOPE>' --limit 100`.
-  Only tasks it returns are yours. The design gate is ON: step 1 admits a task at `design` only if
-  it is tagged `design=approved`." With `--no-design-gate`, say instead "The design gate is OFF:
-  step 1 admits a task at `design` on the legacy path."
+  Only tasks it returns are yours. The design gate is ON: step 1b builds a task at `design` only if
+  it is tagged `design=approved`, and starts a designer for every other task at `design`." With
+  `--no-design-gate`, say instead "The design gate is OFF: step 1b builds a task at `design` on the
+  legacy path."
 - **uid mode:** "Your tasks are exactly: <uids>. A task is ready when `jkb task show <uid> --json`
-  shows it open, unblocked and unclaimed. They are hand-picked: step 1 admits one at `design` on
+  shows it open, unblocked and unclaimed. They are hand-picked: step 1b builds one at `design` on
   the legacy path."
 
 ## 7. When it is done
 
-Stop the keepalive (`kill <its pid>`) and relay the coordinator's report. Then tell the user how
-to finish:
+Stop the keepalive (`kill <its pid>`) and relay the coordinator's report, its tasks awaiting your
+design approval first: approve each with `jkb workflow fire <uid> approve_design` (or reject it
+with `reject_design --reason <notes>`, and a designer answers the notes). An approval or rejection
+given while the run is going is picked up by its next frontier. Then tell the user how to finish:
 - **Check the result.** `git -C .swarm/integration log --oneline "$BASE".."$INTEG"`, and run the
   tests there.
 - **Merge it.** Merge or open a PR from `$INTEG` as with any feature branch.

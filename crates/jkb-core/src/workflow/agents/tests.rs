@@ -166,6 +166,16 @@ fn the_packaged_templates_are_what_the_coordinators_fill() {
     for p in ["repo", "task_list", "branch_step", "feedback_block"] {
         assert!(names.contains(&p.to_owned()), "{p} in {names:?}");
     }
+    // The designer the coordinator starts for a task the design gate holds back: it writes the KB
+    // (the task's design) and no files, so it needs no worktree.
+    let des = get("swarm-designer");
+    assert_eq!(des.def.role, Role::Designer);
+    assert_eq!(des.def.permissions.isolation, Isolation::None);
+    assert_eq!(des.def.permissions.writes, Writes::Kb);
+    assert_eq!(
+        placeholders(&des.def.template).unwrap(),
+        ["feedback_block", "repo", "task_title", "task_uid"]
+    );
     // Each session's coordinator is a template of its own, acting as the coordinator.
     for c in ["swarm-coordinator", "review-coordinator"] {
         assert_eq!(get(c).def.role, Role::Coordinator, "{c}");
@@ -226,7 +236,7 @@ fn the_swarm_templates_drive_the_workflow() {
     for row in [
         "  implement, review, landable   a WORKFLOW task",
         "  design                        a LEGACY task",
-        "  design_review                 left out",
+        "  design_review                 PARKED",
         "  anything else                 left out (systemic_review, landed, cancelled)",
     ] {
         assert!(coord.contains(row), "step 1's admission table: {row}");
@@ -250,6 +260,76 @@ fn the_swarm_templates_drive_the_workflow() {
     // A refusal stops the group: nothing routes on the reviewer's reply instead of the phase.
     assert!(!coord.contains("route step 4 on the reviewer's VERDICT"));
     assert!(coord.contains("If jkb refuses a fire, stall the group"));
+}
+
+/// Under a swarm a designer writes the design and the operator approves it: the coordinator routes a
+/// task the gate holds back to a `swarm-designer` started as a `jkb-designer`, parks a task awaiting
+/// approval without settling it (so the approval, once given, is built by a later frontier), stops
+/// when only parked tasks are left, and reports them to the operator. `jkb-api`'s swarm-loop test
+/// makes the same calls as the same principals.
+#[test]
+fn the_swarm_designs_what_the_gate_holds_back_and_parks_it_for_approval() {
+    let agents = packaged().unwrap();
+    let get = |n: &str| agents.iter().find(|a| a.name == n).unwrap();
+    let des = &get("swarm-designer").def.template;
+    let at_in = |t: &str, s: &str| t.find(s).unwrap_or_else(|| panic!("{s}"));
+    // Bound first, the design written into the task, then submitted; the result line the
+    // coordinator reads.
+    for call in [
+        "jkb role bind {{task_uid}}",
+        "jkb task edit {{task_uid}} --append --stdin",
+        "jkb workflow fire {{task_uid}} submit_design",
+        "RESULT: submitted {{task_uid}}",
+        "RESULT: failed <reason>",
+    ] {
+        assert!(des.contains(call), "swarm-designer: {call}");
+    }
+    assert!(at_in(des, "jkb role bind") < at_in(des, "jkb task edit"));
+    assert!(at_in(des, "jkb task edit") < at_in(des, "submit_design`"));
+    assert!(
+        des.contains("OPEN QUESTIONS"),
+        "a headless designer asks in the design"
+    );
+
+    let coord = &get("swarm-coordinator").def.template;
+    assert!(get("swarm-coordinator")
+        .def
+        .hands_off_to
+        .iter()
+        .any(|h| h == "swarm-designer"));
+    let at = |s: &str| at_in(coord, s);
+    // Routed by the phase, after the findings are left out and before anything is grouped.
+    assert!(at("First leave out every review finding") < at("1b. ROUTE BY PHASE"));
+    assert!(at("1b. ROUTE BY PHASE") < at("GROUP what you build"));
+    assert!(coord.contains("`jkb workflow show <uid> --json` gives its `phase`"));
+    assert!(coord.contains("A task the gate holds back goes to a DESIGNER"));
+    let designing = &coord[at("DESIGNING A TASK")..at("GROUP what you build")];
+    for step in [
+        "jkb task claim <uid> --owner '{{owner}}'",
+        "jkb workflow agent show swarm-designer",
+        "subagent type `jkb-designer`",
+        "RESULT: submitted <uid>",
+        "jkb task set <uid> --status open",
+        "jkb task release <uid> --owner '{{owner}}'",
+        "phase: design_review",
+    ] {
+        assert!(designing.contains(step), "DESIGNING A TASK: {step}");
+    }
+    // A parked task is never settled, or an approval given mid-run is never built.
+    let parked = &coord[at("  design_review                 PARKED")..at("  anything else ")];
+    assert!(
+        parked.contains("never") && parked.contains("settle it"),
+        "{parked}"
+    );
+    // The stop rule and the report.
+    assert!(coord.contains("the frontier holds only PARKED tasks, or nothing"));
+    let report = &coord[at("\nREPORT\n")..];
+    assert!(
+        report.contains("\"awaiting your design approval\""),
+        "{report}"
+    );
+    // The coordinator writes no design: the NEVER rule it is not held to by jkb.
+    assert!(coord.contains("- Edit code or a task's design"));
 }
 
 /// CLOSING FINDINGS writes tasks outside SCOPE, so the NEVER rule that keeps the coordinator inside
@@ -319,6 +399,16 @@ fn the_slash_command_leaves_the_design_gate_to_step_one() {
     assert!(md.contains("The design gate is ON"));
     assert!(md.contains("The design gate is OFF"));
     assert!(md.contains("no run builds a finding"));
+    // The step it names is the coordinator's routing step, which starts the designers and parks
+    // what awaits approval; the preview and the relay say so too.
+    assert!(md.contains("coordinator's step 1b"));
+    assert!(
+        !md.contains("step 1 admits"),
+        "the admission table moved to step 1b"
+    );
+    assert!(md.contains("starts a designer for every other task at `design`"));
+    assert!(md.contains("`jkb-designer`"));
+    assert!(md.contains("awaiting your design approval"));
 }
 
 /// The workers' subagent types: rendered from the packaged file, prefixed like everything the
@@ -327,7 +417,7 @@ fn the_slash_command_leaves_the_design_gate_to_step_one() {
 fn every_subagent_template_renders_as_an_agent_definition() {
     let defs = subagent_definitions().unwrap();
     let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-    assert_eq!(names, ["jkb-implementer", "jkb-reviewer"]);
+    assert_eq!(names, ["jkb-designer", "jkb-implementer", "jkb-reviewer"]);
     for d in &defs {
         assert!(
             d.markdown
@@ -337,7 +427,8 @@ fn every_subagent_template_renders_as_an_agent_definition() {
         );
         assert!(!d.markdown.contains("{{"), "{} holds a placeholder", d.name);
     }
-    // A reviewer reads and runs; neither type can start a worker, which would attest as its own role.
+    // A designer and a reviewer read and run; no type can start a worker, which would attest as its
+    // own role.
     let tools = |n: &str| {
         defs.iter()
             .find(|d| d.name == n)
@@ -347,10 +438,13 @@ fn every_subagent_template_renders_as_an_agent_definition() {
             .find(|l| l.starts_with("tools:"))
             .map(str::to_owned)
     };
-    assert_eq!(
-        tools("jkb-reviewer").as_deref(),
-        Some("tools: Read, Grep, Glob, Bash")
-    );
+    for kb in ["jkb-designer", "jkb-reviewer"] {
+        assert_eq!(
+            tools(kb).as_deref(),
+            Some("tools: Read, Grep, Glob, Bash"),
+            "{kb}"
+        );
+    }
     let imp = tools("jkb-implementer").unwrap();
     assert!(imp.contains("Edit"), "{imp}");
     for d in &defs {

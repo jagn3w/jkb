@@ -265,11 +265,11 @@ pub static BASE: RoleTable<Role, WorkflowEvent> = RoleTable {
         },
         Grant {
             role: Role::Coordinator,
+            // Not `submit_design`, `submit_systemic` or `systemic_redesign`: a coordinator schedules
+            // and never writes, so a design is a designer's to submit and a systemic finding a
+            // systemic reviewer's. Held here rather than left to the coordinator's prompt.
             permits: &[
-                WorkflowEvent::SubmitDesign,
                 WorkflowEvent::SubmitWork,
-                WorkflowEvent::SubmitSystemic,
-                WorkflowEvent::SystemicRedesign,
                 WorkflowEvent::Rework,
                 WorkflowEvent::Cancel,
             ],

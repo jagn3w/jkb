@@ -120,10 +120,7 @@
         "agent_types": [],
         "describe": "The session driving a task: spawns workers, advances the workflow, never approves what the operator approves unless the task's strategy toggles say so.",
         "events": [
-          "submit_design",
           "submit_work",
-          "submit_systemic",
-          "systemic_redesign",
           "rework",
           "cancel"
         ],
@@ -542,12 +539,9 @@
         "agent_types": [],
         "describe": "The session driving a task: spawns workers, advances the workflow, never approves what the operator approves unless the task's strategy toggles say so.",
         "events": [
-          "submit_design",
           "approve_design",
           "reject_design",
           "submit_work",
-          "submit_systemic",
-          "systemic_redesign",
           "rework",
           "cancel"
         ],
@@ -961,10 +955,7 @@
         "agent_types": [],
         "describe": "The session driving a task: spawns workers, advances the workflow, never approves what the operator approves unless the task's strategy toggles say so.",
         "events": [
-          "submit_design",
           "submit_work",
-          "submit_systemic",
-          "systemic_redesign",
           "rework",
           "cancel"
         ],

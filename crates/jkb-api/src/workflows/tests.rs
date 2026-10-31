@@ -623,7 +623,8 @@ fn a_role_may_land_where_the_strategy_lets_it() {
 
 /// One swarm run's principals on one database: the main session (the container credential's ceiling,
 /// the coordinator), and attested subagents of the types `scripts/setup.sh` maps — `jkb-reviewer` to
-/// the reviewer, `jkb-implementer` to the implementer (pinned against the script by
+/// the reviewer, `jkb-implementer` to the implementer, `jkb-designer` to the designer (pinned against
+/// the script by
 /// `setup_maps_every_subagent_type_to_its_templates_role` in `jkb-core`).
 struct Swarm {
     kb: Kb,
@@ -639,6 +640,10 @@ enum Path {
     Workflow,
     /// A task still at `design` that the run's design gate let through: routed on the verdict.
     Legacy,
+    /// A task at `design` the gate holds back: a designer writes its design, and builds nothing.
+    Design,
+    /// `design_review`: the operator's. Skipped, and never settled, so an approval is built later.
+    Parked,
 }
 
 /// The run's design gate, as `scope_block` tells the coordinator.
@@ -672,6 +677,8 @@ fn admission(task: &Seen, gate: Gate) -> Option<Path> {
     match task.phase.as_str() {
         "implement" | "review" | "landable" => Some(Path::Workflow),
         "design" if task.tagged || gate != Gate::On => Some(Path::Legacy),
+        "design" => Some(Path::Design),
+        "design_review" => Some(Path::Parked),
         _ => None,
     }
 }
@@ -700,6 +707,15 @@ impl Swarm {
         assert!(m.moved, "{event}: {m:?}");
     }
 
+    /// The operator fires `event` on the lead with a written reason.
+    fn operator_fires_with(&self, event: &str, reason: &str) {
+        let m = Self::moved(ok(
+            &self.kb.op,
+            json!({ "op": "workflow.fire", "uid": self.lead, "event": event, "reason": reason }),
+        ));
+        assert!(m.moved, "{event}: {m:?}");
+    }
+
     /// A task with no workflow history, so at `design` — where nearly every task sits, since
     /// `/design-pass` sets only the `design=approved` tag.
     fn at_design() -> Self {
@@ -711,6 +727,7 @@ impl Swarm {
         for (agent_type, role) in [
             ("jkb-reviewer", "reviewer"),
             ("jkb-implementer", "implementer"),
+            ("jkb-designer", "designer"),
         ] {
             ok(
                 &kb.op,
@@ -805,6 +822,36 @@ impl Swarm {
                                  "facet_value": format!("repo={REPO}"), "mode": "set" }));
         self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
                                  "facet_value": format!("swarm-lead={}", self.lead), "mode": "set" }));
+    }
+
+    /// `swarm-designer`'s calls, as a `jkb-designer` subagent `agent`: bind, read, write the design
+    /// into the task, submit it.
+    fn designer_designs(&self, agent: &str) {
+        let des = || self.as_agent(Some((agent, "jkb-designer")));
+        ok(&des(), json!({ "op": "role.bind", "uid": self.lead }));
+        match ok(&des(), json!({ "op": "task.show", "uid": self.lead })) {
+            Response::Task { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        ok(
+            &des(),
+            json!({ "op": "task.edit", "uid": self.lead, "text": "Design: the approach",
+                    "append": true }),
+        );
+        let m = Self::moved(ok(
+            &des(),
+            json!({ "op": "workflow.fire", "uid": self.lead, "event": "submit_design" }),
+        ));
+        assert!(m.moved && m.phase == "design_review", "{m:?}");
+    }
+
+    /// `swarm-coordinator`'s DESIGNING A TASK around the designer: claim, then reopen and release on
+    /// its report.
+    fn coordinator_designs(&self, agent: &str) {
+        self.coordinator(json!({ "op": "task.claim", "uid": self.lead, "owner": OWNER }));
+        self.designer_designs(agent);
+        self.coordinator(json!({ "op": "task.set", "uid": self.lead, "status": "open" }));
+        self.coordinator(json!({ "op": "task.release", "uid": self.lead, "owner": OWNER }));
     }
 
     /// The implementer's calls: it reads its task and design, and moves no workflow itself.
@@ -1011,7 +1058,7 @@ fn step_one_admits_exactly_the_phases_step_three_can_drive() {
                 s.coordinator_submits();
                 assert_eq!(s.phase(), "review", "from {phase}");
             }
-            Some(Path::Legacy) | None => {
+            Some(Path::Legacy | Path::Design | Path::Parked) | None => {
                 assert!([
                     "design",
                     "design_review",
@@ -1042,10 +1089,10 @@ fn step_one_admits_by_phase_or_tag_and_never_a_finding() {
     for gate in gates {
         assert_eq!(admission(&seen, gate), Some(Path::Workflow), "{gate:?}");
     }
-    // At `design`, untagged: held back by the gate only.
+    // At `design`, untagged: held back by the gate only, for a designer.
     let untagged = Swarm::at_design();
     let seen = untagged.seen(&untagged.lead);
-    assert_eq!(admission(&seen, Gate::On), None);
+    assert_eq!(admission(&seen, Gate::On), Some(Path::Design));
     assert_eq!(admission(&seen, Gate::Off), Some(Path::Legacy));
     assert_eq!(admission(&seen, Gate::HandPicked), Some(Path::Legacy));
     // ...and tagged: legacy on a gated run too.
@@ -1079,6 +1126,73 @@ fn step_one_admits_by_phase_or_tag_and_never_a_finding() {
     for gate in gates {
         assert_eq!(admission(&seen, gate), None, "{gate:?}");
     }
+}
+
+/// Under a swarm a designer writes the design and the operator approves it. A task the gate holds
+/// back goes to a `jkb-designer`, with exactly the calls `swarm-designer` and the coordinator's
+/// DESIGNING A TASK make: it lands at `design_review`, PARKED. The coordinator cannot submit a design
+/// itself, nor the designer approve one. Approved, the next frontier builds it on the workflow path;
+/// rejected, it is back at `design` with the operator's notes last in its history, for a designer.
+#[test]
+fn a_task_the_gate_holds_back_is_designed_parked_and_then_built() {
+    let s = Swarm::at_design();
+    assert_eq!(admission(&s.seen(&s.lead), Gate::On), Some(Path::Design));
+    // jkb holds the coordinator to scheduling: the design is not its to submit.
+    let refused = Swarm::moved(
+        s.coordinator(json!({ "op": "workflow.fire", "uid": s.lead, "event": "submit_design" })),
+    );
+    assert!(!refused.moved && refused.phase == "design", "{refused:?}");
+    let why = refused.refusal.unwrap_or_default();
+    assert!(
+        why.contains("holds coordinator") && why.contains("allowed: operator, designer"),
+        "{why}"
+    );
+    s.coordinator_designs("d1");
+    match ok(&s.kb.op, json!({ "op": "task.show", "uid": s.lead })) {
+        Response::Task { task, .. } => {
+            assert!(
+                task.item
+                    .content
+                    .as_deref()
+                    .is_some_and(|c| c.contains("Design: the approach")),
+                "{task:?}"
+            );
+            assert_eq!(task.item.status.as_deref(), Some("open"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(admission(&s.seen(&s.lead), Gate::On), Some(Path::Parked));
+    // A designer does not approve its own design.
+    let refused = Swarm::moved(ok(
+        &s.as_agent(Some(("d1", "jkb-designer"))),
+        json!({ "op": "workflow.fire", "uid": s.lead, "event": "approve_design" }),
+    ));
+    assert!(
+        !refused.moved && refused.phase == "design_review",
+        "{refused:?}"
+    );
+
+    // Rejected with notes: back to a designer, the notes the last history line.
+    s.operator_fires_with("reject_design", "name the files");
+    let w = match s.coordinator(json!({ "op": "workflow.show", "uid": s.lead })) {
+        Response::Workflow { workflow } => workflow,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(admission(&s.seen(&s.lead), Gate::On), Some(Path::Design));
+    let last = w.history.last().unwrap();
+    assert!(
+        last.contains("reject_design") && last.contains("name the files"),
+        "{last}"
+    );
+    s.coordinator_designs("d2");
+
+    // Approved: the next frontier builds it on the workflow path, no tag needed.
+    s.operator_fires("approve_design", None);
+    s.start_group();
+    s.implementer_works();
+    s.coordinator_submits();
+    s.reviewer_records("r1", 1, None);
+    assert_eq!(s.coordinator_observes(), "landable");
 }
 
 /// A task still at `design` that the design gate let through is built on the legacy path: the same
