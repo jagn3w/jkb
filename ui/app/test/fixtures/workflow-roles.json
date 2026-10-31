@@ -46,15 +46,15 @@
         "name": "operator",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
@@ -62,7 +62,7 @@
             "name": "task_status"
           },
           {
-            "describe": "Claim, start, take, abandon or release work.",
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
             "name": "task_claim"
           },
           {
@@ -70,7 +70,7 @@
             "name": "review"
           },
           {
-            "describe": "Land a task's branch, where the task's strategy lets the role.",
+            "describe": "Land a task's branch, check whether it may land, record a landing and close tasks merged elsewhere, where the task's strategy lets the role.",
             "name": "land"
           },
           {
@@ -78,7 +78,7 @@
             "name": "workflow"
           },
           {
-            "describe": "Write design documents: create, edit, merge and stage their parts.",
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
             "name": "design"
           },
           {
@@ -98,7 +98,7 @@
             "name": "exec_request"
           },
           {
-            "describe": "The operator's own: choose strategies, map agent types, reclaim work, remove items and approve run requests.",
+            "describe": "The operator's own: choose and define strategies, edit agent templates, map agent types, rotate the container credential, reclaim work, break leases, waive reviews, record what ran on the host, remove items, move namespaces, compact the queue and designs, start and resolve design threads, approve selections, retire and restore designs, and approve, decline, refuse, run and finish run requests.",
             "name": "admin"
           }
         ],
@@ -146,15 +146,15 @@
         "name": "coordinator",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
@@ -162,11 +162,11 @@
             "name": "task_status"
           },
           {
-            "describe": "Claim, start, take, abandon or release work.",
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
             "name": "task_claim"
           },
           {
-            "describe": "Land a task's branch, where the task's strategy lets the role.",
+            "describe": "Land a task's branch, check whether it may land, record a landing and close tasks merged elsewhere, where the task's strategy lets the role.",
             "name": "land"
           },
           {
@@ -174,7 +174,7 @@
             "name": "workflow"
           },
           {
-            "describe": "Write design documents: create, edit, merge and stage their parts.",
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
             "name": "design"
           },
           {
@@ -222,15 +222,15 @@
         "name": "designer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
@@ -238,7 +238,7 @@
             "name": "workflow"
           },
           {
-            "describe": "Write design documents: create, edit, merge and stage their parts.",
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
             "name": "design"
           },
           {
@@ -273,19 +273,19 @@
         "name": "implementer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
-            "describe": "Claim, start, take, abandon or release work.",
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
             "name": "task_claim"
           },
           {
@@ -315,11 +315,11 @@
         "name": "reviewer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
@@ -362,15 +362,15 @@
         "name": "systemic_reviewer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
@@ -468,15 +468,15 @@
         "name": "operator",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
@@ -484,7 +484,7 @@
             "name": "task_status"
           },
           {
-            "describe": "Claim, start, take, abandon or release work.",
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
             "name": "task_claim"
           },
           {
@@ -492,7 +492,7 @@
             "name": "review"
           },
           {
-            "describe": "Land a task's branch, where the task's strategy lets the role.",
+            "describe": "Land a task's branch, check whether it may land, record a landing and close tasks merged elsewhere, where the task's strategy lets the role.",
             "name": "land"
           },
           {
@@ -500,7 +500,7 @@
             "name": "workflow"
           },
           {
-            "describe": "Write design documents: create, edit, merge and stage their parts.",
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
             "name": "design"
           },
           {
@@ -520,7 +520,7 @@
             "name": "exec_request"
           },
           {
-            "describe": "The operator's own: choose strategies, map agent types, reclaim work, remove items and approve run requests.",
+            "describe": "The operator's own: choose and define strategies, edit agent templates, map agent types, rotate the container credential, reclaim work, break leases, waive reviews, record what ran on the host, remove items, move namespaces, compact the queue and designs, start and resolve design threads, approve selections, retire and restore designs, and approve, decline, refuse, run and finish run requests.",
             "name": "admin"
           }
         ],
@@ -570,15 +570,15 @@
         "name": "coordinator",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
@@ -586,7 +586,7 @@
             "name": "task_status"
           },
           {
-            "describe": "Claim, start, take, abandon or release work.",
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
             "name": "task_claim"
           },
           {
@@ -594,7 +594,7 @@
             "name": "workflow"
           },
           {
-            "describe": "Write design documents: create, edit, merge and stage their parts.",
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
             "name": "design"
           },
           {
@@ -642,15 +642,15 @@
         "name": "designer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
@@ -658,7 +658,7 @@
             "name": "workflow"
           },
           {
-            "describe": "Write design documents: create, edit, merge and stage their parts.",
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
             "name": "design"
           },
           {
@@ -693,19 +693,19 @@
         "name": "implementer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
-            "describe": "Claim, start, take, abandon or release work.",
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
             "name": "task_claim"
           },
           {
@@ -735,11 +735,11 @@
         "name": "reviewer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
@@ -782,15 +782,15 @@
         "name": "systemic_reviewer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
@@ -889,15 +889,15 @@
         "name": "operator",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
@@ -905,7 +905,7 @@
             "name": "task_status"
           },
           {
-            "describe": "Claim, start, take, abandon or release work.",
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
             "name": "task_claim"
           },
           {
@@ -913,7 +913,7 @@
             "name": "review"
           },
           {
-            "describe": "Land a task's branch, where the task's strategy lets the role.",
+            "describe": "Land a task's branch, check whether it may land, record a landing and close tasks merged elsewhere, where the task's strategy lets the role.",
             "name": "land"
           },
           {
@@ -921,7 +921,7 @@
             "name": "workflow"
           },
           {
-            "describe": "Write design documents: create, edit, merge and stage their parts.",
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
             "name": "design"
           },
           {
@@ -941,7 +941,7 @@
             "name": "exec_request"
           },
           {
-            "describe": "The operator's own: choose strategies, map agent types, reclaim work, remove items and approve run requests.",
+            "describe": "The operator's own: choose and define strategies, edit agent templates, map agent types, rotate the container credential, reclaim work, break leases, waive reviews, record what ran on the host, remove items, move namespaces, compact the queue and designs, start and resolve design threads, approve selections, retire and restore designs, and approve, decline, refuse, run and finish run requests.",
             "name": "admin"
           }
         ],
@@ -987,15 +987,15 @@
         "name": "coordinator",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
@@ -1003,7 +1003,7 @@
             "name": "task_status"
           },
           {
-            "describe": "Claim, start, take, abandon or release work.",
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
             "name": "task_claim"
           },
           {
@@ -1011,7 +1011,7 @@
             "name": "workflow"
           },
           {
-            "describe": "Write design documents: create, edit, merge and stage their parts.",
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
             "name": "design"
           },
           {
@@ -1059,15 +1059,15 @@
         "name": "designer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
@@ -1075,7 +1075,7 @@
             "name": "workflow"
           },
           {
-            "describe": "Write design documents: create, edit, merge and stage their parts.",
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
             "name": "design"
           },
           {
@@ -1110,19 +1110,19 @@
         "name": "implementer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {
-            "describe": "Claim, start, take, abandon or release work.",
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
             "name": "task_claim"
           },
           {
@@ -1152,11 +1152,11 @@
         "name": "reviewer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
@@ -1199,15 +1199,15 @@
         "name": "systemic_reviewer",
         "ops": [
           {
-            "describe": "Read the knowledge base: tasks, items, designs, workflows and timelines.",
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
             "name": "read"
           },
           {
-            "describe": "Send what every agent's hooks send: notifications, session records and queue messages.",
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
             "name": "hook"
           },
           {
-            "describe": "Change a task's text, placement, tags or dependencies.",
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
             "name": "task_write"
           },
           {

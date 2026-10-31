@@ -26,7 +26,8 @@ import { AgentPanel } from "../workflows/AgentPanel";
 import { LifecyclePane } from "../workflows/LifecyclePane";
 import { MachinePanel } from "../workflows/MachinePanel";
 import { PickerSentences } from "../workflows/PickerSentences";
-import { RolePanel, RolesTable } from "../workflows/RolesView";
+import { RolePanel, RolePending, RolesTable, type KnownAgents } from "../workflows/RolesView";
+import { AGENT, machinePart, roleSide, sideForView, type AgentsView, type Loaded, type Side } from "../workflows/side";
 import { WorkflowLegend } from "../workflows/WorkflowLegend";
 
 /** The last agent set and agent, per-window conveniences (D53.1): the only state the tab keeps itself. */
@@ -50,21 +51,6 @@ function remember(key: string, value: string): void {
   }
 }
 
-/** What fills the side panel: the selected agent, a role, or a part of the Lifecycle pane's picture. */
-type Side = { readonly kind: "agent" } | { readonly kind: "role"; readonly name: string } | MachineSelection;
-
-const AGENT: Side = { kind: "agent" };
-
-/** The side panel's machine selection, if that is what it holds. */
-const machinePart = (side: Side): MachineSelection | undefined => (side.kind === "agent" || side.kind === "role" ? undefined : side);
-
-/** What the Agents pane shows: an agent set's agents as a graph, or every role. */
-type AgentsView = "agents" | "roles";
-
-type Loaded<T> =
-  | { readonly kind: "loading" }
-  | { readonly kind: "loaded"; readonly value: T }
-  | { readonly kind: "failed"; readonly message: string };
 
 const op = (request: Parameters<typeof window.jkb.op>[0]) => window.jkb.op(request);
 
@@ -177,7 +163,13 @@ export function WorkflowsTab(): React.JSX.Element {
     setView("roles");
     setSide({ kind: "role", name });
   }, []);
-  const roleShown = selectedRole !== undefined && roles.kind === "loaded" ? roles.value.roles.find((r) => r.name === selectedRole) : undefined;
+  const role = roleSide(side, roles);
+  // Whether the templates are known: until they are, no role can be said to have no agent.
+  const knownAgents: KnownAgents = agents.kind === "loaded" ? { kind: "loaded", agents: list } : agents;
+  const pickView = (v: AgentsView): void => {
+    setView(v);
+    setSide((s) => sideForView(s, v));
+  };
   // A selection names its machine, so switching machines clears one (and only a machine's).
   const pickMachine = (w: MachineName): void => {
     setWhich(w);
@@ -274,7 +266,7 @@ export function WorkflowsTab(): React.JSX.Element {
                     aria-checked={view === v}
                     className="bar-button"
                     data-active={view === v ? "true" : undefined}
-                    onClick={() => setView(v)}
+                    onClick={() => pickView(v)}
                   >
                     {v === "agents" ? "Agents" : "Roles"}
                   </button>
@@ -301,7 +293,7 @@ export function WorkflowsTab(): React.JSX.Element {
                 ) : (
                   <RolesTable
                     view={roles.value}
-                    agents={list}
+                    agents={knownAgents}
                     selected={selectedRole}
                     onSelect={(name) => setSide({ kind: "role", name })}
                     onOpenAgent={openAgent}
@@ -336,17 +328,18 @@ export function WorkflowsTab(): React.JSX.Element {
               onOpenAgent={pick}
             />
           )}
-          {shown === undefined && roleShown !== undefined && roles.kind === "loaded" && (
-            <RolePanel view={roles.value} role={roleShown} agents={list} onClose={() => setSide(AGENT)} onOpenAgent={openAgent} />
+          {shown === undefined && role.kind === "shown" && (
+            <RolePanel view={role.view} role={role.role} agents={knownAgents} onClose={() => setSide(AGENT)} onOpenAgent={openAgent} />
           )}
+          {shown === undefined && role.kind === "pending" && <RolePending name={role.name} message={role.message} onClose={() => setSide(AGENT)} />}
           {/* Kept mounted while a machine part or a role fills the aside, so an unsaved template edit survives. */}
           {agent !== undefined ? (
-            <div className="agent-panel-host" hidden={shown !== undefined || selectedRole !== undefined}>
+            <div className="agent-panel-host" hidden={shown !== undefined || role.kind !== "none"}>
               <AgentPanel agent={agent} roles={roleNames} onSaved={onSaved} onNotice={onNotice} onOpenRole={openRole} />
             </div>
           ) : (
             shown === undefined &&
-            selectedRole === undefined && (
+            role.kind === "none" && (
               <p className="muted plan-hint workflows-pick">
                 {showingRoles ? "Pick a role to see what it may do." : "Pick an agent in the graph to see its template and permissions."}
               </p>

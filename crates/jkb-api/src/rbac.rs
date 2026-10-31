@@ -118,21 +118,36 @@ impl OpPermission {
     pub const fn describe(self) -> &'static str {
         match self {
             Self::Read => {
-                "Read the knowledge base: tasks, items, designs, workflows and timelines."
+                "Read the knowledge base: tasks, items, namespaces, views, history, designs, \
+                 workflows, roles, timelines, leases, removals and its own run requests; and bind \
+                 an attested agent to its task."
             }
             Self::Hook => {
-                "Send what every agent's hooks send: notifications, session records and queue \
-                 messages."
+                "Send what every agent's hooks send: notifications, the session registry, and \
+                 messages on the queue."
             }
-            Self::TaskWrite => "Change a task's text, placement, tags or dependencies.",
+            Self::TaskWrite => {
+                "Add tasks and change their text, fields, tags, dependencies, placement and \
+                 bindings; record a task's worktree location and its pull request; ingest text; \
+                 write investigations."
+            }
             Self::TaskStatus => "Set a task's status directly, past its workflow.",
-            Self::TaskClaim => "Claim, start, take, abandon or release work.",
+            Self::TaskClaim => {
+                "Claim, start, take, abandon or release work; take and release a repo's land \
+                 lease; queue, archive, cancel and drop worktree removals."
+            }
             Self::Review => "File and record a review round.",
-            Self::Land => "Land a task's branch, where the task's strategy lets the role.",
+            Self::Land => {
+                "Land a task's branch, check whether it may land, record a landing and close tasks \
+                 merged elsewhere, where the task's strategy lets the role."
+            }
             Self::Workflow => {
                 "Fire or observe workflow events, each as the task's strategy allows."
             }
-            Self::Design => "Write design documents: create, edit, merge and stage their parts.",
+            Self::Design => {
+                "Write design documents: create, move, split, edit and stage them and their parts, \
+                 apply changes, reply to threads, and record plans, prompts, targets and sources."
+            }
             Self::DesignApprove => "Approve a part of a design, when it names this reviewer.",
             Self::Grant => "Hand out and revoke role grants, of the roles it may grant.",
             Self::Attest => {
@@ -140,8 +155,11 @@ impl OpPermission {
             }
             Self::ExecRequest => "Ask the operator to run one command.",
             Self::Admin => {
-                "The operator's own: choose strategies, map agent types, reclaim work, remove \
-                 items and approve run requests."
+                "The operator's own: choose and define strategies, edit agent templates, map agent \
+                 types, rotate the container credential, reclaim work, break leases, waive \
+                 reviews, record what ran on the host, remove items, move namespaces, compact the \
+                 queue and designs, start and resolve design threads, approve selections, retire \
+                 and restore designs, and approve, decline, refuse, run and finish run requests."
             }
         }
     }

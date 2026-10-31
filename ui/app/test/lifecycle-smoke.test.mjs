@@ -430,6 +430,11 @@ test("an agent's panel opens its role in the Roles view, which lists every role 
   await page.keyboard.press("Escape");
   await side().locator(".role-panel").waitFor({ state: "detached" });
   await agentPanel.waitFor();
+  // Switching back to Agents with a role open gives the side panel back to the agent too.
+  await table.locator('tr[data-role="designer"]').getByRole("button", { name: "designer", exact: true }).click();
+  await side().locator('.role-panel[aria-label="Role designer"]').waitFor();
   await views.getByRole("radio", { name: "Agents", exact: true }).click();
+  await side().locator(".role-panel").waitFor({ state: "detached" });
+  await agentPanel.waitFor();
   await show(DEFAULT);
 });

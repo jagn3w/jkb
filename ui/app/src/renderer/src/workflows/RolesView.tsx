@@ -6,6 +6,15 @@ import { templatesActingAs, toggleMarks, type AgentTemplate, type RoleInfo, type
 export const NO_AGENT = "no agent: done by hand";
 
 /**
+ * The agent templates as far as they are known: until `workflow.agents` has answered, a role with no
+ * mapped agent type cannot be said to have no agent.
+ */
+export type KnownAgents =
+  | { readonly kind: "loaded"; readonly agents: readonly AgentTemplate[] }
+  | { readonly kind: "loading" }
+  | { readonly kind: "failed"; readonly message: string };
+
+/**
  * Grants, each toggle-controlled one marked with its toggle's name (its label on hover), then what
  * a toggle could grant this role but does not under the strategy, marked "(off in this strategy)".
  * `marks` are the role's toggles that control what this list holds.
@@ -64,13 +73,20 @@ function Agents({
   onOpenAgent,
 }: {
   readonly role: RoleInfo;
-  readonly agents: readonly AgentTemplate[];
+  readonly agents: KnownAgents;
   readonly onOpenAgent: (name: string, agentSet: string) => void;
 }): React.JSX.Element {
-  const templates = templatesActingAs(agents, role.name);
-  if (templates.length === 0 && role.agent_types.length === 0) return <span className="muted role-no-agent">{NO_AGENT}</span>;
+  const templates = agents.kind === "loaded" ? templatesActingAs(agents.agents, role.name) : [];
+  if (agents.kind === "loaded" && templates.length === 0 && role.agent_types.length === 0) {
+    return <span className="muted role-no-agent">{NO_AGENT}</span>;
+  }
   return (
     <ul className="role-grants">
+      {agents.kind !== "loaded" && (
+        <li className="muted role-agents-unknown">
+          {agents.kind === "loading" ? "agents unknown: the templates are loading" : `agents unknown: ${agents.message}`}
+        </li>
+      )}
       {templates.map((a) => (
         <li key={`${a.workflow}/${a.name}`}>
           <button type="button" className="link-button" title={`${a.workflow}: ${a.describe}`} onClick={() => onOpenAgent(a.name, a.workflow)}>
@@ -102,8 +118,8 @@ export function RolesTable({
   onOpenAgent,
 }: {
   readonly view: RolesView;
-  /** Every agent template, in every agent set (`workflow.agents`). */
-  readonly agents: readonly AgentTemplate[];
+  /** Every agent template, in every agent set (`workflow.agents`), once known. */
+  readonly agents: KnownAgents;
   readonly selected: string | undefined;
   readonly onSelect: (role: string) => void;
   readonly onOpenAgent: (name: string, agentSet: string) => void;
@@ -188,7 +204,7 @@ export function RolePanel({
 }: {
   readonly view: RolesView;
   readonly role: RoleInfo;
-  readonly agents: readonly AgentTemplate[];
+  readonly agents: KnownAgents;
   readonly onClose: () => void;
   readonly onOpenAgent: (name: string, agentSet: string) => void;
 }): React.JSX.Element {
@@ -267,6 +283,54 @@ export function RolePanel({
             <Agents role={role} agents={agents} onOpenAgent={onOpenAgent} />
           </Fact>
         </dl>
+      </div>
+    </section>
+  );
+}
+
+/**
+ * The side panel for a selected role that cannot be drawn yet or at all — the roles are loading,
+ * reading them failed (an older daemon), or the strategy has no such role — so a selection never
+ * leaves the panel blank: it says why, and closes with its button or Escape.
+ */
+export function RolePending({
+  name,
+  message,
+  onClose,
+}: {
+  readonly name: string;
+  readonly message: string;
+  readonly onClose: () => void;
+}): React.JSX.Element {
+  const title = `Role ${name}`;
+  const heading = useRef<HTMLHeadingElement>(null);
+  const panel = useRef<HTMLElement>(null);
+  // As `RolePanel` does, so Escape reaches it.
+  useEffect(() => {
+    const at = document.activeElement;
+    if (at === null || at === document.body || panel.current?.contains(at) === true) heading.current?.focus();
+  }, [name]);
+  return (
+    <section
+      ref={panel}
+      className="machine-panel role-panel"
+      aria-label={title}
+      data-pending="true"
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onClose();
+      }}
+    >
+      <header className="pane-bar">
+        <h2 title={title} ref={heading} tabIndex={-1}>
+          {title}
+        </h2>
+        <span className="spacer" />
+        <button type="button" className="bar-button" onClick={onClose} aria-label="Close">
+          ×
+        </button>
+      </header>
+      <div className="pane-body">
+        <p className="muted plan-hint">{message}</p>
       </div>
     </section>
   );
