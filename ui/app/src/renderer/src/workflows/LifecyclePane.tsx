@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 
 import {
   machineDrawing,
@@ -85,6 +85,10 @@ function pressed(e: React.KeyboardEvent, pick: () => void): void {
   }
 }
 
+/** A part's `data-part`, by which the pane finds its button again. */
+const partKey = (sel: MachineSelection): string =>
+  sel.kind === "state" ? `state:${sel.name}` : sel.kind === "edge" ? `edge:${sel.from}|${sel.event}` : `marker:${sel.to}`;
+
 /** An edge as its button is announced: `review --review_failed--> implement`. */
 export const edgeLabel = (t: GraphEdge): string => `${t.from} --${t.event}--> ${t.to ?? STATED}`;
 
@@ -150,8 +154,24 @@ export function LifecyclePane({
   const markerOf = new Map(drawing.markers.map((m) => [m.to, m]));
   const { width, height } = geometry;
 
+  // Closing the panel from inside it (its ×, or Escape there) removes what had focus: give focus
+  // back to the part that was selected, so the keyboard carries on from the picture.
+  const pane = useRef<HTMLElement>(null);
+  const before = useRef<MachineSelection | undefined>(selected);
+  useEffect(() => {
+    const was = before.current;
+    before.current = selected;
+    if (was === undefined || selected !== undefined) return;
+    const at = document.activeElement;
+    if (at !== null && at !== document.body) return;
+    const key = partKey(was);
+    const part = [...(pane.current?.querySelectorAll<SVGGElement>("[data-part]") ?? [])].find((el) => el.getAttribute("data-part") === key);
+    part?.focus();
+  }, [selected]);
+
   return (
     <section
+      ref={pane}
       className="lifecycle-pane"
       aria-label="Lifecycle"
       onKeyDown={(e) => {
@@ -215,6 +235,7 @@ export function LifecyclePane({
                   data-visited={went !== undefined ? "true" : undefined}
                   data-back={e.back ? "true" : undefined}
                   data-selected={sameSelection(selected, part) ? "true" : undefined}
+                  data-part={partKey(part)}
                   role="button"
                   tabIndex={0}
                   aria-label={edgeLabel(t)}
@@ -247,6 +268,7 @@ export function LifecyclePane({
                   data-current={current ? "true" : undefined}
                   data-visited={stood.has(n.id) ? "true" : undefined}
                   data-selected={sameSelection(selected, part) ? "true" : undefined}
+                  data-part={partKey(part)}
                   role="button"
                   tabIndex={0}
                   aria-label={`state ${n.id}`}
@@ -280,6 +302,7 @@ export function LifecyclePane({
                   className="machine-marker"
                   data-visited={went > 0 ? "true" : undefined}
                   data-selected={sameSelection(selected, part) ? "true" : undefined}
+                  data-part={partKey(part)}
                   role="button"
                   tabIndex={0}
                   aria-label={`${markerText(m)} into ${m.to}`}

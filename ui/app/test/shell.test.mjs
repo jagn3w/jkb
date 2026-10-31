@@ -274,8 +274,7 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
   assert.doesNotMatch(html.task, /machine-table|<table[^>]*>\s*<thead>\s*<tr>\s*<th>from/);
   assert.doesNotMatch(html.task, /class="machine-panel"/);
   // Keyed by (from, event): the untaken row between the same states is not inked.
-  assert.match(html.task, /<g class="machine-edge" role="button"[^>]*aria-label="implement --submit_systemic--&gt; review"/);
-  assert.doesNotMatch(html.task, /<g class="machine-edge" data-visited="true"[^>]*aria-label="implement --submit_systemic/);
+  assert.match(html.task, /<g class="machine-edge"(?![^>]*data-visited)[^>]*role="button"[^>]*aria-label="implement --submit_systemic--&gt; review"/);
   assert.match(html.task, /<g class="machine-edge" data-visited="true"[^>]*aria-label="implement --submit_work--&gt; review"/);
   // How often each row was taken is in the panels now: a state's leaves count its edges, and an
   // override — one row whatever its destination — is summed, under the rows the picture omits.

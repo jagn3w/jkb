@@ -242,7 +242,7 @@ export function WorkflowsTab(): React.JSX.Element {
           )}
         </div>
         <aside className="workflows-side">
-          {shown !== undefined && graph.kind === "loaded" ? (
+          {shown !== undefined && graph.kind === "loaded" && (
             <MachinePanel
               graph={graph.value}
               selection={shown}
@@ -250,10 +250,14 @@ export function WorkflowsTab(): React.JSX.Element {
               onSelect={onSelectPart}
               onOpenAgent={pick}
             />
-          ) : agent !== undefined ? (
-            <AgentPanel agent={agent} roles={roles} onSaved={onSaved} onNotice={onNotice} />
+          )}
+          {/* Kept mounted while a machine part fills the aside, so an unsaved template edit survives. */}
+          {agent !== undefined ? (
+            <div className="agent-panel-host" hidden={shown !== undefined}>
+              <AgentPanel agent={agent} roles={roles} onSaved={onSaved} onNotice={onNotice} />
+            </div>
           ) : (
-            <p className="muted plan-hint workflows-pick">Pick an agent in the graph to see its template and permissions.</p>
+            shown === undefined && <p className="muted plan-hint workflows-pick">Pick an agent in the graph to see its template and permissions.</p>
           )}
         </aside>
       </div>

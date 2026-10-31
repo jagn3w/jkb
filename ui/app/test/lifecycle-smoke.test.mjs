@@ -224,7 +224,7 @@ test("clicking a state shows its next step and its undrawn override", { skip }, 
   const text = await panel.innerText();
   assert.ok(text.includes(implement.next_step), `the next step, with <uid> as sent: ${text}`);
   assert.ok(text.includes(implement.next_role));
-  const undrawn = panel.getByRole("region", { name: "Not drawn" });
+  const undrawn = panel.getByRole("region", { name: "Not drawn", exact: true });
   const override = await undrawn.innerText();
   assert.ok(override.includes("implement --override--> (stated)"), override);
   assert.ok(override.includes("the operator names the destination"), override);
@@ -283,12 +283,12 @@ test("clicking the landed marker lists one row per phase", { skip }, async () =>
   await lifecycle().getByRole("button", { name: `observed ×${new Set(into.map((t) => t.from)).size} into landed`, exact: true }).click();
   const panel = side().locator(".machine-panel");
   await panel.waitFor();
-  const rows = panel.getByRole("region", { name: "observed_landed" }).locator(".machine-row");
+  const rows = panel.getByRole("region", { name: "observed_landed", exact: true }).locator(".machine-row");
   assert.equal(await rows.count(), into.length);
   assert.deepEqual(await rows.locator("button").allInnerTexts(), into.map((t) => t.from));
   assert.ok((await panel.innerText()).includes(into[0].guard), "the observation's guard, in jkb's words");
-  // A source is a link to its state.
-  await rows.locator("button", { hasText: into[0].from }).click();
+  // A source is a link to its state. Matched whole: `design` is also the start of `design_review`.
+  await rows.getByRole("button", { name: into[0].from, exact: true }).click();
   await page.waitForFunction((name) => document.querySelector("#pane-workflows .machine-panel")?.getAttribute("aria-label") === `State ${name}`, into[0].from);
 });
 
@@ -307,8 +307,31 @@ test("Escape returns to the agent panel", { skip }, async () => {
   await review.focus();
   await page.keyboard.press("Space");
   await side().locator('.machine-panel[aria-label="State review"]').waitFor();
-  await lifecycle().getByRole("radio", { name: "Task status" }).click();
+  await lifecycle().getByRole("radio", { name: "Task status", exact: true }).click();
   await side().locator(".machine-panel").waitFor({ state: "detached" });
+});
+
+test("following a link in the panel keeps the keyboard: focus goes to its heading, then back to the picture", { skip }, async () => {
+  await phases();
+  await lifecycle().getByRole("button", { name: "state implement", exact: true }).click();
+  const panel = side().locator(".machine-panel");
+  await panel.waitFor();
+  // A Leaves row is a link to its edge; the body it sat in is replaced.
+  await panel.getByRole("region", { name: "Leaves", exact: true }).getByRole("button", { name: "implement --submit_work--> review", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector("#pane-workflows .machine-panel")?.getAttribute("aria-label") === "implement --submit_work--> review");
+  assert.equal(await page.evaluate(() => document.activeElement?.closest(".machine-panel") !== null && document.activeElement?.tagName === "H2"), true, "focus is on the panel's heading");
+  // Escape from there closes the panel and focus returns to the part that was selected.
+  await page.keyboard.press("Escape");
+  await panel.waitFor({ state: "detached" });
+  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("data-part")), "edge:implement|submit_work");
+  // The same through the panel's close button, then from a marker's source link.
+  await page.keyboard.press("Enter");
+  await panel.waitFor();
+  await panel.getByRole("button", { name: "review", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector("#pane-workflows .machine-panel")?.getAttribute("aria-label") === "State review");
+  await panel.getByRole("button", { name: "Close", exact: true }).click();
+  await panel.waitFor({ state: "detached" });
+  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("data-part")), "state:review");
 });
 
 test("a phase's agent template opens in the agent panel", { skip }, async () => {
@@ -319,4 +342,13 @@ test("a phase's agent template opens in the agent panel", { skip }, async () => 
   assert.equal(await side().locator(".machine-panel").count(), 0);
   // The selected agent's role still marks the states where it acts.
   assert.equal(await lifecycle().locator('.machine-state[data-state="implement"]').getAttribute("data-acts"), "true");
+  // An unsaved edit to the template survives a look at a state and back.
+  const template = side().locator(".agent-template");
+  await template.fill("Build {{what}}, unsaved.");
+  await lifecycle().getByRole("button", { name: "state review", exact: true }).click();
+  await side().locator('.machine-panel[aria-label="State review"]').waitFor();
+  assert.equal(await side().locator(".agent-panel").isVisible(), false, "the agent's panel is hidden, not shown beside it");
+  await page.keyboard.press("Escape");
+  await side().locator(".machine-panel").waitFor({ state: "detached" });
+  assert.equal(await template.inputValue(), "Build {{what}}, unsaved.");
 });

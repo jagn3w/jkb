@@ -229,6 +229,18 @@
   pointer-events: none;
 }
 
+/* The agent's panel stays mounted, hidden, while a machine part fills the aside. */
+.agent-panel-host {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.agent-panel-host[hidden] {
+  display: none;
+}
+
 /* ---- the side panel --------------------------------------------------------------------------- */
 
 .agent-panel {

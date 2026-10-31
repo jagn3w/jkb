@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 
 import {
   eventsFiredBy,
@@ -176,6 +176,16 @@ export function MachinePanel({
   const table = machine === "workflow" ? graph.workflow : graph.lifecycle;
   const drawing = useMemo(() => machineDrawing(table), [table]);
   const select = (sel: MachineSelection): void => onSelect(sel);
+  const panel = useRef<HTMLElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  // A link followed inside the panel replaces the body it sat in, and focus would fall to the page,
+  // where Escape reaches nobody: take it to the heading instead. A pick made in the picture keeps
+  // its focus there.
+  const key = JSON.stringify(selection);
+  useEffect(() => {
+    const at = document.activeElement;
+    if (at === null || at === document.body || panel.current?.contains(at) === true) heading.current?.focus();
+  }, [key]);
 
   let title: string;
   let body: React.JSX.Element;
@@ -307,6 +317,7 @@ export function MachinePanel({
 
   return (
     <section
+      ref={panel}
       className="machine-panel"
       aria-label={title}
       onKeyDown={(e) => {
@@ -314,7 +325,9 @@ export function MachinePanel({
       }}
     >
       <header className="pane-bar">
-        <h2 title={title}>{title}</h2>
+        <h2 title={title} ref={heading} tabIndex={-1}>
+          {title}
+        </h2>
         <span className="spacer" />
         <button type="button" className="bar-button" onClick={() => onSelect(undefined)} aria-label="Close">
           ×
