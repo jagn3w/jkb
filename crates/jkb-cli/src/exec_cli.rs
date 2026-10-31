@@ -94,12 +94,17 @@ pub enum ExecCmd {
         #[arg(long)]
         state: Option<String>,
     },
-    /// The tree pin of the repository containing a directory — what a request would record. Opens no
-    /// database.
+    /// The tree pin of the repository containing a directory — what a request would record — and the
+    /// `.gitignore` files it applied. Opens no database.
     Pin {
         /// The directory.
         #[arg(long, default_value = ".")]
         dir: PathBuf,
+        /// A clean checkout of main (the host's own clone) whose `.gitignore` set the pinned tree's
+        /// must equal: any difference is printed and exits 1, because the ignore rules decide what
+        /// the pin leaves out and must be main's.
+        #[arg(long)]
+        against: Option<PathBuf>,
     },
 }
 
@@ -166,7 +171,7 @@ fn expect_view(r: Response) -> Result<ExecView> {
 #[allow(clippy::too_many_lines)] // one arm per verb, like `mq_cli::run`
 pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
     match cmd {
-        ExecCmd::Pin { dir } => pin(&dir, json),
+        ExecCmd::Pin { dir, against } => pin(&dir, against.as_deref(), json),
         ExecCmd::Request {
             target,
             dir,
@@ -306,16 +311,56 @@ pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
 ///
 /// # Errors
 /// An unreadable directory, or a pin that cannot be computed.
-pub fn pin(dir: &Path, json: bool) -> Result<()> {
+pub fn pin(dir: &Path, against: Option<&Path>, json: bool) -> Result<()> {
     let dir = std::fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
-    let pin = crate::gitrepo::tree_pin(&dir)?.map(Pin::from);
+    let tree = crate::gitrepo::pin_tree(&dir)?;
+    // The `.gitignore` files that decided what the pin leaves out — the set the host holds to main's.
+    let ignores: Vec<String> = tree
+        .as_ref()
+        .map(|t| {
+            t.gitignores
+                .keys()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let drift: Option<Vec<String>> = match (against, tree.as_ref()) {
+        (Some(main), Some(t)) => {
+            let main = std::fs::canonicalize(main)
+                .with_context(|| format!("resolving {}", main.display()))?;
+            let main_tree = crate::gitrepo::pin_tree(&main)?
+                .with_context(|| format!("{} is in no repository", main.display()))?;
+            Some(
+                crate::gitrepo::ignore_rules_drift(&t.gitignores, &main_tree.gitignores)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )
+        }
+        _ => None,
+    };
+    let pin = tree.map(|t| Pin::from(t.pin));
     if json {
-        println!("{}", serde_json::json!({ "dir": dir, "pin": pin }));
+        println!(
+            "{}",
+            serde_json::json!({ "dir": dir, "pin": pin, "gitignores": ignores, "ignore_drift": drift })
+        );
     } else {
         match pin {
-            Some(p) => println!("head {}\nchanges {}", p.head, p.changes),
+            Some(p) => {
+                println!("head {} (a label only)\nchanges {}", p.head, p.changes);
+                for g in &ignores {
+                    println!("ignore rules {g}");
+                }
+            }
             None => println!("{} is in no repository: no pin", dir.display()),
         }
+        for d in drift.iter().flatten() {
+            println!("this tree {d} relative to main");
+        }
+    }
+    if drift.is_some_and(|d| !d.is_empty()) {
+        bail!("this request changes the ignore rules; land that change first");
     }
     Ok(())
 }
@@ -388,6 +433,15 @@ fn print_view(v: &ExecView, out: &mut dyn Write) -> Result<()> {
     Ok(())
 }
 
+/// Whether `v` ended by `settle`'s age rule alone ([`jkb_core::exec::SETTLED_INTERRUPT`]) — an
+/// ending the recorded runner's own late report replaces, so a waiter does not act on it while the
+/// runner can still answer.
+fn is_provisional(v: &ExecView) -> bool {
+    v.state == "finished"
+        && v.outcome.as_deref() == Some("interrupted")
+        && v.note.as_deref() == Some(jkb_core::exec::SETTLED_INTERRUPT)
+}
+
 /// The exit status a terminal request makes `jkb exec request` exit with.
 #[must_use]
 pub fn exit_code(v: &ExecView) -> Option<i32> {
@@ -432,8 +486,10 @@ fn retrying<T>(interval: Duration, mut f: impl FnMut() -> Result<T, ApiError>) -
 /// published before the end is missed. A chunk the topic dropped (it was full) shows as a gap in the
 /// chunk numbers and is reported, naming the log that holds everything.
 ///
-/// Gives up at the latest a request can still end ([`jkb_core::exec::LATEST_END_MS`] after it was
-/// made, and a minute): past that, nothing it waits for can arrive.
+/// An ending `settle` wrote by age alone is provisional: the waiter keeps following until the
+/// runner reports its own. Gives up at the latest a request can still end
+/// ([`jkb_core::exec::LATEST_END_MS`] after it was made, and a minute): past that, nothing it waits
+/// for can arrive, and a provisional ending is reported as it stands.
 ///
 /// # Errors
 /// A refusal that is not transient, or the deadline.
@@ -455,8 +511,14 @@ pub fn wait(
         gaps: Vec::new(),
     };
     let mut ended: Option<ExecView> = None;
+    // The ending `settle` wrote by age alone, while the runner may still report its own.
+    let mut provisional: Option<ExecView> = None;
+    let mut announced_provisional = false;
     loop {
         if jkb_core::mq::now_ms() > latest {
+            if let Some(view) = provisional {
+                return finish(&view, &s, out, err);
+            }
             bail!(
                 "{} has not ended by the latest a request can end — the record is unreachable or \
                  stuck",
@@ -507,7 +569,20 @@ pub fn wait(
                 })
             })
             .and_then(expect_view)?;
-            if exit_code(&view).is_some() {
+            if is_provisional(&view) {
+                // Not the runner's word: it may only have been asleep. Keep following until it
+                // reports, or until nothing more can arrive.
+                if !announced_provisional {
+                    writeln!(
+                        err,
+                        "jkb exec: {} went quiet past its timeout and was marked interrupted; \
+                         waiting for its runner's own report",
+                        view.id
+                    )?;
+                    announced_provisional = true;
+                }
+                provisional = Some(view);
+            } else if exit_code(&view).is_some() {
                 ended = Some(view);
                 continue;
             }

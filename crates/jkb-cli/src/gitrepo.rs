@@ -101,14 +101,10 @@ const SAFE_SUBCOMMANDS: &[&str] = &[
     // `jkb_s_git_does_not_run_a_submodule_s_config`: the planted filter did not run, and an
     // untracked file inside the submodule survived while the superproject's own was removed.
     "clean",
-    // The tree pin's reads (`tree_pin`): `ls-tree` and `cat-file blob` read objects alone — no
-    // index, no work tree, no attributes — and `hash-object --no-filters` hashes the bytes of the
-    // files it is named, applying no filter. Measured on git 2.51.1 by
-    // `jkb_s_git_does_not_run_a_submodule_s_config`: the planted filter ran for none of them, named
-    // on a path inside the submodule included.
-    "ls-tree",
-    "cat-file",
-    "hash-object",
+    // Only in the tree pin's own throwaway repository (`IgnoreJudge`), which holds nothing but the
+    // pinned tree's `.gitignore` files: no submodule, no index entries, no config but `git init`'s.
+    // Never run in a request repository.
+    "check-ignore",
 ];
 
 /// Where the subcommand is in `args`: past any leading `-c <key>=<value>` pairs, the one global
@@ -2482,220 +2478,192 @@ fn exists(dir: &Path, reference: &str) -> Result<bool> {
 }
 
 /// The framing version a tree pin's hash starts with ([`tree_pin`]).
-const PIN_FRAMING: &[u8] = b"jkb-tree-pin/v2\n";
+const PIN_FRAMING: &[u8] = b"jkb-tree-pin/v3\n";
 
-/// How many paths one `git hash-object` call is handed.
-const HASH_BATCH: usize = 256;
-
-/// `git` in `dir` for its raw stdout; an error carrying git's message when it exits non-zero.
-/// Audited and hooks-off like every jkb git call ([`git_cmd`]).
-fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    checked(dir, args)?;
-    let out = git_cmd(dir, args)
-        .output()
-        .with_context(|| format!("running `git {}`", args.join(" ")))?;
-    anyhow::ensure!(
-        out.status.success(),
-        "`git {}` failed in {}: {}",
-        args.join(" "),
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
-    Ok(out.stdout)
+/// One pinned path's kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PinKind {
+    /// A regular file with no owner execute bit.
+    File,
+    /// A regular file with the owner execute bit (git's rule for the executable mode).
+    Exec,
+    /// A symbolic link; pinned by its target's text, never followed.
+    Link,
 }
 
-/// One path of `HEAD`'s tree, as `ls-tree` reports it.
-struct HeadEntry {
-    /// The mode: `100644`, `100755`, `120000` (a link) or `160000` (a submodule).
-    mode: String,
-    /// The object id.
-    oid: String,
-}
-
-/// Every path of `head`'s tree. `ls-tree` reads objects only: no index, no work tree, no attributes.
-fn head_tree(top: &Path, head: &str) -> Result<BTreeMap<Vec<u8>, HeadEntry>> {
-    let out = git_raw(top, &["ls-tree", "-r", "-z", "--full-tree", head])?;
-    let mut tree = BTreeMap::new();
-    for line in out.split(|b| *b == 0).filter(|l| !l.is_empty()) {
-        let tab = line
-            .iter()
-            .position(|b| *b == b'\t')
-            .with_context(|| "an `ls-tree` line with no path")?;
-        let meta = String::from_utf8_lossy(&line[..tab]).into_owned();
-        let mut parts = meta.split(' ');
-        let (Some(mode), Some(_kind), Some(oid)) = (parts.next(), parts.next(), parts.next())
-        else {
-            anyhow::bail!("an `ls-tree` line that does not parse: {meta:?}");
-        };
-        tree.insert(
-            line[tab + 1..].to_vec(),
-            HeadEntry {
-                mode: mode.to_owned(),
-                oid: oid.to_owned(),
-            },
-        );
+impl PinKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Exec => "exec",
+            Self::Link => "link",
+        }
     }
-    Ok(tree)
 }
 
-/// One ignore rule from one of `HEAD`'s `.gitignore` files.
-struct IgnoreRule {
-    /// The directory the file is in, as a prefix: empty, or `sub/dir/`.
-    base: Vec<u8>,
-    glob: globset::GlobMatcher,
-    negate: bool,
-    dir_only: bool,
+/// What a pin's walk saw: the pin, and the `.gitignore` files that decided what it left out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedTree {
+    /// The pin.
+    pub pin: jkb_core::exec::TreePin,
+    /// Every `.gitignore` file the walk applied, by path from the top, with its bytes. The host
+    /// holds this to its clean clone's own set ([`ignore_rules_drift`]): the rules that leave files
+    /// out of the pin must be the ones already on main.
+    pub gitignores: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
-/// The ignore rules a tree pin honours: **only `HEAD`'s committed `.gitignore` files**, read from the
-/// tree, never from the work tree. The work tree's `.gitignore` files, `$GIT_DIR/info/exclude` and a
-/// global excludes file are all writable by the session or differ between the two sides, so a
-/// session could otherwise decide for itself which of its files the pin does not see. Matched by
-/// gitignore's rules: a pattern with no inner slash matches at any depth below its file's directory,
-/// one with a slash is anchored there, a trailing slash matches directories only, `!` re-includes,
-/// and among the files that apply the deepest wins and within one file the last line does.
-struct HeadIgnores {
-    rules: Vec<IgnoreRule>,
+/// How a pinned tree's `.gitignore` set differs from main's ([`ignore_rules_drift`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IgnoreDrift {
+    /// A `.gitignore` main does not have.
+    Added(Vec<u8>),
+    /// A `.gitignore` main has and the pinned tree does not.
+    Removed(Vec<u8>),
+    /// A `.gitignore` both have, with other bytes.
+    Changed(Vec<u8>),
 }
 
-impl HeadIgnores {
-    fn read(top: &Path, tree: &BTreeMap<Vec<u8>, HeadEntry>) -> Result<Self> {
-        let mut files: Vec<(&Vec<u8>, &HeadEntry)> = tree
-            .iter()
-            .filter(|(p, e)| {
-                (p.as_slice() == b".gitignore" || p.ends_with(b"/.gitignore"))
-                    && matches!(e.mode.as_str(), "100644" | "100755")
-            })
+impl std::fmt::Display for IgnoreDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (what, p) = match self {
+            Self::Added(p) => ("adds", p),
+            Self::Removed(p) => ("removes", p),
+            Self::Changed(p) => ("changes", p),
+        };
+        write!(f, "{what} {}", String::from_utf8_lossy(p))
+    }
+}
+
+/// How `pinned`'s `.gitignore` set differs from `main`'s — empty when they are equal, paths and
+/// bytes. **A pure function**: the runner calls it with the set its own walk of the request found
+/// ([`PinnedTree::gitignores`]) and the set its walk of the host's clean clone of `origin/main`
+/// found, and refuses the request at review on any difference ("this request changes the ignore
+/// rules; land that change first"), because ignored files are exactly what the pin does not cover.
+#[must_use]
+pub fn ignore_rules_drift(
+    pinned: &BTreeMap<Vec<u8>, Vec<u8>>,
+    main: &BTreeMap<Vec<u8>, Vec<u8>>,
+) -> Vec<IgnoreDrift> {
+    let mut drift = Vec::new();
+    for (path, bytes) in pinned {
+        match main.get(path) {
+            None => drift.push(IgnoreDrift::Added(path.clone())),
+            Some(b) if b != bytes => drift.push(IgnoreDrift::Changed(path.clone())),
+            Some(_) => {}
+        }
+    }
+    for path in main.keys() {
+        if !pinned.contains_key(path) {
+            drift.push(IgnoreDrift::Removed(path.clone()));
+        }
+    }
+    drift
+}
+
+/// A throwaway repository holding only a pinned tree's `.gitignore` files, at their paths, where
+/// `check-ignore` decides what they ignore — so the rules are gitignore's own, from the same git
+/// binary on both sides, and nothing of the request repository's `.git` (its index, its
+/// `info/exclude`, its config) takes part. Deleted with the guard.
+struct IgnoreJudge {
+    dir: PathBuf,
+}
+
+impl IgnoreJudge {
+    fn new() -> Result<Self> {
+        let token = jkb_core::roles::fresh_token().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let name: String = token
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(24)
             .collect();
-        // Shallow first, so a deeper file's rules come later and win.
-        files.sort_by_key(|(p, _)| (p.split(|b| *b == b'/').count(), (*p).clone()));
-        let mut rules = Vec::new();
-        for (path, entry) in files {
-            let base = path[..path.len() - b".gitignore".len()].to_vec();
-            let text = git_raw(top, &["cat-file", "blob", &entry.oid])?;
-            for line in text.split(|b| *b == b'\n') {
-                if let Some(rule) = Self::rule(&base, line) {
-                    rules.push(rule);
-                }
-            }
-        }
-        Ok(Self { rules })
+        let dir = std::env::temp_dir().join(format!("jkb-pin-ignore-{name}"));
+        fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let judge = Self { dir };
+        // Not through `checked`: the directory is not a repository until this runs, and it is ours.
+        let out = git_cmd(&judge.dir, &["init", "-q"])
+            .output()
+            .context("running `git init` for the pin's ignore rules")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "`git init` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Ok(judge)
     }
 
-    /// One `.gitignore` line as a rule, or `None` for a blank line, a comment or a pattern globset
-    /// cannot read (which then ignores nothing, so the path is pinned: fail closed).
-    fn rule(base: &[u8], line: &[u8]) -> Option<IgnoreRule> {
-        let mut line = String::from_utf8_lossy(line).into_owned();
-        if line.ends_with('\r') {
-            line.pop();
-        }
-        // Trailing spaces go, unless escaped with a backslash.
-        while line.ends_with(' ') && !line.ends_with("\\ ") {
-            line.pop();
-        }
-        if line.is_empty() || line.starts_with('#') {
-            return None;
-        }
-        let negate = line.starts_with('!');
-        let mut pat = if negate { &line[1..] } else { &line[..] }.to_owned();
-        let dir_only = pat.ends_with('/');
-        if dir_only {
-            pat.pop();
-        }
-        if pat.is_empty() {
-            return None;
-        }
-        let anchored = pat.contains('/');
-        let pat = pat.strip_prefix('/').unwrap_or(&pat);
-        let pattern = if anchored {
-            pat.to_owned()
-        } else {
-            format!("**/{pat}")
-        };
-        let glob = globset::GlobBuilder::new(&pattern)
-            .literal_separator(true)
-            .backslash_escape(true)
-            .build()
-            .ok()?
-            .compile_matcher();
-        Some(IgnoreRule {
-            base: base.to_vec(),
-            glob,
-            negate,
-            dir_only,
-        })
-    }
-
-    /// Whether `rel` (from the top, no trailing slash) is ignored, given whether it is a directory.
-    fn ignored(&self, rel: &[u8], is_dir: bool) -> bool {
+    /// Place a `.gitignore` found at `rel` (from the top) with `bytes`.
+    fn add(&self, rel: &[u8], bytes: &[u8]) -> Result<()> {
         use std::os::unix::ffi::OsStrExt as _;
-        let mut ignored = false;
-        for rule in &self.rules {
-            if !rel.starts_with(&rule.base) || rel.len() == rule.base.len() {
-                continue;
-            }
-            if rule.dir_only && !is_dir {
-                continue;
-            }
-            let sub = Path::new(std::ffi::OsStr::from_bytes(&rel[rule.base.len()..]));
-            if rule.glob.is_match(sub) {
-                ignored = !rule.negate;
-            }
+        let path = self.dir.join(std::ffi::OsStr::from_bytes(rel));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        ignored
+        fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))
     }
 
-    /// Whether `rel` or any directory above it is ignored.
-    fn covers(&self, rel: &[u8], is_dir: bool) -> bool {
-        let mut at = 0;
-        while let Some(slash) = rel[at..].iter().position(|b| *b == b'/') {
-            if self.ignored(&rel[..at + slash], true) {
-                return true;
-            }
-            at += slash + 1;
+    /// Which of `paths` (from the top; a directory's ends with `/`) are ignored.
+    fn ignored(&self, paths: &[Vec<u8>]) -> Result<std::collections::HashSet<Vec<u8>>> {
+        use std::io::Write as _;
+        use std::process::Stdio;
+        if paths.is_empty() {
+            return Ok(std::collections::HashSet::new());
         }
-        self.ignored(rel, is_dir)
+        let args = [
+            "-c",
+            "core.excludesFile=/dev/null",
+            "-c",
+            "core.ignoreCase=false",
+            "check-ignore",
+            "--no-index",
+            "--stdin",
+            "-z",
+            "-v",
+            "-n",
+        ];
+        checked(&self.dir, &args)?;
+        let mut child = git_cmd(&self.dir, &args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("running `git check-ignore` for the pin")?;
+        let mut stdin = child.stdin.take().context("check-ignore's stdin")?;
+        let input: Vec<u8> = paths
+            .iter()
+            .flat_map(|p| p.iter().copied().chain(std::iter::once(0)))
+            .collect();
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let out = child
+            .wait_with_output()
+            .context("waiting for `git check-ignore`")?;
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("check-ignore's writer panicked"))?
+            .context("writing to `git check-ignore`")?;
+        // Exit 1 means "nothing matched", which `-n` still reports path by path.
+        anyhow::ensure!(
+            matches!(out.status.code(), Some(0 | 1)),
+            "`git check-ignore` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        // Records of four fields: source, line, pattern, path. A path is ignored when a pattern
+        // matched and it is not a negation.
+        let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+        let mut ignored = std::collections::HashSet::new();
+        for rec in fields.chunks(4).filter(|r| r.len() == 4) {
+            let pattern = rec[2];
+            if !pattern.is_empty() && !pattern.starts_with(b"!") {
+                ignored.insert(rec[3].to_vec());
+            }
+        }
+        Ok(ignored)
     }
 }
 
-/// One path's state in the work tree, read without following a link.
-enum Seen {
-    Missing,
-    File { exec: bool },
-    Link(Vec<u8>),
-    Dir,
-    Other,
-}
-
-fn seen(path: &Path) -> Result<Seen> {
-    use std::os::unix::ffi::OsStringExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Ok(Seen::Missing)
-        }
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let ty = meta.file_type();
-    Ok(if ty.is_symlink() {
-        let target = fs::read_link(path).with_context(|| format!("reading {}", path.display()))?;
-        Seen::Link(target.into_os_string().into_vec())
-    } else if ty.is_dir() {
-        Seen::Dir
-    } else if ty.is_file() {
-        // Git's own rule for the executable mode: the owner's execute bit.
-        Seen::File {
-            exec: meta.permissions().mode() & 0o100 != 0,
-        }
-    } else {
-        Seen::Other
-    })
+impl Drop for IgnoreJudge {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
 }
 
 /// The blake3 of a regular file's bytes, read without following a link (a link swapped in since it
@@ -2720,249 +2688,231 @@ fn file_digest(path: &Path) -> Result<Vec<u8>> {
 }
 
 /// The tree pin of the repository containing `dir` (the Executions design), or `None` when `dir` is
-/// in no repository: its `HEAD` commit, and the blake3 of its working-tree changes.
+/// in no repository ([`pin_tree`]'s pin).
 ///
-/// **The pin never asks git what changed.** Git's own comparison applies the repository's index,
-/// excludes and attributes, all writable from the dev container: `update-index --skip-worktree`
-/// hid an edited tracked file, `.git/info/exclude` an untracked one, and an `ident` attribute an
-/// edit to a tracked script, each from `git diff` and `git status` alike (rounds 1 and 2, measured
-/// on git 2.51.1). So the change set is computed from raw bytes:
+/// # Errors
+/// As [`pin_tree`].
+pub fn tree_pin(dir: &Path) -> Result<Option<jkb_core::exec::TreePin>> {
+    Ok(pin_tree(dir)?.map(|t| t.pin))
+}
+
+/// The tree pin of the repository containing `dir`, and the `.gitignore` set it applied — or `None`
+/// when `dir` is in no repository.
 ///
-/// - **tracked**: every path of `HEAD`'s tree (`ls-tree -r -z`, which reads objects only) is looked
-///   at in the work tree without following a link, and is unchanged only when its kind matches
-///   `HEAD`'s mode and its raw bytes do — a file's `hash-object --no-filters` (git's own object hash,
-///   collision-detecting) equal to `HEAD`'s blob id, a link's target equal to `HEAD`'s blob. Bytes
-///   that differ for any reason — an edit, CRLF, an attribute's conversion — count as changed:
-///   that fails closed;
-/// - **untracked**: every path the work tree holds that `HEAD`'s tree does not, unless `HEAD`'s own
-///   committed `.gitignore` files ignore it ([`HeadIgnores`]).
+/// **The pin trusts nothing in `.git`** (framing v3). Five holes in three review rounds — the
+/// index's flags, nested repositories, `info/exclude`, attributes, then replace refs and unverified
+/// loose objects — had one shape: the pin learned a fact about the tree by reading git state the
+/// dev container can write, and a forged `HEAD`, `packed-refs` or `objects/info/alternates` would
+/// have been the next. So the pin is computed from the work tree alone:
 ///
-/// **The framing, version 2** — main and the CLI run this same function, and a change to it is a
-/// new version: blake3 over `jkb-tree-pin/v2\n`, then for each changed path in byte order three
+/// - **every path** below the top that the tree's own `.gitignore` files do not ignore, skipping
+///   only the top-level `.git`, walked without following a link, is pinned as `(path, kind,
+///   digest)`: `file` or `exec` (the owner execute bit, as git decides the mode) with the blake3 of
+///   its bytes, or `link` with its target's text. A link is never followed: a target outside the
+///   tree is pinned as text, a stated residual.
+/// - **what is ignored** is decided by `git check-ignore` in a throwaway repository holding only
+///   those `.gitignore` files at their paths ([`IgnoreJudge`]), so gitignore's own rules apply and
+///   nothing of the request repository takes part. A directory it ignores is never walked
+///   (`target/`, `node_modules`), and a `.gitignore` inside one is never read, as git does. The set
+///   applied is returned ([`PinnedTree::gitignores`]) for the host to hold to main's
+///   ([`ignore_rules_drift`]).
+/// - **`head`** is `rev-parse HEAD`, a label for the operator only: nothing in the digest depends
+///   on it, or on anything else `.git` says.
+///
+/// **The framing, version 3** — main and the CLI run this same function, and a change to it is a
+/// new version: blake3 over `jkb-tree-pin/v3\n`, then for each pinned path in byte order three
 /// frames — the path's bytes, its kind, its digest — where a frame is the length as a
-/// little-endian `u64` followed by the bytes. The kinds: `file` and `exec` (digest: the blake3 of
-/// the bytes), `link` (digest: the target), `missing`, `dir` (a tracked file replaced by a
-/// directory, whose contents are listed as untracked), `other` (a FIFO, a socket); the last three
-/// have an empty digest.
+/// little-endian `u64` followed by the bytes.
 ///
-/// **Not pinnable — refused rather than pinned in part:** a request directory `HEAD`'s `.gitignore`
-/// covers (nothing in it would be pinned); a nested repository (a directory holding `.git`) the
-/// ignore rules do not cover; a populated submodule, whose own work tree is never read; and a
-/// tracked path below a directory that has become a link, which a run would follow out of the tree.
+/// **Not pinnable — refused rather than pinned in part:** a request directory the `.gitignore`
+/// files cover (nothing in it would be pinned); a `.git` below the top that the rules do not ignore
+/// (a nested repository, or a populated submodule — neither's own state is read); and anything that
+/// is not a file, a directory or a link (a FIFO, a socket).
 ///
-/// **What it does not cover**, stated by the design: files `HEAD`'s `.gitignore` ignores
-/// (`target/`, build output), and a change made between the pin check and the moment a run reads
-/// the file.
+/// **What it does not cover**, stated by the design: ignored files (exactly main's rules, once the
+/// host has held the set to main's); `.git` itself; and a change made between the pin check and the
+/// moment a run reads the file.
 ///
 /// # Errors
 /// "not pinnable" for the cases above; the audit's refusal (a repository whose own config names a
-/// program); a repository with no commit; an unreadable file; or `git` failing to run.
-pub fn tree_pin(dir: &Path) -> Result<Option<jkb_core::exec::TreePin>> {
+/// program); a repository with no commit; an unreadable path; or `git` failing to run.
+pub fn pin_tree(dir: &Path) -> Result<Option<PinnedTree>> {
     use std::os::unix::ffi::OsStrExt as _;
     let Some(top) = root(dir)? else {
         return Ok(None);
     };
     let head = git(&top, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])?
         .filter(|h| !h.is_empty())
-        .with_context(|| format!("{} has no commit to pin", top.display()))?;
-    let tree = head_tree(&top, &head)?;
-    let ignores = HeadIgnores::read(&top, &tree)?;
+        .with_context(|| format!("{} has no commit to label the pin with", top.display()))?;
+    let judge = IgnoreJudge::new()?;
+    let mut walk = PinWalk {
+        top: &top,
+        judge: &judge,
+        gitignores: BTreeMap::new(),
+        pinned: Vec::new(),
+        walked_dirs: std::collections::HashSet::new(),
+    };
+    walk.run()?;
 
     if let Ok(rel) = dir.strip_prefix(&top) {
         let rel = rel.as_os_str().as_bytes();
-        if !rel.is_empty() && ignores.covers(rel, true) {
-            anyhow::bail!(
-                "not pinnable: {} is ignored by the repository's committed .gitignore, so nothing \
-                 in it would be pinned — run from a directory the repository tracks",
-                dir.display()
-            );
+        // The request directory must be one the walk entered: every directory on its way down
+        // that the rules ignore was skipped.
+        let mut at = 0;
+        let mut prefix = Vec::new();
+        while !rel.is_empty() {
+            let end = rel[at..]
+                .iter()
+                .position(|b| *b == b'/')
+                .map_or(rel.len(), |p| at + p);
+            prefix.clear();
+            prefix.extend_from_slice(&rel[..end]);
+            if !walk.walked_dirs.contains(&prefix) {
+                anyhow::bail!(
+                    "not pinnable: {} is ignored by the repository's .gitignore, so nothing in it \
+                     would be pinned — run from a directory the repository tracks",
+                    dir.display()
+                );
+            }
+            if end == rel.len() {
+                break;
+            }
+            at = end + 1;
         }
     }
 
-    let abs = |rel: &[u8]| top.join(std::ffi::OsStr::from_bytes(rel));
-    let submodules: std::collections::BTreeSet<Vec<u8>> = tree
-        .iter()
-        .filter(|(_, e)| e.mode == "160000")
-        .map(|(p, _)| p.clone())
-        .collect();
-    for sub in &submodules {
-        if fs::read_dir(abs(sub)).is_ok_and(|mut d| d.next().is_some()) {
-            anyhow::bail!(
-                "not pinnable: {} holds a populated submodule, {}, whose own work tree jkb does \
-                 not read, so a dirty or moved one could not be told from a clean one",
-                top.display(),
-                abs(sub).display()
-            );
-        }
-    }
-
-    let mut changed = tracked_changes(&top, &tree)?;
-
-    let mut untracked = Vec::new();
-    walk_untracked(&top, &[], &tree, &submodules, &ignores, &mut untracked)?;
-    for path in untracked {
-        let (kind, digest) = match seen(&abs(&path))? {
-            Seen::File { exec } => (
-                if exec { "exec" } else { "file" },
-                file_digest(&abs(&path))?,
-            ),
-            Seen::Link(target) => ("link", target),
-            Seen::Missing => continue,
-            Seen::Dir | Seen::Other => ("other", Vec::new()),
-        };
-        changed.push((path, kind, digest));
-    }
-
-    changed.sort();
-    changed.dedup_by(|a, b| a.0 == b.0);
+    walk.pinned.sort();
     let mut hasher = blake3::Hasher::new();
     hasher.update(PIN_FRAMING);
-    for (path, kind, digest) in &changed {
-        for part in [path.as_slice(), kind.as_bytes(), digest.as_slice()] {
+    for (path, kind, digest) in &walk.pinned {
+        for part in [path.as_slice(), kind.as_str().as_bytes(), digest.as_slice()] {
             hasher.update(&u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
             hasher.update(part);
         }
     }
-    Ok(Some(jkb_core::exec::TreePin {
-        head,
-        changes: hasher.finalize().to_hex().to_string(),
+    Ok(Some(PinnedTree {
+        pin: jkb_core::exec::TreePin {
+            head,
+            changes: hasher.finalize().to_hex().to_string(),
+        },
+        gitignores: walk.gitignores,
     }))
 }
 
-/// A changed path for [`tree_pin`]'s framing: the path, its kind and its digest.
-type Change = (Vec<u8>, &'static str, Vec<u8>);
-
-/// Every path of `HEAD`'s tree whose kind or raw bytes in the work tree differ from `HEAD`
-/// ([`tree_pin`]). Submodules are judged by the caller.
-fn tracked_changes(top: &Path, tree: &BTreeMap<Vec<u8>, HeadEntry>) -> Result<Vec<Change>> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let abs = |rel: &[u8]| top.join(std::ffi::OsStr::from_bytes(rel));
-    let mut changed: Vec<Change> = Vec::new();
-    let mut to_hash: Vec<(&Vec<u8>, &HeadEntry, bool)> = Vec::new();
-    let mut dirs: std::collections::HashMap<Vec<u8>, Seen> = std::collections::HashMap::new();
-    for (path, entry) in tree.iter().filter(|(_, e)| e.mode != "160000") {
-        // Every directory above a tracked path must still be a directory: one swapped for a link
-        // would send a run out of the tree.
-        let mut gone = false;
-        let mut at = 0;
-        while let Some(slash) = path[at..].iter().position(|b| *b == b'/') {
-            let parent = path[..at + slash].to_vec();
-            if !dirs.contains_key(&parent) {
-                let s = seen(&abs(&parent))?;
-                dirs.insert(parent.clone(), s);
-            }
-            match &dirs[&parent] {
-                Seen::Dir => {}
-                Seen::Link(_) => anyhow::bail!(
-                    "not pinnable: {} is a link where the repository has a directory",
-                    abs(&parent).display()
-                ),
-                _ => gone = true,
-            }
-            at += slash + 1;
-        }
-        let state = if gone {
-            Seen::Missing
-        } else {
-            seen(&abs(path))?
-        };
-        match state {
-            Seen::File { exec } => to_hash.push((path, entry, exec)),
-            Seen::Link(target) => {
-                let same = entry.mode == "120000"
-                    && git_raw(top, &["cat-file", "blob", &entry.oid])? == target;
-                if !same {
-                    changed.push((path.clone(), "link", target));
-                }
-            }
-            Seen::Missing => changed.push((path.clone(), "missing", Vec::new())),
-            Seen::Dir => changed.push((path.clone(), "dir", Vec::new())),
-            Seen::Other => changed.push((path.clone(), "other", Vec::new())),
-        }
-    }
-    for batch in to_hash.chunks(HASH_BATCH) {
-        let mut args: Vec<&str> = vec!["hash-object", "--no-filters", "--"];
-        let names: Vec<String> = batch
-            .iter()
-            .map(|(p, _, _)| {
-                std::str::from_utf8(p)
-                    .map(str::to_owned)
-                    .with_context(|| format!("{} is not UTF-8", abs(p).display()))
-            })
-            .collect::<Result<_>>()?;
-        args.extend(names.iter().map(String::as_str));
-        let out = git_raw(top, &args)?;
-        let oids: Vec<&[u8]> = out
-            .split(|b| *b == b'\n')
-            .filter(|l| !l.is_empty())
-            .collect();
-        anyhow::ensure!(
-            oids.len() == batch.len(),
-            "`git hash-object` answered {} ids for {} files",
-            oids.len(),
-            batch.len()
-        );
-        for ((path, entry, exec), oid) in batch.iter().zip(oids) {
-            let mode = if *exec { "100755" } else { "100644" };
-            if entry.mode != mode || oid != entry.oid.as_bytes() {
-                let kind = if *exec { "exec" } else { "file" };
-                changed.push(((*path).clone(), kind, file_digest(&abs(path))?));
-            }
-        }
-    }
-
-    Ok(changed)
+/// [`pin_tree`]'s walk, a directory level at a time: each level's `.gitignore` files are placed in
+/// the judge before that level's entries are asked about, so a directory's rules apply to what is
+/// in it, and one `check-ignore` call serves a whole level.
+struct PinWalk<'a> {
+    top: &'a Path,
+    judge: &'a IgnoreJudge,
+    gitignores: BTreeMap<Vec<u8>, Vec<u8>>,
+    pinned: Vec<(Vec<u8>, PinKind, Vec<u8>)>,
+    walked_dirs: std::collections::HashSet<Vec<u8>>,
 }
 
-/// Every path under `rel` that `HEAD`'s tree does not hold and its `.gitignore` files do not ignore,
-/// walking without following a link and never into an ignored directory. A nested repository the
-/// rules do not ignore is refused.
-fn walk_untracked(
-    top: &Path,
-    rel: &[u8],
-    tree: &BTreeMap<Vec<u8>, HeadEntry>,
-    submodules: &std::collections::BTreeSet<Vec<u8>>,
-    ignores: &HeadIgnores,
-    out: &mut Vec<Vec<u8>>,
-) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let here = top.join(std::ffi::OsStr::from_bytes(rel));
-    let mut entries: Vec<(Vec<u8>, fs::FileType)> = fs::read_dir(&here)
-        .with_context(|| format!("reading {}", here.display()))?
-        .map(|e| {
-            let e = e?;
-            Ok((e.file_name().as_bytes().to_vec(), e.file_type()?))
-        })
-        .collect::<std::io::Result<_>>()
-        .with_context(|| format!("reading {}", here.display()))?;
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    for (name, ty) in entries {
-        if rel.is_empty() && name == b".git" {
-            continue;
-        }
-        let mut path = rel.to_vec();
-        if !path.is_empty() {
-            path.push(b'/');
-        }
-        path.extend_from_slice(&name);
-        if ty.is_dir() {
-            if submodules.contains(&path) || ignores.ignored(&path, true) {
-                continue;
-            }
-            let abs = top.join(std::ffi::OsStr::from_bytes(&path));
-            if fs::symlink_metadata(abs.join(".git")).is_ok() {
-                anyhow::bail!(
-                    "not pinnable: {} is a nested repository, whose files the pin cannot see — \
-                     make it a submodule, move it out of the repository, or remove it",
-                    abs.display()
-                );
-            }
-            walk_untracked(top, &path, tree, submodules, ignores, out)?;
-        } else if !tree.contains_key(&path) && !ignores.ignored(&path, false) {
-            out.push(path);
-        }
+impl PinWalk<'_> {
+    fn abs(&self, rel: &[u8]) -> PathBuf {
+        use std::os::unix::ffi::OsStrExt as _;
+        self.top.join(std::ffi::OsStr::from_bytes(rel))
     }
-    Ok(())
+
+    fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
+        let mut p = dir.to_vec();
+        if !p.is_empty() {
+            p.push(b'/');
+        }
+        p.extend_from_slice(name);
+        p
+    }
+
+    fn run(&mut self) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut level: Vec<Vec<u8>> = vec![Vec::new()];
+        while !level.is_empty() {
+            // This level's entries, and its directories' `.gitignore` files into the judge.
+            let mut entries: Vec<(Vec<u8>, fs::FileType)> = Vec::new();
+            for dir in &level {
+                let here = self.abs(dir);
+                let mut names: Vec<(Vec<u8>, fs::FileType)> = fs::read_dir(&here)
+                    .with_context(|| format!("reading {}", here.display()))?
+                    .map(|e| {
+                        let e = e?;
+                        Ok((e.file_name().as_bytes().to_vec(), e.file_type()?))
+                    })
+                    .collect::<std::io::Result<_>>()
+                    .with_context(|| format!("reading {}", here.display()))?;
+                names.sort_by(|a, b| a.0.cmp(&b.0));
+                for (name, ty) in names {
+                    if name == b".git" {
+                        if dir.is_empty() {
+                            continue;
+                        }
+                        anyhow::bail!(
+                            "not pinnable: {} is a nested repository or a populated submodule, \
+                             whose own state the pin does not read — move it out of the \
+                             repository, or ignore it in the repository's .gitignore",
+                            here.display()
+                        );
+                    }
+                    let path = Self::join(dir, &name);
+                    if name == b".gitignore" && ty.is_file() {
+                        let bytes = fs::read(self.abs(&path))
+                            .with_context(|| format!("reading {}", self.abs(&path).display()))?;
+                        self.judge.add(&path, &bytes)?;
+                        self.gitignores.insert(path.clone(), bytes);
+                    }
+                    entries.push((path, ty));
+                }
+            }
+            let asked: Vec<Vec<u8>> = entries
+                .iter()
+                .map(|(p, ty)| {
+                    let mut q = p.clone();
+                    if ty.is_dir() {
+                        q.push(b'/');
+                    }
+                    q
+                })
+                .collect();
+            let ignored = self.judge.ignored(&asked)?;
+            let mut next = Vec::new();
+            for ((path, ty), q) in entries.into_iter().zip(asked) {
+                // An ignored `.gitignore` still applies, as git reads it; it is simply not pinned.
+                if ignored.contains(&q) || ignored.contains(&path) {
+                    continue;
+                }
+                if ty.is_dir() {
+                    self.walked_dirs.insert(path.clone());
+                    next.push(path);
+                } else if ty.is_symlink() {
+                    let target = fs::read_link(self.abs(&path))
+                        .with_context(|| format!("reading {}", self.abs(&path).display()))?;
+                    self.pinned
+                        .push((path, PinKind::Link, target.as_os_str().as_bytes().to_vec()));
+                } else if ty.is_file() {
+                    let abs = self.abs(&path);
+                    let mode = fs::symlink_metadata(&abs)
+                        .with_context(|| format!("reading {}", abs.display()))?
+                        .permissions()
+                        .mode();
+                    let kind = if mode & 0o100 == 0 {
+                        PinKind::File
+                    } else {
+                        PinKind::Exec
+                    };
+                    self.pinned.push((path, kind, file_digest(&abs)?));
+                } else {
+                    anyhow::bail!(
+                        "not pinnable: {} is neither a file, a directory nor a link",
+                        self.abs(&path).display()
+                    );
+                }
+            }
+            level = next;
+        }
+        Ok(())
+    }
 }
 
 /// Which ref to ask about when a branch exists both locally and on the remote. They can
@@ -5257,10 +5207,6 @@ mod tests {
         std::fs::write(sup.join("sub/f"), "gggg\n").unwrap();
         let e = format!("{:#}", super::tree_pin(&sup).unwrap_err());
         assert!(e.contains("populated submodule"), "{e}");
-        // …and its reads, each named on a path inside the submodule as well.
-        let _ = super::git_raw(&sup, &["ls-tree", "-r", "-z", "--full-tree", "HEAD"]);
-        let _ = super::git_raw(&sup, &["cat-file", "blob", "HEAD:.gitmodules"]);
-        let _ = super::git_raw(&sup, &["hash-object", "--no-filters", "--", "sub/f"]);
         assert!(!marker.exists(), "the tree pin entered the submodule");
         // The graft tree's `clean -fd` removes the superproject's untracked file and neither enters
         // the submodule nor deletes inside it.
@@ -5553,16 +5499,18 @@ mod tests {
         assert_ne!(pin_of(&dir), one);
         std::fs::remove_file(&new).unwrap();
 
-        // A commit moves HEAD.
-        std::fs::write(&file, "committed").unwrap();
-        for args in [&["add", "-A"][..], &["commit", "-qm", "c"][..]] {
-            assert!(fixture_git(&dir, args).status().unwrap().success());
-        }
+        // A commit moves HEAD, the label, and nothing else: the digest is the work tree's.
+        assert!(
+            fixture_git(&dir, &["commit", "-q", "--allow-empty", "-m", "c"])
+                .status()
+                .unwrap()
+                .success()
+        );
         let committed = pin_of(&dir);
         assert_ne!(committed.head, clean.head);
         assert_eq!(
             committed.changes, clean.changes,
-            "a clean tree hashes the same whatever HEAD is"
+            "the same work tree hashes the same whatever HEAD is"
         );
     }
 
@@ -5614,8 +5562,8 @@ mod tests {
     }
 
     /// The repository's own index is writable from the container: an entry marked skip-worktree or
-    /// assume-unchanged hides an edit from `git diff` and `git status`. The pin lists against an
-    /// index of its own, so the edit still moves it.
+    /// assume-unchanged hides an edit from `git diff` and `git status`. The pin never reads the
+    /// index, so the edit still moves it.
     #[test]
     fn the_tree_pin_sees_an_edit_the_index_was_told_to_hide() {
         for flag in ["--skip-worktree", "--assume-unchanged"] {
@@ -5726,36 +5674,204 @@ mod tests {
         );
     }
 
-    /// Only `HEAD`'s committed `.gitignore` files decide what is ignored: one the session edits or
-    /// adds in the work tree hides nothing (the edit itself is pinned too).
+    /// The ignore rules are the pinned tree's own `.gitignore` files: one the session adds does hide
+    /// what it names — and is itself pinned, and reported in the set the host holds to main's.
     #[test]
-    fn the_tree_pin_reads_only_head_s_gitignore() {
+    fn the_tree_pin_s_ignore_rules_are_the_tree_s_own_and_reported() {
         let (_t, dir) = pin_repo();
-        let clean = pin_of(&dir);
+        let clean = super::pin_tree(&dir).unwrap().unwrap();
+        assert_eq!(
+            clean.gitignores.keys().cloned().collect::<Vec<_>>(),
+            vec![b".gitignore".to_vec()]
+        );
         std::fs::create_dir_all(dir.join("tools")).unwrap();
         std::fs::write(dir.join("tools/.gitignore"), "helper.sh\n").unwrap();
         std::fs::write(dir.join("tools/helper.sh"), "echo one\n").unwrap();
-        let one = pin_of(&dir);
-        assert_ne!(one, clean);
-        std::fs::write(dir.join("tools/helper.sh"), "echo two\n").unwrap();
-        assert_ne!(
-            pin_of(&dir),
-            one,
-            "a work-tree .gitignore hid a file from the pin"
+        let added = super::pin_tree(&dir).unwrap().unwrap();
+        assert_ne!(added.pin, clean.pin, "the new .gitignore is pinned");
+        assert_eq!(
+            super::ignore_rules_drift(&added.gitignores, &clean.gitignores),
+            vec![super::IgnoreDrift::Added(b"tools/.gitignore".to_vec())],
+            "the host sees the rules changed"
         );
-        // A committed rule is honoured, at depth and with a negation.
-        std::fs::write(dir.join(".gitignore"), "target/\n*.log\n!keep.log\n").unwrap();
-        for args in [&["add", "-A"][..], &["commit", "-qm", "ignores"][..]] {
-            assert!(fixture_git(&dir, args).status().unwrap().success());
-        }
+        std::fs::write(dir.join(".gitignore"), "target/\nnew\n").unwrap();
+        assert_eq!(
+            super::ignore_rules_drift(
+                &clean.gitignores,
+                &super::pin_tree(&dir).unwrap().unwrap().gitignores
+            ),
+            vec![
+                super::IgnoreDrift::Changed(b".gitignore".to_vec()),
+                super::IgnoreDrift::Removed(b"tools/.gitignore".to_vec()),
+            ]
+        );
+        assert!(super::ignore_rules_drift(&clean.gitignores, &clean.gitignores).is_empty());
+        // Gitignore's own rules: at depth, a negation, and braces read literally.
+        std::fs::write(
+            dir.join(".gitignore"),
+            "target/\n*.log\n!keep.log\n*.{tmp,bak}\n",
+        )
+        .unwrap();
+        std::fs::remove_dir_all(dir.join("tools")).unwrap();
+        std::fs::create_dir_all(dir.join("tools")).unwrap();
         let base = pin_of(&dir);
         std::fs::write(dir.join("tools/x.log"), "noise").unwrap();
-        assert_eq!(
-            pin_of(&dir),
-            base,
-            "a committed `*.log` ignores a log at depth"
-        );
+        assert_eq!(pin_of(&dir), base, "`*.log` ignores a log at depth");
         std::fs::write(dir.join("tools/keep.log"), "kept").unwrap();
-        assert_ne!(pin_of(&dir), base, "a committed negation re-includes");
+        let kept = pin_of(&dir);
+        assert_ne!(kept, base, "a negation re-includes");
+        std::fs::write(dir.join("tools/z.tmp"), "x").unwrap();
+        assert_ne!(
+            pin_of(&dir),
+            kept,
+            "git reads `*.{{tmp,bak}}` literally, so z.tmp is pinned"
+        );
+    }
+
+    /// A pin learns nothing from `.git`'s word for the tree: a commit that records an edit leaves
+    /// the old pin's digest behind, whatever `HEAD` now names.
+    #[test]
+    fn the_tree_pin_s_digest_does_not_take_head_s_word_for_the_tree() {
+        let (_t, dir) = pin_repo();
+        let clean = pin_of(&dir);
+        std::fs::write(dir.join("run.sh"), "echo PWNED\n").unwrap();
+        for args in [&["add", "-A"][..], &["commit", "-qm", "forged"][..]] {
+            assert!(fixture_git(&dir, args).status().unwrap().success());
+        }
+        assert_ne!(
+            pin_of(&dir).changes,
+            clean.changes,
+            "an edit committed to a moved HEAD left the digest unchanged"
+        );
+    }
+
+    /// The object id of `dir`'s `HEAD:<path>` blob.
+    fn blob_of(dir: &Path, path: &str) -> String {
+        let out = fixture_git(dir, &["rev-parse", &format!("HEAD:{path}")])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// Write `content` as a loose object and return the path of its object file.
+    fn forged_object(dir: &Path, content: &str) -> std::path::PathBuf {
+        let src = dir.join("forged-src");
+        std::fs::write(&src, content).unwrap();
+        let out = fixture_git(dir, &["hash-object", "-w", "forged-src"])
+            .output()
+            .unwrap();
+        std::fs::remove_file(&src).unwrap();
+        let id = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+        dir.join(".git/objects").join(&id[..2]).join(&id[2..])
+    }
+
+    /// The `.gitignore` blob's loose object overwritten in place: git does not hash-verify a blob it
+    /// reads, so a pin that read `HEAD`'s rules from objects ignored the planted file.
+    #[test]
+    fn the_tree_pin_does_not_read_a_forged_loose_object() {
+        let (_t, dir) = pin_repo();
+        let clean = pin_of(&dir);
+        let blob = blob_of(&dir, ".gitignore");
+        let target = dir.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+        let forged = forged_object(&dir, "target/\nevil.sh\n");
+        std::fs::remove_file(&target).unwrap();
+        std::fs::copy(&forged, &target).unwrap();
+        std::fs::write(dir.join("evil.sh"), "echo PWNED\n").unwrap();
+        assert_ne!(
+            pin_of(&dir),
+            clean,
+            "a forged loose object hid a file from the pin"
+        );
+    }
+
+    /// The same forgery served through `objects/info/alternates`.
+    #[test]
+    fn the_tree_pin_does_not_read_objects_through_alternates() {
+        let (t, dir) = pin_repo();
+        let clean = pin_of(&dir);
+        let blob = blob_of(&dir, ".gitignore");
+        let forged = forged_object(&dir, "target/\nevil.sh\n");
+        let alt = t.path().join("alt/objects");
+        std::fs::create_dir_all(alt.join(&blob[..2])).unwrap();
+        std::fs::copy(&forged, alt.join(&blob[..2]).join(&blob[2..])).unwrap();
+        std::fs::remove_file(dir.join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
+        std::fs::create_dir_all(dir.join(".git/objects/info")).unwrap();
+        std::fs::write(
+            dir.join(".git/objects/info/alternates"),
+            format!("{}\n", alt.display()),
+        )
+        .unwrap();
+        std::fs::write(dir.join("evil.sh"), "echo PWNED\n").unwrap();
+        assert_ne!(
+            pin_of(&dir),
+            clean,
+            "an alternate object store hid a file from the pin"
+        );
+    }
+
+    /// A replace ref swapping `HEAD`'s tree for one holding the edited script: a pin that compared
+    /// against `HEAD`'s tree saw no change.
+    #[test]
+    fn the_tree_pin_does_not_follow_a_replace_ref() {
+        let (t, dir) = pin_repo();
+        let clean = pin_of(&dir);
+        std::fs::write(dir.join("run.sh"), "echo PWNED\n").unwrap();
+        let index = t.path().join("forged-index");
+        let run = |args: &[&str]| {
+            let out = fixture_git(&dir, args)
+                .env("GIT_INDEX_FILE", &index)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        run(&["read-tree", "HEAD"]);
+        run(&["update-index", "--add", "run.sh"]);
+        let forged_tree = run(&["write-tree"]);
+        let head_tree = run(&["rev-parse", "HEAD^{tree}"]);
+        run(&["replace", &head_tree, &forged_tree]);
+        assert_ne!(
+            pin_of(&dir),
+            clean,
+            "a replace ref hid an edit from the pin"
+        );
+    }
+
+    /// A file where `HEAD` records an unpopulated submodule is a file like any other.
+    #[test]
+    fn the_tree_pin_pins_a_file_at_a_submodule_path() {
+        let (_t, dir) = pin_repo();
+        let commit = String::from_utf8(
+            fixture_git(&dir, &["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        assert!(fixture_git(
+            &dir,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{commit},vendor")
+            ]
+        )
+        .status()
+        .unwrap()
+        .success());
+        assert!(fixture_git(&dir, &["commit", "-qm", "gitlink"])
+            .status()
+            .unwrap()
+            .success());
+        let clean = pin_of(&dir);
+        std::fs::write(dir.join("vendor"), "echo PWNED\n").unwrap();
+        assert_ne!(
+            pin_of(&dir),
+            clean,
+            "a file at a gitlink path was not pinned"
+        );
     }
 }

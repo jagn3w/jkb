@@ -318,3 +318,63 @@ fn exec_runs_through_the_daemon_and_its_pin_needs_neither() {
         _ => panic!("not an exec request"),
     }
 }
+
+/// Begin `id` as long ago as a settle needs to call it interrupted at the next read.
+fn began_long_ago(db: &Db, id: i64) {
+    db.write_txn("t", move |c, m| {
+        let long_ago =
+            jkb_core::mq::now_ms() - exec::DEFAULT_TIMEOUT_MS - exec::RUN_GRACE_MS - 60_000;
+        exec::begin(c, m, id, None, "app", long_ago)?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// `settle`'s interrupted is provisional: the waiter keeps following, and exits with the runner's
+/// own late ending.
+#[test]
+fn a_settled_interrupt_is_waited_past_for_the_runner_s_own_end() {
+    let db = Db::open_in_memory().unwrap();
+    let (id, view) = requested(&db, "make");
+    began_long_ago(&db, id);
+    let runner = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            db.write_txn("t", move |c, m| {
+                exec::finish(
+                    c,
+                    m,
+                    id,
+                    &Finished {
+                        runner: "app",
+                        outcome: Outcome::Exited,
+                        exit_status: Some(0),
+                        tail: b"",
+                        total_bytes: 0,
+                        log_path: None,
+                    },
+                    jkb_core::mq::now_ms(),
+                )
+            })
+            .unwrap();
+        })
+    };
+    let (code, _, err) = waited(&db, &view);
+    runner.join().unwrap();
+    assert_eq!(
+        code, 0,
+        "the waiter acted on the provisional interrupt: {err}"
+    );
+    assert!(err.contains("waiting for its runner"), "{err}");
+}
+
+/// With no runner report by the latest a request can end, the provisional ending stands.
+#[test]
+fn a_settled_interrupt_stands_at_the_deadline() {
+    let db = Db::open_in_memory().unwrap();
+    let (id, mut view) = requested(&db, "make");
+    began_long_ago(&db, id);
+    view.created_at = jkb_core::mq::now_ms() - exec::LATEST_END_MS - 60_000 + 300;
+    assert_eq!(waited(&db, &view).0, super::EXIT_TIMED_OUT);
+}

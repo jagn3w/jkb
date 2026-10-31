@@ -3,7 +3,7 @@
 //!
 //! **What the operator approves is exactly what runs.** A request is a typed record — `argv` as a
 //! list run without a shell, the requester's real directory, the target, and a **tree pin** of the
-//! directory's repository (its `HEAD` and a blake3 of its working-tree changes). Nothing edits a
+//! directory's repository (a blake3 of its work tree, labelled with its `HEAD`). Nothing edits a
 //! request after it is made: the operator runs it, declines it with a note, or it is refused or
 //! expires, and a session that wants something else asks again.
 //!
@@ -210,13 +210,14 @@ word_enum! {
     }
 }
 
-/// A repository's state when the request was made: its `HEAD` and the blake3 of its working-tree
-/// changes (the framing is `jkb-cli`'s `gitrepo::tree_pin`).
+/// A repository's work tree when the request was made: the blake3 over every path its `.gitignore`
+/// files do not cover, and its `HEAD` as a label (the framing, v3, is `jkb-cli`'s
+/// `gitrepo::pin_tree`, which trusts nothing in `.git`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreePin {
-    /// The `HEAD` commit, hex.
+    /// The `HEAD` commit, hex — a label for the operator; the digest does not depend on it.
     pub head: String,
-    /// The blake3 of the working-tree changes, 64 hex digits.
+    /// The blake3 of the pinned work tree, 64 hex digits.
     pub changes: String,
 }
 

@@ -1988,7 +1988,6 @@ dependencies = [
  "blake3",
  "clap",
  "ctrlc",
- "globset",
  "jkb-api",
  "jkb-core",
  "jkb-daemon",

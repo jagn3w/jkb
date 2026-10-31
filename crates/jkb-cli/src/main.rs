@@ -1737,10 +1737,10 @@ fn run(cli: Cli) -> Result<()> {
 
     // `jkb exec pin` is git and a hash: no database, no daemon, in any mode.
     if let Command::Exec {
-        cmd: exec_cli::ExecCmd::Pin { dir },
+        cmd: exec_cli::ExecCmd::Pin { dir, against },
     } = &cli.command
     {
-        return exec_cli::pin(dir, cli.json);
+        return exec_cli::pin(dir, against.as_deref(), cli.json);
     }
 
     // (2) With JKB_REMOTE set this process must never open a database — on the dev container's

@@ -503,8 +503,8 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
                 Ok(())
             }
             Command::Exec {
-                cmd: ExecCmd::Pin { dir },
-            } => super::exec_cli::pin(&dir, cli.json),
+                cmd: ExecCmd::Pin { dir, against },
+            } => super::exec_cli::pin(&dir, against.as_deref(), cli.json),
             _ => bail!("internal: a NoDatabase command with no remote dispatch"),
         },
         Support::Ported => {

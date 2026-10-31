@@ -18,8 +18,6 @@ workspace = true
 anyhow = "1.0.103"
 # The tree pin of a run request (`gitrepo::tree_pin`); already in the tree through jkb-core.
 blake3 = "1.8.5"
-# `.gitignore` matching for the tree pin, which reads HEAD's ignore files itself (`gitrepo::tree_pin`).
-globset = "0.4"
 clap = { version = "4.6.1", features = ["derive"] }
 # SIGINT only. Its `termination` feature would add SIGTERM, but SIGHUP with it, installed over an
 # ignored one — `nohup` would stop the daemon on a hangup. SIGTERM is tokio's, below (src/stop.rs).

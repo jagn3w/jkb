@@ -30,9 +30,9 @@ use crate::{ApiError, ErrorCode};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pin {
-    /// The repository's `HEAD` commit.
+    /// The repository's `HEAD` commit — a label only.
     pub head: String,
-    /// The blake3 of its working-tree changes.
+    /// The blake3 of its pinned work tree.
     pub changes: String,
 }
 
