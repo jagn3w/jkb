@@ -109,6 +109,44 @@ impl jkb_rbac::Permission for OpPermission {
     }
 }
 
+impl OpPermission {
+    /// What holding this class lets a role do, in one plain sentence: what the Workflows tab's Roles
+    /// view and `jkb workflow roles` print beside the class's name. Beside
+    /// [`Role::describe`](jkb_core::roles::Role::describe), so a role and its op classes read in the
+    /// same words everywhere.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Read => {
+                "Read the knowledge base: tasks, items, designs, workflows and timelines."
+            }
+            Self::Hook => {
+                "Send what every agent's hooks send: notifications, session records and queue \
+                 messages."
+            }
+            Self::TaskWrite => "Change a task's text, placement, tags or dependencies.",
+            Self::TaskStatus => "Set a task's status directly, past its workflow.",
+            Self::TaskClaim => "Claim, start, take, abandon or release work.",
+            Self::Review => "File and record a review round.",
+            Self::Land => "Land a task's branch, where the task's strategy lets the role.",
+            Self::Workflow => {
+                "Fire or observe workflow events, each as the task's strategy allows."
+            }
+            Self::Design => "Write design documents: create, edit, merge and stage their parts.",
+            Self::DesignApprove => "Approve a part of a design, when it names this reviewer.",
+            Self::Grant => "Hand out and revoke role grants, of the roles it may grant.",
+            Self::Attest => {
+                "Vouch for which agent made a tool call: the dev container's credential alone."
+            }
+            Self::ExecRequest => "Ask the operator to run one command.",
+            Self::Admin => {
+                "The operator's own: choose strategies, map agent types, reclaim work, remove \
+                 items and approve run requests."
+            }
+        }
+    }
+}
+
 /// Which role may run which class of op (D52.4). `Land` is held here by the operator only; a
 /// strategy's `lands` toggle extends it per task ([`authorize`]). `Attest` is held by the operator
 /// and granted by [`authorize`] to the dev container's credential alone — never to a ticket, or the
@@ -230,6 +268,7 @@ impl Request {
             | Self::WorkflowShow { .. }
             | Self::WorkflowStrategies {}
             | Self::WorkflowGraph { .. }
+            | Self::WorkflowRoles { .. }
             | Self::WorkflowAgents {}
             | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }
@@ -489,6 +528,7 @@ impl Request {
             | Self::WorkflowShow { .. }
             | Self::WorkflowStrategies {}
             | Self::WorkflowGraph { .. }
+            | Self::WorkflowRoles { .. }
             | Self::WorkflowAgents {}
             | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }

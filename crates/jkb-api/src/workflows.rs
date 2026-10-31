@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use jkb_core::roles::Role;
 use jkb_core::workflow::agents::{self, Agent, AgentPermissions, Edit, Listed, Pick, Source};
 use jkb_core::workflow::store as wf;
-use jkb_core::workflow::strategy::StrategySpec;
+use jkb_core::workflow::strategy::{Controls, StrategySpec, ToggleDef, TOGGLES};
 use jkb_core::workflow::{Phase, WorkflowEvent};
 use jkb_core::{task, WriteMeta};
 use jkb_fsm::Table;
@@ -538,6 +538,18 @@ fn lifecycle_view(spec: &StrategySpec) -> MachineView {
     )
 }
 
+/// The op classes `role` may run under `spec`, in [`OpPermission`]'s order, as the one dispatch
+/// decides them by role alone ([`crate::rbac::role_decision`]): `land` by the strategy's `lands`
+/// toggle, every other class by [`OP_GRANTS`]. What both `workflow.graph`'s `role_ops` and
+/// `workflow.roles` answer, so the two views cannot disagree.
+fn ops_under(spec: &StrategySpec, role: Role) -> Vec<OpPermission> {
+    <OpPermission as jkb_rbac::Permission>::ALL
+        .iter()
+        .copied()
+        .filter(|p| crate::rbac::role_decision(spec, &[role], *p).is_allowed())
+        .collect()
+}
+
 /// `workflow.graph`: the machines of a task's strategy (`uid`), a named one (`strategy`), or the
 /// default.
 ///
@@ -572,12 +584,8 @@ pub fn graph(
                 meta.status,
             )
         }
-        (None, Some(name)) => {
-            let (source, spec) = wf::resolve_strategy(conn, name)?;
-            (source, spec, None, None, None)
-        }
-        (None, None) => {
-            let (source, spec) = wf::default_strategy(conn)?;
+        (None, strategy) => {
+            let (source, spec) = named_or_default(conn, strategy)?;
             (source, spec, None, None, None)
         }
     };
@@ -607,9 +615,8 @@ pub fn graph(
         role_ops: <Role as jkb_rbac::Role>::ALL
             .iter()
             .map(|r| {
-                let ops = <OpPermission as jkb_rbac::Permission>::ALL
-                    .iter()
-                    .filter(|p| crate::rbac::role_decision(&spec, &[*r], **p).is_allowed())
+                let ops = ops_under(&spec, *r)
+                    .into_iter()
                     .map(|p| p.name().to_owned())
                     .collect();
                 (r.as_str().to_owned(), ops)
@@ -617,6 +624,212 @@ pub fn graph(
             .collect(),
         default,
         changes_from_default,
+    })
+}
+
+// -------------------------------------------------------------------------------------------
+// The roles, as data
+// -------------------------------------------------------------------------------------------
+
+/// An op class and what holding it lets a role do ([`OpPermission::describe`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpClassView {
+    /// Its name, as `jkb role matrix` prints it.
+    pub name: String,
+    /// One plain sentence on what it lets a role do.
+    pub describe: String,
+}
+
+/// A strategy toggle ([`TOGGLES`]) and what this strategy sets it to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToggleView {
+    /// The spec field and CLI flag (`approves_design`).
+    pub name: String,
+    /// What it grants, in a few plain words ([`ToggleDef::label`]).
+    pub label: String,
+    /// The workflow events it grants, or `["land"]` for landing, an op rather than an event.
+    pub controls: Vec<String>,
+    /// The roles it may ever name.
+    pub domain: Vec<String>,
+    /// The phase it acts in, if it acts in only one.
+    pub acts_in: Option<String>,
+    /// The roles this strategy names, as its spec stores them (the operator always holds it).
+    pub value: Vec<String>,
+}
+
+/// A toggle that can change what a role may do, and whether this strategy turns it on for the role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToggledBy {
+    /// The toggle's name.
+    pub toggle: String,
+    /// The role holds what the toggle grants under this strategy.
+    pub on: bool,
+}
+
+/// One role, under a strategy: what it may do in jkb, who grants it, and where it acts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleView {
+    /// Its name.
+    pub name: String,
+    /// One sentence on what it is for ([`Role::describe`]).
+    pub describe: String,
+    /// The op classes it may run under this strategy (`ops_under`, the same answer as
+    /// `workflow.graph`'s `role_ops`), each with its sentence.
+    pub ops: Vec<OpClassView>,
+    /// The roles it may grant ([`roles::GRANTABLE`]).
+    pub may_grant: Vec<String>,
+    /// The roles that may grant it.
+    pub granted_by: Vec<String>,
+    /// The workflow acts it may fire under this strategy ([`StrategySpec::authorize`]); an
+    /// observation is anyone's, so none is listed.
+    pub events: Vec<String>,
+    /// It may land a task under this strategy ([`StrategySpec::may_land`]).
+    pub lands: bool,
+    /// The phases of the strategy's graph where it acts next ([`StrategySpec::next_actor`]).
+    pub acts_next_in: Vec<String>,
+    /// The phases of the strategy's graph with a row it may fire.
+    pub fires_in: Vec<String>,
+    /// The toggles that can name it, and whether this strategy does.
+    pub toggled_by: Vec<ToggledBy>,
+    /// The attested agent types the operator maps to it ([`roles::agent_type_map`]).
+    pub agent_types: Vec<String>,
+}
+
+/// `workflow.roles`' answer: every role, in [`jkb_rbac::Role::ALL`]'s order, under one strategy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolesView {
+    /// The strategy read: a preset or `name@version`.
+    pub strategy: String,
+    /// Every toggle, and what this strategy sets it to.
+    pub toggles: Vec<ToggleView>,
+    /// Every role, including those no agent template acts as.
+    pub roles: Vec<RoleView>,
+}
+
+/// A named strategy, or the default.
+fn named_or_default(
+    conn: &Connection,
+    strategy: Option<&str>,
+) -> Result<(String, StrategySpec), ApiError> {
+    Ok(match strategy {
+        Some(name) => wf::resolve_strategy(conn, name)?,
+        None => wf::default_strategy(conn)?,
+    })
+}
+
+/// Whether `role` holds what toggle `t` grants under `spec`, decided by the deciders the dispatch and
+/// the workflow use rather than by reading the list: the operator holds every toggle whatever it lists.
+fn toggle_on(spec: &StrategySpec, t: &ToggleDef, role: Role) -> bool {
+    match t.controls {
+        Controls::Land => {
+            crate::rbac::role_decision(spec, &[role], OpPermission::Land).is_allowed()
+        }
+        Controls::Events(events) => events
+            .iter()
+            .all(|e| spec.authorize(&[role], *e).is_allowed()),
+    }
+}
+
+fn names(roles: &[Role]) -> Vec<String> {
+    roles.iter().map(|r| r.as_str().to_owned()).collect()
+}
+
+/// `workflow.roles`: every role under a named strategy or the default — its op classes, who grants
+/// it, the acts it may fire, whether it lands, the phases where it acts, the toggles that change it
+/// and the agent types mapped to it. Agent templates are not joined here: each already names its role
+/// in `workflow.agents`.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for an unknown strategy; a database error.
+pub fn roles(conn: &Connection, strategy: Option<&str>) -> Result<RolesView, ApiError> {
+    let (source, spec) = named_or_default(conn, strategy)?;
+    let table = spec.graph.machine().table();
+    let phases: Vec<Phase> = table
+        .states
+        .iter()
+        .filter_map(|s| Phase::parse(s.name))
+        .collect();
+    let mapped = jkb_core::roles::agent_type_map(conn)?;
+    let all = <Role as jkb_rbac::Role>::ALL;
+    let view = |r: Role| {
+        let may_fire = |event: &str| {
+            WorkflowEvent::parse(event).is_some_and(|e| spec.authorize(&[r], e).is_allowed())
+        };
+        RoleView {
+            name: r.as_str().to_owned(),
+            describe: r.describe().to_owned(),
+            ops: ops_under(&spec, r)
+                .into_iter()
+                .map(|p| OpClassView {
+                    name: p.name().to_owned(),
+                    describe: p.describe().to_owned(),
+                })
+                .collect(),
+            may_grant: names(&jkb_core::roles::GRANTABLE.permissions_of(r)),
+            granted_by: names(
+                &all.iter()
+                    .copied()
+                    .filter(|g| jkb_core::roles::GRANTABLE.permits(*g, r))
+                    .collect::<Vec<_>>(),
+            ),
+            events: <WorkflowEvent as jkb_fsm::Event>::ALL
+                .iter()
+                .filter(|e| {
+                    jkb_fsm::Event::kind(**e) == jkb_fsm::EventKind::Applied
+                        && spec.authorize(&[r], **e).is_allowed()
+                })
+                .map(|e| e.as_str().to_owned())
+                .collect(),
+            lands: spec.may_land(&[r]).is_allowed(),
+            acts_next_in: phases
+                .iter()
+                .filter(|p| spec.next_actor(**p).0 == r)
+                .map(|p| p.as_str().to_owned())
+                .collect(),
+            fires_in: phases
+                .iter()
+                .filter(|p| {
+                    table
+                        .transitions
+                        .iter()
+                        .any(|t| !t.reconciled && t.from == p.as_str() && may_fire(t.event))
+                })
+                .map(|p| p.as_str().to_owned())
+                .collect(),
+            toggled_by: TOGGLES
+                .iter()
+                .filter(|t| t.domain.contains(&r))
+                .map(|t| ToggledBy {
+                    toggle: t.name.to_owned(),
+                    on: toggle_on(&spec, t, r),
+                })
+                .collect(),
+            agent_types: mapped
+                .iter()
+                .filter(|(_, role)| *role == r)
+                .map(|(t, _)| t.clone())
+                .collect(),
+        }
+    };
+    Ok(RolesView {
+        strategy: source,
+        toggles: TOGGLES
+            .iter()
+            .map(|t| ToggleView {
+                name: t.name.to_owned(),
+                label: t.label.to_owned(),
+                controls: match t.controls {
+                    Controls::Events(events) => {
+                        events.iter().map(|e| e.as_str().to_owned()).collect()
+                    }
+                    Controls::Land => vec![OpPermission::Land.name().to_owned()],
+                },
+                domain: names(t.domain),
+                acts_in: t.acts_in.map(|p| p.as_str().to_owned()),
+                value: names(spec.toggles.get(t.name)),
+            })
+            .collect(),
+        roles: all.iter().map(|r| view(*r)).collect(),
     })
 }
 

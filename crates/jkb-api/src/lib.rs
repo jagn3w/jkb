@@ -864,6 +864,14 @@ pub enum Request {
         #[serde(default)]
         strategy: Option<String>,
     },
+    /// Every role under a named strategy or the default: its op classes, grants, acts, phases,
+    /// toggles and mapped agent types ([`workflows::roles`]).
+    #[serde(rename = "workflow.roles")]
+    WorkflowRoles {
+        /// The strategy to read the roles under.
+        #[serde(default)]
+        strategy: Option<String>,
+    },
     /// Every agent template, each as the one in effect ([`workflows::list`]).
     #[serde(rename = "workflow.agents")]
     WorkflowAgents {},
@@ -1844,6 +1852,7 @@ impl Request {
         "workflow.define",
         "workflow.strategies",
         "workflow.graph",
+        "workflow.roles",
         "workflow.agents",
         "workflow.agent",
         "workflow.agent_copy",
@@ -1995,6 +2004,7 @@ impl Request {
             Self::WorkflowDefine { .. } => "workflow.define",
             Self::WorkflowStrategies {} => "workflow.strategies",
             Self::WorkflowGraph { .. } => "workflow.graph",
+            Self::WorkflowRoles { .. } => "workflow.roles",
             Self::WorkflowAgents {} => "workflow.agents",
             Self::WorkflowAgent { .. } => "workflow.agent",
             Self::WorkflowAgentCopy { .. } => "workflow.agent_copy",
@@ -2120,6 +2130,7 @@ impl Request {
             | Self::WorkflowShow { .. }
             | Self::WorkflowStrategies {}
             | Self::WorkflowGraph { .. }
+            | Self::WorkflowRoles { .. }
             | Self::WorkflowAgents {}
             | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }
@@ -2810,6 +2821,11 @@ pub enum Response {
         /// The machines.
         graph: Box<workflows::GraphView>,
     },
+    /// A `workflow.roles`.
+    WorkflowRoles {
+        /// Every role, under the strategy.
+        roles: Box<workflows::RolesView>,
+    },
     /// A `workflow.agents`.
     WorkflowAgents {
         /// Every template, as the one in effect.
@@ -3074,6 +3090,7 @@ impl Response {
             | Self::Strategies { .. }
             | Self::Defined { .. }
             | Self::WorkflowGraph { .. }
+            | Self::WorkflowRoles { .. }
             | Self::WorkflowAgents { .. }
             | Self::WorkflowAgent { .. }
             | Self::Ticket { .. }
@@ -3218,6 +3235,7 @@ impl Response {
             | Self::Strategies { .. }
             | Self::Defined { .. }
             | Self::WorkflowGraph { .. }
+            | Self::WorkflowRoles { .. }
             | Self::WorkflowAgents { .. }
             | Self::WorkflowAgent { .. }
             | Self::Ticket { .. }
@@ -4524,6 +4542,9 @@ impl LocalBackend {
                 graph: Box::new(db.read_with(move |c| {
                     workflows::graph(c, uid.as_deref(), strategy.as_deref())
                 })?),
+            },
+            Request::WorkflowRoles { strategy } => Response::WorkflowRoles {
+                roles: Box::new(db.read_with(move |c| workflows::roles(c, strategy.as_deref()))?),
             },
             Request::WorkflowAgents {} => Response::WorkflowAgents {
                 agents: db.read_with(workflows::list)?,

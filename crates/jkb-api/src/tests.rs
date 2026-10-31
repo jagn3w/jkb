@@ -416,6 +416,9 @@ fn samples() -> Vec<Request> {
             uid: None,
             strategy: Some("autonomous".into()),
         },
+        Request::WorkflowRoles {
+            strategy: Some("coordinated".into()),
+        },
         Request::WorkflowAgents {},
         Request::WorkflowAgent {
             name: "swarm-implementer".into(),
@@ -2014,6 +2017,7 @@ const READS: &[&str] = &[
     "workflow.show",
     "workflow.strategies",
     "workflow.graph",
+    "workflow.roles",
     "workflow.agents",
     "workflow.agent",
     "design.list",

@@ -157,6 +157,14 @@ pub enum WorkflowCmd {
     },
     /// List the presets and definitions, and the default.
     Strategies,
+    /// Every role under a strategy (the default's unless `--strategy`): the op classes it may run,
+    /// who grants it, the acts it may fire, whether it lands, the phases where it acts, the toggles
+    /// that change it, and the agent types mapped to it.
+    Roles {
+        /// A preset or a defined name.
+        #[arg(long)]
+        strategy: Option<String>,
+    },
     /// Print a graph as Graphviz dot.
     Dot {
         /// The graph: design-gate or direct (the former name reviewed-design is still accepted).
@@ -534,6 +542,14 @@ pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()>
             );
             Ok(())
         }
+        WorkflowCmd::Roles { strategy } => {
+            let r = call(b, Request::WorkflowRoles { strategy })?;
+            let Response::WorkflowRoles { roles } = r else {
+                return unexpected("workflow.roles", &r);
+            };
+            print(json_out, &json!(roles), || print!("{}", roles_text(&roles)));
+            Ok(())
+        }
         WorkflowCmd::Agent { cmd } => crate::agent_cli::run(b, cmd, json_out),
         WorkflowCmd::Dot { graph } => {
             let g = jkb_core::workflow::GraphId::parse(&graph)
@@ -597,6 +613,53 @@ fn changes_block(graph: &jkb_api::workflows::GraphView) -> String {
     for line in &graph.changes_from_default {
         // Writing to a `String` cannot fail.
         let _ = writeln!(out, "  {line}");
+    }
+    out
+}
+
+/// `jkb workflow roles` as text: a block per role.
+fn roles_text(v: &jkb_api::workflows::RolesView) -> String {
+    use std::fmt::Write as _;
+    let list = |items: &[String]| {
+        if items.is_empty() {
+            "-".to_owned()
+        } else {
+            items.join(", ")
+        }
+    };
+    let mut out = format!("strategy:  {}\n", v.strategy);
+    for r in &v.roles {
+        let mut ops = String::new();
+        for o in &r.ops {
+            // Writing to a `String` cannot fail.
+            let _ = write!(ops, "\n    {:<15}{}", o.name, o.describe);
+        }
+        if ops.is_empty() {
+            ops.push_str(" -");
+        }
+        let toggles: Vec<String> = r
+            .toggled_by
+            .iter()
+            .map(|t| format!("{} {}", t.toggle, if t.on { "on" } else { "off" }))
+            .collect();
+        // Writing to a `String` cannot fail.
+        let _ = write!(
+            out,
+            "\n{} — {}\n  may run:{}\n  may fire:    {}\n  lands:       {}\n  \
+             acts next:   {}\n  fires in:    {}\n  may grant:   {}\n  granted by:  {}\n  \
+             toggles:     {}\n  agent types: {}\n",
+            r.name,
+            r.describe,
+            ops,
+            list(&r.events),
+            if r.lands { "yes" } else { "no" },
+            list(&r.acts_next_in),
+            list(&r.fires_in),
+            list(&r.may_grant),
+            list(&r.granted_by),
+            list(&toggles),
+            list(&r.agent_types),
+        );
     }
     out
 }

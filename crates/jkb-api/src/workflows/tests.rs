@@ -1106,3 +1106,239 @@ fn a_legacy_task_at_design_builds_on_the_verdict_path() {
     s.coordinator_closes(&round_1);
     assert_eq!(s.phase(), "design");
 }
+
+fn roles_under(b: &LocalBackend, strategy: Option<&str>) -> super::RolesView {
+    let r = match strategy {
+        Some(s) => json!({ "op": "workflow.roles", "strategy": s }),
+        None => json!({ "op": "workflow.roles" }),
+    };
+    match ok(b, r) {
+        Response::WorkflowRoles { roles } => *roles,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn role<'a>(v: &'a super::RolesView, name: &str) -> &'a super::RoleView {
+    v.roles
+        .iter()
+        .find(|r| r.name == name)
+        .unwrap_or_else(|| panic!("no {name} in {v:?}"))
+}
+
+fn toggled(r: &super::RoleView, toggle: &str) -> Option<bool> {
+    r.toggled_by
+        .iter()
+        .find(|t| t.toggle == toggle)
+        .map(|t| t.on)
+}
+
+/// `workflow.roles` answers every role once, in `Role::ALL`'s order — those no template acts as
+/// too — with what it may do under the strategy, decided by the deciders the dispatch and the
+/// workflow use.
+#[test]
+fn every_role_is_answered_with_what_the_strategy_lets_it_do() {
+    let kb = Kb::new();
+    let reviewed = roles_under(&kb.op, None);
+    assert_eq!(reviewed.strategy, "design-reviewed", "the default");
+    let order: Vec<&str> = reviewed.roles.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(order, super::role_names(), "every role, once, in order");
+
+    // A designer submits the design, and acts next where it is written.
+    let designer = role(&reviewed, "designer");
+    assert_eq!(designer.events, vec!["submit_design"]);
+    assert_eq!(designer.acts_next_in, vec!["design"]);
+    assert_eq!(designer.fires_in, vec!["design"]);
+    assert_eq!(
+        designer.describe,
+        jkb_core::roles::Role::Designer.describe()
+    );
+    assert_eq!(designer.granted_by, vec!["operator", "coordinator"]);
+    assert!(designer.may_grant.is_empty());
+    assert!(designer.toggled_by.is_empty(), "no toggle can name it");
+
+    // A role no agent template acts as still has its op classes, each with its sentence.
+    let systemic = role(&reviewed, "systemic_reviewer");
+    let ops: Vec<&str> = systemic.ops.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(
+        ops,
+        vec!["read", "hook", "task_write", "workflow", "exec_request"]
+    );
+    assert!(systemic.ops.iter().all(|o| !o.describe.is_empty()));
+    assert_eq!(systemic.acts_next_in, vec!["systemic_review"]);
+    assert_eq!(systemic.granted_by, vec!["operator"]);
+
+    // Under the default the coordinator neither approves designs nor lands; the toggles that could
+    // let it are named, off.
+    let coordinator = role(&reviewed, "coordinator");
+    assert!(!coordinator.events.iter().any(|e| e == "approve_design"));
+    assert!(!coordinator.lands);
+    assert!(!coordinator.ops.iter().any(|o| o.name == "land"));
+    assert_eq!(toggled(coordinator, "approves_design"), Some(false));
+    assert_eq!(toggled(coordinator, "lands"), Some(false));
+    assert_eq!(coordinator.may_grant, vec!["designer", "implementer"]);
+    // The operator holds every toggle, whatever a spec lists.
+    let operator = role(&reviewed, "operator");
+    assert_eq!(toggled(operator, "approves_design"), Some(true));
+    assert_eq!(toggled(operator, "lands"), Some(true));
+    assert!(operator.lands);
+    assert!(operator.acts_next_in.iter().any(|p| p == "design_review"));
+
+    // `coordinated`: the approves_design toggle gives the coordinator approve and reject.
+    let coordinated = roles_under(&kb.op, Some("coordinated"));
+    assert_eq!(coordinated.strategy, "coordinated");
+    let coordinator = role(&coordinated, "coordinator");
+    for e in ["approve_design", "reject_design"] {
+        assert!(coordinator.events.iter().any(|x| x == e), "{e}");
+    }
+    assert_eq!(toggled(coordinator, "approves_design"), Some(true));
+    assert_eq!(toggled(coordinator, "lands"), Some(false));
+    assert!(coordinator
+        .acts_next_in
+        .iter()
+        .any(|p| p == "design_review"));
+    assert!(coordinator.fires_in.iter().any(|p| p == "design_review"));
+
+    // `autonomous`: the lands toggle lets the coordinator land, as an op class too.
+    let autonomous = roles_under(&kb.op, Some("autonomous"));
+    let coordinator = role(&autonomous, "coordinator");
+    assert!(coordinator.lands);
+    assert!(coordinator.ops.iter().any(|o| o.name == "land"));
+    assert_eq!(toggled(coordinator, "lands"), Some(true));
+    assert!(coordinator.acts_next_in.iter().any(|p| p == "landable"));
+    // The toggles, with this strategy's value.
+    let lands = autonomous
+        .toggles
+        .iter()
+        .find(|t| t.name == "lands")
+        .unwrap();
+    assert_eq!(lands.label, "lands");
+    assert_eq!(lands.controls, vec!["land"]);
+    assert_eq!(lands.domain, vec!["operator", "coordinator"]);
+    assert_eq!(lands.value, vec!["operator", "coordinator"]);
+    let approves = autonomous
+        .toggles
+        .iter()
+        .find(|t| t.name == "approves_design")
+        .unwrap();
+    assert_eq!(approves.controls, vec!["approve_design", "reject_design"]);
+    assert_eq!(approves.acts_in.as_deref(), Some("design_review"));
+    assert_eq!(approves.label, "approves designs");
+}
+
+/// A role's op classes are `workflow.graph`'s `role_ops` for the same strategy: one function answers
+/// both, so the Roles view and the Lifecycle panel cannot disagree.
+#[test]
+fn a_roles_op_classes_are_the_graphs() {
+    let kb = Kb::new();
+    for strategy in ["design-reviewed", "coordinated", "autonomous"] {
+        let g = match ok(
+            &kb.op,
+            json!({ "op": "workflow.graph", "strategy": strategy }),
+        ) {
+            Response::WorkflowGraph { graph } => *graph,
+            other => panic!("{other:?}"),
+        };
+        let v = roles_under(&kb.op, Some(strategy));
+        for r in &v.roles {
+            let ops: Vec<String> = r.ops.iter().map(|o| o.name.clone()).collect();
+            assert_eq!(ops, g.role_ops[&r.name], "{strategy} {}", r.name);
+            let fired: Vec<String> = {
+                let mut seen = Vec::new();
+                for t in &g.workflow.transitions {
+                    if t.roles.contains(&r.name) && !seen.contains(&t.event) {
+                        seen.push(t.event.clone());
+                    }
+                }
+                seen
+            };
+            // Every act the graph lets it fire is in its events (the events cover the whole
+            // event set; the graph only the rows its machine has).
+            for e in &fired {
+                assert!(r.events.contains(e), "{strategy} {}: {e}", r.name);
+            }
+        }
+    }
+}
+
+/// An attested agent type mapped to a role is listed with it; a reader runs the op; an unknown
+/// strategy is a named refusal.
+#[test]
+fn mapped_agent_types_are_listed_and_any_reader_may_ask() {
+    let kb = Kb::new();
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "jkb-reviewer", "role": "reviewer" }),
+    );
+    let v = roles_under(&kb.as_role("implementer"), None);
+    assert_eq!(role(&v, "reviewer").agent_types, vec!["jkb-reviewer"]);
+    assert!(role(&v, "designer").agent_types.is_empty());
+    let e = call(
+        &kb.op,
+        json!({ "op": "workflow.roles", "strategy": "no-such-strategy" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+}
+
+/// `ui/app/test/fixtures/workflow-roles.json` is what `workflow.roles` answers for every preset: the
+/// app's decoder and Roles view are tested against it, so a wire change fails there.
+#[test]
+fn roles_fixture_matches_presets() {
+    let db = Db::open_in_memory().unwrap();
+    let presets: Vec<&'static str> = jkb_core::workflow::strategy::PRESETS
+        .iter()
+        .map(|p| p.name)
+        .collect();
+    let answered: serde_json::Map<String, Value> = db
+        .read_with(move |c| {
+            presets
+                .into_iter()
+                .map(|name| {
+                    let v = super::roles(c, Some(name))?;
+                    Ok((name.to_owned(), serde_json::to_value(v).unwrap()))
+                })
+                .collect::<Result<_, ApiError>>()
+        })
+        .unwrap();
+    let answered = Value::Object(answered);
+    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../ui/app/test/fixtures/workflow-roles.json");
+    if std::env::var_os(WRITE_FIXTURE).is_some() {
+        let text = serde_json::to_string_pretty(&answered).unwrap() + "\n";
+        std::fs::write(&file, text).unwrap();
+        return;
+    }
+    let held: Value = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    assert!(
+        held == answered,
+        "{} is not what workflow.roles answers for every preset; rewrite it with\n  \
+         {WRITE_FIXTURE}=1 ./scripts/test.sh -p jkb-api roles_fixture_matches_presets",
+        file.display()
+    );
+}
+
+/// A toggle's list names roles beyond the operator, who always holds it: a strategy listing only the
+/// coordinator still has the operator landing, and says so.
+#[test]
+fn the_operator_holds_a_toggle_its_list_leaves_out() {
+    let kb = Kb::new();
+    ok(
+        &kb.op,
+        json!({
+            "op": "workflow.define",
+            "name": "coord-lands",
+            "describe": "The coordinator lands.",
+            "spec": { "graph": "design-gate", "toggles": { "lands": ["coordinator"] } },
+        }),
+    );
+    let v = roles_under(&kb.op, Some("coord-lands"));
+    let lands = v.toggles.iter().find(|t| t.name == "lands").unwrap();
+    assert_eq!(lands.value, vec!["coordinator"], "as the spec stores it");
+    let operator = role(&v, "operator");
+    assert!(operator.lands);
+    assert_eq!(toggled(operator, "lands"), Some(true));
+    assert_eq!(toggled(role(&v, "coordinator"), "lands"), Some(true));
+}

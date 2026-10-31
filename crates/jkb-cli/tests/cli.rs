@@ -6455,6 +6455,56 @@ fn workflow_show_graph_prints_the_machines() {
         .stderr(predicate::str::contains("--graph"));
 }
 
+/// `jkb workflow roles --json` is `workflow.roles`' answer as it stands, for a named strategy or the
+/// default; the text form names every role, those no agent acts as too.
+#[test]
+fn workflow_roles_prints_every_role_under_the_strategy() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args(["--json", "workflow", "roles", "--strategy", "autonomous"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: jkb_api::workflows::RolesView = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v.strategy, "autonomous");
+    let coordinator = v.roles.iter().find(|r| r.name == "coordinator").unwrap();
+    assert!(coordinator.lands);
+    let wire: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(wire, serde_json::to_value(&v).unwrap(), "nothing dropped");
+    let text = jkb(&db).args(["workflow", "roles"]).output().unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.starts_with("strategy:  design-reviewed\n"), "{text}");
+    for role in [
+        "operator",
+        "coordinator",
+        "designer",
+        "implementer",
+        "reviewer",
+        "systemic_reviewer",
+    ] {
+        assert!(text.contains(&format!("\n{role} — ")), "{role}: {text}");
+    }
+    assert!(
+        text.contains("toggles:     approves_design off, lands off"),
+        "{text}"
+    );
+    // Each op class with its sentence.
+    assert!(
+        text.contains("\n    exec_request   Ask the operator to run one command.\n"),
+        "{text}"
+    );
+    jkb(&db)
+        .args(["workflow", "roles", "--strategy", "no-such-strategy"])
+        .assert()
+        .failure();
+}
+
 /// `jkb task edit` and `jkb item edit` take the base a replace was made against (`--expected`, or
 /// `--expected-file`): a note appended since makes it stale, and the replace exits non-zero having
 /// written nothing.
