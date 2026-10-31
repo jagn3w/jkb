@@ -16,7 +16,6 @@ import {
   isAgentName,
   layered,
   machineDrawing,
-  machineLayout,
   markerSources,
   placeholdersOf,
   saveRequest,
@@ -189,19 +188,14 @@ const machine = {
   ],
 };
 
-test("a machine is laid out from its drawing, self-loops and overrides left to be listed", () => {
+test("a machine's drawing keeps its states and edges, self-loops and overrides left to be listed", () => {
   const d = machineDrawing(machine);
-  const l = machineLayout(d);
   assert.deepEqual(
-    l.nodes.map((n) => [n.id, n.layer]),
-    [
-      ["design", 0],
-      ["implement", 1],
-      ["landed", 2],
-    ],
+    d.states.map((s) => s.name),
+    ["design", "implement", "landed"],
   );
   assert.deepEqual(
-    l.links.map((x) => x.label),
+    d.edges.map((x) => x.event),
     ["submit_design", "observed_landed"],
   );
   assert.deepEqual(
@@ -252,13 +246,12 @@ test("observations from two or more phases collapse into one marker per target",
     "a guarded and an unguarded row of one (to, event) share a group, each keeping its own flag",
   );
   assert.ok(d.edges.every((e) => e.event !== "observed_landed" && e.event !== "observed_cancelled"));
-  const l = machineLayout(d);
   assert.deepEqual(
-    l.links.map((x) => x.label),
+    d.edges.map((x) => x.event),
     ["submit_design", "approve_design", "submit_work", "review_passed", "request_changes", "submit_work"],
     "the graph draws only the real phase-to-phase edges",
   );
-  assert.ok(l.nodes.some((n) => n.id === "landed") && l.nodes.some((n) => n.id === "cancelled"), "a state only markers reach is still placed");
+  assert.ok(d.states.some((s) => s.name === "landed") && d.states.some((s) => s.name === "cancelled"), "a state only markers reach is still drawn");
 
   // Two collapsed events reaching one target: one marker, two groups.
   const two = {

@@ -278,6 +278,50 @@ fn the_graph_is_the_compiled_table_with_the_strategys_permissions() {
     assert_eq!(e.code, ErrorCode::NotFound);
 }
 
+/// The variable that makes [`graph_fixture_matches_presets`] rewrite the fixture instead of failing.
+const WRITE_FIXTURE: &str = "JKB_WRITE_GRAPH_FIXTURE";
+
+/// The app's layout tests and its Lifecycle smoke draw every preset's machines from
+/// `ui/app/test/fixtures/workflow-graphs.json`, which must be what `workflow.graph` answers today:
+/// a fixture that drifted from the tables would pin the layout of a machine jkb no longer has.
+#[test]
+fn graph_fixture_matches_presets() {
+    let db = Db::open_in_memory().unwrap();
+    let presets: Vec<&'static str> = jkb_core::workflow::strategy::PRESETS
+        .iter()
+        .map(|p| p.name)
+        .collect();
+    let answered: serde_json::Map<String, Value> = db
+        .read_with(move |c| {
+            presets
+                .into_iter()
+                .map(|name| {
+                    let g = super::graph(c, None, Some(name))?;
+                    Ok((name.to_owned(), serde_json::to_value(g).unwrap()))
+                })
+                .collect::<Result<_, ApiError>>()
+        })
+        .unwrap();
+    let answered = Value::Object(answered);
+    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../ui/app/test/fixtures/workflow-graphs.json");
+    if std::env::var_os(WRITE_FIXTURE).is_some() {
+        let text = serde_json::to_string_pretty(&answered).unwrap() + "\n";
+        std::fs::write(&file, text).unwrap();
+        return;
+    }
+    let held: Value = std::fs::read_to_string(&file)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null);
+    assert!(
+        held == answered,
+        "{} is not what workflow.graph answers for every preset; rewrite it with\n  \
+         {WRITE_FIXTURE}=1 ./scripts/test.sh -p jkb-api graph_fixture_matches_presets",
+        file.display()
+    );
+}
+
 #[test]
 fn a_copy_with_an_edit_is_one_op_and_a_refused_edit_leaves_no_copy() {
     let kb = Kb::new();

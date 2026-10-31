@@ -1,18 +1,58 @@
 import { useMemo, useState } from "react";
 
-import { machineDrawing, machineLayout, markerSources, STATED, strategyLabel, type MachineTable, type VisitedEdge, type WorkflowGraph } from "@jkb/core";
+import { machineDrawing, STATED, strategyLabel, type GraphEdge, type MachineTable, type VisitedEdge, type WorkflowGraph } from "@jkb/core";
 
-const NODE_W = 150;
-const NODE_H = 46;
-const GAP_X = 96;
-const GAP_Y = 26;
-const PAD = 16;
-/** The `observed ×N` pill sitting on a target node's top edge. */
-const MARKER_W = 86;
-const MARKER_H = 18;
+import { estimate, machineGeometry, markerText, nodeMeta, type Font, type Measure, type Point } from "./machineGeometry";
 
-const x = (layer: number): number => PAD + layer * (NODE_W + GAP_X);
-const y = (row: number): number => PAD + row * (NODE_H + GAP_Y);
+/**
+ * A smooth path through `points` (Catmull-Rom, as cubic Béziers): it passes through every point
+ * the layout gave, the label's centre among them, so the label sits on its own edge.
+ */
+export function pathThrough(points: readonly Point[]): string {
+  const [first] = points;
+  if (first === undefined) return "";
+  let d = `M${first.x},${first.y}`;
+  for (let i = 0; i + 1 < points.length; i++) {
+    const p0 = points[i - 1] ?? (points[i] as Point);
+    const p1 = points[i] as Point;
+    const p2 = points[i + 1] as Point;
+    const p3 = points[i + 2] ?? p2;
+    const c1 = { x: p1.x + (p2.x - p0.x) / 6, y: p1.y + (p2.y - p0.y) / 6 };
+    const c2 = { x: p2.x - (p3.x - p1.x) / 6, y: p2.y - (p3.y - p1.y) / 6 };
+    d += ` C${c1.x},${c1.y} ${c2.x},${c2.y} ${p2.x},${p2.y}`;
+  }
+  return d;
+}
+
+/** The CSS each measured style uses (`workflows.css`), with the font stack read from the page. */
+const FONTS: Record<Font, (ui: string, mono: string) => string> = {
+  name: (ui) => `600 12px ${ui}`,
+  meta: (ui) => `11px ${ui}`,
+  label: (_, mono) => `10px ${mono}`,
+};
+
+/**
+ * Text measured in the page's own fonts, never narrower than the estimate: a font still loading
+ * measures as its fallback, and a box too small for the text is the overlap this layout prevents.
+ */
+function pageMeasure(): Measure {
+  const ctx = typeof document === "undefined" ? null : document.createElement("canvas").getContext("2d");
+  if (ctx === null) return estimate;
+  const css = getComputedStyle(document.documentElement);
+  const ui = css.getPropertyValue("--font-ui").trim() || "sans-serif";
+  const mono = css.getPropertyValue("--font-mono").trim() || "monospace";
+  const seen = new Map<string, number>();
+  return (text, font) => {
+    const k = `${font}\u0000${text}`;
+    let w = seen.get(k);
+    if (w === undefined) {
+      ctx.font = FONTS[font](ui, mono);
+      w = Math.max(estimate(text, font), ctx.measureText(text).width);
+      seen.set(k, w);
+    }
+    return w;
+  };
+}
 
 type Which = "workflow" | "lifecycle";
 
@@ -35,11 +75,12 @@ const rowKey = (from: string, event: string): string => `${from}\u0000${event}`;
  * The Lifecycle pane (D53.7): the task's state machines drawn from the compiled `jkb-fsm` tables
  * (`workflow.graph`, what `jkb workflow show --graph --json` prints) — never redrawn by hand. The
  * strategy's workflow (its phases, who acts next in each, and who may fire each event), or the task
- * lifecycle (its statuses). Observations are dashed. One observation reaching a state from several
- * states (`observed_landed` from every live phase) is one dashed `observed ×N` pill on that state,
- * not an arrow per phase (`machineDrawing`). Self-loops and the operator's override, which every
- * live state has, are listed under the picture rather than drawn into it, with every other row: the
- * list is the whole table.
+ * lifecycle (its statuses), laid out in layers left to right with routed edges (`machineGeometry`),
+ * so no label sits on a node or another label. Observations are dashed. One observation reaching a
+ * state from several states (`observed_landed` from every live phase) is one dashed `observed ×N`
+ * pill above that state, not an arrow per phase (`machineDrawing`). Self-loops and the operator's
+ * override, which every live state has, are listed under the picture rather than drawn into it,
+ * with every other row: the list is the whole table.
  *
  * `role` highlights the states where that role acts next — the selected agent's place in the
  * strategy. `visited`, from the Executions tab, draws one task's path over the same table: each
@@ -75,11 +116,19 @@ export function LifecyclePane({
     [moves, machine],
   );
   const drawing = useMemo(() => machineDrawing(machine), [machine]);
-  const layout = useMemo(() => machineLayout(drawing), [drawing]);
+  const measure = useMemo(pageMeasure, []);
+  // An edge's label is its event and, on a task's path, how often it was taken: the layout sizes
+  // the box for what is printed.
+  const labelOf = useMemo(() => {
+    return (t: GraphEdge): string => {
+      const went = taken.get(rowKey(t.from, t.event));
+      return went === undefined ? t.event : `${t.event} ×${went}`;
+    };
+  }, [taken]);
+  const geometry = useMemo(() => machineGeometry(drawing, measure, labelOf), [drawing, measure, labelOf]);
   const states = useMemo(() => new Map(machine.states.map((s) => [s.name, s])), [machine]);
-  const at = new Map(layout.nodes.map((n) => [n.id, n]));
-  const width = PAD * 2 + Math.max(1, layout.layers) * NODE_W + Math.max(0, layout.layers - 1) * GAP_X;
-  const height = PAD * 2 + Math.max(1, layout.rows) * NODE_H + Math.max(0, layout.rows - 1) * GAP_Y + 40;
+  const markerOf = new Map(drawing.markers.map((m) => [m.to, m]));
+  const { width, height } = geometry;
 
   return (
     <section className="lifecycle-pane" aria-label="Lifecycle">
@@ -113,95 +162,66 @@ export function LifecyclePane({
                 <path d="M0,0 L8,4 L0,8 z" className="graph-arrowhead" />
               </marker>
             </defs>
-            {layout.links.map((l, i) => {
-              const from = at.get(l.from);
-              const to = at.get(l.to);
-              const t = drawing.edges.find((r) => r.from === l.from && r.event === l.label);
-              if (from === undefined || to === undefined || t === undefined) return null;
-              let d: string;
-              let lx: number;
-              let ly: number;
-              if (l.back) {
-                const sx = x(from.layer) + NODE_W / 2;
-                const sy = y(from.row) + NODE_H;
-                const tx = x(to.layer) + NODE_W / 2 + 10;
-                const ty = y(to.row) + NODE_H;
-                const dip = Math.max(sy, ty) + 22 + (i % 3) * 6;
-                d = `M${sx},${sy} C${sx},${dip} ${tx},${dip} ${tx},${ty}`;
-                lx = (sx + tx) / 2;
-                ly = dip - 4;
-              } else {
-                const x1 = x(from.layer) + NODE_W;
-                const y1 = y(from.row) + NODE_H / 2;
-                const x2 = x(to.layer);
-                const y2 = y(to.row) + NODE_H / 2;
-                d = `M${x1},${y1} C${x1 + GAP_X / 2},${y1} ${x2 - GAP_X / 2},${y2} ${x2},${y2}`;
-                lx = (x1 + x2) / 2;
-                ly = (y1 + y2) / 2 - 4;
-              }
-              const went = taken.get(rowKey(l.from, l.label));
+            {geometry.edges.map((e) => {
+              const t = e.row;
+              const went = taken.get(rowKey(t.from, t.event));
+              const l = e.label;
               return (
                 <g
-                  key={`${l.from}-${l.label}`}
+                  key={e.key}
                   className="machine-edge"
                   data-reconciled={t.reconciled ? "true" : undefined}
                   data-visited={went !== undefined ? "true" : undefined}
+                  data-back={e.back ? "true" : undefined}
                 >
-                  <path d={d} className="graph-edge" markerEnd="url(#machine-arrow)" />
-                  <text x={lx} y={ly} textAnchor="middle" className="graph-edge-label">
-                    {l.label}
-                    {went !== undefined ? ` ×${went}` : ""}
+                  <path d={pathThrough(e.points)} className="graph-edge" markerEnd="url(#machine-arrow)" />
+                  <text x={l.x + l.w / 2} y={l.y + l.h / 2} textAnchor="middle" dominantBaseline="central" className="graph-edge-label">
+                    {labelOf(t)}
                   </text>
-                  <title>{`${l.from} --${l.label}--> ${l.to}${firedBy(t) ? ` (${firedBy(t)})` : ""}${t.guarded ? ", guarded" : ""}`}</title>
+                  <title>{`${t.from} --${t.event}--> ${t.to ?? STATED}${firedBy(t) ? ` (${firedBy(t)})` : ""}${t.guarded ? ", guarded" : ""}`}</title>
                 </g>
               );
             })}
-            {layout.nodes.map((n) => {
+            {geometry.nodes.map((n) => {
               const s = states.get(n.id);
+              const meta = s === undefined ? undefined : nodeMeta(s);
               const acts = role !== undefined && s?.next_role === role;
               const current = which === "workflow" ? graph.phase === n.id : graph.status === n.id;
               return (
                 <g
                   key={n.id}
                   className="machine-state"
+                  data-state={n.id}
                   data-settled={s?.settled ? "true" : undefined}
                   data-initial={s?.initial ? "true" : undefined}
                   data-acts={acts ? "true" : undefined}
                   data-current={current ? "true" : undefined}
                   data-visited={stood.has(n.id) ? "true" : undefined}
-                  transform={`translate(${x(n.layer)},${y(n.row)})`}
                 >
-                  <rect width={NODE_W} height={NODE_H} rx={NODE_H / 2} />
-                  <text x={NODE_W / 2} y={s?.next_role ? 19 : 28} textAnchor="middle" className="graph-node-name">
+                  <rect x={n.x} y={n.y} width={n.w} height={n.h} rx={n.h / 2} />
+                  <text x={n.x + n.w / 2} y={n.y + (meta !== undefined ? 19 : 28)} textAnchor="middle" className="graph-node-name">
                     {n.id}
                   </text>
-                  {s?.next_role && (
-                    <text x={NODE_W / 2} y={35} textAnchor="middle" className="graph-node-meta">
-                      {s.settled ? "settled" : s.next_role}
+                  {meta !== undefined && (
+                    <text x={n.x + n.w / 2} y={n.y + 35} textAnchor="middle" className="graph-node-meta">
+                      {meta}
                     </text>
                   )}
                   <title>{s?.next_step ?? (s?.settled ? "settled" : n.id)}</title>
                 </g>
               );
             })}
-            {drawing.markers.map((m) => {
-              const n = at.get(m.to);
-              if (n === undefined) return null;
-              const left = x(n.layer) + (NODE_W - MARKER_W) / 2;
-              const top = y(n.row) - MARKER_H / 2;
+            {geometry.markers.map((b) => {
+              const m = markerOf.get(b.to);
+              if (m === undefined) return null;
               // The task's path can run through a row folded into this marker; ink the marker then,
               // or the step would show in the table below but vanish from the picture.
               const went = m.groups.flatMap((g) => g.rows).reduce((sum, r) => sum + (taken.get(rowKey(r.from, r.event)) ?? 0), 0);
               return (
-                <g
-                  key={`marker-${m.to}`}
-                  className="machine-marker"
-                  data-visited={went > 0 ? "true" : undefined}
-                  transform={`translate(${left},${top})`}
-                >
-                  <rect width={MARKER_W} height={MARKER_H} rx={MARKER_H / 2} />
-                  <text x={MARKER_W / 2} y={MARKER_H / 2 + 3.5} textAnchor="middle" className="machine-marker-label">
-                    {`observed ×${markerSources(m).length}`}
+                <g key={`marker-${m.to}`} className="machine-marker" data-visited={went > 0 ? "true" : undefined}>
+                  <rect x={b.x} y={b.y} width={b.w} height={b.h} rx={b.h / 2} />
+                  <text x={b.x + b.w / 2} y={b.y + b.h / 2} textAnchor="middle" dominantBaseline="central" className="machine-marker-label">
+                    {markerText(m)}
                   </text>
                   <title>
                     {m.groups

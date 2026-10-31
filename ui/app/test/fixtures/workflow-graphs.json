@@ -1,0 +1,2934 @@
+{
+  "autonomous": {
+    "describe": "design → implement ⇄ review (⇄ systemic review) → landable",
+    "graph": "direct",
+    "lifecycle": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "open",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "in_progress",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "needs_review",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "done",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "event": "start",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "start",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "start",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "land",
+          "fired_by": "operator, coordinator",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "done"
+        },
+        {
+          "event": "land",
+          "fired_by": "operator, coordinator",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "done"
+        },
+        {
+          "event": "land",
+          "fired_by": "operator, coordinator",
+          "from": "done",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "done"
+        },
+        {
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "done",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "done",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "open",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "done",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "done",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "cancelled",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        }
+      ]
+    },
+    "phase": null,
+    "spec": {
+      "attributes": {
+        "repeated_area": {
+          "rounds": 2,
+          "scope": "file"
+        }
+      },
+      "graph": "direct",
+      "toggles": {
+        "approves_design": [
+          "operator"
+        ],
+        "lands": [
+          "operator",
+          "coordinator"
+        ]
+      }
+    },
+    "status": null,
+    "strategy": "autonomous",
+    "task": null,
+    "workflow": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "design",
+          "next_role": "designer",
+          "next_step": "write the design into the task, then `jkb workflow fire <uid> submit_design`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "design_review",
+          "next_role": "operator",
+          "next_step": "read the design, then `jkb workflow fire <uid> approve_design` (or `reject_design`)",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "implement",
+          "next_role": "implementer",
+          "next_step": "implement and commit, then `jkb workflow fire <uid> submit_work`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "review",
+          "next_role": "reviewer",
+          "next_step": "run a review round (`/jkb-review`), then `jkb workflow observe <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "systemic_review",
+          "next_role": "systemic_reviewer",
+          "next_step": "find the systemic cause and record it, then `jkb workflow fire <uid> submit_systemic --reason …` — or `systemic_redesign --reason …` if the fix changes how the operator understands the system",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landable",
+          "next_role": "coordinator",
+          "next_step": "land it: `jkb task land <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landed",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "event": "submit_design",
+          "fired_by": "operator, coordinator, designer",
+          "from": "design",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "designer"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "approve_design",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "reject_design",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "design"
+        },
+        {
+          "event": "submit_work",
+          "fired_by": "operator, coordinator, implementer",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "implementer"
+          ],
+          "to": "review"
+        },
+        {
+          "event": "review_passed",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landable"
+        },
+        {
+          "event": "review_failed",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "implement"
+        },
+        {
+          "event": "review_repeated",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "systemic_review"
+        },
+        {
+          "event": "submit_systemic",
+          "fired_by": "operator, coordinator, systemic_reviewer",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "systemic_reviewer"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "systemic_redesign",
+          "fired_by": "operator, coordinator, systemic_reviewer",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "systemic_reviewer"
+          ],
+          "to": "design"
+        },
+        {
+          "event": "rework",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "implement",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "landable",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "implement",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "landable",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landable",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landed",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        }
+      ]
+    }
+  },
+  "coordinated": {
+    "describe": "design → design review → implement ⇄ review (⇄ systemic review) → landable",
+    "graph": "design-gate",
+    "lifecycle": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "open",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "in_progress",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "needs_review",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "done",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "event": "start",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "start",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "start",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "land",
+          "fired_by": "operator",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "event": "land",
+          "fired_by": "operator",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "event": "land",
+          "fired_by": "operator",
+          "from": "done",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "done",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "done",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "open",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "done",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "done",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "cancelled",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        }
+      ]
+    },
+    "phase": null,
+    "spec": {
+      "attributes": {
+        "repeated_area": {
+          "rounds": 2,
+          "scope": "file"
+        }
+      },
+      "graph": "design-gate",
+      "toggles": {
+        "approves_design": [
+          "operator",
+          "coordinator"
+        ],
+        "lands": [
+          "operator"
+        ]
+      }
+    },
+    "status": null,
+    "strategy": "coordinated",
+    "task": null,
+    "workflow": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "design",
+          "next_role": "designer",
+          "next_step": "write the design into the task, then `jkb workflow fire <uid> submit_design`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "design_review",
+          "next_role": "coordinator",
+          "next_step": "read the design, then `jkb workflow fire <uid> approve_design` (or `reject_design`)",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "implement",
+          "next_role": "implementer",
+          "next_step": "implement and commit, then `jkb workflow fire <uid> submit_work`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "review",
+          "next_role": "reviewer",
+          "next_step": "run a review round (`/jkb-review`), then `jkb workflow observe <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "systemic_review",
+          "next_role": "systemic_reviewer",
+          "next_step": "find the systemic cause and record it, then `jkb workflow fire <uid> submit_systemic --reason …` — or `systemic_redesign --reason …` if the fix changes how the operator understands the system",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landable",
+          "next_role": "operator",
+          "next_step": "land it: `jkb task land <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landed",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "event": "submit_design",
+          "fired_by": "operator, coordinator, designer",
+          "from": "design",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "designer"
+          ],
+          "to": "design_review"
+        },
+        {
+          "event": "approve_design",
+          "fired_by": "operator, coordinator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "reject_design",
+          "fired_by": "operator, coordinator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "design"
+        },
+        {
+          "event": "submit_work",
+          "fired_by": "operator, coordinator, implementer",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "implementer"
+          ],
+          "to": "review"
+        },
+        {
+          "event": "review_passed",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landable"
+        },
+        {
+          "event": "review_failed",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "implement"
+        },
+        {
+          "event": "review_repeated",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "systemic_review"
+        },
+        {
+          "event": "submit_systemic",
+          "fired_by": "operator, coordinator, systemic_reviewer",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "systemic_reviewer"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "systemic_redesign",
+          "fired_by": "operator, coordinator, systemic_reviewer",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "systemic_reviewer"
+          ],
+          "to": "design"
+        },
+        {
+          "event": "rework",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "implement",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "landable",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "implement",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "landable",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landable",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landed",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        }
+      ]
+    }
+  },
+  "design-reviewed": {
+    "describe": "design → design review → implement ⇄ review (⇄ systemic review) → landable",
+    "graph": "design-gate",
+    "lifecycle": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "open",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "in_progress",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "needs_review",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "done",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "event": "start",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "start",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "start",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "land",
+          "fired_by": "operator",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "event": "land",
+          "fired_by": "operator",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "event": "land",
+          "fired_by": "operator",
+          "from": "done",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "done",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "open",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "done",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "open",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "in_progress",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "needs_review",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "done",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "done",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "cancelled",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        }
+      ]
+    },
+    "phase": null,
+    "spec": {
+      "attributes": {
+        "repeated_area": {
+          "rounds": 2,
+          "scope": "file"
+        }
+      },
+      "graph": "design-gate",
+      "toggles": {
+        "approves_design": [
+          "operator"
+        ],
+        "lands": [
+          "operator"
+        ]
+      }
+    },
+    "status": null,
+    "strategy": "design-reviewed",
+    "task": null,
+    "workflow": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "design",
+          "next_role": "designer",
+          "next_step": "write the design into the task, then `jkb workflow fire <uid> submit_design`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "design_review",
+          "next_role": "operator",
+          "next_step": "read the design, then `jkb workflow fire <uid> approve_design` (or `reject_design`)",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "implement",
+          "next_role": "implementer",
+          "next_step": "implement and commit, then `jkb workflow fire <uid> submit_work`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "review",
+          "next_role": "reviewer",
+          "next_step": "run a review round (`/jkb-review`), then `jkb workflow observe <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "systemic_review",
+          "next_role": "systemic_reviewer",
+          "next_step": "find the systemic cause and record it, then `jkb workflow fire <uid> submit_systemic --reason …` — or `systemic_redesign --reason …` if the fix changes how the operator understands the system",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landable",
+          "next_role": "operator",
+          "next_step": "land it: `jkb task land <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landed",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "event": "submit_design",
+          "fired_by": "operator, coordinator, designer",
+          "from": "design",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "designer"
+          ],
+          "to": "design_review"
+        },
+        {
+          "event": "approve_design",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "reject_design",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "design"
+        },
+        {
+          "event": "submit_work",
+          "fired_by": "operator, coordinator, implementer",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "implementer"
+          ],
+          "to": "review"
+        },
+        {
+          "event": "review_passed",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landable"
+        },
+        {
+          "event": "review_failed",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "implement"
+        },
+        {
+          "event": "review_repeated",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "systemic_review"
+        },
+        {
+          "event": "submit_systemic",
+          "fired_by": "operator, coordinator, systemic_reviewer",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "systemic_reviewer"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "systemic_redesign",
+          "fired_by": "operator, coordinator, systemic_reviewer",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "systemic_reviewer"
+          ],
+          "to": "design"
+        },
+        {
+          "event": "rework",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "implement",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "landable",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "implement",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "landable",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "implement",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "systemic_review",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landable",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landed",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "event": "override",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        }
+      ]
+    }
+  }
+}

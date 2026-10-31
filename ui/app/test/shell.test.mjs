@@ -261,7 +261,7 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
   // A task: its path inked and counted over its strategy's machine, and the override it took listed.
   assert.match(html.task, /class="machine-edge"[^>]*data-visited="true"/);
   assert.match(html.task, /submit_work ×2/);
-  assert.match(html.task, /data-visited="true"[^>]*transform/);
+  assert.match(html.task, /class="machine-state" data-state="review"[^>]*data-visited="true"/);
   assert.match(html.task, /<th>taken<\/th>/);
   // Keyed by (from, event): the untaken row between the same states is not inked.
   assert.match(html.task, /<g class="machine-edge"><path [^>]*><\/path><text [^>]*>submit_systemic</);

@@ -1,7 +1,8 @@
 //! The Workflows tab's data as the ops answer it (D53.7), minus the window: agent templates
 //! (`workflow.agents` / `workflow.agent` / `workflow.agent_copy` / `workflow.agent_set`), a
-//! strategy's machines (`workflow.graph`), and the two layouts the tab draws — the agent graph from
-//! the templates' hand-offs, and a machine from its compiled table.
+//! strategy's machines (`workflow.graph`), the agent graph's layout from the templates' hand-offs,
+//! and what of a machine's compiled table the Lifecycle pane draws (`machineDrawing`; the app lays
+//! it out, in `machineGeometry.ts`).
 //
 // The Rust side is the source of truth: `crates/jkb-api/src/workflows.rs` (the shapes) and
 // `crates/jkb-core/src/workflow/agents.rs` (the rules: read-only packaged templates, copies that
@@ -543,15 +544,4 @@ export function machineDrawing(m: MachineTable): MachineDrawing {
     })),
     listed,
   };
-}
-
-/**
- * A machine laid out from what it draws: states by distance from the initial one, along its drawn
- * `edges` only. A state only markers reach falls into a trailing layer.
- */
-export function machineLayout(d: MachineDrawing): Layout {
-  const ids = d.states.map((s) => s.name);
-  const edges = d.edges.map((t) => ({ from: t.from, to: t.to as string, label: t.event }));
-  const roots = d.states.filter((s) => s.initial).map((s) => s.name);
-  return layered(ids, edges, roots);
 }
