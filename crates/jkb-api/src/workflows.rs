@@ -350,8 +350,9 @@ pub struct GraphView {
     pub workflow: MachineView,
     /// The task lifecycle machine (statuses).
     pub lifecycle: MachineView,
-    /// Every role, with the jkb op classes it may run (`jkb role matrix`): the permissions a
-    /// phase's actor holds, whether or not an agent template acts as it.
+    /// Every role, with the jkb op classes it may run under this strategy (`rbac::role_decision`:
+    /// `jkb role matrix`, plus `land` for the roles the strategy's `lands` toggle names): the
+    /// permissions a phase's actor holds, whether or not an agent template acts as it.
     #[serde(default)]
     pub role_ops: BTreeMap<String, Vec<String>>,
 }
@@ -471,7 +472,10 @@ fn lifecycle_view(spec: &StrategySpec) -> MachineView {
                 "land" => Some(
                     <Role as jkb_rbac::Role>::ALL
                         .iter()
-                        .filter(|r| spec.may_land(&[**r]).is_allowed())
+                        .filter(|r| {
+                            crate::rbac::role_decision(spec, &[**r], OpPermission::Land)
+                                .is_allowed()
+                        })
                         .map(|r| r.as_str().to_owned())
                         .collect(),
                 ),
@@ -552,7 +556,14 @@ pub fn graph(
         lifecycle,
         role_ops: <Role as jkb_rbac::Role>::ALL
             .iter()
-            .map(|r| (r.as_str().to_owned(), role_ops(*r)))
+            .map(|r| {
+                let ops = <OpPermission as jkb_rbac::Permission>::ALL
+                    .iter()
+                    .filter(|p| crate::rbac::role_decision(&spec, &[*r], **p).is_allowed())
+                    .map(|p| p.name().to_owned())
+                    .collect();
+                (r.as_str().to_owned(), ops)
+            })
             .collect(),
     })
 }

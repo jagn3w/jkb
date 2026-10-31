@@ -509,31 +509,32 @@
       "coordinator": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
         "task_status",
         "task_claim",
+        "land",
         "workflow",
-        "grant",
         "design",
-        "design_approve"
+        "design_approve",
+        "grant",
+        "exec_request"
       ],
       "designer": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
         "workflow",
         "design",
-        "design_approve"
+        "design_approve",
+        "exec_request"
       ],
       "implementer": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
         "task_claim",
-        "workflow"
+        "workflow",
+        "exec_request"
       ],
       "operator": [
         "read",
@@ -554,17 +555,17 @@
       "reviewer": [
         "read",
         "hook",
-        "exec_request",
         "review",
         "workflow",
-        "design_approve"
+        "design_approve",
+        "exec_request"
       ],
       "systemic_reviewer": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
-        "workflow"
+        "workflow",
+        "exec_request"
       ]
     },
     "spec": {
@@ -1697,31 +1698,31 @@
       "coordinator": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
         "task_status",
         "task_claim",
         "workflow",
-        "grant",
         "design",
-        "design_approve"
+        "design_approve",
+        "grant",
+        "exec_request"
       ],
       "designer": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
         "workflow",
         "design",
-        "design_approve"
+        "design_approve",
+        "exec_request"
       ],
       "implementer": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
         "task_claim",
-        "workflow"
+        "workflow",
+        "exec_request"
       ],
       "operator": [
         "read",
@@ -1742,17 +1743,17 @@
       "reviewer": [
         "read",
         "hook",
-        "exec_request",
         "review",
         "workflow",
-        "design_approve"
+        "design_approve",
+        "exec_request"
       ],
       "systemic_reviewer": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
-        "workflow"
+        "workflow",
+        "exec_request"
       ]
     },
     "spec": {
@@ -2887,31 +2888,31 @@
       "coordinator": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
         "task_status",
         "task_claim",
         "workflow",
-        "grant",
         "design",
-        "design_approve"
+        "design_approve",
+        "grant",
+        "exec_request"
       ],
       "designer": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
         "workflow",
         "design",
-        "design_approve"
+        "design_approve",
+        "exec_request"
       ],
       "implementer": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
         "task_claim",
-        "workflow"
+        "workflow",
+        "exec_request"
       ],
       "operator": [
         "read",
@@ -2932,17 +2933,17 @@
       "reviewer": [
         "read",
         "hook",
-        "exec_request",
         "review",
         "workflow",
-        "design_approve"
+        "design_approve",
+        "exec_request"
       ],
       "systemic_reviewer": [
         "read",
         "hook",
-        "exec_request",
         "task_write",
-        "workflow"
+        "workflow",
+        "exec_request"
       ]
     },
     "spec": {

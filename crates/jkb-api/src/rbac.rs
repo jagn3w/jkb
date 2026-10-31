@@ -997,6 +997,23 @@ fn reference_of<'r>(
     })
 }
 
+/// Whether [`OP_GRANTS`] lets `roles` run ops of class `permission`.
+fn grants_decision(roles: &[Role], permission: OpPermission) -> Decision {
+    RoleBased::new(&OP_GRANTS).decide(roles, Requirement::Permission(permission))
+}
+
+/// Whether `roles` may run ops of class `permission` under `spec`, by role alone, as [`authorize`]
+/// decides it: `land` by the strategy (`StrategySpec::may_land`, its `lands` toggle), every other
+/// class by [`OP_GRANTS`]. A task's scope and the container-only `attest` are `authorize`'s further
+/// checks on top.
+#[must_use]
+pub fn role_decision(spec: &StrategySpec, roles: &[Role], permission: OpPermission) -> Decision {
+    match permission {
+        OpPermission::Land => spec.may_land(roles),
+        _ => grants_decision(roles, permission),
+    }
+}
+
 /// May `principal` run `request`? The operator may run anything. Everyone else is held to
 /// [`OP_GRANTS`], to its task scope for an op that writes one task, to the task's strategy for a
 /// landing, and — for attestation — to being the container credential itself.
@@ -1041,9 +1058,7 @@ pub fn authorize(
         }
         OpPermission::Land => {}
         _ => {
-            if let Decision::Deny(no) = RoleBased::new(&OP_GRANTS)
-                .decide(&principal.roles, Requirement::Permission(permission))
-            {
+            if let Decision::Deny(no) = grants_decision(&principal.roles, permission) {
                 let mut e = deny(&no, op);
                 if permission == OpPermission::Review {
                     e.message.push_str(
@@ -1066,7 +1081,9 @@ pub fn authorize(
     };
     if permission == OpPermission::Land {
         let current = wf::current(conn, target)?;
-        if let Decision::Deny(no) = current.spec.may_land(&principal.roles) {
+        if let Decision::Deny(no) =
+            role_decision(&current.spec, &principal.roles, OpPermission::Land)
+        {
             return Err(deny(&no, op));
         }
         // A workflow parked at `landed`/`cancelled` is picked back up by the operator alone

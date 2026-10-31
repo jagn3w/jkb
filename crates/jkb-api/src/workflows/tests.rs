@@ -460,10 +460,50 @@ fn each_row_says_what_its_guard_checks_and_how_it_fires() {
         r.sort();
         r
     });
+    // Under the default strategy only the operator lands, so every role's classes are the table's:
+    // the same set an agent template of that role carries.
     for a in &agents {
-        assert_eq!(g.role_ops[&a.role], a.role_ops, "{}", a.name);
+        let mut graph = g.role_ops[&a.role].clone();
+        let mut agent = a.role_ops.clone();
+        graph.sort();
+        agent.sort();
+        assert_eq!(graph, agent, "{}", a.name);
     }
-    assert!(!g.role_ops["operator"].is_empty());
+    assert!(g.role_ops["operator"].iter().any(|o| o == "land"));
+}
+
+#[test]
+fn a_role_may_land_where_the_strategy_lets_it() {
+    let kb = Kb::new();
+    let graph = |strategy: &str| match ok(
+        &kb.op,
+        json!({ "op": "workflow.graph", "strategy": strategy }),
+    ) {
+        Response::WorkflowGraph { graph } => *graph,
+        other => panic!("{other:?}"),
+    };
+    let lands = |g: &super::GraphView, role: &str| g.role_ops[role].iter().any(|o| o == "land");
+    // `autonomous` lets the coordinator land: its `landable` actor may run what its step says.
+    let autonomous = graph("autonomous");
+    assert!(lands(&autonomous, "coordinator"));
+    let landable = autonomous
+        .workflow
+        .states
+        .iter()
+        .find(|s| s.name == "landable")
+        .unwrap();
+    assert_eq!(landable.next_role.as_deref(), Some("coordinator"));
+    // ...and it is the same answer the lifecycle's `land` row gives.
+    assert!(autonomous
+        .lifecycle
+        .transitions
+        .iter()
+        .any(|t| t.event == "land" && t.roles.iter().any(|r| r == "coordinator")));
+    // `design-reviewed` does not.
+    let reviewed = graph("design-reviewed");
+    assert!(!lands(&reviewed, "coordinator"));
+    assert!(lands(&reviewed, "operator"));
+    assert!(!lands(&reviewed, "implementer"));
 }
 
 /// One swarm run's principals on one database: the main session (the container credential's ceiling,
