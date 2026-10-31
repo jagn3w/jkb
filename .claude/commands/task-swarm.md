@@ -1,5 +1,5 @@
 ---
-description: Make this session the COORDINATOR of a task swarm. It starts a jkb-designer for each ready task still awaiting a design, groups overlapping ready jkb tasks, starts one jkb-implementer per group and a fresh jkb-reviewer per pass, and runs the deterministic merge queue (no agent), which lands approved branches on one feature branch and records each landing. Claim-guarded, and it keeps going as dependents unblock.
+description: Make this session the COORDINATOR of a task swarm. It starts a jkb-designer for each ready task still awaiting a design, groups overlapping ready jkb tasks, starts one jkb-implementer per group and a fresh jkb-reviewer per pass, starts a jkb-systemic-reviewer when review keeps failing in one area, and runs the deterministic merge queue (no agent), which lands approved branches on one feature branch and records each landing. Claim-guarded, and it keeps going as dependents unblock.
 argument-hint: "<jkb-path | task-uids...>  [--branch <name>]  [--dry-run]  [--no-design-gate]"
 ---
 
@@ -12,7 +12,7 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   parked task is tagged `swarm-parked=<owner>` and kept out of the frontier, so parked tasks never
   fill its limit, but never settled: the coordinator re-checks each one's phase before every
   frontier read, so a design you approve or reject during the run is routed again. A rejected
-  task's revised design is appended under a heading that supersedes the rejected one, and the last
+  task's revised design is appended under a heading that supersedes the earlier one, and the last
   Design section governs.
   Its role comes from the operator's agent-type map (`jkb-designer` → `designer`). The coordinator
   cannot submit a design itself: jkb gives it no `submit_design`.
@@ -29,7 +29,9 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   `landable` is a *workflow* task. A task still at `design` that the run's design gate let through (the `design=approved` tag, a
   hand-pick by uid, or `--no-design-gate`) is a *legacy* task: its design was never approved in
   jkb, so it is built on the legacy path, routed on the reviewer's verdict, and named as legacy in
-  the report. A task at `design` that the gate holds back goes to a designer. A task at
+  the report. A task at `design` that the gate holds back goes to a designer, and so does one
+  whose design was turned down (its last workflow move a `reject_design` or `systemic_redesign`),
+  whatever the gate, the tag or a hand-pick says. A task at
   `design_review` is parked, and the report lists it as awaiting your design approval. A task at
   any other phase is left out and reported. A group never mixes legacy and workflow tasks. The workflow moves through
   the group's lead (its first task, recorded as `swarm-lead=<lead uid>` on every task of the
@@ -38,8 +40,18 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   `rework` then `submit_work` from `landable`; it stalls the group from any other phase, or on a
   refused fire. After a merge-queue eject it fires `rework`. After each review it runs `jkb workflow
   observe <lead>` and routes on the phase jkb reports, never on the reviewer's verdict word:
-  `implement` goes back to the implementer, `systemic_review` stops the group for a systemic
-  review, and `landable` goes to the merge queue.
+  `implement` goes back to the implementer, `systemic_review` goes to a systemic reviewer, and
+  `landable` goes to the merge queue.
+- **Systemic reviewer.** When a round's must-fixes repeat an area an earlier round found, jkb moves
+  the lead to `systemic_review`, and the coordinator starts one `jkb-systemic-reviewer` subagent on
+  it instead of sending the work round the loop again. It finds the cause, records it in the task
+  (`Systemic cause: …`), and fires exactly one exit with a written reason: `submit_systemic` sends
+  the cause back to the same implementer, and `systemic_redesign` sends the task back to design. Then
+  the group pauses with its claims, branch and implementer kept: a designer revises the design, the
+  task parks at `design_review` for you, and once you approve it the same implementer carries on. A
+  paused group still parked when the run stops is released and listed as awaiting your design
+  approval. Its role comes from the operator's agent-type map (`jkb-systemic-reviewer` →
+  `systemic_reviewer`); the coordinator cannot fire either exit itself.
 - **Findings.** Whoever verifies a fix closes its finding. When a round comes back clean, the
   coordinator closes the must-fix findings of the group's earlier rounds (`jkb task set <finding>
   --status done`) before the merge queue. Concerns and nits stay open as backlog.
@@ -95,8 +107,9 @@ jkb query    --global --json 'kind:task <SCOPE>' --limit 1000
 
 For each ready task, `jkb workflow show <uid>` gives its phase, and `jkb task show <uid>` its
 namespace. Route it as the coordinator's step 1b will: a finding is left out; `implement`, `review`
-and `landable` are built; `design` is built when it is tagged, hand-picked, or the gate is off, and
-otherwise goes to a designer; `design_review` is parked; everything else is left out.
+and `landable` are built; `design` goes to a designer if its last workflow move turned its design
+down (`reject_design` or `systemic_redesign`), is otherwise built when it is tagged, hand-picked, or
+the gate is off, and otherwise goes to a designer; `design_review` is parked; everything else is left out.
 
 Print:
 - the ready tasks, and how many are not yet terminal;
@@ -107,7 +120,8 @@ Print:
   each: approving them before the run lets it build them;
 - for named uids, any still at `design`, which go on the legacy path;
 - a rough agent count: one designer per task the gate holds back, plus about two per group per
-  attempt (an implementer and a reviewer), with up to 3 attempts per group.
+  attempt (an implementer and a reviewer), with up to 3 attempts per group, and a systemic reviewer
+  for a group whose review keeps failing in one area.
 
 With `--dry-run`, stop here.
 

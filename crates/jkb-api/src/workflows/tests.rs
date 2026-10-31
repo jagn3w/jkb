@@ -657,11 +657,12 @@ enum Gate {
     HandPicked,
 }
 
-/// What step 1 reads of a task: its namespace (`jkb task show`), its phase (`jkb workflow show`),
-/// and whether it carries `design=approved`.
+/// What step 1 reads of a task: its namespace (`jkb task show`), its phase and its last history
+/// line (`jkb workflow show`), and whether it carries `design=approved`.
 struct Seen {
     namespace: String,
     phase: String,
+    last: String,
     tagged: bool,
 }
 
@@ -674,8 +675,13 @@ fn admission(task: &Seen, gate: Gate) -> Option<Path> {
     if finding {
         return None;
     }
+    // A design turned down goes to a designer whatever the gate, the tag or a hand-pick says.
+    let turned_down = ["reject_design", "systemic_redesign"]
+        .iter()
+        .any(|e| task.last.split_whitespace().nth(1) == Some(e));
     match task.phase.as_str() {
         "implement" | "review" | "landable" => Some(Path::Workflow),
+        "design" if turned_down => Some(Path::Design),
         "design" if task.tagged || gate != Gate::On => Some(Path::Legacy),
         "design" => Some(Path::Design),
         "design_review" => Some(Path::Parked),
@@ -822,13 +828,17 @@ impl Swarm {
             ),
             other => panic!("{other:?}"),
         };
-        let phase = match self.coordinator(json!({ "op": "workflow.show", "uid": uid })) {
-            Response::Workflow { workflow } => workflow.phase,
+        let (phase, last) = match self.coordinator(json!({ "op": "workflow.show", "uid": uid })) {
+            Response::Workflow { workflow } => (
+                workflow.phase,
+                workflow.history.last().cloned().unwrap_or_default(),
+            ),
             other => panic!("{other:?}"),
         };
         Seen {
             namespace,
             phase,
+            last,
             tagged,
         }
     }
@@ -1017,6 +1027,46 @@ impl Swarm {
         self.reviewer_records("r2", 2, Some("src/lib.rs"));
         assert_eq!(self.coordinator_observes(), "systemic_review");
     }
+
+    /// `swarm-systemic-reviewer`'s calls, as a `jkb-systemic-reviewer` subagent `agent`: bind, read
+    /// the task, append the cause to its body, and fire `event` with the cause as its reason.
+    fn systemic_reviewer_fires(&self, agent: &str, event: &str, cause: &str) -> String {
+        let sys = || self.as_agent(Some((agent, "jkb-systemic-reviewer")));
+        ok(&sys(), json!({ "op": "role.bind", "uid": self.lead }));
+        match ok(&sys(), json!({ "op": "task.show", "uid": self.lead })) {
+            Response::Task { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        ok(
+            &sys(),
+            json!({ "op": "task.edit", "uid": self.lead,
+                    "text": format!("Systemic cause: {cause}"), "append": true }),
+        );
+        let m = Self::moved(ok(
+            &sys(),
+            json!({ "op": "workflow.fire", "uid": self.lead, "event": event, "reason": cause }),
+        ));
+        assert!(m.moved, "{event}: {m:?}");
+        m.phase
+    }
+
+    /// The lead's last history line, which `jkb workflow show` prints.
+    fn last_history(&self) -> String {
+        match self.coordinator(json!({ "op": "workflow.show", "uid": self.lead })) {
+            Response::Workflow { workflow } => workflow.history.last().cloned().unwrap_or_default(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Whether `owner` holds the lead's claim.
+    fn claimed_by(&self, owner: &str) -> bool {
+        match ok(&self.kb.op, json!({ "op": "task.claims" })) {
+            Response::Claims { claims, .. } => claims
+                .iter()
+                .any(|c| c.uid == self.lead && c.owner == owner),
+            other => panic!("{other:?}"),
+        }
+    }
 }
 
 /// The swarm's review loop through the workflow, with exactly the calls the `swarm-coordinator` and
@@ -1070,6 +1120,96 @@ fn a_task_at_systemic_review_moves_only_by_a_systemic_reviewer() {
         !again.moved && again.phase == "systemic_review",
         "{again:?}"
     );
+}
+
+/// Step 4b's code-pattern exit: the coordinator starts a `jkb-systemic-reviewer` (an agent type
+/// `scripts/setup.sh` maps), which records the cause in the task and fires `submit_systemic` with
+/// it as the reason. The work is back at `implement` for the same implementer, and the next clean
+/// round makes it landable.
+#[test]
+fn a_systemic_review_sends_the_cause_back_to_the_same_implementer() {
+    let s = Swarm::new();
+    s.reach_systemic_review();
+    let cause = "every caller re-derives the path; one helper owns it";
+    assert_eq!(
+        s.systemic_reviewer_fires("sr1", "submit_systemic", cause),
+        "implement"
+    );
+    assert!(s.body().contains(&format!("Systemic cause: {cause}")));
+    let last = s.last_history();
+    assert!(
+        last.contains("submit_systemic") && last.contains(cause),
+        "{last}"
+    );
+    // The coordinator reopens the work for the implementer it kept, and goes back to step 3.
+    s.coordinator(json!({ "op": "task.set", "uid": s.lead, "status": "in_progress" }));
+    s.implementer_works();
+    s.coordinator_submits();
+    s.reviewer_records("r3", 3, None);
+    assert_eq!(s.coordinator_observes(), "landable");
+}
+
+/// Step 4b's redesign exit: `systemic_redesign` puts the lead back at `design`, the group pauses
+/// with its claim held, and a designer whose FEEDBACK is the reason writes a revised design, parked
+/// at `design_review` for the operator. A paused group is out of the frontier whatever its tags say
+/// (it is claimed), so no new group builds it; once the operator approves, the re-check resumes the
+/// same group on its implementer.
+#[test]
+fn a_systemic_redesign_pauses_the_group_for_a_designer_and_resumes_it_once_approved() {
+    let s = Swarm::new();
+    s.reach_systemic_review();
+    let cause = "the cache is per-call, not per-run: callers cannot see what it holds";
+    assert_eq!(
+        s.systemic_reviewer_fires("sr1", "systemic_redesign", cause),
+        "design"
+    );
+    // DESIGNING A TASK's feedback: the last history line is the systemic redesign, with its reason.
+    let last = s.last_history();
+    assert!(
+        last.contains("systemic_redesign") && last.contains(cause),
+        "{last}"
+    );
+    // A redesigned task always goes to a designer: neither the gate being off, a hand-pick nor an
+    // old `design=approved` tag lets its superseded design be built.
+    ok(
+        &s.kb.op,
+        json!({ "op": "task.tag", "uid": s.lead, "facet_value": "design=approved", "mode": "set" }),
+    );
+    for gate in [Gate::On, Gate::Off, Gate::HandPicked] {
+        assert_eq!(
+            admission(&s.seen(&s.lead), gate),
+            Some(Path::Design),
+            "{gate:?}"
+        );
+    }
+    // The group keeps its claim through the redesign: the designer works on it as it is.
+    assert!(s.claimed_by(OWNER));
+    let revised =
+        format!("Design (revised; it replaces every earlier Design section above): {cause}");
+    s.designer_designs("d1", &revised);
+    s.coordinator(json!({ "op": "task.tag", "uid": s.lead,
+                          "facet_value": format!("swarm-parked={OWNER}"), "mode": "set" }));
+    assert!(s.claimed_by(OWNER));
+    assert!(
+        !s.in_frontier(),
+        "a paused group is not offered to a new group"
+    );
+    s.coordinator_rechecks_parked();
+    assert!(!s.in_frontier(), "still awaiting approval");
+    // Approved: the re-check finds the paused group at `implement` and resumes it — reopened for
+    // the same implementer, which the coordinator continues rather than replaces.
+    s.operator_fires("approve_design", None);
+    s.coordinator_rechecks_parked();
+    assert_eq!(s.phase(), "implement");
+    assert!(
+        !s.in_frontier(),
+        "a resumed group is still its own, not the frontier's"
+    );
+    s.coordinator(json!({ "op": "task.set", "uid": s.lead, "status": "in_progress" }));
+    s.implementer_works();
+    s.coordinator_submits();
+    s.reviewer_records("r3", 3, None);
+    assert_eq!(s.coordinator_observes(), "landable");
 }
 
 /// The same loop, with the second round clean: the work is `landable`. A merge-queue eject then
@@ -1270,7 +1410,13 @@ fn a_task_the_gate_holds_back_is_designed_parked_and_then_built() {
         Response::Workflow { workflow } => workflow,
         other => panic!("{other:?}"),
     };
-    assert_eq!(admission(&s.seen(&s.lead), Gate::On), Some(Path::Design));
+    for gate in [Gate::On, Gate::Off, Gate::HandPicked] {
+        assert_eq!(
+            admission(&s.seen(&s.lead), gate),
+            Some(Path::Design),
+            "{gate:?}"
+        );
+    }
     let last = w.history.last().unwrap();
     assert!(
         last.contains("reject_design") && last.contains("name the files"),
@@ -1280,8 +1426,8 @@ fn a_task_the_gate_holds_back_is_designed_parked_and_then_built() {
     // rejected design: the last Design section governs.
     s.coordinator_rechecks_parked();
     assert!(s.in_frontier(), "a rejected design is routed again");
-    let revised = "Design (revised; it replaces every earlier Design section above, which was not \
-                   approved): name the files";
+    let revised =
+        "Design (revised; it replaces every earlier Design section above): name the files";
     s.coordinator_designs("d2", revised);
     let body = s.body();
     assert!(

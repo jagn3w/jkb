@@ -176,6 +176,28 @@ fn the_packaged_templates_are_what_the_coordinators_fill() {
         placeholders(&des.def.template).unwrap(),
         ["feedback_block", "repo", "task_title", "task_uid"]
     );
+    // The systemic reviewer the coordinator starts when review repeats an area: it records the cause
+    // in the task (the KB) and reads the branch in a worktree of its own.
+    for (name, isolation) in [
+        ("swarm-systemic-reviewer", Isolation::Worktree),
+        ("jkb-systemic-reviewer", Isolation::Worktree),
+    ] {
+        let sys = get(name);
+        assert_eq!(sys.def.role, Role::SystemicReviewer, "{name}");
+        assert_eq!(sys.def.permissions.isolation, isolation, "{name}");
+        assert_eq!(sys.def.permissions.writes, Writes::Kb, "{name}");
+    }
+    assert_eq!(
+        placeholders(&get("swarm-systemic-reviewer").def.template).unwrap(),
+        [
+            "branch",
+            "integration",
+            "repo",
+            "rounds_block",
+            "task_title",
+            "task_uid"
+        ]
+    );
     // Each session's coordinator is a template of its own, acting as the coordinator.
     for c in ["swarm-coordinator", "review-coordinator"] {
         assert_eq!(get(c).def.role, Role::Coordinator, "{c}");
@@ -355,6 +377,98 @@ fn the_swarm_designs_what_the_gate_holds_back_and_parks_it_for_approval() {
     assert!(coord.contains("- Edit code or a task's design"));
 }
 
+/// A task whose review keeps failing in one area goes to a systemic reviewer, never round the loop
+/// again: the coordinator's step 4b starts a `swarm-systemic-reviewer` as a `jkb-systemic-reviewer`,
+/// routes on the lead's phase afterwards, and on a redesign pauses the group, keeping its claim and
+/// implementer, for a designer and the operator. `jkb-api`'s swarm-loop tests make the same calls as
+/// the same principals.
+#[test]
+fn the_swarm_sends_a_repeated_area_to_a_systemic_reviewer() {
+    let agents = packaged().unwrap();
+    let get = |n: &str| agents.iter().find(|a| a.name == n).unwrap();
+    let sys = &get("swarm-systemic-reviewer").def.template;
+    let at_in = |t: &str, s: &str| t.find(s).unwrap_or_else(|| panic!("{s}"));
+    // Bound first, on the branch, the cause recorded in the task, then exactly one exit with a
+    // reason; the result and cause lines the coordinator reads.
+    for call in [
+        "jkb role bind {{task_uid}}",
+        "git switch {{branch}}",
+        "jkb task edit {{task_uid}} --append --stdin",
+        "Systemic cause: ",
+        "jkb workflow fire {{task_uid}} submit_systemic --reason",
+        "jkb workflow fire {{task_uid}} systemic_redesign --reason",
+        "RESULT: submit_systemic {{task_uid}}",
+        "RESULT: systemic_redesign {{task_uid}}",
+        "RESULT: failed <reason>",
+        "CAUSE: ",
+    ] {
+        assert!(sys.contains(call), "swarm-systemic-reviewer: {call}");
+    }
+    assert!(at_in(sys, "jkb role bind") < at_in(sys, "git switch"));
+    assert!(at_in(sys, "jkb task edit") < at_in(sys, "submit_systemic --reason"));
+    assert!(sys.contains("Fire exactly one exit"));
+
+    let swarm = get("swarm-coordinator");
+    assert!(swarm
+        .def
+        .hands_off_to
+        .iter()
+        .any(|h| h == "swarm-systemic-reviewer"));
+    let coord = &swarm.def.template;
+    let at = |s: &str| at_in(coord, s);
+    // Step 4's systemic arm goes to step 4b rather than settling the group.
+    let arm = &coord[at("- systemic_review: ")..at("- landable: the round")];
+    assert!(arm.contains("go to step 4b"), "{arm}");
+    assert!(!arm.contains("SETTLED"), "{arm}");
+    let step = &coord[at("4b. A SYSTEMIC REVIEW")..at("5. THE MERGE QUEUE")];
+    for rule in [
+        "jkb workflow agent show swarm-systemic-reviewer",
+        "subagent type `jkb-systemic-reviewer`",
+        "worktree isolation",
+        "jkb ls --global <namespace>/must-fix",
+        "never on the RESULT word",
+        // jkb holds the coordinator to it: neither exit is the coordinator's.
+        "jkb gives you neither `submit_systemic` nor\n`systemic_redesign`",
+        "- implement (submit_systemic): a code-pattern fix. An attempt used.",
+        "send the CAUSE and the last NOTES to the same implementer",
+        "- design (systemic_redesign): the fix changes the design, so the group PAUSES.",
+        "claim nothing",
+        "neither reopen nor release",
+        "tag the lead PARKED",
+        "RESUMING A PAUSED GROUP",
+        "- systemic_review (nothing moved)",
+    ] {
+        assert!(step.contains(rule), "step 4b: {rule}");
+    }
+    // The parked re-check knows a paused group by its claim, and resumes it rather than waiting for
+    // a frontier that never offers it.
+    assert!(coord.contains("A parked task claimed by '{{owner}}' is the lead of a PAUSED group"));
+    // A design turned down goes to a designer whatever the gate says, so a redesigned task is never
+    // built on its superseded design by a later run.
+    let design_row =
+        &coord[at("  design                        a LEGACY task")..at("  design_review ")];
+    assert!(
+        design_row.contains("`reject_design` or a\n                                `systemic_redesign`, whatever the gate says"),
+        "{design_row}"
+    );
+    // A paused group waits on the operator: it does not hold the run open, and after a compaction
+    // its lead's phase or tag names it.
+    let continuing = &coord[at("\nCONTINUING\n")..at("\nREPORT\n")];
+    assert!(continuing.contains("A PAUSED group is not in\nflight"));
+    assert!(continuing.contains("A lead at `systemic_review` has a systemic reviewer at\nwork"));
+    let report = &coord[at("\nREPORT\n")..];
+    assert!(report.contains("each systemic review (its exit and its CAUSE)"));
+    assert!(report.contains("a PAUSED group's lead as a systemic redesign"));
+    // A revised design is true of a redesign as well as a rejection: it does not claim the earlier
+    // design was never approved.
+    let des = &get("swarm-designer").def.template;
+    assert!(!des.contains("which was not approved"), "{des}");
+    assert!(!get("swarm-implementer")
+        .def
+        .template
+        .contains("an earlier one\n   was rejected"));
+}
+
 /// CLOSING FINDINGS writes tasks outside SCOPE, so the NEVER rule that keeps the coordinator inside
 /// SCOPE must carve out exactly the findings CLOSING FINDINGS closes — or a coordinator that keeps
 /// both rules closes nothing. The two name the same set: the must-fixes under the lead's recorded
@@ -432,6 +546,10 @@ fn the_slash_command_leaves_the_design_gate_to_step_one() {
     assert!(md.contains("starts a designer for every other task at `design`"));
     assert!(md.contains("`jkb-designer`"));
     assert!(md.contains("awaiting your design approval"));
+    // The systemic reviewer, and what its two exits do to the group.
+    assert!(md.contains("`jkb-systemic-reviewer`"));
+    assert!(md.contains("`systemic_review` goes to a systemic reviewer"));
+    assert!(!md.contains("`systemic_review` stops the group"));
 }
 
 /// The workers' subagent types: rendered from the packaged file, prefixed like everything the
@@ -440,7 +558,15 @@ fn the_slash_command_leaves_the_design_gate_to_step_one() {
 fn every_subagent_template_renders_as_an_agent_definition() {
     let defs = subagent_definitions().unwrap();
     let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-    assert_eq!(names, ["jkb-designer", "jkb-implementer", "jkb-reviewer"]);
+    assert_eq!(
+        names,
+        [
+            "jkb-designer",
+            "jkb-implementer",
+            "jkb-reviewer",
+            "jkb-systemic-reviewer"
+        ]
+    );
     for d in &defs {
         assert!(
             d.markdown
@@ -450,8 +576,8 @@ fn every_subagent_template_renders_as_an_agent_definition() {
         );
         assert!(!d.markdown.contains("{{"), "{} holds a placeholder", d.name);
     }
-    // A designer and a reviewer read and run; no type can start a worker, which would attest as its
-    // own role.
+    // A designer, a reviewer and a systemic reviewer read and run; no type can start a worker, which
+    // would attest as its own role.
     let tools = |n: &str| {
         defs.iter()
             .find(|d| d.name == n)
@@ -461,7 +587,7 @@ fn every_subagent_template_renders_as_an_agent_definition() {
             .find(|l| l.starts_with("tools:"))
             .map(str::to_owned)
     };
-    for kb in ["jkb-designer", "jkb-reviewer"] {
+    for kb in ["jkb-designer", "jkb-reviewer", "jkb-systemic-reviewer"] {
         assert_eq!(
             tools(kb).as_deref(),
             Some("tools: Read, Grep, Glob, Bash"),

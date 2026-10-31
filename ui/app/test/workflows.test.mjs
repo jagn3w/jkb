@@ -456,11 +456,11 @@ test("switching back to Agents gives the side panel back to the agent; nothing e
 const { agentGraph } = await load(path.join(here, "..", "..", "core", "src", "workflows.ts"));
 const packagedAgents = JSON.parse(fs.readFileSync(path.join(here, "..", "..", "..", PACKAGED_FILE), "utf8")).agents;
 
-test("the packaged swarm's Agents graph draws the designer its coordinator starts", () => {
+test("the packaged swarm's Agents graph draws the designer and the systemic reviewer its coordinator starts", () => {
   const g = agentGraph(packagedAgents, "task-swarm");
   assert.deepEqual(
     g.nodes.map((n) => n.id).sort(),
-    ["swarm-coordinator", "swarm-designer", "swarm-implementer", "swarm-reviewer"],
+    ["swarm-coordinator", "swarm-designer", "swarm-implementer", "swarm-reviewer", "swarm-systemic-reviewer"],
   );
   const at = (id) => g.nodes.find((n) => n.id === id);
   assert.equal(at("swarm-coordinator").layer, 0, "the coordinator is the graph's root");
@@ -469,5 +469,10 @@ test("the packaged swarm's Agents graph draws the designer its coordinator start
     "the coordinator hands a held-back task to a designer",
   );
   assert.ok(at("swarm-designer").layer > 0);
+  assert.ok(
+    g.links.some((l) => l.from === "swarm-coordinator" && l.to === "swarm-systemic-reviewer"),
+    "the coordinator hands a task whose review repeats an area to a systemic reviewer",
+  );
+  assert.ok(at("swarm-systemic-reviewer").layer > 0);
   assert.deepEqual(g.dangling, []);
 });

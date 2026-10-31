@@ -239,6 +239,83 @@ fn each_role_fires_only_its_own_workflow_step() {
     }
 }
 
+/// A `jkb-systemic-reviewer` subagent, attested through the operator's agent-type map as
+/// `scripts/setup.sh` writes it: bound to the task at `systemic_review`, it may fire `submit_systemic`
+/// with a written reason and is refused one without; it cannot do another role's step, and it lands
+/// nothing.
+#[test]
+fn an_attested_systemic_reviewer_picks_the_exit_with_a_reason_and_nothing_else() {
+    let kb = Kb::new();
+    let a = add(&kb.op, "task a");
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.fire", "uid": a, "event": "override", "to": "systemic_review",
+                "reason": "review repeated an area" }),
+    );
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "jkb-systemic-reviewer",
+                "role": "systemic_reviewer" }),
+    );
+    let hook = kb.as_token(&container);
+    let tool = std::cell::Cell::new(0);
+    let sys = || {
+        tool.set(tool.get() + 1);
+        match ok(
+            &hook,
+            json!({ "op": "attest.mint", "session": "s1", "agent_id": "sr1",
+                    "agent_type": "jkb-systemic-reviewer",
+                    "tool_use_id": format!("tool-{}", tool.get()) }),
+        ) {
+            Response::Ticket { token } => kb.as_token(&token),
+            other => panic!("{other:?}"),
+        }
+    };
+    let fire = |event: &str, reason: Option<&str>| {
+        call(
+            &sys(),
+            json!({ "op": "workflow.fire", "uid": a, "event": event, "reason": reason }),
+        )
+    };
+    let moved = |r: Result<Response, ApiError>| match r {
+        Ok(Response::WorkflowMoved { outcome }) => outcome,
+        other => panic!("{other:?}"),
+    };
+    ok(&sys(), json!({ "op": "role.bind", "uid": a }));
+    // Another role's step: refused by the strategy, nothing moves.
+    let no = moved(fire("submit_work", None));
+    assert!(!no.moved && no.phase == "systemic_review", "{no:?}");
+    assert!(
+        no.refusal
+            .as_deref()
+            .unwrap_or("")
+            .contains("holds systemic_reviewer"),
+        "{no:?}"
+    );
+    // Its own exit, without a reason: refused, and nothing moves.
+    for reason in [None, Some("  ")] {
+        let e = fire("submit_systemic", reason).unwrap_err();
+        assert!(e.message.contains("needs a written reason"), "{e:?}");
+    }
+    // Landing is never a systemic reviewer's.
+    let e = refused(
+        &sys(),
+        json!({ "op": "task.land", "uid": a, "landed": { "branch": "b", "onto": "o" } }),
+    );
+    assert!(e.message.contains("task.land"), "{e:?}");
+    match ok(&kb.op, json!({ "op": "workflow.show", "uid": a })) {
+        Response::Workflow { workflow } => assert_eq!(workflow.phase, "systemic_review"),
+        other => panic!("{other:?}"),
+    }
+    // With a reason: back to implementation.
+    let yes = moved(fire("submit_systemic", Some("one helper owns the path")));
+    assert!(yes.moved && yes.phase == "implement", "{yes:?}");
+}
+
 /// The dev container's credential, the tickets it mints for the hook, and what each ticket holds.
 #[test]
 fn harness_tickets_carry_the_attested_agent_and_bind_it_to_one_task() {
