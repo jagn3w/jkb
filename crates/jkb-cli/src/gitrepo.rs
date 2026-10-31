@@ -2628,9 +2628,21 @@ impl IgnoreJudge {
             .spawn()
             .context("running `git check-ignore` for the pin")?;
         let mut stdin = child.stdin.take().context("check-ignore's stdin")?;
+        // `check-ignore --stdin` reads each path as a PATHSPEC, so a top-level name like `:(top)target`
+        // or `:/target` was judged as `target` — ignored, its contents left out of the pin — and
+        // unsupported magic (`:(icase)…`) failed the pin outright (measured, git 2.51.1).
+        // `--literal-pathspecs` is refused by check-ignore. Every path is asked as `./<path>`, which
+        // no magic begins with, and the prefix is taken off the answer; here, so no caller has to
+        // remember it.
         let input: Vec<u8> = paths
             .iter()
-            .flat_map(|p| p.iter().copied().chain(std::iter::once(0)))
+            .flat_map(|p| {
+                b"./"
+                    .iter()
+                    .chain(p.iter())
+                    .copied()
+                    .chain(std::iter::once(0))
+            })
             .collect();
         let writer = std::thread::spawn(move || stdin.write_all(&input));
         let out = child
@@ -2653,7 +2665,8 @@ impl IgnoreJudge {
         for rec in fields.chunks(4).filter(|r| r.len() == 4) {
             let pattern = rec[2];
             if !pattern.is_empty() && !pattern.starts_with(b"!") {
-                ignored.insert(rec[3].to_vec());
+                let path = rec[3].strip_prefix(b"./").unwrap_or(rec[3]);
+                ignored.insert(path.to_vec());
             }
         }
         Ok(ignored)
@@ -5873,5 +5886,33 @@ mod tests {
             clean,
             "a file at a gitlink path was not pinned"
         );
+    }
+
+    /// A name that reads as pathspec magic is still a name: `:(top)target` at the top is not
+    /// `target` (which `/target` ignores), and `:(icase)X` is pinned rather than failing the pin.
+    #[test]
+    fn the_tree_pin_reads_names_literally_not_as_pathspec_magic() {
+        let (_t, dir) = pin_repo();
+        std::fs::write(dir.join(".gitignore"), "/target\n").unwrap();
+        let clean = pin_of(&dir);
+        let magic = dir.join(":(top)target");
+        std::fs::create_dir_all(&magic).unwrap();
+        std::fs::write(magic.join("run.sh"), "echo PWNED\n").unwrap();
+        let with_magic = pin_of(&dir);
+        assert_ne!(
+            with_magic, clean,
+            "a `:(top)target` directory was skipped as `target`"
+        );
+        std::fs::write(magic.join("run.sh"), "echo changed\n").unwrap();
+        assert_ne!(pin_of(&dir), with_magic, "its contents are not pinned");
+        std::fs::write(dir.join(":(icase)X"), "x").unwrap();
+        let p = super::tree_pin(&dir).expect("unsupported magic failed the pin");
+        assert!(p.is_some());
+        // Nested, the same names are names too.
+        std::fs::create_dir_all(dir.join("sub/:(top)target")).unwrap();
+        std::fs::write(dir.join("sub/:(top)target/f"), "y").unwrap();
+        let nested = pin_of(&dir);
+        std::fs::write(dir.join("sub/:(top)target/f"), "z").unwrap();
+        assert_ne!(pin_of(&dir), nested);
     }
 }
