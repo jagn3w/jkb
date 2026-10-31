@@ -127,6 +127,52 @@ export interface WorkflowGraph {
   readonly changes_from_default: readonly string[] | null;
 }
 
+/** `jkb_api::workflows::OpClassView`: an op class and what holding it lets a role do. */
+export interface OpClass {
+  readonly name: string;
+  readonly describe: string;
+}
+
+/** `jkb_api::workflows::ToggleView`: a strategy toggle and what the strategy sets it to. */
+export interface ToggleInfo {
+  readonly name: string;
+  /** What it grants, in a few plain words. */
+  readonly label: string;
+  /** The workflow events it grants, or `["land"]`. */
+  readonly controls: readonly string[];
+  /** The roles it may ever name. */
+  readonly domain: readonly string[];
+  readonly acts_in: string | null;
+  /** The roles the strategy names, as stored (the operator always holds it). */
+  readonly value: readonly string[];
+}
+
+/** `jkb_api::workflows::RoleView`: one role under a strategy. */
+export interface RoleInfo {
+  readonly name: string;
+  readonly describe: string;
+  readonly ops: readonly OpClass[];
+  readonly may_grant: readonly string[];
+  readonly granted_by: readonly string[];
+  /** The workflow acts it may fire under the strategy. */
+  readonly events: readonly string[];
+  readonly lands: boolean;
+  readonly acts_next_in: readonly string[];
+  readonly fires_in: readonly string[];
+  /** The toggles that can name it; `on` when the strategy does. */
+  readonly toggled_by: readonly { readonly toggle: string; readonly on: boolean }[];
+  /** The attested agent types mapped to it. */
+  readonly agent_types: readonly string[];
+}
+
+/** `jkb_api::workflows::RolesView`: `workflow.roles`' answer. */
+export interface RolesView {
+  readonly strategy: string;
+  readonly toggles: readonly ToggleInfo[];
+  /** Every role, in jkb's order, including those no agent acts as. */
+  readonly roles: readonly RoleInfo[];
+}
+
 /** What a save changes: `jkb_api::workflows::AgentEdit`. */
 export interface AgentEdit {
   readonly template?: string;
@@ -156,6 +202,8 @@ export const workflowOps = {
   set: (name: string, edit: AgentEdit) => ({ op: "workflow.agent_set", name, edit }),
   /** A named strategy's machines, or the default's. */
   graph: (strategy?: string) => (strategy === undefined ? { op: "workflow.graph" } : { op: "workflow.graph", strategy }),
+  /** Every role under a named strategy, or the default's. */
+  roles: (strategy?: string) => (strategy === undefined ? { op: "workflow.roles" } : { op: "workflow.roles", strategy }),
 } as const;
 
 /** `jkb_core::workflow::agents::validate_name`: what a copy may be called. */
@@ -390,6 +438,86 @@ export function decodeWorkflowGraph(o: Outcome<OpResponse>): Outcome<WorkflowGra
         : { default: null, changes_from_default: null }),
     },
   };
+}
+
+function isRole(v: unknown): v is RoleInfo {
+  return (
+    isObject(v) &&
+    isString(v["name"]) &&
+    isString(v["describe"]) &&
+    Array.isArray(v["ops"]) &&
+    v["ops"].every((o) => isObject(o) && isString(o["name"]) && isString(o["describe"])) &&
+    isStrings(v["may_grant"]) &&
+    isStrings(v["granted_by"]) &&
+    isStrings(v["events"]) &&
+    isBool(v["lands"]) &&
+    isStrings(v["acts_next_in"]) &&
+    isStrings(v["fires_in"]) &&
+    Array.isArray(v["toggled_by"]) &&
+    v["toggled_by"].every((t) => isObject(t) && isString(t["toggle"]) && isBool(t["on"])) &&
+    isStrings(v["agent_types"])
+  );
+}
+
+function isToggle(v: unknown): v is ToggleInfo {
+  return (
+    isObject(v) &&
+    isString(v["name"]) &&
+    isString(v["label"]) &&
+    isStrings(v["controls"]) &&
+    isStrings(v["domain"]) &&
+    isOptString(v["acts_in"]) &&
+    isStrings(v["value"])
+  );
+}
+
+/** `workflow.roles`' answer. */
+export function decodeRoles(o: Outcome<OpResponse>): Outcome<RolesView> {
+  if (!o.ok) return o;
+  const v = o.value.result === "workflow_roles" ? o.value["roles"] : undefined;
+  if (
+    !isObject(v) ||
+    !isString(v["strategy"]) ||
+    !Array.isArray(v["toggles"]) ||
+    !v["toggles"].every(isToggle) ||
+    !Array.isArray(v["roles"]) ||
+    !v["roles"].every(isRole)
+  ) {
+    return failed("internal", "jkb serve did not answer with a well-formed `workflow_roles`");
+  }
+  return {
+    ok: true,
+    value: {
+      strategy: v["strategy"],
+      toggles: (v["toggles"] as ToggleInfo[]).map((t) => ({ ...t, acts_in: t.acts_in ?? null })),
+      roles: v["roles"] as RoleInfo[],
+    },
+  };
+}
+
+/** The agent templates that act as `role`, in any agent set (fragments are not agents). */
+export function templatesActingAs(agents: readonly AgentTemplate[], role: string): AgentTemplate[] {
+  return agents.filter((a) => a.role === role && !a.fragment);
+}
+
+/**
+ * How a role's grant from a toggle reads: for each toggle that can name the role, what it controls
+ * that this role holds (`on`) or would hold (`off in this strategy`). A grant no toggle controls has
+ * no entry.
+ */
+export interface ToggleMark {
+  readonly toggle: string;
+  readonly label: string;
+  readonly on: boolean;
+  /** The events (or `land`) it controls. */
+  readonly controls: readonly string[];
+}
+
+export function toggleMarks(view: RolesView, role: RoleInfo): ToggleMark[] {
+  return role.toggled_by.flatMap(({ toggle, on }) => {
+    const t = view.toggles.find((x) => x.name === toggle);
+    return t === undefined ? [] : [{ toggle, label: t.label, on, controls: t.controls }];
+  });
 }
 
 // ---- layouts ----------------------------------------------------------------------------------

@@ -422,3 +422,57 @@
   font-family: var(--font-ui);
   font-size: var(--text-xs);
 }
+
+/* The Roles view: one row per role, ink only. A toggle-controlled grant carries its toggle's name;
+ * one the strategy leaves off is muted, never coloured. */
+.roles-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.roles-table th,
+.roles-table td {
+  padding: var(--space-1) var(--space-2);
+  text-align: left;
+  vertical-align: top;
+  border-bottom: var(--hairline-width) solid var(--hairline);
+}
+
+.roles-table thead th {
+  color: var(--ink-muted);
+  font-weight: 600;
+}
+
+.roles-table th[scope="row"] .link-button {
+  padding: 0;
+  font-weight: 600;
+}
+
+.roles-table tr[data-selected="true"] {
+  background: var(--surface-active);
+}
+
+.role-grants,
+.role-ops {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.role-ops li {
+  padding: 1px 0;
+  font-size: var(--text-sm);
+}
+
+.role-toggle {
+  margin-left: var(--space-1);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  color: var(--ink-muted);
+}
+
+.role-describe {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-sm);
+}

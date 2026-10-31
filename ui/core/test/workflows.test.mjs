@@ -13,6 +13,7 @@ import {
   decodeAgent,
   agentSetSentence,
   decodeAgents,
+  decodeRoles,
   decodeWorkflowGraph,
   draftOf,
   editBetween,
@@ -28,6 +29,8 @@ import {
   selectionIn,
   stateRows,
   takenByRow,
+  templatesActingAs,
+  toggleMarks,
   workflowOps,
 } from "../dist/index.js";
 
@@ -442,4 +445,69 @@ test("a row's guard and command are jkb's words, absent ones null; every role's 
   const bad = (graph) => decodeWorkflowGraph(ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "d", workflow: machine, lifecycle: machine, ...graph } })).ok;
   assert.equal(bad({ role_ops: { operator: "read" } }), false);
   assert.equal(bad({ workflow: { ...machine, transitions: [{ ...machine.transitions[0], guard: 3 }] } }), false);
+});
+
+// `workflow.roles`, read from what jkb answers for every preset (fixtures/workflow-roles.json, which
+// `roles_fixture_matches_presets` in crates/jkb-api holds to the op).
+const rolesFixture = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "..", "app", "test", "fixtures", "workflow-roles.json"), "utf8"));
+
+test("workflow.roles asks for a strategy's roles, or the default's", () => {
+  assert.deepEqual(workflowOps.roles(), { op: "workflow.roles" });
+  assert.deepEqual(workflowOps.roles("autonomous"), { op: "workflow.roles", strategy: "autonomous" });
+});
+
+test("every preset's workflow.roles answer decodes whole, every role once", () => {
+  assert.deepEqual(Object.keys(rolesFixture).sort(), ["autonomous", "coordinated", "design-reviewed"]);
+  for (const [name, roles] of Object.entries(rolesFixture)) {
+    const d = decodeRoles(ok({ result: "workflow_roles", roles }));
+    assert.equal(d.ok, true, name);
+    assert.deepEqual(d.value, roles, `${name}: nothing dropped or renamed`);
+    assert.deepEqual(
+      d.value.roles.map((r) => r.name),
+      ["operator", "coordinator", "designer", "implementer", "reviewer", "systemic_reviewer"],
+    );
+    assert.ok(d.value.roles.every((r) => r.ops.every((o) => o.describe.length > 0)), `${name}: every op class has its sentence`);
+  }
+  const autonomous = decodeRoles(ok({ result: "workflow_roles", roles: rolesFixture.autonomous })).value;
+  const coordinator = autonomous.roles.find((r) => r.name === "coordinator");
+  assert.equal(coordinator.lands, true);
+  assert.ok(coordinator.ops.some((o) => o.name === "land"), "the strategy's lands toggle shows as the land op class");
+});
+
+test("a malformed or foreign answer is refused, and a missing acts_in is null", () => {
+  const roles = rolesFixture["design-reviewed"];
+  assert.equal(decodeRoles(ok({ result: "workflow_graph", roles })).ok, false);
+  assert.equal(decodeRoles(ok({ result: "workflow_roles", roles: { ...roles, roles: [{ name: "x" }] } })).ok, false);
+  assert.equal(decodeRoles(ok({ result: "workflow_roles", roles: { ...roles, toggles: [{ name: "lands" }] } })).ok, false);
+  const bad = { ...roles.roles[0], toggled_by: [{ toggle: "lands", on: "yes" }] };
+  assert.equal(decodeRoles(ok({ result: "workflow_roles", roles: { ...roles, roles: [bad] } })).ok, false);
+  const { acts_in: _, ...lands } = roles.toggles.find((t) => t.name === "lands");
+  const d = decodeRoles(ok({ result: "workflow_roles", roles: { ...roles, toggles: [lands] } }));
+  assert.equal(d.ok, true);
+  assert.equal(d.value.toggles[0].acts_in, null);
+  const failure = { ok: false, error: { code: "bad_request", message: "unknown variant" } };
+  assert.equal(decodeRoles(failure), failure, "a refusal passes through");
+});
+
+test("a role's toggle marks say which toggle grants what, on or off in this strategy", () => {
+  const view = rolesFixture["design-reviewed"];
+  const coordinator = view.roles.find((r) => r.name === "coordinator");
+  assert.deepEqual(toggleMarks(view, coordinator), [
+    { toggle: "approves_design", label: "approves designs", on: false, controls: ["approve_design", "reject_design"] },
+    { toggle: "lands", label: "lands", on: false, controls: ["land"] },
+  ]);
+  const coordinated = rolesFixture.coordinated;
+  assert.equal(toggleMarks(coordinated, coordinated.roles.find((r) => r.name === "coordinator"))[0].on, true);
+  assert.deepEqual(toggleMarks(view, view.roles.find((r) => r.name === "designer")), [], "no toggle can name a designer");
+});
+
+test("a role's agents are the templates acting as it in any agent set, never a fragment", () => {
+  const agents = [
+    agent({ name: "a", workflow: "task-swarm", role: "reviewer" }),
+    agent({ name: "b", workflow: "code-review", role: "reviewer" }),
+    agent({ name: "c", workflow: "code-review", role: "reviewer", fragment: true }),
+    agent({ name: "d", role: "implementer" }),
+  ];
+  assert.deepEqual(templatesActingAs(agents, "reviewer").map((a) => a.name), ["a", "b"]);
+  assert.deepEqual(templatesActingAs(agents, "systemic_reviewer"), []);
 });

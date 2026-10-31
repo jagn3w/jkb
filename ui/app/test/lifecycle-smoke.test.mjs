@@ -8,7 +8,8 @@
 // The app talks to a stand-in `jkb serve` on loopback (the daemon-client.test.mjs pattern) that
 // answers `hello`, `workflow.agents`, `plan.strategies`, and `workflow.graph` from
 // fixtures/workflow-graphs.json, which `graph_fixture_matches_presets` in crates/jkb-api holds to
-// the tables; anything else is refused. The skip, and where a skip is a failure, are
+// the tables, and `workflow.roles` from fixtures/workflow-roles.json (`roles_fixture_matches_presets`);
+// anything else is refused. The skip, and where a skip is a failure, are
 // electron-harness.mjs's.
 
 import assert from "node:assert/strict";
@@ -26,6 +27,7 @@ import { overlaps } from "./lifecycle-boxes.mjs";
 const skip = smokeSkip();
 
 const presets = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "fixtures", "workflow-graphs.json"), "utf8"));
+const rolesByPreset = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "fixtures", "workflow-roles.json"), "utf8"));
 const DEFAULT = "design-reviewed";
 const TOKEN = "lifecycle-smoke-token";
 /** The one agent template the stand-in serves: what a phase's panel links to. */
@@ -52,6 +54,8 @@ const IMPLEMENTER = {
 };
 /** Each strategy whose machines the stand-in answered, in order. */
 const graphsServed = [];
+/** Each strategy whose roles the stand-in answered, in order. */
+const rolesServed = [];
 
 /** What the stand-in answers each op, as `jkb_api::Response` serializes it; `undefined`: refused. */
 function answer(req) {
@@ -68,6 +72,11 @@ function answer(req) {
       const g = presets[req.strategy ?? DEFAULT];
       if (g !== undefined) graphsServed.push(req.strategy ?? DEFAULT);
       return g === undefined ? undefined : { result: "workflow_graph", graph: g };
+    }
+    case "workflow.roles": {
+      const v = rolesByPreset[req.strategy ?? DEFAULT];
+      if (v !== undefined) rolesServed.push(req.strategy ?? DEFAULT);
+      return v === undefined ? undefined : { result: "workflow_roles", roles: v };
     }
     default:
       return undefined;
@@ -92,7 +101,7 @@ before(async () => {
       };
       if (req.headers.authorization !== `Bearer ${TOKEN}`) return reply(401, { code: "unauthorized", message: "bad token" });
       if (req.method === "GET" && req.url === "/v1/hello") {
-        return reply(200, { protocol: 1, schema_version: 1, supported_schema: 1, ops: ["workflow.agents", "plan.strategies", "workflow.graph"] });
+        return reply(200, { protocol: 1, schema_version: 1, supported_schema: 1, ops: ["workflow.agents", "plan.strategies", "workflow.graph", "workflow.roles"] });
       }
       let parsed;
       try {
@@ -369,4 +378,58 @@ test("a phase's agent template opens in the agent panel", { skip }, async () => 
   await page.keyboard.press("Escape");
   await side().locator(".machine-panel").waitFor({ state: "detached" });
   assert.equal(await template.inputValue(), "Build {{what}}, unsaved.");
+});
+
+test("an agent's panel opens its role in the Roles view, which lists every role and marks where one acts", { skip }, async () => {
+  await phases();
+  const pane = page.locator("#pane-workflows .agents-pane");
+  const views = pane.getByRole("radiogroup", { name: "Agents or roles", exact: true });
+  // The agent first, from the phase it acts in; its panel names its role as a link, not a list.
+  await lifecycle().getByRole("button", { name: "state implement", exact: true }).click();
+  await side().locator(".machine-panel").getByRole("button", { name: IMPLEMENTER.name, exact: true }).click();
+  const agentPanel = side().locator(`.agent-panel[aria-label="Agent ${IMPLEMENTER.name}"]`);
+  await agentPanel.waitFor();
+  assert.equal(await agentPanel.getByText("In jkb, a implementer may", { exact: false }).count(), 0);
+  await agentPanel.locator(".agent-role-link").getByRole("button", { name: "implementer", exact: true }).click();
+
+  // The Roles view, its role open beside it.
+  assert.equal(await views.getByRole("radio", { name: "Roles", exact: true }).getAttribute("aria-checked"), "true");
+  const rolePanel = side().locator('.role-panel[aria-label="Role implementer"]');
+  await rolePanel.waitFor();
+  assert.equal(await agentPanel.isVisible(), false, "the agent's panel is hidden, not shown beside it");
+  const table = pane.locator(".roles-table");
+  assert.deepEqual(
+    await table.locator("tbody tr").evaluateAll((rows) => rows.map((r) => r.getAttribute("data-role"))),
+    rolesByPreset[DEFAULT].roles.map((r) => r.name),
+  );
+  assert.equal(await table.locator('tr[data-role="implementer"]').getAttribute("data-selected"), "true");
+  assert.ok(rolesServed.includes(DEFAULT));
+
+  // A role no agent acts as: done by hand, and the Lifecycle pane marks its phase.
+  const designer = table.locator('tr[data-role="designer"]');
+  assert.equal(await designer.locator(".role-no-agent").innerText(), "no agent: done by hand");
+  await designer.getByRole("button", { name: "designer", exact: true }).click();
+  await side().locator('.role-panel[aria-label="Role designer"]').waitFor();
+  assert.equal(await lifecycle().locator('.machine-state[data-state="design"]').getAttribute("data-acts"), "true");
+  assert.equal(await lifecycle().locator('.machine-state[data-state="implement"]').getAttribute("data-acts"), null);
+
+  // Another strategy re-reads the roles: under coordinated the coordinator approves designs.
+  const asked = rolesServed.length;
+  await show("coordinated");
+  const deadline = Date.now() + 15_000;
+  while (!rolesServed.slice(asked).includes("coordinated")) {
+    assert.ok(Date.now() < deadline, `the app never asked for coordinated's roles: ${JSON.stringify(rolesServed)}`);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  const coordinator = pane.locator('.roles-table tr[data-role="coordinator"]');
+  await coordinator.locator('.role-toggle[data-on="true"]', { hasText: "approves_design" }).first().waitFor();
+  assert.equal(await coordinator.locator('.role-toggle[data-on="false"]', { hasText: "lands (off in this strategy)" }).count(), 1);
+
+  // Escape closes the role, and the agent's panel comes back.
+  await side().locator(".role-panel h2").focus();
+  await page.keyboard.press("Escape");
+  await side().locator(".role-panel").waitFor({ state: "detached" });
+  await agentPanel.waitFor();
+  await views.getByRole("radio", { name: "Agents", exact: true }).click();
+  await show(DEFAULT);
 });

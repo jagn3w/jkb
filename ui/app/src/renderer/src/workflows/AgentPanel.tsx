@@ -37,21 +37,24 @@ function handoffs(text: string): string[] {
  * and opens a pull request, in the container — offered only for a copy that differs from the
  * packaged text.
  *
- * The permissions shown are both halves: what the role may do in jkb (its op classes, enforced by
- * `jkb serve`) and what the script lets the agent do (where it runs, its model, the most it may
- * change).
+ * The permissions shown here are what the script lets the agent do (where it runs, its model, the
+ * most it may change). What it may do in jkb is its role's, never the agent's own, and depends on the
+ * strategy: the panel links to that role in the Roles view rather than repeating it.
  */
 export function AgentPanel({
   agent,
   roles,
   onSaved,
   onNotice,
+  onOpenRole,
 }: {
   readonly agent: AgentTemplate;
   /** The roles a template may act as, as `workflow.agents` answered them. */
   readonly roles: readonly string[];
   readonly onSaved: (name: string) => void;
   readonly onNotice: (message: string, failed?: boolean) => void;
+  /** Open the role the agent acts as in the Roles view. */
+  readonly onOpenRole: (role: string) => void;
 }): React.JSX.Element {
   const terminals = useTerminals();
   const [draft, setDraft] = useState<AgentDraft>(() => draftOf(agent));
@@ -202,8 +205,11 @@ export function AgentPanel({
             </select>
           </label>
         </div>
-        <p className="muted plan-hint" title="The op classes jkb serve lets this role run (`jkb role matrix`)">
-          In jkb, a {agent.role} may: {agent.role_ops.join(", ") || "nothing"}
+        <p className="muted plan-hint agent-role-link">
+          What it may do in jkb is its role&apos;s:{" "}
+          <button type="button" className="link-button" title="Open this role in the Roles view" onClick={() => onOpenRole(agent.role)}>
+            {agent.role}
+          </button>
         </p>
         <label className="field">
           <span>Hands off to</span>
