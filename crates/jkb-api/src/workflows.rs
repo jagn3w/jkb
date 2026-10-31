@@ -384,6 +384,17 @@ pub struct GraphView {
     /// permissions a phase's actor holds, whether or not an agent template acts as it.
     #[serde(default)]
     pub role_ops: BTreeMap<String, Vec<String>>,
+    /// The strategy an unpinned task runs ([`wf::default_strategy`]): [`DEFAULT_PRESET`] or the
+    /// operator's `default` definition, as `name@version`. Empty from a daemon that predates it.
+    ///
+    /// [`DEFAULT_PRESET`]: jkb_core::workflow::strategy::DEFAULT_PRESET
+    #[serde(default)]
+    pub default: String,
+    /// What this strategy changes from [`Self::default`], one line each
+    /// ([`StrategySpec::changes_from`]); empty when it is the default's spec. A client meeting an
+    /// answer without the field (an older daemon) treats the changes as unknown.
+    #[serde(default)]
+    pub changes_from_default: Vec<String>,
 }
 
 /// What a machine's rows say beyond the table: per event, who may fire it (`None` for an event no
@@ -538,6 +549,7 @@ pub fn graph(
     uid: Option<&str>,
     strategy: Option<&str>,
 ) -> Result<GraphView, ApiError> {
+    let (default, default_spec) = wf::default_strategy(conn)?;
     let (source, spec, task, phase, status): (String, StrategySpec, _, _, _) = match (uid, strategy)
     {
         (Some(_), Some(_)) => {
@@ -565,11 +577,9 @@ pub fn graph(
             let (source, spec) = wf::resolve_strategy(conn, name)?;
             (source, spec, None, None, None)
         }
-        (None, None) => {
-            let (source, spec) = wf::default_strategy(conn)?;
-            (source, spec, None, None, None)
-        }
+        (None, None) => (default.clone(), default_spec.clone(), None, None, None),
     };
+    let changes_from_default = spec.changes_from(&default_spec);
     let workflow = workflow_view(&spec);
     let lifecycle = lifecycle_view(&spec);
     Ok(GraphView {
@@ -595,6 +605,8 @@ pub fn graph(
                 (r.as_str().to_owned(), ops)
             })
             .collect(),
+        default,
+        changes_from_default,
     })
 }
 

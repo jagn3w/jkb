@@ -304,6 +304,49 @@ fn the_graph_is_the_compiled_table_with_the_strategys_permissions() {
     assert_eq!(e.code, ErrorCode::NotFound);
 }
 
+#[test]
+fn the_graph_says_what_its_strategy_changes_from_the_default() {
+    let kb = Kb::new();
+    let graph = |r: Value| match ok(&kb.op, r) {
+        Response::WorkflowGraph { graph } => *graph,
+        other => panic!("{other:?}"),
+    };
+    let autonomous = graph(json!({ "op": "workflow.graph", "strategy": "autonomous" }));
+    assert_eq!(autonomous.default, "design-reviewed");
+    assert_eq!(
+        autonomous.changes_from_default,
+        vec![
+            "graph: direct (default: design-gate)",
+            "lands: operator, coordinator (default: operator)",
+        ]
+    );
+    let wire = serde_json::to_value(&autonomous).unwrap();
+    assert_eq!(wire["default"], "design-reviewed");
+    assert_eq!(
+        wire["changes_from_default"][0],
+        "graph: direct (default: design-gate)"
+    );
+    let default = graph(json!({ "op": "workflow.graph" }));
+    assert_eq!(default.changes_from_default, Vec::<String>::new());
+
+    // The operator's `default` definition is what the diff is taken against.
+    ok(
+        &kb.op,
+        json!({ "op": "workflow.define", "name": "default", "describe": "The coordinator approves.",
+                "spec": { "graph": "design-gate",
+                          "toggles": { "approves_design": ["operator", "coordinator"] } } }),
+    );
+    let reviewed = graph(json!({ "op": "workflow.graph", "strategy": "design-reviewed" }));
+    assert_eq!(reviewed.default, "default@1");
+    assert_eq!(
+        reviewed.changes_from_default,
+        vec!["approves designs: operator (default: operator, coordinator)"]
+    );
+    let default = graph(json!({ "op": "workflow.graph" }));
+    assert_eq!(default.strategy, "default@1");
+    assert_eq!(default.changes_from_default, Vec::<String>::new());
+}
+
 /// The variable that makes [`graph_fixture_matches_presets`] rewrite the fixture instead of failing.
 const WRITE_FIXTURE: &str = "JKB_WRITE_GRAPH_FIXTURE";
 

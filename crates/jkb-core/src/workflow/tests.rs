@@ -2,7 +2,7 @@ use jkb_fsm::{Event as _, Fact, Outcome, Reconciliation, State as _};
 use jkb_rbac::{Decision, Grants as _};
 use jkb_types::TaskStatus;
 
-use super::strategy::{preset, StrategySpec, Toggles, BASE, PRESETS};
+use super::strategy::{preset, AreaScope, StrategySpec, Toggles, BASE, PRESETS, TOGGLES};
 use super::{GraphId, Phase, WorkflowEvent, WorkflowFacts};
 use crate::roles::Role;
 
@@ -166,6 +166,79 @@ fn every_preset_validates_and_design_reviewed_is_the_default() {
     assert_eq!(d.graph, GraphId::DesignGate);
     assert_eq!(d.toggles, Toggles::default());
     assert_eq!(BASE.check(), vec![], "the shared base table is sound");
+}
+
+#[test]
+fn each_preset_says_what_it_changes_from_design_reviewed() {
+    let base = preset("design-reviewed").unwrap();
+    assert_eq!(base.changes_from(&base), Vec::<String>::new());
+    assert_eq!(
+        preset("coordinated").unwrap().changes_from(&base),
+        vec!["approves designs: operator, coordinator (default: operator)"]
+    );
+    assert_eq!(
+        preset("autonomous").unwrap().changes_from(&base),
+        vec![
+            "graph: direct (default: design-gate)",
+            "lands: operator, coordinator (default: operator)",
+        ]
+    );
+    // Against another base, the lines name that base's values as the default.
+    assert_eq!(
+        base.changes_from(&preset("autonomous").unwrap()),
+        vec![
+            "graph: design-gate (default: direct)",
+            "lands: operator (default: operator, coordinator)",
+        ]
+    );
+}
+
+#[test]
+fn a_toggle_change_is_the_roles_it_grants_not_how_the_list_is_written() {
+    let base = preset("design-reviewed").unwrap();
+    let mut same = base.clone();
+    // The operator always holds every toggle, so an empty list grants what `[operator]` does.
+    same.toggles.lands = vec![];
+    assert_eq!(same.changes_from(&base), Vec::<String>::new());
+    let coordinated = preset("coordinated").unwrap();
+    let mut reordered = coordinated.clone();
+    reordered.toggles.approves_design = vec![Role::Coordinator, Role::Operator];
+    assert_eq!(reordered.changes_from(&coordinated), Vec::<String>::new());
+}
+
+#[test]
+fn a_repeated_area_change_says_its_rounds_and_scope() {
+    let base = preset("design-reviewed").unwrap();
+    let mut spec = base.clone();
+    spec.attributes.repeated_area.rounds = 3;
+    spec.attributes.repeated_area.scope = AreaScope::Directory;
+    assert_eq!(
+        spec.changes_from(&base),
+        vec!["must-fixes repeat after 3 rounds in one directory (default: 2 in one file)"]
+    );
+}
+
+/// `changes_from` walks `TOGGLES`, so every toggle is named without anyone adding it there.
+#[test]
+fn every_toggle_has_a_label_and_flipping_it_alone_is_one_change() {
+    let base = preset("design-reviewed").unwrap();
+    for t in TOGGLES {
+        assert!(!t.label.trim().is_empty(), "{} has no label", t.name);
+        let mut spec = base.clone();
+        let flipped: Vec<Role> = if base.toggles.get(t.name).iter().eq(t.domain.iter()) {
+            vec![Role::Operator]
+        } else {
+            t.domain.to_vec()
+        };
+        spec.toggles.set(t.name, flipped).unwrap();
+        let lines = spec.changes_from(&base);
+        assert_eq!(lines.len(), 1, "{}: {lines:?}", t.name);
+        assert!(
+            lines[0].starts_with(&format!("{}: ", t.label)),
+            "{}: {lines:?}",
+            t.name
+        );
+    }
 }
 
 fn allowed(spec: &StrategySpec, role: Role, event: WorkflowEvent) -> bool {

@@ -1,5 +1,10 @@
 {
   "autonomous": {
+    "changes_from_default": [
+      "graph: direct (default: design-gate)",
+      "lands: operator, coordinator (default: operator)"
+    ],
+    "default": "design-reviewed",
     "describe": "A written design goes straight to implementation.",
     "graph": "direct",
     "lifecycle": {
@@ -1193,6 +1198,10 @@
     }
   },
   "coordinated": {
+    "changes_from_default": [
+      "approves designs: operator, coordinator (default: operator)"
+    ],
+    "default": "design-reviewed",
     "describe": "A written design waits for approval before implementation starts.",
     "graph": "design-gate",
     "lifecycle": {
@@ -2384,6 +2393,8 @@
     }
   },
   "design-reviewed": {
+    "changes_from_default": [],
+    "default": "design-reviewed",
     "describe": "A written design waits for approval before implementation starts.",
     "graph": "design-gate",
     "lifecycle": {

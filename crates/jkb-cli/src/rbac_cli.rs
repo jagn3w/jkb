@@ -563,6 +563,7 @@ fn show_graph(
                 graph.status.as_deref().unwrap_or("-")
             );
         }
+        print!("{}", changes_block(&graph));
         for (title, m) in [
             ("workflow", &graph.workflow),
             ("lifecycle", &graph.lifecycle),
@@ -580,6 +581,24 @@ fn show_graph(
         }
     });
     Ok(())
+}
+
+/// The `changes from default:` block of `jkb workflow show --graph`: a line per change, or that the
+/// strategy is the default's; nothing from a daemon that predates the field.
+fn changes_block(graph: &jkb_api::workflows::GraphView) -> String {
+    use std::fmt::Write as _;
+    if graph.default.is_empty() {
+        return String::new();
+    }
+    if graph.changes_from_default.is_empty() {
+        return format!("changes from default ({}): none\n", graph.default);
+    }
+    let mut out = format!("changes from default ({}):\n", graph.default);
+    for line in &graph.changes_from_default {
+        // Writing to a `String` cannot fail.
+        let _ = writeln!(out, "  {line}");
+    }
+    out
 }
 
 fn strategies(b: &dyn Backend) -> Result<(Vec<jkb_api::rbac::StrategyInfo>, String)> {
@@ -1144,8 +1163,9 @@ pub fn attest(cmd: &AttestCmd) {
 #[cfg(test)]
 mod tests {
     use super::{
-        attestation, driven, failure_line, is_blank, pre_tool_use, runs_jkb, shell_commands,
-        workflow, Attestation, Drive, WorkflowCmd, BREAKS, FATAL, HARMLESS, SEPARATORS, UNQUOTABLE,
+        attestation, changes_block, driven, failure_line, is_blank, pre_tool_use, runs_jkb,
+        shell_commands, workflow, Attestation, Drive, WorkflowCmd, BREAKS, FATAL, HARMLESS,
+        SEPARATORS, UNQUOTABLE,
     };
     use jkb_api::{rbac::StrategyInfo, ApiError, Backend, Request, Response};
     use serde_json::{json, Value};
@@ -1210,6 +1230,29 @@ mod tests {
             sent[0]["toggles"]["approves_design"],
             json!(["operator", "coordinator"])
         );
+    }
+
+    /// `jkb workflow show --graph` names what the strategy changes from the default, says when it
+    /// changes nothing, and prints nothing for a daemon that predates the field.
+    #[test]
+    fn show_graph_prints_what_the_strategy_changes_from_the_default() {
+        let db = jkb_core::Db::open_in_memory().unwrap();
+        let graph = |name: &'static str| {
+            db.read_with(move |c| jkb_api::workflows::graph(c, None, Some(name)))
+                .unwrap()
+        };
+        assert_eq!(
+            changes_block(&graph("autonomous")),
+            "changes from default (design-reviewed):\n  graph: direct (default: design-gate)\n  \
+             lands: operator, coordinator (default: operator)\n"
+        );
+        let mut reviewed = graph("design-reviewed");
+        assert_eq!(
+            changes_block(&reviewed),
+            "changes from default (design-reviewed): none\n"
+        );
+        reviewed.default = String::new();
+        assert_eq!(changes_block(&reviewed), "");
     }
 
     /// A line of `attest-hook.log` can be dated: it opens with the RFC 3339 UTC stamp and pid that

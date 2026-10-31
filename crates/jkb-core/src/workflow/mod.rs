@@ -398,10 +398,7 @@ impl WorkflowEvent {
     pub fn describe_guard(self, area: &strategy::RepeatedArea) -> Option<String> {
         let live = "the work has not landed and the task is not cancelled";
         let fresh = "a review round was filed since the work was submitted";
-        let unit = match area.scope {
-            strategy::AreaScope::File => "file",
-            strategy::AreaScope::Directory => "directory",
-        };
+        let unit = area.scope.unit();
         let repeated = format!(
             "the newest {} rounds all flagged must-fixes in the same {unit}",
             area.rounds
