@@ -826,7 +826,7 @@ impl Swarm {
 
     /// `swarm-designer`'s calls, as a `jkb-designer` subagent `agent`: bind, read, write the design
     /// into the task, submit it.
-    fn designer_designs(&self, agent: &str) {
+    fn designer_designs(&self, agent: &str, design: &str) {
         let des = || self.as_agent(Some((agent, "jkb-designer")));
         ok(&des(), json!({ "op": "role.bind", "uid": self.lead }));
         match ok(&des(), json!({ "op": "task.show", "uid": self.lead })) {
@@ -835,8 +835,7 @@ impl Swarm {
         }
         ok(
             &des(),
-            json!({ "op": "task.edit", "uid": self.lead, "text": "Design: the approach",
-                    "append": true }),
+            json!({ "op": "task.edit", "uid": self.lead, "text": design, "append": true }),
         );
         let m = Self::moved(ok(
             &des(),
@@ -846,12 +845,37 @@ impl Swarm {
     }
 
     /// `swarm-coordinator`'s DESIGNING A TASK around the designer: claim, then reopen and release on
-    /// its report.
-    fn coordinator_designs(&self, agent: &str) {
+    /// its report, and tag it PARKED.
+    fn coordinator_designs(&self, agent: &str, design: &str) {
         self.coordinator(json!({ "op": "task.claim", "uid": self.lead, "owner": OWNER }));
-        self.designer_designs(agent);
+        self.designer_designs(agent, design);
         self.coordinator(json!({ "op": "task.set", "uid": self.lead, "status": "open" }));
         self.coordinator(json!({ "op": "task.release", "uid": self.lead, "owner": OWNER }));
+        self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
+                                 "facet_value": format!("swarm-parked={OWNER}"), "mode": "set" }));
+    }
+
+    /// RE-CHECK THE PARKED: a parked lead no longer at `design_review` is untagged for the frontier.
+    fn coordinator_rechecks_parked(&self) {
+        if self.phase() != "design_review" {
+            self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
+                                     "facet_value": format!("swarm-parked={OWNER}"), "mode": "rm" }));
+        }
+    }
+
+    /// Whether the run's frontier query, settled and parked tasks excluded, offers the lead.
+    fn in_frontier(&self) -> bool {
+        let r = self.coordinator(json!({ "op": "task.ready",
+            "dsl": format!("-tag:swarm-settled={OWNER} -tag:swarm-parked={OWNER}"), "limit": 100 }));
+        serde_json::to_string(&r).unwrap().contains(&self.lead)
+    }
+
+    /// The lead's body.
+    fn body(&self) -> String {
+        match ok(&self.kb.op, json!({ "op": "task.show", "uid": self.lead })) {
+            Response::Task { task, .. } => task.item.content.unwrap_or_default(),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The implementer's calls: it reads its task and design, and moves no workflow itself.
@@ -1147,21 +1171,19 @@ fn a_task_the_gate_holds_back_is_designed_parked_and_then_built() {
         why.contains("holds coordinator") && why.contains("allowed: operator, designer"),
         "{why}"
     );
-    s.coordinator_designs("d1");
+    assert!(s.in_frontier());
+    s.coordinator_designs("d1", "Design: the approach");
+    assert!(s.body().contains("Design: the approach"));
     match ok(&s.kb.op, json!({ "op": "task.show", "uid": s.lead })) {
-        Response::Task { task, .. } => {
-            assert!(
-                task.item
-                    .content
-                    .as_deref()
-                    .is_some_and(|c| c.contains("Design: the approach")),
-                "{task:?}"
-            );
-            assert_eq!(task.item.status.as_deref(), Some("open"));
-        }
+        Response::Task { task, .. } => assert_eq!(task.item.status.as_deref(), Some("open")),
         other => panic!("{other:?}"),
     }
     assert_eq!(admission(&s.seen(&s.lead), Gate::On), Some(Path::Parked));
+    // Parked: open and unclaimed, yet kept out of the frontier, so parked tasks never fill its limit;
+    // a re-check while it still awaits approval leaves it out.
+    assert!(!s.in_frontier(), "a parked task is out of the frontier");
+    s.coordinator_rechecks_parked();
+    assert!(!s.in_frontier(), "still awaiting approval");
     // A designer does not approve its own design.
     let refused = Swarm::moved(ok(
         &s.as_agent(Some(("d1", "jkb-designer"))),
@@ -1184,10 +1206,25 @@ fn a_task_the_gate_holds_back_is_designed_parked_and_then_built() {
         last.contains("reject_design") && last.contains("name the files"),
         "{last}"
     );
-    s.coordinator_designs("d2");
+    // The re-check gives it back to the frontier, for a designer whose revision supersedes the
+    // rejected design: the last Design section governs.
+    s.coordinator_rechecks_parked();
+    assert!(s.in_frontier(), "a rejected design is routed again");
+    let revised = "Design (revised; it replaces every earlier Design section above, which was not \
+                   approved): name the files";
+    s.coordinator_designs("d2", revised);
+    let body = s.body();
+    assert!(
+        body.find("Design: the approach").unwrap() < body.find(revised).unwrap(),
+        "{body}"
+    );
+    assert!(!s.in_frontier());
 
-    // Approved: the next frontier builds it on the workflow path, no tag needed.
+    // Approved mid-run: the re-check gives it back, and the next frontier builds it on the workflow
+    // path, no tag needed.
     s.operator_fires("approve_design", None);
+    s.coordinator_rechecks_parked();
+    assert!(s.in_frontier(), "an approved design is built");
     s.start_group();
     s.implementer_works();
     s.coordinator_submits();

@@ -315,19 +315,42 @@ fn the_swarm_designs_what_the_gate_holds_back_and_parks_it_for_approval() {
     ] {
         assert!(designing.contains(step), "DESIGNING A TASK: {step}");
     }
-    // A parked task is never settled, or an approval given mid-run is never built.
+    // A parked task is never settled, or an approval given mid-run is never built; and it is not
+    // "left out", which would settle it.
     let parked = &coord[at("  design_review                 PARKED")..at("  anything else ")];
-    assert!(
-        parked.contains("never") && parked.contains("settle it"),
-        "{parked}"
-    );
-    // The stop rule and the report.
-    assert!(coord.contains("the frontier holds only PARKED tasks, or nothing"));
+    assert!(parked.contains("never claim or settle it"), "{parked}");
+    assert!(coord.contains("A PARKED task is not left out: it is tagged PARKED, never SETTLED."));
+    // ...but it is kept out of the frontier, or parked tasks fill its limit and the stop rule ends
+    // the run with the tasks behind them never read; and re-checked before every read, so an
+    // approval or a rejection given mid-run is routed again.
+    for rule in [
+        "`jkb task tag set <uid>\nswarm-parked={{owner}}`",
+        "`-tag:swarm-parked={{owner}}`",
+        "tag:swarm-parked={{owner}}' --limit 1000",
+        "`jkb task tag rm <uid> swarm-parked={{owner}}`",
+    ] {
+        assert!(coord.contains(rule), "the parked rule: {rule}");
+    }
+    assert!(at("RE-CHECK THE PARKED. ") < at("1. READ THE FRONTIER"));
+    let continuing = &coord[at("\nCONTINUING\n")..at("\nREPORT\n")];
+    assert!(continuing.contains("RE-CHECK THE PARKED and read the frontier again"));
+    // The stop rule: the frontier, parked tasks excluded, is empty after a re-check.
+    assert!(continuing.contains("the frontier, read after a re-check, is empty"));
+    assert!(!coord.contains("holds only PARKED"));
+    // After a compaction the designer's report may be gone: the phase says whether it submitted.
+    assert!(continuing.contains("At `design_review` it was submitted"));
     let report = &coord[at("\nREPORT\n")..];
     assert!(
         report.contains("\"awaiting your design approval\""),
         "{report}"
     );
+    assert!(report.contains("task tagged `swarm-parked={{owner}}`"));
+    // A redesign after a rejection supersedes the rejected one, and the implementer reads the last.
+    assert!(des.contains("it replaces every earlier Design section above"));
+    assert!(get("swarm-implementer")
+        .def
+        .template
+        .contains("the LAST governs"));
     // The coordinator writes no design: the NEVER rule it is not held to by jkb.
     assert!(coord.contains("- Edit code or a task's design"));
 }

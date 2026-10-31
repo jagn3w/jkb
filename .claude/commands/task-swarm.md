@@ -8,8 +8,12 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
 
 - **Designer.** A task at `design` that the run's design gate holds back gets one `jkb-designer`
   subagent, which writes the task's design into it, with its open questions, and fires
-  `submit_design`. The task then waits at `design_review` for your approval: it is *parked*, never
-  built and never settled, so a design you approve during the run is built by a later frontier.
+  `submit_design`. The task then waits at `design_review` for your approval: it is *parked*. A
+  parked task is tagged `swarm-parked=<owner>` and kept out of the frontier, so parked tasks never
+  fill its limit, but never settled: the coordinator re-checks each one's phase before every
+  frontier read, so a design you approve or reject during the run is routed again. A rejected
+  task's revised design is appended under a heading that supersedes the rejected one, and the last
+  Design section governs.
   Its role comes from the operator's agent-type map (`jkb-designer` → `designer`). The coordinator
   cannot submit a design itself: jkb gives it no `submit_design`.
 - **Groups.** The coordinator reads the ready frontier and groups overlapping tasks, at most 4
