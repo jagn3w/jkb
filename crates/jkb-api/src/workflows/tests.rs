@@ -622,10 +622,10 @@ fn a_role_may_land_where_the_strategy_lets_it() {
 }
 
 /// One swarm run's principals on one database: the main session (the container credential's ceiling,
-/// the coordinator), and attested subagents of the types `scripts/setup.sh` maps — `jkb-reviewer` to
-/// the reviewer, `jkb-implementer` to the implementer, `jkb-designer` to the designer (pinned against
-/// the script by
-/// `setup_maps_every_subagent_type_to_its_templates_role` in `jkb-core`).
+/// the coordinator), and attested subagents of exactly the types `scripts/setup.sh` maps, read from
+/// the script ([`setup_role_maps`]), so a worker the script leaves unmapped holds no role here
+/// either. That every packaged subagent type is among them is pinned by
+/// `setup_maps_every_subagent_type_to_its_templates_role` in `jkb-core`.
 struct Swarm {
     kb: Kb,
     hook: LocalBackend,
@@ -683,6 +683,30 @@ fn admission(task: &Seen, gate: Gate) -> Option<Path> {
     }
 }
 
+/// Every `role map <type> <role>` line of `scripts/setup.sh`, as `(type, role)`: the agent types
+/// an installed jkb attests, and the roles they attest as.
+fn setup_role_maps() -> Vec<(String, String)> {
+    let setup = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/setup.sh"),
+    )
+    .unwrap();
+    let maps: Vec<(String, String)> = setup
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| {
+            let mut words = l.split(" role map ").nth(1)?.split_whitespace();
+            let (agent_type, role) = (words.next()?, words.next()?);
+            (!agent_type.starts_with('"') && !role.starts_with('-'))
+                .then(|| (agent_type.to_owned(), role.to_owned()))
+        })
+        .collect();
+    assert!(
+        maps.iter().any(|(t, _)| t == "jkb-implementer"),
+        "no `role map` line read from scripts/setup.sh: {maps:?}"
+    );
+    maps
+}
+
 const OWNER: &str = "box:1";
 const BRANCH: &str = "swarm-task/lead";
 const REPO: &str = "r";
@@ -724,11 +748,7 @@ impl Swarm {
             Response::Added { added } => added.uid,
             other => panic!("{other:?}"),
         };
-        for (agent_type, role) in [
-            ("jkb-reviewer", "reviewer"),
-            ("jkb-implementer", "implementer"),
-            ("jkb-designer", "designer"),
-        ] {
+        for (agent_type, role) in setup_role_maps() {
             ok(
                 &kb.op,
                 json!({ "op": "role.map", "agent_type": agent_type, "role": role }),
@@ -984,6 +1004,21 @@ impl Swarm {
     }
 }
 
+impl Swarm {
+    /// Two rounds with a must-fix in the same file: the lead is at `systemic_review`.
+    fn reach_systemic_review(&self) {
+        self.start_group();
+        self.implementer_works();
+        self.coordinator_submits();
+        self.reviewer_records("r1", 1, Some("src/lib.rs"));
+        assert_eq!(self.coordinator_observes(), "implement");
+        self.implementer_works();
+        self.coordinator_submits();
+        self.reviewer_records("r2", 2, Some("src/lib.rs"));
+        assert_eq!(self.coordinator_observes(), "systemic_review");
+    }
+}
+
 /// The swarm's review loop through the workflow, with exactly the calls the `swarm-coordinator` and
 /// `swarm-reviewer` templates make, each as the principal that makes it: a must-fix round sends the
 /// work back to `implement`, and a second round with must-fixes in the same file goes on to a
@@ -1000,6 +1035,41 @@ fn the_swarm_loop_reaches_a_systemic_review_when_must_fixes_repeat_an_area() {
     s.coordinator_submits();
     s.reviewer_records("r2", 2, Some("src/lib.rs"));
     assert_eq!(s.coordinator_observes(), "systemic_review");
+}
+
+/// A task at `systemic_review` moves only by a systemic reviewer: the coordinator holds no systemic
+/// event (jkb enforces the NEVER rule), nor can it send the work round the loop again, and neither
+/// the implementer nor a fresh reviewer can move it. A swarm without a systemic reviewer stalls here.
+#[test]
+fn a_task_at_systemic_review_moves_only_by_a_systemic_reviewer() {
+    let s = Swarm::new();
+    s.reach_systemic_review();
+    let stays = |b: &LocalBackend, event: &str, reason: Option<&str>| {
+        let m = Swarm::moved(ok(
+            b,
+            json!({ "op": "workflow.fire", "uid": s.lead, "event": event, "reason": reason }),
+        ));
+        assert!(!m.moved && m.phase == "systemic_review", "{event}: {m:?}");
+        m.refusal.unwrap_or_default()
+    };
+    let main = s.as_agent(None);
+    for event in ["submit_systemic", "systemic_redesign"] {
+        let why = stays(&main, event, Some("the coordinator decides"));
+        assert!(why.contains("holds coordinator"), "{event}: {why}");
+    }
+    stays(&main, "submit_work", None);
+    stays(&main, "rework", None);
+    let imp = || s.as_agent(Some(("i1", "jkb-implementer")));
+    ok(&imp(), json!({ "op": "role.bind", "uid": s.lead }));
+    stays(&imp(), "submit_work", None);
+    let rev = || s.as_agent(Some(("r3", "jkb-reviewer")));
+    ok(&rev(), json!({ "op": "role.bind", "uid": s.lead }));
+    stays(&rev(), "submit_systemic", Some("a reviewer decides"));
+    let again = Swarm::moved(s.coordinator(json!({ "op": "workflow.observe", "uid": s.lead })));
+    assert!(
+        !again.moved && again.phase == "systemic_review",
+        "{again:?}"
+    );
 }
 
 /// The same loop, with the second round clean: the work is `landable`. A merge-queue eject then
