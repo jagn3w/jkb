@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 159.ngGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 cca35d2a71086a5b5ea30e8c4ae3eda6027f969f7af1630c507da2432af1dfde) -->
+<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 7ed19f632e4a9845de4ec401e059fdbda5b67e56f0be7f5f76e1388fa6a3d405) -->
 # Agents and roles
 
 jkb is driven by agents as much as by people: a task swarm that schedules, implements, reviews
@@ -870,9 +870,9 @@ There is one phase set: design, `design_review`, implement, review, `systemic_re
 landed, cancelled. Two graphs over it are `jkb-fsm` tables that pass `check()` and an `audit()`
 over every combination of facts. A strategy is a composition (the operator's clarification): a
 graph, permission **toggles** (`approves_design`, `lands`), each bounded by a domain so no toggle
-can hand an operator power to a worker, and **attributes** (`repeated_area`). The presets are
-`design-reviewed` (the default), `coordinated` and `autonomous`; operator definitions are
-versioned. Phases were not folded into `TaskStatus`: the status is the claim and land axis every
+can hand an operator power to a worker, and **attributes** (`repeated_area`). The presets are `design-reviewed` (the default), `coordinated` and `autonomous`; operator
+definitions are versioned, and each version carries the one-sentence description
+`jkb workflow define --describe` requires. Phases were not folded into `TaskStatus`: the status is the claim and land axis every
 frontier and synced checkbox reads, and the workflow is a second axis over it.
 
 ### A task pins its workflow at its first move
@@ -1565,3 +1565,132 @@ the reap scan.
 The reap scan first judged the template directory as a whole, which a single hook symlinked into
 `~/repos` stepped around, and the standing finding it then raised against every repository hid any
 real one behind an unchanged summary. Replaced by judging each template hook where it really is.
+
+## Executions: the operator's view of sessions at work, and the commands they ask for
+
+Code Factory's Executions tab has two jobs. It shows the lifecycle being applied: which sessions
+hold which tasks, how each task has moved through its strategy's phases, and how a plan progresses
+over time. And it is where a session that is blocked by its own permissions asks the operator to
+run one command for it, somewhere the session cannot reach: on the host, or in the container
+outside the agent's sandbox. The operator reads exactly what would run, runs it with a click or
+declines it, and the output goes straight back to the session that asked.
+
+The second job opens a hole in a boundary on purpose. The hooks-off git design holds that the host
+never runs code the container wrote; a run request is the one sanctioned exception, and the
+operator's click is the only thing standing in for that rule. So everything below serves one
+property: **what the operator approves is exactly what runs, and anything that would make them
+differ refuses the run.**
+
+### The timeline is read from facts jkb already records
+
+The tab invents no new record for the first job. It reads the transition log (every phase change,
+with its actor and time), claims (which session holds which task, and since when), review rounds,
+landings and the session registry. It shows them per session (the tasks it holds and the events it
+fired), per task (its path through the strategy's graph, drawn over the same graph the Workflows
+tab draws), and per plan (open, in progress and done over time). A session that has stopped firing
+events while holding claims is shown as stalled, with how long ago its last event was.
+
+### A run request is a typed record, never a shell string
+
+A session asks with `jkb exec request --target host|container --dir <path> -- <argv>…`. An MCP
+tool of the same shape waits until `jkb mcp` can name the session that calls it: today it
+authenticates with a role token, so a request made through it would have no requester to record. The request records:
+
+- the **argv**, as a list, run without a shell. A request that needs a pipeline names `sh -c` and
+  its script as argv explicitly, so the operator sees that a shell is involved;
+- the **directory**, resolved to its real path when the request is made;
+- the **target**: `host`, or `container`, which runs in the dev container through `docker exec`,
+  outside the agent's sandbox but inside the container;
+- the **requester**: the session, its role (from its attested credential) and the task it holds;
+- a **reason**, one sentence the session writes for the operator;
+- the **tree pin** (next section).
+
+Requests are KB-local rows in their own table, written through the writer-actor, so they have a
+changelog and appear in the audit history. They never appear in git. Asking needs a new op class,
+`exec_request`, granted to every role but the operator in the static op table (`OP_GRANTS`),
+not per strategy. Approving, declining and running
+are operator-only: the container holds only a coordinator credential, so no session can approve
+its own request.
+
+### The tree pin: the operator reviews the code that would run, and the run refuses if it changes
+
+Running `./scripts/check.sh` runs everything that script sources, builds and executes, and none of
+that can be enumerated from the argv. So the request pins the directory's whole repository rather
+than single files: a blake3 over every path of its working tree that its committed ignore rules do
+not ignore, each as its path, its kind (file, executable, link target) and its bytes, read from the
+files and never from `.git`. Everything under `.git` is container-written (only `config` and
+`hooks` are bound read-only), so nothing in it is trusted: not the index, refs, objects, excludes or
+attributes. The ignore rules are the tree's own `.gitignore` files, matched by git's own matcher in
+a throwaway repository on both sides. The `HEAD` commit is recorded as a label for the operator and
+trusted for nothing. The tab
+shows the operator:
+
+- the argv, one argument per line, with control characters and invisible characters escaped;
+- the directory and target;
+- the program file, when `argv[0]` is a path inside the repository;
+- the diff from `origin/main` as the host's own clean clone holds it, never the request
+  directory's refs or objects, to the pinned bytes. This is the code the operator is about to run
+  that nobody has reviewed yet. It is rendered on the host from the same walk that computed the
+  pin, over raw bytes with no attribute, filter or diff driver applied, so a `.gitattributes` in
+  the tree cannot hide a file's content from the operator.
+
+When Run is clicked, main recomputes the pin. Any difference refuses the run and the request is
+marked `refused: tree changed`. The session may ask again, and the new request is reviewed fresh.
+So does the review: a request whose pin the host cannot reproduce is refused before its diff is
+shown. The pinned tree's `.gitignore` files must be `origin/main`'s, byte for byte; a request that
+changes the ignore rules is refused, because the files a new rule hides would not be shown. Land
+that change first.
+A host run also runs the hooks-off git audit on the repository first, and a refused audit refuses
+the run. A directory outside any repository gets no tree pin, and the tab says so in place of a
+diff.
+
+The pin does not cover everything a run reads, and this is accepted for now. Files git ignores
+(`target/`, `node_modules/`, build output) are outside it, and `check.sh` runs them. And the
+container can change a file between the pin check and the moment the run reads it. Closing both
+means running from a private host copy of the pinned tree, which costs a cold build per run and
+keeps the run's effects out of the session's directory; revisit that if a request ever needs it. State under `.git` other than the read-only `config` and `hooks` (index, refs, objects, `info/`) is
+not pinned either: a run whose scripts consult git in that repository acts on container-written
+state, which no run today executes. A link's target outside the tree is pinned and shown; the file
+it names is not.
+
+### A run is the Container tab's button, generalized
+
+The run reuses the integrated terminal's existing rules rather than adding a second way to start a
+host program. The renderer names a request id. Main reads the request from jkb, recomputes the pin,
+and builds the terminal spec itself (`issueHost`), so a window cannot turn an approval into a
+different argv. The terminal runs once (no Restart), and one run per request is taken
+synchronously from the click, as `ActionGate` does for the Container tab. The environment is
+`hostEnv`'s fixed environment, not the app's, plus `JKB_EXEC_REQUEST=<id>`. Each run has a
+timeout, shown before Run is clicked.
+
+### Output goes straight to the session
+
+`jkb exec request` waits by default. It subscribes to the request's `mq` topic and prints what
+arrives: the decision, the output streamed as it is produced, and the exit status, which becomes
+its own exit status. Main publishes the run's output to that topic as the terminal shows it, so
+the operator and the session see the same bytes. The row keeps the last 256 KiB and the exit
+status; the full output goes to a log under `~/.jkb/logs`. `--no-wait` returns the request id at
+once, and `jkb exec status <id>` reads the outcome later.
+
+### A request's states
+
+`pending`, then `running` and `finished` (exit status), or `declined` (the operator's note goes to
+the session), `refused` (tree changed, audit refused, or directory gone), or `expired` (the
+requester's session ended, or it went unanswered for two hours). A run times out after 15 minutes unless the request asks
+for longer, up to two hours. A session holding claims with no event for 30 minutes is stalled. A request runs at most once. An
+identical pending request from the same session (same argv, directory, target and pin) folds into
+the existing one instead of queueing twice. Editing a request before running it is not offered:
+the operator declines with a note saying what to ask for instead, so that what ran is always
+exactly what a session asked for.
+
+### Rejected
+
+- **Auto-approval by pattern.** An allowlist of argv shapes that run unattended would bring back,
+  inside jkb, the permission-prompt fatigue this boundary exists to avoid. It would also make the
+  tree pin decorative, because nobody would read the diff. Revisit only with a measurement of how
+  many requests are truly identical.
+- **Pinning only the files the argv names.** Scripts source, build and exec other files, and no
+  static reading of an argv finds them all. Pinning the repository is the only pin that covers
+  what actually runs.
+- **Running in the requesting session's own sandbox with wider permissions.** That widens every
+  later call the session makes, not this one command.
