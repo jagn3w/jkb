@@ -26,14 +26,15 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   (`jkb-reviewer` → `reviewer`), never from a grant the coordinator mints.
 - **Workflow.** The coordinator routes a task by its workflow phase, and admits a group only if
   every task in it is admitted, and never a review finding. A task at `implement`, `review` or
-  `landable` is a *workflow* task. A task still at `design` that the run's design gate let through (the `design=approved` tag, a
-  hand-pick by uid, or `--no-design-gate`) is a *legacy* task: its design was never approved in
-  jkb, so it is built on the legacy path, routed on the reviewer's verdict, and named as legacy in
-  the report. A task at `design` that the gate holds back goes to a designer, and so does one
+  `landable` is a *workflow* task. A task still at `design` that the run's design gate let through
+  (the `design=approved` tag, a hand-pick by uid, or `--no-design-gate`), and whose design was never
+  turned down, is a *legacy* task: its design was never approved in jkb, so it is built on the
+  legacy path, routed on the reviewer's verdict, and named as legacy in the report. A task at `design` that the gate holds back goes to a designer, and so does one
   whose design was turned down (its last workflow move a `reject_design` or `systemic_redesign`),
   whatever the gate, the tag or a hand-pick says. A task at
-  `design_review` is parked, and the report lists it as awaiting your design approval. A task at
-  any other phase is left out and reported. A group never mixes legacy and workflow tasks. The workflow moves through
+  `design_review` is parked, and the report lists it as awaiting your design approval. A task an
+  earlier run left at `systemic_review` goes to a systemic reviewer. A task at any other phase is
+  left out and reported. A group never mixes legacy and workflow tasks. The workflow moves through
   the group's lead (its first task, recorded as `swarm-lead=<lead uid>` on every task of the
   group). For a workflow group, when the implementer reports ready the coordinator reads the lead's
   phase and fires `submit_work` from `implement`, nothing from `review` (already submitted), and
@@ -88,7 +89,9 @@ approved design is not skipped: a designer writes its design, and you approve or
 
 The query DSL cannot test a workflow phase, so the gate is applied by the coordinator's step 1b
 (ROUTE BY PHASE), not by the frontier query. Naming exact uids is a deliberate hand-pick, so
-the tag gate does not apply to them (but see step 3). On every path the swarm leaves out review
+the tag gate does not apply to them (but see step 3). Neither the tag, a hand-pick nor
+`--no-design-gate` builds a task whose design was turned down (its last workflow move a
+`reject_design` or `systemic_redesign`): it always goes to a designer. On every path the swarm leaves out review
 findings (tasks under `repos/<repo>/codereviews/`): no run builds a finding.
 
 ## 2. Preflight
@@ -109,7 +112,8 @@ For each ready task, `jkb workflow show <uid>` gives its phase, and `jkb task sh
 namespace. Route it as the coordinator's step 1b will: a finding is left out; `implement`, `review`
 and `landable` are built; `design` goes to a designer if its last workflow move turned its design
 down (`reject_design` or `systemic_redesign`), is otherwise built when it is tagged, hand-picked, or
-the gate is off, and otherwise goes to a designer; `design_review` is parked; everything else is left out.
+the gate is off, and otherwise goes to a designer; `design_review` is parked; `systemic_review` goes
+to a systemic reviewer; everything else is left out.
 
 Print:
 - the ready tasks, and how many are not yet terminal;
@@ -118,8 +122,11 @@ Print:
   another phase;
 - the parked tasks, awaiting your design approval (`design_review`), one `<uid> — <title>` line
   each: approving them before the run lets it build them;
-- for named uids, any still at `design`, which go on the legacy path;
-- a rough agent count: one designer per task the gate holds back, plus about two per group per
+- for named uids, any still at `design`, which go on the legacy path unless their design was
+  turned down (then they go to a designer);
+- the tasks at `systemic_review`, each of which gets a systemic reviewer;
+- a rough agent count: one designer per task the gate holds back and per task whose design was
+  turned down, one systemic reviewer per task at `systemic_review`, plus about two per group per
   attempt (an implementer and a reviewer), with up to 3 attempts per group, and a systemic reviewer
   for a group whose review keeps failing in one area.
 
@@ -163,10 +170,10 @@ jkb workflow agent show swarm-coordinator \
   Only tasks it returns are yours. The design gate is ON: step 1b builds a task at `design` only if
   it is tagged `design=approved`, and starts a designer for every other task at `design`." With
   `--no-design-gate`, say instead "The design gate is OFF: step 1b builds a task at `design` on the
-  legacy path."
+  legacy path, unless its design was turned down."
 - **uid mode:** "Your tasks are exactly: <uids>. A task is ready when `jkb task show <uid> --json`
   shows it open, unblocked and unclaimed. They are hand-picked: step 1b builds one at `design` on
-  the legacy path."
+  the legacy path, unless its design was turned down."
 
 ## 7. When it is done
 

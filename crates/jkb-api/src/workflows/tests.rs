@@ -644,6 +644,8 @@ enum Path {
     Design,
     /// `design_review`: the operator's. Skipped, and never settled, so an approval is built later.
     Parked,
+    /// `systemic_review`, left by an earlier run: a group of one, straight to a systemic reviewer.
+    Systemic,
 }
 
 /// The run's design gate, as `scope_block` tells the coordinator.
@@ -685,6 +687,7 @@ fn admission(task: &Seen, gate: Gate) -> Option<Path> {
         "design" if task.tagged || gate != Gate::On => Some(Path::Legacy),
         "design" => Some(Path::Design),
         "design_review" => Some(Path::Parked),
+        "systemic_review" => Some(Path::Systemic),
         _ => None,
     }
 }
@@ -1212,6 +1215,85 @@ fn a_systemic_redesign_pauses_the_group_for_a_designer_and_resumes_it_once_appro
     assert_eq!(s.coordinator_observes(), "landable");
 }
 
+/// A task an earlier run left at `systemic_review` — its coordinator stopped mid-review, its claim
+/// released — is offered by the next run's frontier, and step 1b sends it, as a group of one, straight
+/// to a systemic reviewer. With no implementer of this run's, the `submit_systemic` exit starts a new
+/// one on the task's branch, and the work goes round to `landable`.
+#[test]
+fn a_task_an_earlier_run_left_at_systemic_review_is_taken_up_by_the_next() {
+    let s = Swarm::new();
+    s.reach_systemic_review();
+    // The earlier run stops: its claim is released, and nothing settles the task.
+    s.coordinator(json!({ "op": "task.set", "uid": s.lead, "status": "open" }));
+    s.coordinator(json!({ "op": "task.release", "uid": s.lead, "owner": OWNER }));
+    // The next run's frontier offers it, and step 1b routes it to step 4b.
+    assert!(s.in_frontier());
+    for gate in [Gate::On, Gate::Off, Gate::HandPicked] {
+        assert_eq!(
+            admission(&s.seen(&s.lead), gate),
+            Some(Path::Systemic),
+            "{gate:?}"
+        );
+    }
+    s.start_group_on(Path::Systemic);
+    assert!(s.claimed_by(OWNER));
+    // The branch the systemic reviewer reads and the new implementer continues is the task's own.
+    match ok(&s.kb.op, json!({ "op": "task.show", "uid": s.lead })) {
+        Response::Task { task, .. } => assert!(
+            task.item
+                .tags
+                .iter()
+                .any(|t| t.facet == "branch" && t.value == BRANCH),
+            "{:?}",
+            task.item.tags
+        ),
+        other => panic!("{other:?}"),
+    }
+    let cause = "the parser and the renderer each own the escape rules";
+    assert_eq!(
+        s.systemic_reviewer_fires("sr2", "submit_systemic", cause),
+        "implement"
+    );
+    s.coordinator(json!({ "op": "task.set", "uid": s.lead, "status": "in_progress" }));
+    let imp = s.as_agent(Some(("i2", "jkb-implementer")));
+    match ok(&imp, json!({ "op": "task.show", "uid": s.lead })) {
+        Response::Task { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    s.coordinator_submits();
+    s.reviewer_records("r3", 3, None);
+    assert_eq!(s.coordinator_observes(), "landable");
+}
+
+/// A designer that cannot finish tags its task `design-failed=<run owner>` before it reports, as
+/// `swarm-designer` says — a write its role may make on its bound task — so a coordinator that lost
+/// the report to a compaction reads the failure from jkb rather than waiting for it.
+#[test]
+fn a_designer_records_its_failure_on_its_task() {
+    let s = Swarm::at_design();
+    s.coordinator(json!({ "op": "task.claim", "uid": s.lead, "owner": OWNER }));
+    let des = || s.as_agent(Some(("d1", "jkb-designer")));
+    ok(&des(), json!({ "op": "role.bind", "uid": s.lead }));
+    ok(
+        &des(),
+        json!({ "op": "task.tag", "uid": s.lead,
+                "facet_value": format!("design-failed={OWNER}"), "mode": "set" }),
+    );
+    // The compaction rebuild: claimed by the run, no `swarm-lead=`, still at `design`, and tagged.
+    assert_eq!(s.phase(), "design");
+    assert!(s.claimed_by(OWNER));
+    match s.coordinator(json!({ "op": "task.show", "uid": s.lead })) {
+        Response::Task { task, .. } => {
+            let tags = &task.item.tags;
+            assert!(tags
+                .iter()
+                .any(|t| t.facet == "design-failed" && t.value == OWNER));
+            assert!(!tags.iter().any(|t| t.facet == "swarm-lead"));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// The same loop, with the second round clean: the work is `landable`. A merge-queue eject then
 /// reworks it, and the resubmitted work goes round the loop again.
 #[test]
@@ -1260,8 +1342,9 @@ fn a_resubmission_from_landable_reworks_first() {
 
 /// Step 1 admits exactly the phases step 3 can drive — from each WORKFLOW phase the template's calls
 /// reach `review` — and from every phase it leaves out, and from `design`, those calls are refused.
-/// So a task at `design_review` is excluded, a task at `systemic_review` is not rebuilt (and not
-/// landed past its systemic review as a non-lead), and a task at `design` can only go the legacy way.
+/// So a task at `design_review` is excluded, a task at `systemic_review` goes to a systemic reviewer
+/// rather than being rebuilt (or landed past its systemic review as a non-lead), and a task at
+/// `design` can only go the legacy way.
 #[test]
 fn step_one_admits_exactly_the_phases_step_three_can_drive() {
     let refused = |s: &Swarm, event: &str| {
@@ -1292,7 +1375,7 @@ fn step_one_admits_exactly_the_phases_step_three_can_drive() {
                 s.coordinator_submits();
                 assert_eq!(s.phase(), "review", "from {phase}");
             }
-            Some(Path::Legacy | Path::Design | Path::Parked) | None => {
+            Some(Path::Legacy | Path::Design | Path::Parked | Path::Systemic) | None => {
                 assert!([
                     "design",
                     "design_review",

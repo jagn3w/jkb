@@ -174,7 +174,7 @@ fn the_packaged_templates_are_what_the_coordinators_fill() {
     assert_eq!(des.def.permissions.writes, Writes::Kb);
     assert_eq!(
         placeholders(&des.def.template).unwrap(),
-        ["feedback_block", "repo", "task_title", "task_uid"]
+        ["feedback_block", "owner", "repo", "task_title", "task_uid"]
     );
     // The systemic reviewer the coordinator starts when review repeats an area: it records the cause
     // in the task (the KB) and reads the branch in a worktree of its own.
@@ -259,7 +259,8 @@ fn the_swarm_templates_drive_the_workflow() {
         "  implement, review, landable   a WORKFLOW task",
         "  design                        a LEGACY task",
         "  design_review                 PARKED",
-        "  anything else                 left out (systemic_review, landed, cancelled)",
+        "  systemic_review               a SYSTEMIC task",
+        "  anything else                 left out (landed, cancelled)",
     ] {
         assert!(coord.contains(row), "step 1's admission table: {row}");
     }
@@ -451,6 +452,26 @@ fn the_swarm_sends_a_repeated_area_to_a_systemic_reviewer() {
         design_row.contains("`reject_design` or a\n                                `systemic_redesign`, whatever the gate says"),
         "{design_row}"
     );
+    // A task an earlier run left at `systemic_review` is not left out (every later run would settle
+    // it, and the stall would persist): step 1b takes it, as a group of one, straight to step 4b,
+    // whose exits start an implementer on its branch since it has none of this run's.
+    let row = &coord[at("  systemic_review               a SYSTEMIC task")..at("  design_review ")];
+    for rule in [
+        "group of one",
+        "start no implementer",
+        "go straight to step 4b",
+    ] {
+        assert!(row.contains(rule), "step 1b's systemic row: {rule}");
+    }
+    assert!(!coord[at("  anything else ")..]
+        .starts_with("  anything else                 left out (systemic_review"));
+    for rule in [
+        "NO IMPLEMENTER OF YOURS: a SYSTEMIC group never had one in this run",
+        "the branch the lead's `branch=` tag names",
+    ] {
+        assert!(step.contains(rule), "step 4b: {rule}");
+    }
+    assert!(at("NO IMPLEMENTER OF YOURS") < at("- implement (submit_systemic)"));
     // A paused group waits on the operator: it does not hold the run open, and after a compaction
     // its lead's phase or tag names it.
     let continuing = &coord[at("\nCONTINUING\n")..at("\nREPORT\n")];
@@ -467,6 +488,33 @@ fn the_swarm_sends_a_repeated_area_to_a_systemic_reviewer() {
         .def
         .template
         .contains("an earlier one\n   was rejected"));
+}
+
+/// A designer's failure outlives a report a compaction loses: `swarm-designer` tags its task
+/// `design-failed=<run owner>` before it reports failed, the coordinator passes the owner, and the
+/// compaction rebuild reads the tag as a failed designer instead of waiting for a report that already
+/// came. `jkb-api`'s swarm tests make the designer's tag call as the designer.
+#[test]
+fn a_failed_designer_leaves_a_tag_the_rebuild_reads() {
+    let agents = packaged().unwrap();
+    let get = |n: &str| agents.iter().find(|a| a.name == n).unwrap();
+    let des = &get("swarm-designer").def.template;
+    let tag = des
+        .find("`jkb task tag set {{task_uid}}\ndesign-failed={{owner}}`")
+        .expect("the designer tags its failure");
+    assert!(tag > des.find("jkb role bind {{task_uid}}").unwrap());
+    assert!(tag < des.find("RESULT: failed <reason>").unwrap());
+    let coord = &get("swarm-coordinator").def.template;
+    assert!(coord.contains("--var owner={{owner}} --var feedback_block="));
+    let continuing =
+        &coord[coord.find("\nCONTINUING\n").unwrap()..coord.find("\nREPORT\n").unwrap()];
+    assert!(
+        continuing.contains(
+            "Still at `design`\nand tagged `design-failed={{owner}}`, its designer failed."
+        ),
+        "{continuing}"
+    );
+    assert!(continuing.contains("unless the lead is tagged `design-failed={{owner}}`"));
 }
 
 /// CLOSING FINDINGS writes tasks outside SCOPE, so the NEVER rule that keeps the coordinator inside
@@ -550,6 +598,13 @@ fn the_slash_command_leaves_the_design_gate_to_step_one() {
     assert!(md.contains("`jkb-systemic-reviewer`"));
     assert!(md.contains("`systemic_review` goes to a systemic reviewer"));
     assert!(!md.contains("`systemic_review` stops the group"));
+    // A turned-down design goes to a designer on every path, and the slash command says so wherever
+    // it names the legacy path for a hand-pick or an ungated run.
+    assert!(md.contains("Neither the tag, a hand-pick nor\n`--no-design-gate` builds a task whose design was turned down"));
+    assert_eq!(md.matches("unless its design was turned down").count(), 2);
+    assert!(md.contains("go on the legacy path unless their design was\n  turned down"));
+    assert!(md.contains("per task whose design was\n  turned down, one systemic reviewer per task at `systemic_review`"));
+    assert!(md.contains("`systemic_review` goes\nto a systemic reviewer"));
 }
 
 /// The workers' subagent types: rendered from the packaged file, prefixed like everything the
