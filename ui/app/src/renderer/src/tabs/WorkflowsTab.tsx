@@ -24,6 +24,7 @@ import { AgentPanel } from "../workflows/AgentPanel";
 import { LifecyclePane } from "../workflows/LifecyclePane";
 import { MachinePanel } from "../workflows/MachinePanel";
 import { PickerSentences } from "../workflows/PickerSentences";
+import { WorkflowLegend } from "../workflows/WorkflowLegend";
 
 /** The last agent set and agent, per-window conveniences (D53.1): the only state the tab keeps itself. */
 // The key predates the name "agent set" and keeps its old spelling so a remembered pick survives.
@@ -202,6 +203,7 @@ export function WorkflowsTab(): React.JSX.Element {
         </button>
       </header>
       <PickerSentences agentSet={activeAgentSet} agentSetLine={agentSetLine} strategy={pickedStrategy} />
+      <WorkflowLegend graph={graph.kind === "loaded" ? graph.value : undefined} />
       {notice !== undefined && (
         <p className="design-notice" data-kind={notice.failed ? "failed" : undefined} role="status">
           {notice.text}

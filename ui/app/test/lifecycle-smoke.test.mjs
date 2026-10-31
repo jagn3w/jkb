@@ -203,6 +203,22 @@ async function phases() {
   await drawn("workflow", wf.states.map((s) => s.name));
 }
 
+// The legend's second half: jkb's own lines on what the drawn strategy changes from the default.
+test("the legend says the default is the default, and lists what another strategy changes", { skip }, async () => {
+  const legend = page.locator("#pane-workflows").getByRole("region", { name: "Legend", exact: true });
+  await show(DEFAULT);
+  assert.equal(presets[DEFAULT].default, DEFAULT, "the fixture names the default");
+  await legend.locator('[data-changes="default"]').waitFor();
+  assert.equal(await legend.locator('[data-changes="default"]').innerText(), `${DEFAULT} is the default strategy.`);
+  await show("autonomous");
+  const changes = legend.locator('[data-changes="changes"]');
+  await changes.waitFor();
+  assert.equal(await changes.locator("p").innerText(), `What autonomous changes from the default (${DEFAULT}):`);
+  const lines = presets.autonomous.changes_from_default;
+  assert.ok(lines.length > 0, "the fixture's autonomous changes something");
+  assert.deepEqual(await changes.locator("li").allInnerTexts(), lines);
+});
+
 test("there is no transitions table under the graph", { skip }, async () => {
   await phases();
   assert.equal(await lifecycle().locator("table").count(), 0, "no table in the Lifecycle pane");
@@ -258,6 +274,8 @@ test("clicking beside an edge's thin line selects it", { skip }, async () => {
   // A point a few units off the line, where the wide hit stroke and nothing else is under it.
   const at = await page.evaluate(() => {
     const hit = document.querySelector('#pane-workflows .machine-edge-hit[data-edge="implement|submit_work"]');
+    // elementFromPoint sees only what is on screen; the column above the picture scrolls.
+    hit.scrollIntoView({ block: "center", inline: "center" });
     const ctm = hit.getScreenCTM();
     const len = hit.getTotalLength();
     for (let f = 0.1; f <= 0.9; f += 0.05) {

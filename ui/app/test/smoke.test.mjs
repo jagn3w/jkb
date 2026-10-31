@@ -222,6 +222,26 @@ test("the Workflows tab says why it has no agents when the daemon is unreachable
   assert.equal(await pane.getByRole("combobox", { name: "Workflow", exact: true }).count(), 0);
 });
 
+// The Workflows legend: open on first visit, the model's words one per line, and folded by its
+// toggle, which the window remembers. With no daemon there is no graph, so it says nothing about
+// the strategy; that half is pinned with data by lifecycle-smoke.test.mjs.
+test("the Workflows legend defines the terms, and folding it hides them and is remembered", { skip }, async () => {
+  await page.getByRole("tab", { name: "Workflows", exact: true }).click();
+  const legend = page.locator("#pane-workflows").getByRole("region", { name: "Legend", exact: true });
+  const toggle = legend.getByRole("button", { name: "Legend", exact: true });
+  await toggle.waitFor();
+  assert.equal(await toggle.getAttribute("aria-expanded"), "true", "open on first visit");
+  assert.deepEqual(await legend.locator("dt").allInnerTexts(), ["Role", "Agent", "Agent set", "Graph", "Strategy"]);
+  assert.equal(await legend.locator(".workflows-legend-changes").count(), 0, "no graph, so nothing on the strategy");
+  await toggle.click();
+  assert.equal(await toggle.getAttribute("aria-expanded"), "false");
+  assert.equal(await legend.locator("dt").count(), 0, "folded, the terms are hidden");
+  assert.equal(await page.evaluate(() => window.localStorage.getItem("jkb.app.workflows.legend")), "collapsed");
+  await toggle.click();
+  assert.equal(await legend.locator("dt").count(), 5);
+  assert.equal(await page.evaluate(() => window.localStorage.getItem("jkb.app.workflows.legend")), "expanded");
+});
+
 // The Sessions tab (D53.9): with no daemon there is no registry to list and no notification to dot,
 // and the pane says why. The join, the dot's rule, the claude/notify feed, the git-file reader and
 // re-attach are pinned by sessions.test.mjs (app and core); the ops by the jkb-api tests.

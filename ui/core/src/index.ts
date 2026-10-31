@@ -14,6 +14,7 @@ export * from "./threads.js";
 export * from "./plan.js";
 export * from "./prompts.js";
 export * from "./workflows.js";
+export * from "./legend.js";
 export * from "./container.js";
 export * from "./sessions.js";
 export * from "./update.js";

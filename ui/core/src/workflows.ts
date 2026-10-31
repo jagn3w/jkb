@@ -121,6 +121,10 @@ export interface WorkflowGraph {
   readonly lifecycle: MachineTable;
   /** Every role's jkb op classes (`jkb role matrix`); empty from an older jkb. */
   readonly role_ops: Readonly<Record<string, readonly string[]>>;
+  /** The strategy an unpinned task runs; `null` from a daemon that predates it. */
+  readonly default: string | null;
+  /** What this strategy changes from the default, one line each; `null` (unknown) from an older daemon. */
+  readonly changes_from_default: readonly string[] | null;
 }
 
 /** What a save changes: `jkb_api::workflows::AgentEdit`. */
@@ -360,7 +364,9 @@ export function decodeWorkflowGraph(o: Outcome<OpResponse>): Outcome<WorkflowGra
     !isOptString(g["status"]) ||
     !isMachine(g["workflow"]) ||
     !isMachine(g["lifecycle"]) ||
-    !(g["role_ops"] === undefined || (isObject(g["role_ops"]) && Object.values(g["role_ops"]).every(isStrings)))
+    !(g["role_ops"] === undefined || (isObject(g["role_ops"]) && Object.values(g["role_ops"]).every(isStrings))) ||
+    !(g["default"] === undefined || isString(g["default"])) ||
+    !(g["changes_from_default"] === undefined || isStrings(g["changes_from_default"]))
   ) {
     return failed("internal", "jkb serve did not answer with a well-formed `workflow_graph`");
   }
@@ -377,6 +383,11 @@ export function decodeWorkflowGraph(o: Outcome<OpResponse>): Outcome<WorkflowGra
       workflow: normalMachine(g["workflow"]),
       lifecycle: normalMachine(g["lifecycle"]),
       role_ops: (g["role_ops"] as Record<string, string[]> | undefined) ?? {},
+      // Both or neither: a daemon that sends one sends the other, and a default without its diff
+      // (or the reverse) is not an answer the legend can word.
+      ...(isString(g["default"]) && g["default"] !== "" && isStrings(g["changes_from_default"])
+        ? { default: g["default"], changes_from_default: g["changes_from_default"] }
+        : { default: null, changes_from_default: null }),
     },
   };
 }
