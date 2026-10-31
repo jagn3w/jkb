@@ -1563,8 +1563,13 @@ pub struct StrategyInfo {
     pub name: String,
     /// A preset, or an operator definition.
     pub preset: bool,
-    /// One line.
+    /// One sentence on why to choose it. A definition written before descriptions were recorded
+    /// reads `No description recorded (graph: <graph sentence>)`.
     pub describe: String,
+    /// One sentence on its graph ([`jkb_core::workflow::GraphId::describe`]); empty from a daemon
+    /// that predates the field.
+    #[serde(default)]
+    pub graph: String,
     /// Its spec.
     pub spec: serde_json::Value,
     /// When a definition's listed version was defined (RFC 3339, UTC); absent for a preset, and from
@@ -1583,11 +1588,13 @@ pub fn strategies(conn: &Connection) -> Result<(Vec<StrategyInfo>, String), ApiE
     };
     let mut out = Vec::new();
     for p in PRESETS {
+        let spec = (p.spec)();
         out.push(StrategyInfo {
             name: p.name.to_owned(),
             preset: true,
             describe: p.describe.to_owned(),
-            spec: json(&(p.spec)())?,
+            graph: spec.graph.describe().to_owned(),
+            spec: json(&spec)?,
             defined_at: None,
         });
     }
@@ -1596,7 +1603,10 @@ pub fn strategies(conn: &Connection) -> Result<(Vec<StrategyInfo>, String), ApiE
         out.push(StrategyInfo {
             name: format!("{}@{}", d.name, d.version),
             preset: false,
-            describe: spec.graph.describe().to_owned(),
+            describe: d.describe.unwrap_or_else(|| {
+                format!("No description recorded (graph: {})", spec.graph.describe())
+            }),
+            graph: spec.graph.describe().to_owned(),
             spec: json(&spec)?,
             defined_at: Some(d.defined_at),
         });
@@ -1607,15 +1617,17 @@ pub fn strategies(conn: &Connection) -> Result<(Vec<StrategyInfo>, String), ApiE
 /// `workflow.define` (operator).
 ///
 /// # Errors
-/// [`ErrorCode::Invalid`] for a spec that does not parse or validate.
+/// [`ErrorCode::Invalid`] for an empty or over-long description, or a spec that does not parse or
+/// validate.
 pub fn define(
     conn: &Connection,
     meta: &WriteMeta,
     name: &str,
+    describe: &str,
     spec: &serde_json::Value,
 ) -> Result<i64, ApiError> {
     let spec = StrategySpec::from_json(&spec.to_string())?;
-    Ok(wf::define(conn, meta, name, &spec)?)
+    Ok(wf::define(conn, meta, name, describe, &spec)?)
 }
 
 /// `attest.mint`: a ticket for one tool call, carrying what the harness reported. Only the container

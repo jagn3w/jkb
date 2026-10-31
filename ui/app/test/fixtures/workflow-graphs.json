@@ -1,6 +1,6 @@
 {
   "autonomous": {
-    "describe": "design → implement ⇄ review (⇄ systemic review) → landable",
+    "describe": "A written design goes straight to implementation.",
     "graph": "direct",
     "lifecycle": {
       "states": [
@@ -504,6 +504,7 @@
         }
       ]
     },
+    "path": "design → implement ⇄ review (⇄ systemic review) → landable",
     "phase": null,
     "role_ops": {
       "coordinator": [
@@ -1192,7 +1193,7 @@
     }
   },
   "coordinated": {
-    "describe": "design → design review → implement ⇄ review (⇄ systemic review) → landable",
+    "describe": "A written design waits for approval before implementation starts.",
     "graph": "design-gate",
     "lifecycle": {
       "states": [
@@ -1693,6 +1694,7 @@
         }
       ]
     },
+    "path": "design → design review → implement ⇄ review (⇄ systemic review) → landable",
     "phase": null,
     "role_ops": {
       "coordinator": [
@@ -2382,7 +2384,7 @@
     }
   },
   "design-reviewed": {
-    "describe": "design → design review → implement ⇄ review (⇄ systemic review) → landable",
+    "describe": "A written design waits for approval before implementation starts.",
     "graph": "design-gate",
     "lifecycle": {
       "states": [
@@ -2883,6 +2885,7 @@
         }
       ]
     },
+    "path": "design → design review → implement ⇄ review (⇄ systemic review) → landable",
     "phase": null,
     "role_ops": {
       "coordinator": [

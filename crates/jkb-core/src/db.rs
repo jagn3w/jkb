@@ -138,8 +138,9 @@ mod tests {
         // V027 edges.id and namespaces.id AUTOINCREMENT (a freed id is never reissued),
         // V028 drops the unread task_transitions branch index; V029 gives placements and tag
         // applications unreusable ids; V030 records each vector's provenance (content_rev,
-        // chunked_rev, vector_sources); V031 run requests (exec_requests, exec_output).
-        assert_eq!(user_version, 31);
+        // chunked_rev, vector_sources); V031 run requests (exec_requests, exec_output); V032 a
+        // strategy definition's description (workflow_strategies.describe).
+        assert_eq!(user_version, 32);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -305,8 +306,9 @@ mod tests {
             .unwrap();
         // V028 drops the unread task_transitions branch index; V029 gives placements and tag
         // applications unreusable ids; V030 records each vector's provenance (content_rev,
-        // chunked_rev, vector_sources); V031 run requests (exec_requests, exec_output).
-        assert_eq!(user_version, 31);
+        // chunked_rev, vector_sources); V031 run requests (exec_requests, exec_output); V032 a
+        // strategy definition's description (workflow_strategies.describe).
+        assert_eq!(user_version, 32);
         assert_eq!(
             crate::supported_schema_version(),
             user_version,

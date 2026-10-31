@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use super::{
-    copy, export, list, packaged, packaged_base, parse_file, placeholders, render, resolve, set,
-    subagent_definitions, validate_name, versions, write_file, AgentPermissions, Edit, ExportBase,
-    Isolation, Pick, Source, Writes, PACKAGED_JSON,
+    agent_sets, copy, export, list, packaged, packaged_base, parse_file, placeholders, render,
+    resolve, set, subagent_definitions, validate_name, versions, write_file, AgentPermissions,
+    Edit, ExportBase, Isolation, Pick, Source, Writes, PACKAGED_JSON,
 };
 use crate::roles::Role;
 use crate::Db;
@@ -45,6 +45,68 @@ fn the_packaged_file_parses_validates_and_is_in_canonical_form() {
     // Canonical form is what `export` writes, so a contribution's diff is only its own change.
     let file = parse_file(PACKAGED_JSON).unwrap();
     assert_eq!(write_file(&file).unwrap(), PACKAGED_JSON);
+}
+
+/// Every agent set the file names has agents, every agent names a set, and each set is described:
+/// the four defects `parse_file` refuses, each on an otherwise-valid copy of the packaged file.
+#[test]
+fn the_packaged_file_refuses_an_undescribed_empty_duplicate_or_unnamed_agent_set() {
+    let sets: Vec<_> = agent_sets()
+        .unwrap()
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(sets, ["task-swarm", "code-review", "subagents"]);
+    let original: serde_json::Value = serde_json::from_str(PACKAGED_JSON).unwrap();
+    let refused = |change: &dyn Fn(&mut serde_json::Value), why: &str| {
+        let mut v = original.clone();
+        change(&mut v);
+        let e = parse_file(&serde_json::to_string(&v).unwrap())
+            .err()
+            .unwrap_or_else(|| panic!("accepted a file where {why}"))
+            .to_string();
+        assert!(e.contains(why), "{why}: {e}");
+    };
+    refused(
+        &|v| {
+            v["agents"][0]["workflow"] = serde_json::json!("nowhere");
+        },
+        "belongs to agent set `nowhere`, which `agent_sets` does not name",
+    );
+    refused(
+        &|v| {
+            v["agent_sets"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({ "name": "idle", "describe": "Nobody here." }));
+        },
+        "agent set `idle` has no agents",
+    );
+    refused(
+        &|v| {
+            let first = v["agent_sets"][0].clone();
+            v["agent_sets"].as_array_mut().unwrap().push(first);
+        },
+        "names agent set `task-swarm` twice",
+    );
+    refused(
+        &|v| {
+            v["agent_sets"][1]["describe"] = serde_json::json!(" ");
+        },
+        "agent set `code-review`: ",
+    );
+    refused(
+        &|v| {
+            v["agent_sets"][1]["describe"] = serde_json::json!("x".repeat(501));
+        },
+        "a description of 1 to 500 characters",
+    );
+    refused(
+        &|v| {
+            v.as_object_mut().unwrap().remove("agent_sets");
+        },
+        "missing field `agent_sets`",
+    );
 }
 
 #[test]

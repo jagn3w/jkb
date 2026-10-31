@@ -196,9 +196,10 @@ export function LifecyclePane({
           ))}
         </div>
         <span className="spacer" />
-        <span className="muted lifecycle-note" title={graph.describe}>
-          {strategyLabel(graph.strategy)}
+        <span className="muted lifecycle-note" title={graph.path ?? undefined} data-describes="graph">
+          {graph.describe}
         </span>
+        <span className="muted lifecycle-note">{strategyLabel(graph.strategy)}</span>
       </header>
       <div className="pane-body">
         <div className="machine-graph">

@@ -408,6 +408,7 @@ fn samples() -> Vec<Request> {
         },
         Request::WorkflowDefine {
             name: "mine".into(),
+            describe: "Mine.".into(),
             spec: json!({ "graph": "direct" }),
         },
         Request::WorkflowStrategies {},

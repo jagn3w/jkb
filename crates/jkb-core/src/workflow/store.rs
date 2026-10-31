@@ -79,15 +79,18 @@ pub fn repeated(rounds: &[Round], n: u32, scope: AreaScope) -> bool {
 // Strategy definitions
 // -------------------------------------------------------------------------------------------
 
-/// Define (or redefine) the strategy `name` as `spec`, returning its new version. Redefining
-/// appends; a task that pinned an earlier version keeps it.
+/// Define (or redefine) the strategy `name` as `spec`, described by `describe` (one sentence on
+/// why to choose it), returning its new version. Redefining appends; a task that pinned an earlier
+/// version keeps it, and each version keeps its own description.
 ///
 /// # Errors
-/// [`Error::Types`] for a malformed name or an invalid spec, or a database error.
+/// [`Error::Types`] for a malformed name, an empty or over-long description
+/// ([`super::validate_describe`]) or an invalid spec, or a database error.
 pub fn define(
     conn: &Connection,
     _meta: &WriteMeta,
     name: &str,
+    describe: &str,
     spec: &StrategySpec,
 ) -> Result<i64> {
     if name.is_empty()
@@ -106,15 +109,16 @@ pub fn define(
              from it)"
         )));
     }
+    super::validate_describe(describe)?;
     spec.validate()?;
     let version: i64 = conn
         .prepare_cached(
-            "INSERT INTO workflow_strategies (name, version, spec, defined_at)
+            "INSERT INTO workflow_strategies (name, version, spec, defined_at, describe)
              VALUES (?1, (SELECT coalesce(max(version), 0) + 1 FROM workflow_strategies WHERE name = ?1),
-                     ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                     ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3)
              RETURNING version",
         )?
-        .query_row(params![name, spec.to_json()?], |r| r.get(0))?;
+        .query_row(params![name, spec.to_json()?, describe], |r| r.get(0))?;
     Ok(version)
 }
 
@@ -157,6 +161,9 @@ pub struct Definition {
     pub spec: String,
     /// When that version was defined (RFC 3339, UTC).
     pub defined_at: String,
+    /// That version's description; `None` for a version defined before descriptions were recorded
+    /// (V032).
+    pub describe: Option<String>,
 }
 
 /// Every operator definition's newest version, by name.
@@ -165,7 +172,7 @@ pub struct Definition {
 /// A database error.
 pub fn definitions(conn: &Connection) -> Result<Vec<Definition>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT name, version, spec, defined_at FROM workflow_strategies w
+        "SELECT name, version, spec, defined_at, describe FROM workflow_strategies w
          WHERE version = (SELECT max(version) FROM workflow_strategies w2 WHERE w2.name = w.name)
          ORDER BY name",
     )?;
@@ -175,6 +182,7 @@ pub fn definitions(conn: &Connection) -> Result<Vec<Definition>> {
             version: r.get(1)?,
             spec: r.get(2)?,
             defined_at: r.get(3)?,
+            describe: r.get(4)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

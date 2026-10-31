@@ -11,6 +11,7 @@ import {
   agentSetsOf,
   canContribute,
   decodeAgent,
+  agentSetSentence,
   decodeAgents,
   decodeWorkflowGraph,
   draftOf,
@@ -91,6 +92,21 @@ test("agents decode, and a malformed answer is a named failure", () => {
   assert.equal(listed.value.agents[0].matches_packaged, false);
   // The roles are the server's, whatever they are: a role added there is offered here.
   assert.deepEqual(listed.value.roles, ["operator", "auditor"]);
+  // An older daemon sends no agent sets: none, so the tab shows no sentence.
+  assert.deepEqual(listed.value.agent_sets, []);
+  assert.equal(agentSetSentence(listed.value.agent_sets, "task-swarm"), undefined);
+  const sets = [
+    { name: "task-swarm", describe: "A swarm." },
+    { name: "code-review", describe: "A review." },
+  ];
+  const described = decodeAgents(ok({ result: "workflow_agents", agents: [agent()], roles: [], agent_sets: sets }));
+  assert.deepEqual(described.value.agent_sets, sets);
+  assert.equal(agentSetSentence(described.value.agent_sets, "code-review"), "A review.");
+  assert.equal(agentSetSentence(described.value.agent_sets, "subagents"), undefined, "a set the daemon did not describe");
+  assert.equal(agentSetSentence(described.value.agent_sets, undefined), undefined);
+  for (const bad of [{ name: "x" }, [{ name: 1, describe: "d" }], [{ name: "x" }]]) {
+    assert.equal(decodeAgents(ok({ result: "workflow_agents", agents: [agent()], roles: [], agent_sets: bad })).ok, false, JSON.stringify(bad));
+  }
   assert.equal(decodeAgents(ok({ result: "workflow_agents", agents: [agent()] })).ok, false, "no roles");
   assert.equal(decodeAgents(ok({ result: "workflow_agents", agents: [{ name: "x" }], roles: [] })).ok, false);
   assert.equal(decodeAgents(ok({ result: "strategies" })).ok, false);
@@ -317,7 +333,17 @@ test("the graph answer decodes, with absent optionals as null", () => {
   );
   assert.equal(g.ok, true);
   assert.equal(g.value.task, null);
+  assert.equal(g.value.path, null, "an older daemon sends no path");
   assert.equal(g.value.workflow.transitions[3].to, null);
+  const pathed = decodeWorkflowGraph(
+    ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "A sentence.", path: "a → b", workflow: machine, lifecycle: machine } }),
+  );
+  assert.equal(pathed.value.describe, "A sentence.");
+  assert.equal(pathed.value.path, "a → b");
+  assert.equal(
+    decodeWorkflowGraph(ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "d", path: 3, workflow: machine, lifecycle: machine } })).ok,
+    false,
+  );
   assert.equal(g.value.lifecycle.transitions[2].fired_by, "applied", "who fires a row is jkb's word, not redecided here");
   const unlabelled = { ...machine, transitions: machine.transitions.map(({ fired_by: _, ...t }) => t) };
   assert.equal(

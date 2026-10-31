@@ -6321,7 +6321,15 @@ fn the_design_gate_graph_answers_to_its_former_name() {
         .stdout(predicate::eq(dot_new.as_str()));
     for (name, graph) in [("gate-new", "design-gate"), ("gate-old", "reviewed-design")] {
         jkb(&db)
-            .args(["workflow", "define", name, "--graph", graph])
+            .args([
+                "workflow",
+                "define",
+                name,
+                "--graph",
+                graph,
+                "--describe",
+                "A gate.",
+            ])
             .assert()
             .success()
             .stdout(predicate::str::contains(format!("defined {name}@1")));
@@ -6341,6 +6349,50 @@ fn the_design_gate_graph_answers_to_its_former_name() {
             .unwrap_or_else(|| panic!("{name} in {listed}"));
         assert_eq!(s["spec"]["graph"], "design-gate", "{name}");
     }
+}
+
+/// `--describe` is required on `jkb workflow define`, also with `--from` (an altered copy is not
+/// described by its base's sentence): clap refuses the call before anything reaches the daemon. An
+/// empty one reaches it and is refused there. The sentence is what `workflow strategies` lists.
+#[test]
+fn workflow_define_requires_a_description() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    for args in [
+        vec!["workflow", "define", "mine"],
+        vec!["workflow", "define", "mine", "--from", "autonomous"],
+    ] {
+        jkb(&db).args(&args).assert().code(2).stderr(
+            predicate::str::contains("the following required arguments were not provided")
+                .and(predicate::str::contains("--describe")),
+        );
+    }
+    jkb(&db)
+        .args(["workflow", "define", "mine", "--describe", ""])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "a description of 1 to 500 characters",
+        ));
+    jkb(&db)
+        .args([
+            "workflow",
+            "define",
+            "mine",
+            "--from",
+            "autonomous",
+            "--describe",
+            "The coordinator lands without a design review.",
+        ])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["workflow", "strategies"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "mine@1               The coordinator lands without a design review.",
+        ));
 }
 
 /// `jkb workflow show --graph` prints the machines from the compiled tables, for a named strategy or

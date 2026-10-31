@@ -190,7 +190,8 @@ pub const DEFAULT_PRESET: &str = "design-reviewed";
 pub struct Preset {
     /// Its name.
     pub name: &'static str,
-    /// One line.
+    /// One sentence on why to choose it. It does not say which is the default: pickers mark that,
+    /// and an operator's `default` definition replaces [`DEFAULT_PRESET`].
     pub describe: &'static str,
     /// Its spec.
     pub spec: fn() -> StrategySpec,
@@ -200,7 +201,7 @@ pub struct Preset {
 pub const PRESETS: &[Preset] = &[
     Preset {
         name: "design-reviewed",
-        describe: "the operator approves each design and lands (the default)",
+        describe: "The operator approves each design and lands each task.",
         spec: || StrategySpec {
             graph: GraphId::DesignGate,
             toggles: Toggles::default(),
@@ -209,7 +210,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "coordinated",
-        describe: "the coordinator may approve designs; the operator lands",
+        describe: "The coordinator may approve designs; the operator lands each task.",
         spec: || StrategySpec {
             graph: GraphId::DesignGate,
             toggles: Toggles {
@@ -221,7 +222,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "autonomous",
-        describe: "no design review; the coordinator may land",
+        describe: "No design review; the coordinator may land.",
         spec: || StrategySpec {
             graph: GraphId::Direct,
             toggles: Toggles {

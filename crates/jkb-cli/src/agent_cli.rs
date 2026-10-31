@@ -274,7 +274,7 @@ pub fn run(b: &dyn Backend, cmd: AgentCmd, json_out: bool) -> Result<()> {
     match cmd {
         AgentCmd::List => {
             let (agents, roles) = match call(b, Request::WorkflowAgents {})? {
-                Response::WorkflowAgents { agents, roles } => (agents, roles),
+                Response::WorkflowAgents { agents, roles, .. } => (agents, roles),
                 other => bail!("workflow.agents: unexpected answer {other:?}"),
             };
             if json_out {

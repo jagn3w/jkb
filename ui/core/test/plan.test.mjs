@@ -78,6 +78,11 @@ test("a work prompt, the strategies and a task decode", () => {
   const listed = decodeStrategies(ok({ ...strategies, strategies: [...strategies.strategies, defined] }));
   assert.equal(listed.value.strategies[1].defined_at, "2026-10-16T06:50:14.473Z");
   assert.equal(decodeStrategies(ok({ ...strategies, strategies: [{ ...defined, defined_at: 5 }] })).ok, false);
+  // Each strategy carries its graph's sentence; an older daemon sends none.
+  assert.equal(listed.value.strategies[0].graph, undefined);
+  const graphed = decodeStrategies(ok({ ...strategies, strategies: [{ ...defined, graph: "A graph." }] }));
+  assert.equal(graphed.value.strategies[0].graph, "A graph.");
+  assert.equal(decodeStrategies(ok({ ...strategies, strategies: [{ ...defined, graph: 5 }] })).ok, false);
 
   const shown = {
     result: "task",

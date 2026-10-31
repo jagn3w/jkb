@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use jkb_core::workflow::strategy::PRESETS;
+use jkb_core::workflow::GraphId;
 use jkb_core::Db;
 use jkb_rbac::Grants as _;
 use serde_json::json;
@@ -335,7 +337,7 @@ fn strategies_list_presets_then_definitions_and_name_the_default() {
     let kb = Kb::new();
     ok(
         &kb.op,
-        json!({ "op": "workflow.define", "name": "mine",
+        json!({ "op": "workflow.define", "name": "mine", "describe": "The coordinator lands.",
                 "spec": { "graph": "direct", "toggles": { "lands": ["operator", "coordinator"] } } }),
     );
     match ok(&kb.op, json!({ "op": "workflow.strategies" })) {
@@ -358,13 +360,22 @@ fn strategies_list_presets_then_definitions_and_name_the_default() {
                 .unwrap()
                 .get("defined_at")
                 .is_none());
+            // Each carries its own sentence and its graph's, which the Workflows tab shows under
+            // the strategy picker without a second call.
+            assert_eq!(strategies[3].describe, "The coordinator lands.");
+            assert_eq!(strategies[3].graph, GraphId::Direct.describe());
+            assert_eq!(strategies[0].describe, PRESETS[0].describe);
+            assert_eq!(strategies[0].graph, GraphId::DesignGate.describe());
+            let wire = serde_json::to_value(&strategies[3]).unwrap();
+            assert_eq!(wire["describe"], "The coordinator lands.");
+            assert_eq!(wire["graph"], GraphId::Direct.describe());
         }
         other => panic!("{other:?}"),
     }
     // A redefinition is listed once, as its newest version.
     ok(
         &kb.op,
-        json!({ "op": "workflow.define", "name": "mine",
+        json!({ "op": "workflow.define", "name": "mine", "describe": "The operator lands.",
                 "spec": { "graph": "direct", "toggles": { "lands": ["operator"] } } }),
     );
     match ok(&kb.op, json!({ "op": "workflow.strategies" })) {
@@ -372,17 +383,63 @@ fn strategies_list_presets_then_definitions_and_name_the_default() {
             let mine: Vec<_> = strategies.iter().filter(|s| !s.preset).collect();
             assert_eq!(mine.len(), 1);
             assert_eq!(mine[0].name, "mine@2");
+            assert_eq!(mine[0].describe, "The operator lands.");
             assert!(mine[0].defined_at.is_some());
         }
         other => panic!("{other:?}"),
     }
     let e = call(
         &kb.op,
-        json!({ "op": "workflow.define", "name": "bad",
+        json!({ "op": "workflow.define", "name": "bad", "describe": "Bad.",
                 "spec": { "graph": "direct", "toggles": { "lands": ["implementer"] } } }),
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid);
+    // The description is required on the wire and refused empty by the callee.
+    let e = serde_json::from_value::<crate::Request>(
+        json!({ "op": "workflow.define", "name": "bare", "spec": { "graph": "direct" } }),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("describe"), "{e}");
+    let e = call(
+        &kb.op,
+        json!({ "op": "workflow.define", "name": "blank", "describe": "  ",
+                "spec": { "graph": "direct" } }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid);
+    assert!(e.message.contains("description"), "{e:?}");
+}
+
+/// A definition written before descriptions were recorded (V032) has none; it is listed with a
+/// fallback naming its graph's sentence, never with an empty description.
+#[test]
+fn a_definition_without_a_recorded_description_lists_a_fallback() {
+    let kb = Kb::new();
+    kb.db
+        .write_txn("test", |c, _| {
+            c.execute(
+                "INSERT INTO workflow_strategies (name, version, spec, defined_at)
+                 VALUES ('legacy', 1, '{\"graph\":\"direct\"}', 'then')",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    match ok(&kb.op, json!({ "op": "workflow.strategies" })) {
+        Response::Strategies { strategies, .. } => {
+            let legacy = strategies.iter().find(|s| s.name == "legacy@1").unwrap();
+            assert_eq!(
+                legacy.describe,
+                format!(
+                    "No description recorded (graph: {})",
+                    GraphId::Direct.describe()
+                )
+            );
+            assert_eq!(legacy.graph, GraphId::Direct.describe());
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

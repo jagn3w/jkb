@@ -157,6 +157,31 @@ pub fn list(conn: &Connection) -> Result<Vec<AgentView>, ApiError> {
     agents::list(conn)?.iter().map(listed_view).collect()
 }
 
+/// An agent set as `workflow.agents` answers it beside the templates: its name (what templates'
+/// `workflow` field names) and one sentence on what it is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSetView {
+    /// Its name.
+    pub name: String,
+    /// One sentence on what it is for.
+    pub describe: String,
+}
+
+/// Every agent set, in the packaged file's order ([`agents::agent_sets`]).
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] if the compiled-in templates file is malformed, which a test refuses
+/// before it can ship.
+pub fn agent_sets() -> Result<Vec<AgentSetView>, ApiError> {
+    Ok(agents::agent_sets()?
+        .iter()
+        .map(|s| AgentSetView {
+            name: s.name.clone(),
+            describe: s.describe.clone(),
+        })
+        .collect())
+}
+
 /// Every role a template may act as, as stored: what `workflow.agents` answers beside the
 /// templates, so a client offers the roles this jkb knows rather than a copy of the list.
 #[must_use]
@@ -336,8 +361,12 @@ pub struct GraphView {
     pub strategy: String,
     /// Its execution graph.
     pub graph: String,
-    /// One line on the graph.
+    /// One sentence on the graph: why a strategy would run it ([`jkb_core::workflow::GraphId::describe`]).
     pub describe: String,
+    /// The phases it passes through, as one arrow line ([`jkb_core::workflow::GraphId::path`]);
+    /// empty from a daemon that predates the field.
+    #[serde(default)]
+    pub path: String,
     /// The strategy's spec.
     pub spec: serde_json::Value,
     /// The task named, when one was.
@@ -547,6 +576,7 @@ pub fn graph(
         strategy: source,
         graph: spec.graph.as_str().to_owned(),
         describe: spec.graph.describe().to_owned(),
+        path: spec.graph.path().to_owned(),
         spec: serde_json::to_value(&spec)
             .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?,
         task,

@@ -135,6 +135,10 @@ pub enum WorkflowCmd {
     Define {
         /// Its name; `default` makes it the default for tasks with none pinned.
         name: String,
+        /// One sentence on why to choose it. Required, also with `--from`: an altered copy is not
+        /// described by its base's sentence.
+        #[arg(long)]
+        describe: String,
         /// Start from this preset or definition.
         #[arg(long)]
         from: Option<String>,
@@ -455,6 +459,7 @@ pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()>
         }
         WorkflowCmd::Define {
             name,
+            describe,
             from,
             graph,
             approves_design,
@@ -493,6 +498,7 @@ pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()>
                 b,
                 Request::WorkflowDefine {
                     name: name.clone(),
+                    describe,
                     spec,
                 },
             )? {
@@ -1161,6 +1167,7 @@ mod tests {
                         name: jkb_core::workflow::strategy::DEFAULT_PRESET.to_owned(),
                         preset: true,
                         describe: String::new(),
+                        graph: String::new(),
                         spec: json!({ "graph": DAEMONS_GRAPH }),
                         defined_at: None,
                     }],
@@ -1186,6 +1193,7 @@ mod tests {
             &b,
             WorkflowCmd::Define {
                 name: "mine".into(),
+                describe: "Mine.".into(),
                 from: None,
                 graph: None,
                 approves_design: Some("operator,coordinator".into()),

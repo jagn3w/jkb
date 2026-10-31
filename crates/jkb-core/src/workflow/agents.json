@@ -1,4 +1,18 @@
 {
+  "agent_sets": [
+    {
+      "name": "task-swarm",
+      "describe": "A coordinator schedules work-groups, has each built and reviewed on its own branch, and lands them through the merge queue."
+    },
+    {
+      "name": "code-review",
+      "describe": "A coordinator has one change reviewed, by a single reviewer or split by area, and the round filed and recorded."
+    },
+    {
+      "name": "subagents",
+      "describe": "The agent types a coordinator starts its workers as, so each worker's jkb calls act as its own role."
+    }
+  ],
   "agents": [
     {
       "name": "jkb-implementer",

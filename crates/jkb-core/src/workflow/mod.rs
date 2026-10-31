@@ -25,6 +25,25 @@ use jkb_fsm::{
 };
 use jkb_types::TaskStatus;
 
+/// The longest description accepted, in characters: an agent template's, a strategy definition's or
+/// an agent set's.
+pub const MAX_DESCRIBE_CHARS: usize = 500;
+
+/// The one rule a description meets, wherever it is written: non-empty once trimmed, and at most
+/// [`MAX_DESCRIBE_CHARS`] characters. Agent templates, strategy definitions and agent sets all call
+/// it, so the three cannot drift apart.
+///
+/// # Errors
+/// [`crate::Error::Types`] for an empty or over-long description.
+pub fn validate_describe(describe: &str) -> crate::Result<()> {
+    if describe.trim().is_empty() || describe.chars().count() > MAX_DESCRIBE_CHARS {
+        return Err(crate::Error::Types(jkb_types::Error::Validation(format!(
+            "a description of 1 to {MAX_DESCRIBE_CHARS} characters"
+        ))));
+    }
+    Ok(())
+}
+
 /// Where a task's work stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Phase {
@@ -700,9 +719,18 @@ impl GraphId {
             })
     }
 
-    /// One line on what it is.
+    /// One sentence on what it is for: why a strategy would run it.
     #[must_use]
     pub const fn describe(self) -> &'static str {
+        match self {
+            Self::DesignGate => "A written design waits for approval before implementation starts.",
+            Self::Direct => "A written design goes straight to implementation.",
+        }
+    }
+
+    /// The phases it passes through, as one arrow line.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
         match self {
             Self::DesignGate => {
                 "design → design review → implement ⇄ review (⇄ systemic review) → landable"

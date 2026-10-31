@@ -54,10 +54,21 @@ export interface AgentTemplate {
   readonly matches_packaged: boolean;
 }
 
-/** `workflow.agents`' answer: every template, and every role one may act as (this jkb's, never a copy). */
+/** `jkb_api::workflows::AgentSetView`: an agent set and the one sentence on what it is for. */
+export interface AgentSetInfo {
+  readonly name: string;
+  readonly describe: string;
+}
+
+/**
+ * `workflow.agents`' answer: every template, every role one may act as (this jkb's, never a copy),
+ * and the agent sets with their sentences — empty from a daemon that predates them, and then the tab
+ * shows no sentence.
+ */
 export interface AgentList {
   readonly agents: readonly AgentTemplate[];
   readonly roles: readonly string[];
+  readonly agent_sets: readonly AgentSetInfo[];
 }
 
 /** `jkb_api::workflows::GraphState`. */
@@ -99,7 +110,10 @@ export interface MachineTable {
 export interface WorkflowGraph {
   readonly strategy: string;
   readonly graph: string;
+  /** One sentence on the graph: why a strategy runs it. */
   readonly describe: string;
+  /** The phases it passes through, as one arrow line; `null` from a daemon that predates it. */
+  readonly path: string | null;
   readonly task: string | null;
   readonly phase: string | null;
   readonly status: string | null;
@@ -267,10 +281,13 @@ export function decodeAgents(o: Outcome<OpResponse>): Outcome<AgentList> {
   const ours = o.value.result === "workflow_agents";
   const agents = ours ? o.value["agents"] : undefined;
   const roles = ours ? o.value["roles"] : undefined;
-  if (!Array.isArray(agents) || !agents.every(isAgent) || !isStrings(roles)) {
+  const sets = ours ? o.value["agent_sets"] : undefined;
+  const setsOk = sets === undefined || (Array.isArray(sets) && sets.every((s) => isObject(s) && isString(s["name"]) && isString(s["describe"])));
+  if (!Array.isArray(agents) || !agents.every(isAgent) || !isStrings(roles) || !setsOk) {
     return failed("internal", "jkb serve did not answer with well-formed `workflow_agents`");
   }
-  return { ok: true, value: { agents: agents.map(normal), roles } };
+  const agentSets = ((sets ?? []) as AgentSetInfo[]).map(({ name, describe }) => ({ name, describe }));
+  return { ok: true, value: { agents: agents.map(normal), roles, agent_sets: agentSets } };
 }
 
 /** `workflow.agent`'s, `workflow.agent_copy`'s or `workflow.agent_set`'s answer. */
@@ -337,6 +354,7 @@ export function decodeWorkflowGraph(o: Outcome<OpResponse>): Outcome<WorkflowGra
     !isString(g["strategy"]) ||
     !isString(g["graph"]) ||
     !isString(g["describe"]) ||
+    !isOptString(g["path"]) ||
     !isOptString(g["task"]) ||
     !isOptString(g["phase"]) ||
     !isOptString(g["status"]) ||
@@ -352,6 +370,7 @@ export function decodeWorkflowGraph(o: Outcome<OpResponse>): Outcome<WorkflowGra
       strategy: g["strategy"],
       graph: g["graph"],
       describe: g["describe"],
+      path: g["path"] ?? null,
       task: g["task"] ?? null,
       phase: g["phase"] ?? null,
       status: g["status"] ?? null,
@@ -449,6 +468,11 @@ export function layered(
     layers: Math.max(0, ...nodes.map((n) => n.layer + 1)),
     rows: Math.max(0, ...perLayer.values()),
   };
+}
+
+/** The sentence describing agent set `name`, if the daemon sent one. */
+export function agentSetSentence(sets: readonly AgentSetInfo[], name: string | undefined): string | undefined {
+  return name === undefined ? undefined : sets.find((s) => s.name === name)?.describe;
 }
 
 /** The agent sets the templates belong to (each template's `workflow` field), in first-seen order. */

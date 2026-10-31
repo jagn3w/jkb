@@ -465,3 +465,48 @@ fn each_event_names_the_command_that_fires_it() {
         );
     }
 }
+
+/// The compiled-in descriptions — presets, graphs, agent sets and packaged agents — are each one
+/// sentence: a capital first letter, a final full stop, no line break. An operator's own text only
+/// has to pass `validate_describe`.
+#[test]
+fn every_compiled_in_description_is_one_sentence() {
+    let mut all: Vec<(String, &str)> = Vec::new();
+    for p in PRESETS {
+        all.push((format!("preset {}", p.name), p.describe));
+    }
+    for g in GraphId::ALL {
+        all.push((format!("graph {}", g.as_str()), g.describe()));
+    }
+    for s in super::agents::agent_sets().unwrap() {
+        all.push((format!("agent set {}", s.name), &s.describe));
+    }
+    for a in super::agents::packaged().unwrap() {
+        all.push((format!("agent {}", a.name), &a.def.describe));
+    }
+    for (what, d) in all {
+        super::validate_describe(d).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            d.chars().next().is_some_and(char::is_uppercase),
+            "{what} starts lowercase: {d}"
+        );
+        assert!(
+            d.ends_with('.'),
+            "{what} does not end with a full stop: {d}"
+        );
+        assert!(!d.contains('\n'), "{what} spans lines: {d}");
+        assert!(
+            !d.contains("(the default)"),
+            "{what} claims the default: {d}"
+        );
+    }
+}
+
+/// A graph's sentence says why; its path says what. They are different texts.
+#[test]
+fn a_graph_s_sentence_is_not_its_path() {
+    for g in GraphId::ALL {
+        assert!(g.path().contains('→'), "{}", g.as_str());
+        assert!(!g.describe().contains('→'), "{}", g.as_str());
+    }
+}

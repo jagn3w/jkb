@@ -296,6 +296,50 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
   assert.match(html.plan, /data-band="done"/);
 });
 
+// The Workflows tab's sentences: one per picker under the bar, and the graph's in the Lifecycle bar.
+test("each picker's selection and the drawn graph are described in one sentence, and an older daemon's absence hides the line", async () => {
+  const { sentences, lifecycle } = await load(
+    path.join(src, "describe-entry.tsx"),
+    `import { renderToString } from "react-dom/server";
+     import { PickerSentences } from "./workflows/PickerSentences";
+     import { LifecyclePane } from "./workflows/LifecyclePane";
+     export const sentences = (p) => renderToString(<PickerSentences {...p} />);
+     export const lifecycle = (graph) =>
+       renderToString(<LifecyclePane graph={graph} role={undefined} which="workflow" onWhich={() => {}} selected={undefined} onSelect={() => {}} />);`,
+  );
+  const strip = (h) => h.replaceAll("<!-- -->", "");
+  const strategy = { name: "mine@2", preset: false, describe: "The coordinator lands.", graph: "A written design goes straight to implementation." };
+  const both = strip(sentences({ agentSet: "task-swarm", agentSetLine: "A swarm of builders.", strategy }));
+  assert.match(both, /<p class="muted" data-describes="agent-set"><span class="workflows-describe-label">task-swarm<\/span> A swarm of builders\.<\/p>/);
+  assert.match(
+    both,
+    /<p class="muted" data-describes="strategy" title="A written design goes straight to implementation\."><span class="workflows-describe-label">mine · v2<\/span> The coordinator lands\.<\/p>/,
+  );
+  // An older daemon: no agent-set sentence and no graph sentence, so no such line and no tooltip.
+  const older = strip(sentences({ agentSet: "task-swarm", agentSetLine: undefined, strategy: { ...strategy, graph: undefined } }));
+  assert.doesNotMatch(older, /data-describes="agent-set"/);
+  assert.match(older, /data-describes="strategy">/);
+  assert.equal(sentences({ agentSet: "task-swarm", agentSetLine: undefined, strategy: undefined }), "");
+
+  const state = (name, initial = false) => ({ name, initial, settled: false, awaits_input: false, next_role: null, next_step: null });
+  const graph = {
+    strategy: "autonomous",
+    graph: "direct",
+    describe: "A written design goes straight to implementation.",
+    path: "design → implement",
+    task: null,
+    phase: null,
+    status: null,
+    workflow: { states: [state("design", true), state("implement")], transitions: [] },
+    lifecycle: { states: [state("open", true)], transitions: [] },
+    role_ops: {},
+  };
+  const bar = strip(lifecycle(graph));
+  assert.match(bar, /<span class="muted lifecycle-note" title="design → implement" data-describes="graph">A written design goes straight to implementation\.<\/span>/);
+  assert.match(bar, /<span class="muted lifecycle-note">autonomous<\/span>/);
+  assert.match(strip(lifecycle({ ...graph, path: null })), /<span class="muted lifecycle-note" data-describes="graph">/, "no path, no tooltip");
+});
+
 // Which answer may land (the Timeline pane's `asks.ts`), without a window.
 test("asks are numbered per scope, a stale page is dropped, and showing the tab re-reads unless a link shows it", async () => {
   const { ask, latest, newAsks, onLinked, onShown, pageApplies } = await load(path.join(src, "executions", "asks.ts"));

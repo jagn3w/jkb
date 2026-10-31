@@ -844,6 +844,9 @@ pub enum Request {
     WorkflowDefine {
         /// Its name.
         name: String,
+        /// One sentence on why to choose it: required, and refused when empty
+        /// ([`jkb_core::workflow::validate_describe`]).
+        describe: String,
         /// Its spec, as JSON.
         spec: Value,
     },
@@ -2814,6 +2817,10 @@ pub enum Response {
         /// Every role a template may act as, as stored ([`workflows::role_names`]).
         #[serde(default)]
         roles: Vec<String>,
+        /// Every agent set, with its sentence ([`workflows::agent_sets`]); empty from a daemon that
+        /// predates the field.
+        #[serde(default)]
+        agent_sets: Vec<workflows::AgentSetView>,
     },
     /// A `workflow.agent`, `workflow.agent_copy` or `workflow.agent_set`.
     WorkflowAgent {
@@ -4497,8 +4504,14 @@ impl LocalBackend {
                 })?;
                 Response::Applied {}
             }
-            Request::WorkflowDefine { name, spec } => Response::Defined {
-                version: db.write_txn_with(actor, move |c, m| rbac::define(c, m, &name, &spec))?,
+            Request::WorkflowDefine {
+                name,
+                describe,
+                spec,
+            } => Response::Defined {
+                version: db.write_txn_with(actor, move |c, m| {
+                    rbac::define(c, m, &name, &describe, &spec)
+                })?,
             },
             Request::WorkflowStrategies {} => {
                 let (strategies, default) = db.read_with(rbac::strategies)?;
@@ -4515,6 +4528,7 @@ impl LocalBackend {
             Request::WorkflowAgents {} => Response::WorkflowAgents {
                 agents: db.read_with(workflows::list)?,
                 roles: workflows::role_names(),
+                agent_sets: workflows::agent_sets()?,
             },
             Request::WorkflowAgent {
                 name,

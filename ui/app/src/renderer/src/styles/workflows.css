@@ -12,6 +12,21 @@
   min-height: 0;
 }
 
+/* One muted sentence per picker, under the bar: what the selected agent set and strategy are for. */
+.workflows-describe {
+  padding: var(--space-1) var(--space-3) var(--space-2);
+  border-bottom: var(--hairline-width) solid var(--hairline);
+  font-size: var(--text-sm);
+}
+
+.workflows-describe p {
+  margin: 0;
+}
+
+.workflows-describe-label {
+  color: var(--ink);
+}
+
 .workflows-split {
   flex: 1;
   display: grid;

@@ -262,11 +262,11 @@ fn only_the_operator_sets_a_strategy_and_a_task_keeps_the_version_it_pinned() {
     db.write_txn("test", move |c, m| {
         let mut spec = preset("coordinated").unwrap();
         spec.attributes.repeated_area.rounds = 3;
-        define(c, m, "mine", &spec)?;
+        define(c, m, "mine", "A test strategy.", &spec)?;
         set_strategy(c, m, id, "mine", &Actor::operator())?;
         // Redefined after the task pinned it.
         spec.attributes.repeated_area.rounds = 5;
-        define(c, m, "mine", &spec)
+        define(c, m, "mine", "A test strategy.", &spec)
     })
     .unwrap();
     let cur = db.read(move |c| current(c, id)).unwrap();
@@ -283,7 +283,13 @@ fn only_the_operator_sets_a_strategy_and_a_task_keeps_the_version_it_pinned() {
 
     let e = db
         .write_txn("test", |c, m| {
-            define(c, m, "autonomous", &preset("autonomous").unwrap())
+            define(
+                c,
+                m,
+                "autonomous",
+                "A test strategy.",
+                &preset("autonomous").unwrap(),
+            )
         })
         .unwrap_err()
         .to_string();
@@ -295,7 +301,13 @@ fn a_default_definition_replaces_the_default_preset() {
     let db = Db::open_in_memory().unwrap();
     let id = a_task(&db);
     db.write_txn("test", |c, m| {
-        define(c, m, "default", &preset("autonomous").unwrap())
+        define(
+            c,
+            m,
+            "default",
+            "A test strategy.",
+            &preset("autonomous").unwrap(),
+        )
     })
     .unwrap();
     let cur = db.read(move |c| current(c, id)).unwrap();
@@ -481,7 +493,13 @@ fn redefining_default_does_not_move_a_task_that_has_started() {
         Moved::To { .. }
     ));
     db.write_txn("test", |c, m| {
-        define(c, m, "default", &preset("autonomous").unwrap())
+        define(
+            c,
+            m,
+            "default",
+            "A test strategy.",
+            &preset("autonomous").unwrap(),
+        )
     })
     .unwrap();
     let cur = db.read(move |c| current(c, id)).unwrap();
@@ -715,8 +733,10 @@ fn a_stored_spec_naming_the_graph_s_former_name_still_resolves() {
         .unwrap();
     assert_eq!(stored, r#"{"graph":"reviewed-design"}"#);
     // A redefinition writes the new name.
-    db.write_txn("test", move |c, m| define(c, m, "legacy", &spec))
-        .unwrap();
+    db.write_txn("test", move |c, m| {
+        define(c, m, "legacy", "A test strategy.", &spec)
+    })
+    .unwrap();
     let json = db
         .read(super::definitions)
         .unwrap()
@@ -725,4 +745,66 @@ fn a_stored_spec_naming_the_graph_s_former_name_still_resolves() {
         .unwrap()
         .spec;
     assert!(json.contains(r#""graph":"design-gate""#), "{json}");
+}
+
+/// A definition's description: required non-empty and at most `MAX_DESCRIBE_CHARS`, refused before
+/// anything is stored, kept per version, and absent (`None`) on a row written before V032.
+#[test]
+fn a_definition_carries_its_own_description_per_version() {
+    use crate::workflow::MAX_DESCRIBE_CHARS;
+    let db = Db::open_in_memory().unwrap();
+    let spec = preset("coordinated").unwrap();
+    for bad in [
+        String::new(),
+        "   ".to_owned(),
+        "x".repeat(MAX_DESCRIBE_CHARS + 1),
+    ] {
+        let s = spec.clone();
+        let e = db
+            .write_txn("test", move |c, m| define(c, m, "mine", &bad, &s))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("a description of 1 to 500 characters"), "{e}");
+    }
+    assert!(
+        db.read(super::definitions).unwrap().is_empty(),
+        "nothing stored"
+    );
+    let longest = "x".repeat(MAX_DESCRIBE_CHARS);
+    let s = spec.clone();
+    db.write_txn("test", move |c, m| {
+        define(c, m, "mine", "The first sentence.", &s)?;
+        define(c, m, "mine", &longest, &s)
+    })
+    .unwrap();
+    let stored: Vec<Option<String>> = db
+        .read(|c| {
+            let mut st = c.prepare(
+                "SELECT describe FROM workflow_strategies WHERE name = 'mine' ORDER BY version",
+            )?;
+            let rows = st.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+        .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            Some("The first sentence.".to_owned()),
+            Some("x".repeat(MAX_DESCRIBE_CHARS))
+        ]
+    );
+    db.write_txn("test", |c, _| {
+        c.execute(
+            "INSERT INTO workflow_strategies (name, version, spec, defined_at)
+             VALUES ('legacy', 1, '{\"graph\":\"direct\"}', 'then')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let defs = db.read(super::definitions).unwrap();
+    let by = |n: &str| defs.iter().find(|d| d.name == n).unwrap().clone();
+    assert_eq!(by("legacy").describe, None);
+    assert_eq!(by("mine").version, 2);
+    assert_eq!(by("mine").describe, Some("x".repeat(MAX_DESCRIBE_CHARS)));
 }

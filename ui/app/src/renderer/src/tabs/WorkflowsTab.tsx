@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
+  agentSetSentence,
   agentSetsOf,
   decodeAgents,
   decodeStrategies,
@@ -22,6 +23,7 @@ import { AgentGraphView } from "../workflows/AgentGraphView";
 import { AgentPanel } from "../workflows/AgentPanel";
 import { LifecyclePane } from "../workflows/LifecyclePane";
 import { MachinePanel } from "../workflows/MachinePanel";
+import { PickerSentences } from "../workflows/PickerSentences";
 
 /** The last agent set and agent, per-window conveniences (D53.1): the only state the tab keeps itself. */
 // The key predates the name "agent set" and keeps its old spelling so a remembered pick survives.
@@ -113,6 +115,10 @@ export function WorkflowsTab(): React.JSX.Element {
   const roles = agents.kind === "loaded" ? agents.value.roles : [];
   const agentSets = useMemo(() => agentSetsOf(list), [list]);
   const activeAgentSet = agentSet !== undefined && agentSets.includes(agentSet) ? agentSet : agentSets[0];
+  // Each picker's selection, in one sentence: absent from an older daemon, and then not shown.
+  const agentSetLine = agentSetSentence(agents.kind === "loaded" ? agents.value.agent_sets : [], activeAgentSet);
+  const strategyValue = strategy ?? strategies?.default ?? "";
+  const pickedStrategy = strategies?.strategies.find((s) => s.name === strategyValue);
   const agent = list.find((a) => a.name === selected && a.workflow === activeAgentSet);
   const fragments = list.filter((a) => a.workflow === activeAgentSet && a.fragment);
 
@@ -170,7 +176,7 @@ export function WorkflowsTab(): React.JSX.Element {
         <label className="picker">
           <span>Strategy</span>
           <select
-            value={strategy ?? strategies?.default ?? ""}
+            value={strategyValue}
             disabled={strategies === undefined}
             onChange={(e) => setStrategy(e.target.value)}
             aria-label="Strategy"
@@ -195,6 +201,7 @@ export function WorkflowsTab(): React.JSX.Element {
           Refresh
         </button>
       </header>
+      <PickerSentences agentSet={activeAgentSet} agentSetLine={agentSetLine} strategy={pickedStrategy} />
       {notice !== undefined && (
         <p className="design-notice" data-kind={notice.failed ? "failed" : undefined} role="status">
           {notice.text}

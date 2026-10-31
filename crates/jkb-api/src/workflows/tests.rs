@@ -64,10 +64,29 @@ fn agent(r: Response) -> (super::AgentView, Option<String>, bool) {
 fn every_role_reads_templates_and_only_the_operator_writes_them() {
     let kb = Kb::new();
     let coordinator = kb.as_role("coordinator");
-    let (listed, roles) = match ok(&coordinator, json!({ "op": "workflow.agents" })) {
-        Response::WorkflowAgents { agents, roles } => (agents, roles),
+    let (listed, roles, sets) = match ok(&coordinator, json!({ "op": "workflow.agents" })) {
+        Response::WorkflowAgents {
+            agents,
+            roles,
+            agent_sets,
+        } => (agents, roles, agent_sets),
         other => panic!("{other:?}"),
     };
+    // The agent sets come with their sentences, in the packaged file's order, and every template
+    // belongs to one of them.
+    let packaged = jkb_core::workflow::agents::agent_sets().unwrap();
+    assert_eq!(sets.len(), packaged.len());
+    for (s, p) in sets.iter().zip(packaged) {
+        assert_eq!((&s.name, &s.describe), (&p.name, &p.describe));
+    }
+    assert!(listed
+        .iter()
+        .all(|a| sets.iter().any(|s| s.name == a.workflow)));
+    let wire = serde_json::to_value(&sets[0]).unwrap();
+    assert_eq!(
+        wire,
+        json!({ "name": "task-swarm", "describe": packaged[0].describe })
+    );
     // The roles a template may take are this jkb's, so a client never keeps its own list.
     assert_eq!(
         roles,
@@ -198,6 +217,13 @@ fn the_graph_is_the_compiled_table_with_the_strategys_permissions() {
     let g = graph(json!({ "op": "workflow.graph" }));
     assert_eq!(g.strategy, "design-reviewed", "the default");
     assert_eq!(g.graph, "design-gate");
+    // The graph's sentence is `describe`; its phase path moved to `path`, both on the wire.
+    let gate = jkb_core::workflow::GraphId::DesignGate;
+    assert_eq!(g.describe, gate.describe());
+    assert_eq!(g.path, gate.path());
+    let wire = serde_json::to_value(&g).unwrap();
+    assert_eq!(wire["describe"], gate.describe());
+    assert_eq!(wire["path"], gate.path());
     let table = jkb_core::workflow::GraphId::DesignGate.machine().table();
     assert_eq!(g.workflow.transitions.len(), table.transitions.len());
     assert_eq!(g.workflow.states.len(), table.states.len());
@@ -452,7 +478,7 @@ fn each_row_says_what_its_guard_checks_and_how_it_fires() {
     assert!(g.lifecycle.transitions.iter().all(|t| t.command.is_none()));
     // Every role's op classes, the same answer an agent template of that role carries.
     let (agents, roles) = match ok(&kb.op, json!({ "op": "workflow.agents" })) {
-        Response::WorkflowAgents { agents, roles } => (agents, roles),
+        Response::WorkflowAgents { agents, roles, .. } => (agents, roles),
         other => panic!("{other:?}"),
     };
     assert_eq!(g.role_ops.keys().cloned().collect::<Vec<_>>(), {

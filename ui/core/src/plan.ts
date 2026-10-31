@@ -70,7 +70,10 @@ export interface WorkPrompt {
 export interface Strategy {
   readonly name: string;
   readonly preset: boolean;
+  /** One sentence on why to choose it (for a definition written before descriptions, a fallback naming its graph). */
   readonly describe: string;
+  /** One sentence on its graph; absent from an older daemon. */
+  readonly graph?: string | null;
   /** When a definition's listed version was defined; absent for a preset, and from an older daemon. */
   readonly defined_at?: string | null;
 }
@@ -435,6 +438,7 @@ export function decodeStrategies(o: Outcome<OpResponse>): Outcome<Strategies> {
           isString(s["name"]) &&
           typeof s["preset"] === "boolean" &&
           isString(s["describe"]) &&
+          isOptString(s["graph"]) &&
           isOptString(s["defined_at"]),
       ),
   );
