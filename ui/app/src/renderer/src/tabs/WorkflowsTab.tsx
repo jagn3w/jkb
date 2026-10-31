@@ -5,11 +5,15 @@ import {
   decodeAgents,
   decodeStrategies,
   decodeWorkflowGraph,
+  machineDrawing,
   planOps,
+  selectionIn,
   strategyName,
   strategyOption,
   workflowOps,
   type AgentList,
+  type MachineName,
+  type MachineSelection,
   type Strategies,
   type WorkflowGraph,
 } from "@jkb/core";
@@ -17,6 +21,7 @@ import {
 import { AgentGraphView } from "../workflows/AgentGraphView";
 import { AgentPanel } from "../workflows/AgentPanel";
 import { LifecyclePane } from "../workflows/LifecyclePane";
+import { MachinePanel } from "../workflows/MachinePanel";
 
 /** The last agent set and agent, per-window conveniences (D53.1): the only state the tab keeps itself. */
 // The key predates the name "agent set" and keeps its old spelling so a remembered pick survives.
@@ -39,6 +44,11 @@ function remember(key: string, value: string): void {
   }
 }
 
+/** What fills the side panel: the selected agent, or a part of the Lifecycle pane's picture. */
+type Side = { readonly kind: "agent" } | MachineSelection;
+
+const AGENT: Side = { kind: "agent" };
+
 type Loaded<T> =
   | { readonly kind: "loading" }
   | { readonly kind: "loaded"; readonly value: T }
@@ -52,7 +62,9 @@ const op = (request: Parameters<typeof window.jkb.op>[0]) => window.jkb.op(reque
  * side panel: its template and permissions, saved as an operator copy that the script then reads by
  * name, reverted to the packaged text, or contributed back to jkb as a pull request. Below the graph,
  * the Lifecycle pane draws the chosen strategy's machines from their compiled tables, marking where
- * the selected agent's role acts.
+ * the selected agent's role acts. Clicking a state, edge or marker there shows its rows in the side
+ * panel instead (`MachinePanel`); whichever was picked last fills it, and Escape gives it back to
+ * the agent.
  *
  * Re-read on demand (the refresh button, a save, a change of strategy): nothing announces a template
  * edit, and D53.1 rules out a poll loop.
@@ -64,6 +76,8 @@ export function WorkflowsTab(): React.JSX.Element {
   const [graph, setGraph] = useState<Loaded<WorkflowGraph>>({ kind: "loading" });
   const [agentSet, setAgentSet] = useState<string | undefined>(() => remembered(LAST_WORKFLOW_KEY));
   const [selected, setSelected] = useState<string | undefined>(() => remembered(LAST_AGENT_KEY));
+  const [which, setWhich] = useState<MachineName>("workflow");
+  const [side, setSide] = useState<Side>(AGENT);
   const [notice, setNotice] = useState<{ readonly text: string; readonly failed: boolean } | undefined>(undefined);
 
   const loadAgents = useCallback(async () => {
@@ -108,8 +122,27 @@ export function WorkflowsTab(): React.JSX.Element {
   };
   const pick = (name: string): void => {
     setSelected(name);
+    setSide(AGENT);
     remember(LAST_AGENT_KEY, name);
   };
+  // A selection names its machine, so switching machines clears one.
+  const pickMachine = (w: MachineName): void => {
+    setWhich(w);
+    setSide(AGENT);
+  };
+  const onSelectPart = useCallback((sel: MachineSelection | undefined) => setSide(sel ?? AGENT), []);
+
+  // What the machine selection names, if it still exists: a strategy switch can take it away, and
+  // the panel then falls back to the agent.
+  const shown = useMemo((): MachineSelection | undefined => {
+    if (side.kind === "agent" || graph.kind !== "loaded") return undefined;
+    const table = side.machine === "workflow" ? graph.value.workflow : graph.value.lifecycle;
+    return selectionIn(machineDrawing(table), side) ? side : undefined;
+  }, [side, graph]);
+  // ...and is forgotten, so switching back does not bring it back unasked.
+  useEffect(() => {
+    if (side.kind !== "agent" && graph.kind === "loaded" && shown === undefined) setSide(AGENT);
+  }, [side, graph, shown]);
 
   const onNotice = useCallback((text: string, failed = false) => setNotice({ text, failed }), []);
   const onSaved = useCallback(
@@ -201,7 +234,7 @@ export function WorkflowsTab(): React.JSX.Element {
             </div>
           </section>
           {graph.kind === "loaded" ? (
-            <LifecyclePane graph={graph.value} role={agent?.role} />
+            <LifecyclePane graph={graph.value} role={agent?.role} which={which} onWhich={pickMachine} selected={shown} onSelect={onSelectPart} />
           ) : (
             <p className="muted plan-hint lifecycle-pending">
               {graph.kind === "failed" ? `Cannot draw the lifecycle: ${graph.message}` : "Loading the lifecycle…"}
@@ -209,7 +242,15 @@ export function WorkflowsTab(): React.JSX.Element {
           )}
         </div>
         <aside className="workflows-side">
-          {agent !== undefined ? (
+          {shown !== undefined && graph.kind === "loaded" ? (
+            <MachinePanel
+              graph={graph.value}
+              selection={shown}
+              agents={list.filter((a) => a.workflow === activeAgentSet)}
+              onSelect={onSelectPart}
+              onOpenAgent={pick}
+            />
+          ) : agent !== undefined ? (
             <AgentPanel agent={agent} roles={roles} onSaved={onSaved} onNotice={onNotice} />
           ) : (
             <p className="muted plan-hint workflows-pick">Pick an agent in the graph to see its template and permissions.</p>

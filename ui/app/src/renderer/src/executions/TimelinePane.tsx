@@ -1,16 +1,21 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   binPlan,
   binUnitFor,
   decodePlanTimeline,
   knownSource,
+  machineDrawing,
+  selectionIn,
+  takenByRow,
   decodeSessionTimeline,
   decodeTaskTimeline,
   decodeTimelineOverview,
   spanText,
   swimlanes,
   timelineOps,
+  type MachineName,
+  type MachineSelection,
   type PlanTimeline,
   type SessionTimeline,
   type TaskView,
@@ -19,7 +24,8 @@ import {
 } from "@jkb/core";
 
 import { useNavigation, type TimelineScope } from "../navigation";
-import { LifecyclePane } from "../workflows/LifecyclePane";
+import { LifecyclePane, movesOn, type VisitedOverlay } from "../workflows/LifecyclePane";
+import { MachinePanel } from "../workflows/MachinePanel";
 import { ask, latest, newAsks, onLinked, onShown, pageApplies, type ShowState } from "./asks";
 
 const op = (request: Parameters<typeof window.jkb.op>[0]) => window.jkb.op(request);
@@ -469,9 +475,25 @@ export function EventList({ events }: { readonly events: readonly TimelineEvent[
   );
 }
 
-/** One task: its path drawn over its strategy's graph, and its events. */
+/**
+ * One task: its path drawn over its strategy's graph, and its events. A state, edge or marker picked
+ * in the picture opens its rows under it, each with how often the task took it.
+ */
 export function TaskTimelineView({ view }: { readonly view: TaskView }): React.JSX.Element {
   const t = view.timeline;
+  const [which, setWhich] = useState<MachineName>("workflow");
+  const [picked, setPicked] = useState<MachineSelection | undefined>(undefined);
+  const visited: VisitedOverlay = useMemo(() => ({ workflow: t.visited, lifecycle: t.visited_status }), [t]);
+  // Another task's view can take the selection away: then nothing is shown.
+  const shown = useMemo(() => {
+    if (picked === undefined) return undefined;
+    const table = picked.machine === "workflow" ? view.graph.workflow : view.graph.lifecycle;
+    return selectionIn(machineDrawing(table), picked) ? picked : undefined;
+  }, [picked, view.graph]);
+  useEffect(() => {
+    if (picked !== undefined && shown === undefined) setPicked(undefined);
+  }, [picked, shown]);
+  const taken = useMemo(() => (shown === undefined ? undefined : takenByRow(movesOn(visited, shown.machine))), [shown, visited]);
   return (
     <div className="timeline-task">
       <p className="timeline-summary">
@@ -494,7 +516,19 @@ export function TaskTimelineView({ view }: { readonly view: TaskView }): React.J
       {t.visited.length === 0 && t.visited_status.length > 0 && (
         <p className="muted plan-hint">No workflow history: this task predates the workflow log, so only its status path is drawn.</p>
       )}
-      <LifecyclePane graph={view.graph} role={undefined} visited={{ workflow: t.visited, lifecycle: t.visited_status }} />
+      <LifecyclePane
+        graph={view.graph}
+        role={undefined}
+        visited={visited}
+        which={which}
+        onWhich={(w) => {
+          setWhich(w);
+          setPicked(undefined);
+        }}
+        selected={shown}
+        onSelect={setPicked}
+      />
+      {shown !== undefined && <MachinePanel graph={view.graph} selection={shown} taken={taken} onSelect={setPicked} />}
       <EventList events={t.events} />
     </div>
   );

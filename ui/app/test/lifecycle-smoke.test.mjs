@@ -1,7 +1,9 @@
 //! The Lifecycle pane in the built app, in Electron: for both machines of every preset strategy, no
 //! two states overlap, no edge label covers a state or another label, and no marker covers either —
 //! measured on the rendered SVG with the real fonts, where lifecycle-layout.test.mjs checks the
-//! layout's own boxes against an estimate of them.
+//! layout's own boxes against an estimate of them. Then the picture as buttons: a state, an edge or a
+//! marker clicked (or picked from the keyboard) shows its rows in the side panel, and there is no
+//! transitions table.
 //
 // The app talks to a stand-in `jkb serve` on loopback (the daemon-client.test.mjs pattern) that
 // answers `hello`, `workflow.agents`, `plan.strategies`, and `workflow.graph` from
@@ -26,6 +28,28 @@ const skip = smokeSkip();
 const presets = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "fixtures", "workflow-graphs.json"), "utf8"));
 const DEFAULT = "design-reviewed";
 const TOKEN = "lifecycle-smoke-token";
+/** The one agent template the stand-in serves: what a phase's panel links to. */
+const IMPLEMENTER = {
+  name: "swarm-implementer",
+  version: 1,
+  source: "packaged",
+  workflow: "task-swarm",
+  role: "implementer",
+  role_ops: ["read"],
+  fragment: false,
+  describe: "Builds one piece of work.",
+  template: "Build {{what}}.",
+  placeholders: ["what"],
+  permissions: { isolation: "worktree", model: null, writes: "code" },
+  hands_off_to: [],
+  based_on: null,
+  defined_at: null,
+  packaged_version: 1,
+  overrides_packaged: false,
+  behind_packaged: false,
+  packaged_base: 1,
+  matches_packaged: false,
+};
 /** Each strategy whose machines the stand-in answered, in order. */
 const graphsServed = [];
 
@@ -33,7 +57,7 @@ const graphsServed = [];
 function answer(req) {
   switch (req.op) {
     case "workflow.agents":
-      return { result: "workflow_agents", agents: [], roles: [] };
+      return { result: "workflow_agents", agents: [IMPLEMENTER], roles: Object.keys(presets[DEFAULT].role_ops) };
     case "plan.strategies":
       return {
         result: "strategies",
@@ -165,3 +189,134 @@ for (const [strategy, graph] of Object.entries(presets)) {
     });
   }
 }
+
+// ---- the picture as buttons, and the side panel ------------------------------------------------
+
+const lifecycle = () => page.locator("#pane-workflows .lifecycle-pane");
+const side = () => page.locator("#pane-workflows .workflows-side");
+const wf = presets[DEFAULT].workflow;
+const row = (from, event) => wf.transitions.find((t) => t.from === from && t.event === event);
+
+/** The default strategy's phases, drawn. */
+async function phases() {
+  await show(DEFAULT);
+  await drawn("workflow", wf.states.map((s) => s.name));
+}
+
+test("there is no transitions table under the graph", { skip }, async () => {
+  await phases();
+  assert.equal(await lifecycle().locator("table").count(), 0, "no table in the Lifecycle pane");
+  assert.equal(await page.locator("#pane-workflows .machine-table").count(), 0);
+  // Every state, drawn edge and marker is a button instead.
+  const buttons = lifecycle().locator("svg [role=button]");
+  const marked = (await lifecycle().locator("svg .machine-marker").count()) + (await lifecycle().locator("svg .machine-edge").count());
+  assert.equal(await buttons.count(), wf.states.length + marked);
+});
+
+test("clicking a state shows its next step and its undrawn override", { skip }, async () => {
+  await phases();
+  const implement = wf.states.find((s) => s.name === "implement");
+  await lifecycle().getByRole("button", { name: "state implement", exact: true }).click();
+  const panel = side().locator(".machine-panel");
+  await panel.waitFor();
+  assert.equal(await panel.getAttribute("aria-label"), "State implement");
+  assert.equal(await lifecycle().locator('.machine-state[data-state="implement"]').getAttribute("data-selected"), "true");
+  const text = await panel.innerText();
+  assert.ok(text.includes(implement.next_step), `the next step, with <uid> as sent: ${text}`);
+  assert.ok(text.includes(implement.next_role));
+  const undrawn = panel.getByRole("region", { name: "Not drawn" });
+  const override = await undrawn.innerText();
+  assert.ok(override.includes("implement --override--> (stated)"), override);
+  assert.ok(override.includes("the operator names the destination"), override);
+  // Who acts there: the role's op classes, as jkb answered them, and its agent template.
+  assert.ok(text.includes(presets[DEFAULT].role_ops.implementer.join(", ")), text);
+  assert.ok(await panel.getByRole("button", { name: IMPLEMENTER.name, exact: true }).isVisible());
+});
+
+test("clicking an edge label shows who fires it", { skip }, async () => {
+  await phases();
+  const approve = row("design_review", "approve_design");
+  await lifecycle().locator('.machine-edge[aria-label="design_review --approve_design--> implement"] .graph-edge-label').click();
+  const panel = side().locator(".machine-panel");
+  await panel.waitFor();
+  assert.equal(await panel.getAttribute("aria-label"), "design_review --approve_design--> implement");
+  const facts = await panel.locator(".machine-facts").innerText();
+  assert.match(facts, new RegExp(`fired by\\s+${approve.fired_by}`), facts);
+  assert.ok(facts.includes(approve.command), facts);
+  // A guarded observation's guard is in jkb's words, and it is fired by observing.
+  const repeated = row("review", "review_repeated");
+  await lifecycle().locator('.machine-edge[aria-label="review --review_repeated--> systemic_review"] .graph-edge-label').click();
+  await page.waitForFunction(() => document.querySelector("#pane-workflows .machine-panel")?.getAttribute("aria-label") === "review --review_repeated--> systemic_review");
+  const guarded = await side().locator(".machine-facts").innerText();
+  assert.ok(guarded.includes(repeated.guard), guarded);
+  assert.ok(guarded.includes("jkb workflow observe <uid>"), guarded);
+});
+
+test("clicking beside an edge's thin line selects it", { skip }, async () => {
+  await phases();
+  const label = "implement --submit_work--> review";
+  // A point a few units off the line, where the wide hit stroke and nothing else is under it.
+  const at = await page.evaluate(() => {
+    const hit = document.querySelector('#pane-workflows .machine-edge-hit[data-edge="implement|submit_work"]');
+    const ctm = hit.getScreenCTM();
+    const len = hit.getTotalLength();
+    for (let f = 0.1; f <= 0.9; f += 0.05) {
+      const p = hit.getPointAtLength(len * f);
+      const q = hit.getPointAtLength(len * f + 1);
+      const n = Math.hypot(q.x - p.x, q.y - p.y) || 1;
+      const off = { x: p.x - ((q.y - p.y) / n) * 4, y: p.y + ((q.x - p.x) / n) * 4 };
+      const x = ctm.a * off.x + ctm.c * off.y + ctm.e;
+      const y = ctm.b * off.x + ctm.d * off.y + ctm.f;
+      if (document.elementFromPoint(x, y) === hit) return { x, y };
+    }
+    return null;
+  });
+  assert.ok(at !== null, "some point beside the line hits the edge's wide stroke");
+  await page.mouse.click(at.x, at.y);
+  await page.waitForFunction((label) => document.querySelector("#pane-workflows .machine-panel")?.getAttribute("aria-label") === label, label);
+});
+
+test("clicking the landed marker lists one row per phase", { skip }, async () => {
+  await phases();
+  const into = wf.transitions.filter((t) => t.reconciled && t.event === "observed_landed" && t.to === "landed");
+  assert.ok(into.length >= 2, "the fixture folds observed_landed into a marker");
+  await lifecycle().getByRole("button", { name: `observed ×${new Set(into.map((t) => t.from)).size} into landed`, exact: true }).click();
+  const panel = side().locator(".machine-panel");
+  await panel.waitFor();
+  const rows = panel.getByRole("region", { name: "observed_landed" }).locator(".machine-row");
+  assert.equal(await rows.count(), into.length);
+  assert.deepEqual(await rows.locator("button").allInnerTexts(), into.map((t) => t.from));
+  assert.ok((await panel.innerText()).includes(into[0].guard), "the observation's guard, in jkb's words");
+  // A source is a link to its state.
+  await rows.locator("button", { hasText: into[0].from }).click();
+  await page.waitForFunction((name) => document.querySelector("#pane-workflows .machine-panel")?.getAttribute("aria-label") === `State ${name}`, into[0].from);
+});
+
+test("Escape returns to the agent panel", { skip }, async () => {
+  await phases();
+  // The keyboard path: focus a state, pick it with Enter, then Escape.
+  const review = lifecycle().getByRole("button", { name: "state review", exact: true });
+  await review.focus();
+  await page.keyboard.press("Enter");
+  await side().locator('.machine-panel[aria-label="State review"]').waitFor();
+  await page.keyboard.press("Escape");
+  await side().locator(".machine-panel").waitFor({ state: "detached" });
+  assert.equal(await lifecycle().locator('.machine-state[data-selected="true"]').count(), 0);
+  assert.ok(await side().locator(".workflows-pick").isVisible(), "no agent is picked yet: the panel asks for one");
+  // Space picks too; switching machines clears a machine selection.
+  await review.focus();
+  await page.keyboard.press("Space");
+  await side().locator('.machine-panel[aria-label="State review"]').waitFor();
+  await lifecycle().getByRole("radio", { name: "Task status" }).click();
+  await side().locator(".machine-panel").waitFor({ state: "detached" });
+});
+
+test("a phase's agent template opens in the agent panel", { skip }, async () => {
+  await phases();
+  await lifecycle().getByRole("button", { name: "state implement", exact: true }).click();
+  await side().locator(".machine-panel").getByRole("button", { name: IMPLEMENTER.name, exact: true }).click();
+  await side().locator(`.agent-panel[aria-label="Agent ${IMPLEMENTER.name}"]`).waitFor();
+  assert.equal(await side().locator(".machine-panel").count(), 0);
+  // The selected agent's role still marks the states where it acts.
+  assert.equal(await lifecycle().locator('.machine-state[data-state="implement"]').getAttribute("data-acts"), "true");
+});

@@ -1,6 +1,18 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 
-import { machineDrawing, STATED, strategyLabel, type GraphEdge, type MachineTable, type VisitedEdge, type WorkflowGraph } from "@jkb/core";
+import {
+  machineDrawing,
+  rowKey,
+  sameSelection,
+  STATED,
+  strategyLabel,
+  takenByRow,
+  type GraphEdge,
+  type MachineName,
+  type MachineSelection,
+  type VisitedEdge,
+  type WorkflowGraph,
+} from "@jkb/core";
 
 import { estimate, machineGeometry, markerText, nodeMeta, type Font, type Measure, type Point } from "./machineGeometry";
 
@@ -54,22 +66,27 @@ function pageMeasure(): Measure {
   };
 }
 
-type Which = "workflow" | "lifecycle";
-
-/** Who fires a transition, as the table says: the strategy's roles, or an observation's guard. */
-/** Who fires a row, as jkb words it (`workflow.graph`'s `fired_by`): the CLI prints the same. */
-function firedBy(t: MachineTable["transitions"][number]): string {
-  return t.fired_by;
-}
-
 /** The edges a task's history took, per machine: `timeline.task`'s `visited` and `visited_status`. */
 export interface VisitedOverlay {
   readonly workflow: readonly VisitedEdge[];
   readonly lifecycle: readonly VisitedEdge[];
 }
 
-/** A row's key, as the table keys rows: the state it applies in and the event it answers. */
-const rowKey = (from: string, event: string): string => `${from}\u0000${event}`;
+/** The moves of `visited` on machine `which`; none without an overlay. */
+export function movesOn(visited: VisitedOverlay | undefined, which: MachineName): readonly VisitedEdge[] {
+  return visited === undefined ? [] : which === "workflow" ? visited.workflow : visited.lifecycle;
+}
+
+/** Enter or Space on a focused part of the picture picks it, as a click does. */
+function pressed(e: React.KeyboardEvent, pick: () => void): void {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    pick();
+  }
+}
+
+/** An edge as its button is announced: `review --review_failed--> implement`. */
+export const edgeLabel = (t: GraphEdge): string => `${t.from} --${t.event}--> ${t.to ?? STATED}`;
 
 /**
  * The Lifecycle pane (D53.7): the task's state machines drawn from the compiled `jkb-fsm` tables
@@ -79,8 +96,11 @@ const rowKey = (from: string, event: string): string => `${from}\u0000${event}`;
  * so no label sits on a node or another label. Observations are dashed. One observation reaching a
  * state from several states (`observed_landed` from every live phase) is one dashed `observed ×N`
  * pill above that state, not an arrow per phase (`machineDrawing`). Self-loops and the operator's
- * override, which every live state has, are listed under the picture rather than drawn into it,
- * with every other row: the list is the whole table.
+ * override, which every live state has, are not drawn: they are in their state's panel.
+ *
+ * Every state, edge and marker is a button: clicking one, or Enter or Space on it, selects it
+ * (`onSelect`), and its host shows the selection's rows in a `MachinePanel`; Escape clears it.
+ * `which` and the selection are the host's, because a selection names its machine.
  *
  * `role` highlights the states where that role acts next — the selected agent's place in the
  * strategy. `visited`, from the Executions tab, draws one task's path over the same table: each
@@ -93,23 +113,23 @@ export function LifecyclePane({
   graph,
   role,
   visited,
+  which,
+  onWhich,
+  selected,
+  onSelect,
 }: {
   readonly graph: WorkflowGraph;
   readonly role: string | undefined;
   readonly visited?: VisitedOverlay;
+  readonly which: MachineName;
+  readonly onWhich: (which: MachineName) => void;
+  readonly selected: MachineSelection | undefined;
+  readonly onSelect: (sel: MachineSelection | undefined) => void;
 }): React.JSX.Element {
-  const [which, setWhich] = useState<Which>("workflow");
   const machine = which === "workflow" ? graph.workflow : graph.lifecycle;
-  const moves = useMemo(
-    () => (visited === undefined ? [] : which === "workflow" ? visited.workflow : visited.lifecycle),
-    [visited, which],
-  );
+  const moves = useMemo(() => movesOn(visited, which), [visited, which]);
   // Per row, how often it was taken: an override is one row with several destinations, so summed.
-  const taken = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const v of moves) counts.set(rowKey(v.from, v.event), (counts.get(rowKey(v.from, v.event)) ?? 0) + v.count);
-    return counts;
-  }, [moves]);
+  const taken = useMemo(() => takenByRow(moves), [moves]);
   const stood = useMemo(() => new Set(moves.flatMap((v) => [v.from, v.to])), [moves]);
   const offTable = useMemo(
     () => moves.filter((v) => !machine.transitions.some((t) => t.from === v.from && t.event === v.event)),
@@ -131,7 +151,13 @@ export function LifecyclePane({
   const { width, height } = geometry;
 
   return (
-    <section className="lifecycle-pane" aria-label="Lifecycle">
+    <section
+      className="lifecycle-pane"
+      aria-label="Lifecycle"
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && selected !== undefined) onSelect(undefined);
+      }}
+    >
       <header className="pane-bar">
         <h2>Lifecycle</h2>
         <div className="segmented" role="radiogroup" aria-label="Machine">
@@ -143,7 +169,7 @@ export function LifecyclePane({
               aria-checked={which === w}
               className="bar-button"
               data-active={which === w ? "true" : undefined}
-              onClick={() => setWhich(w)}
+              onClick={() => onWhich(w)}
             >
               {w === "workflow" ? `Phases · ${graph.graph} graph` : "Task status"}
             </button>
@@ -156,16 +182,31 @@ export function LifecyclePane({
       </header>
       <div className="pane-body">
         <div className="machine-graph">
-          <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`The ${which} state machine`}>
+          <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} role="group" aria-label={`The ${which} state machine`}>
             <defs>
               <marker id="machine-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
                 <path d="M0,0 L8,4 L0,8 z" className="graph-arrowhead" />
               </marker>
             </defs>
+            {/* A thin arrow is a hard target: a wide transparent stroke along each takes its clicks.
+                They are a layer under every edge, so no edge's stroke covers another's label. */}
+            <g className="machine-edge-hits" aria-hidden="true">
+              {geometry.edges.map((e) => (
+                <path
+                  key={e.key}
+                  d={pathThrough(e.points)}
+                  className="machine-edge-hit"
+                  data-edge={e.key}
+                  onClick={() => onSelect({ kind: "edge", machine: which, from: e.row.from, event: e.row.event })}
+                />
+              ))}
+            </g>
             {geometry.edges.map((e) => {
               const t = e.row;
               const went = taken.get(rowKey(t.from, t.event));
               const l = e.label;
+              const part: MachineSelection = { kind: "edge", machine: which, from: t.from, event: t.event };
+              const pick = (): void => onSelect(part);
               return (
                 <g
                   key={e.key}
@@ -173,12 +214,18 @@ export function LifecyclePane({
                   data-reconciled={t.reconciled ? "true" : undefined}
                   data-visited={went !== undefined ? "true" : undefined}
                   data-back={e.back ? "true" : undefined}
+                  data-selected={sameSelection(selected, part) ? "true" : undefined}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={edgeLabel(t)}
+                  onClick={pick}
+                  onKeyDown={(k) => pressed(k, pick)}
                 >
                   <path d={pathThrough(e.points)} className="graph-edge" markerEnd="url(#machine-arrow)" />
                   <text x={l.x + l.w / 2} y={l.y + l.h / 2} textAnchor="middle" dominantBaseline="central" className="graph-edge-label">
                     {labelOf(t)}
                   </text>
-                  <title>{`${t.from} --${t.event}--> ${t.to ?? STATED}${firedBy(t) ? ` (${firedBy(t)})` : ""}${t.guarded ? ", guarded" : ""}`}</title>
+                  <title>{`${edgeLabel(t)}${t.fired_by ? ` (${t.fired_by})` : ""}${t.guarded ? ", guarded" : ""}`}</title>
                 </g>
               );
             })}
@@ -187,6 +234,8 @@ export function LifecyclePane({
               const meta = s === undefined ? undefined : nodeMeta(s);
               const acts = role !== undefined && s?.next_role === role;
               const current = which === "workflow" ? graph.phase === n.id : graph.status === n.id;
+              const part: MachineSelection = { kind: "state", machine: which, name: n.id };
+              const pick = (): void => onSelect(part);
               return (
                 <g
                   key={n.id}
@@ -197,6 +246,12 @@ export function LifecyclePane({
                   data-acts={acts ? "true" : undefined}
                   data-current={current ? "true" : undefined}
                   data-visited={stood.has(n.id) ? "true" : undefined}
+                  data-selected={sameSelection(selected, part) ? "true" : undefined}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`state ${n.id}`}
+                  onClick={pick}
+                  onKeyDown={(k) => pressed(k, pick)}
                 >
                   <rect x={n.x} y={n.y} width={n.w} height={n.h} rx={n.h / 2} />
                   <text x={n.x + n.w / 2} y={n.y + (meta !== undefined ? 19 : 28)} textAnchor="middle" className="graph-node-name">
@@ -215,10 +270,22 @@ export function LifecyclePane({
               const m = markerOf.get(b.to);
               if (m === undefined) return null;
               // The task's path can run through a row folded into this marker; ink the marker then,
-              // or the step would show in the table below but vanish from the picture.
+              // or the step would show in its panel but vanish from the picture.
               const went = m.groups.flatMap((g) => g.rows).reduce((sum, r) => sum + (taken.get(rowKey(r.from, r.event)) ?? 0), 0);
+              const part: MachineSelection = { kind: "marker", machine: which, to: m.to };
+              const pick = (): void => onSelect(part);
               return (
-                <g key={`marker-${m.to}`} className="machine-marker" data-visited={went > 0 ? "true" : undefined}>
+                <g
+                  key={`marker-${m.to}`}
+                  className="machine-marker"
+                  data-visited={went > 0 ? "true" : undefined}
+                  data-selected={sameSelection(selected, part) ? "true" : undefined}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`${markerText(m)} into ${m.to}`}
+                  onClick={pick}
+                  onKeyDown={(k) => pressed(k, pick)}
+                >
                   <rect x={b.x} y={b.y} width={b.w} height={b.h} rx={b.h / 2} />
                   <text x={b.x + b.w / 2} y={b.y + b.h / 2} textAnchor="middle" dominantBaseline="central" className="machine-marker-label">
                     {markerText(m)}
@@ -234,35 +301,6 @@ export function LifecyclePane({
             })}
           </svg>
         </div>
-        <table className="machine-table">
-          <thead>
-            <tr>
-              <th>from</th>
-              <th>event</th>
-              <th>to</th>
-              <th>{which === "workflow" ? "fired by" : "kind"}</th>
-              {visited !== undefined && <th>taken</th>}
-            </tr>
-          </thead>
-          <tbody>
-            {machine.transitions.map((t) => (
-              <tr
-                key={`${t.from}-${t.event}`}
-                data-reconciled={t.reconciled ? "true" : undefined}
-                data-visited={taken.has(rowKey(t.from, t.event)) ? "true" : undefined}
-              >
-                <td>{t.from}</td>
-                <td>
-                  {t.event}
-                  {t.guarded ? <span className="muted"> · guarded</span> : null}
-                </td>
-                <td>{t.to ?? STATED}</td>
-                <td>{firedBy(t)}</td>
-                {visited !== undefined && <td>{taken.get(rowKey(t.from, t.event)) ?? ""}</td>}
-              </tr>
-            ))}
-          </tbody>
-        </table>
         {offTable.length > 0 && (
           <ul className="visited-off-table" aria-label="Moves this table has no row for">
             {offTable.map((v) => (

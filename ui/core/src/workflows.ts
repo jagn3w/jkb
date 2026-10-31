@@ -83,6 +83,10 @@ export interface GraphEdge {
   readonly roles: readonly string[];
   /** Who fires it, as jkb words it for every surface: `observed`, `applied`, the roles, or `no one`. */
   readonly fired_by: string;
+  /** What its guard checks, in jkb's plain words; `null` for an unguarded row (or an older jkb). */
+  readonly guard: string | null;
+  /** The command that fires it, `<uid>` standing for the task; `null` where jkb names none. */
+  readonly command: string | null;
 }
 
 /** `jkb_api::workflows::MachineView`. */
@@ -101,6 +105,8 @@ export interface WorkflowGraph {
   readonly status: string | null;
   readonly workflow: MachineTable;
   readonly lifecycle: MachineTable;
+  /** Every role's jkb op classes (`jkb role matrix`); empty from an older jkb. */
+  readonly role_ops: Readonly<Record<string, readonly string[]>>;
 }
 
 /** What a save changes: `jkb_api::workflows::AgentEdit`. */
@@ -299,7 +305,9 @@ function isEdge(v: unknown): v is GraphEdge {
     isBool(v["guarded"]) &&
     isBool(v["planned"]) &&
     isStrings(v["roles"]) &&
-    isString(v["fired_by"])
+    isString(v["fired_by"]) &&
+    isOptString(v["guard"]) &&
+    isOptString(v["command"])
   );
 }
 
@@ -316,7 +324,7 @@ function isMachine(v: unknown): v is MachineTable {
 function normalMachine(m: MachineTable): MachineTable {
   return {
     states: m.states.map((s) => ({ ...s, next_role: s.next_role ?? null, next_step: s.next_step ?? null })),
-    transitions: m.transitions.map((t) => ({ ...t, to: t.to ?? null })),
+    transitions: m.transitions.map((t) => ({ ...t, to: t.to ?? null, guard: t.guard ?? null, command: t.command ?? null })),
   };
 }
 
@@ -333,7 +341,8 @@ export function decodeWorkflowGraph(o: Outcome<OpResponse>): Outcome<WorkflowGra
     !isOptString(g["phase"]) ||
     !isOptString(g["status"]) ||
     !isMachine(g["workflow"]) ||
-    !isMachine(g["lifecycle"])
+    !isMachine(g["lifecycle"]) ||
+    !(g["role_ops"] === undefined || (isObject(g["role_ops"]) && Object.values(g["role_ops"]).every(isStrings)))
   ) {
     return failed("internal", "jkb serve did not answer with a well-formed `workflow_graph`");
   }
@@ -348,6 +357,7 @@ export function decodeWorkflowGraph(o: Outcome<OpResponse>): Outcome<WorkflowGra
       status: g["status"] ?? null,
       workflow: normalMachine(g["workflow"]),
       lifecycle: normalMachine(g["lifecycle"]),
+      role_ops: (g["role_ops"] as Record<string, string[]> | undefined) ?? {},
     },
   };
 }
@@ -544,4 +554,83 @@ export function machineDrawing(m: MachineTable): MachineDrawing {
     })),
     listed,
   };
+}
+
+/** The two machines a strategy draws: its workflow (phases) and the task lifecycle (statuses). */
+export type MachineName = "workflow" | "lifecycle";
+
+/** What of a drawn machine the Lifecycle pane's side panel shows: a state, a drawn edge, or a marker. */
+export type MachineSelection =
+  | { readonly kind: "state"; readonly machine: MachineName; readonly name: string }
+  | { readonly kind: "edge"; readonly machine: MachineName; readonly from: string; readonly event: string }
+  | { readonly kind: "marker"; readonly machine: MachineName; readonly to: string };
+
+/** A state's rows, as its panel lists them. */
+export interface StateRows {
+  /** The drawn edges out of it. */
+  readonly leaves: readonly GraphEdge[];
+  /** The drawn edges into it, then the rows its marker collapsed. */
+  readonly arrives: readonly GraphEdge[];
+  /** Its self-loops and its override: rows the picture does not draw. */
+  readonly listed: readonly GraphEdge[];
+}
+
+/**
+ * A state's rows, each in table order: what leaves it and what arrives along the drawn edges and its
+ * marker, and its rows the picture does not draw. With the table gone this is where rows are read,
+ * so every transition is in some state's lists (a collapsed row in its target's `arrives`).
+ */
+export function stateRows(d: MachineDrawing, name: string): StateRows {
+  return {
+    leaves: d.edges.filter((t) => t.from === name),
+    arrives: [
+      ...d.edges.filter((t) => t.to === name),
+      ...d.markers.filter((m) => m.to === name).flatMap((m) => m.groups.flatMap((g) => g.rows)),
+    ],
+    listed: d.listed.filter((t) => t.from === name),
+  };
+}
+
+/** Whether `sel` still names something drawn in `d`: after a strategy switch it may not. */
+export function selectionIn(d: MachineDrawing, sel: MachineSelection): boolean {
+  switch (sel.kind) {
+    case "state":
+      return d.states.some((s) => s.name === sel.name);
+    case "edge":
+      return d.edges.some((t) => t.from === sel.from && t.event === sel.event);
+    case "marker":
+      return d.markers.some((m) => m.to === sel.to);
+  }
+}
+
+/** Whether two selections name the same part of the same machine. */
+export function sameSelection(a: MachineSelection | undefined, b: MachineSelection | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  if (a.machine !== b.machine) return false;
+  switch (a.kind) {
+    case "state":
+      return b.kind === "state" && a.name === b.name;
+    case "edge":
+      return b.kind === "edge" && a.from === b.from && a.event === b.event;
+    case "marker":
+      return b.kind === "marker" && a.to === b.to;
+  }
+}
+
+/** The events `role` may fire under the strategy (each row's `roles`), once each, in table order. */
+export function eventsFiredBy(m: MachineTable, role: string): string[] {
+  return [...new Set(m.transitions.filter((t) => t.roles.includes(role)).map((t) => t.event))];
+}
+
+/** A row's key, as the table keys rows: the state it applies in and the event it answers. */
+export const rowKey = (from: string, event: string): string => `${from}\u0000${event}`;
+
+/**
+ * How often a task took each row, from the moves its history made (`timeline.task`'s `visited`): an
+ * override is one row with several destinations, so its moves are summed.
+ */
+export function takenByRow(moves: readonly { readonly from: string; readonly event: string; readonly count: number }[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const v of moves) counts.set(rowKey(v.from, v.event), (counts.get(rowKey(v.from, v.event)) ?? 0) + v.count);
+  return counts;
 }

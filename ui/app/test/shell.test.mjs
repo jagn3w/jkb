@@ -159,11 +159,18 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
   const { render } = await load(
     path.join(src, "timeline-entry.tsx"),
     `import { renderToString } from "react-dom/server";
+     import { takenByRow } from "@jkb/core";
      import { PlanChart, SessionLanes, SessionsOverview, TaskTimelineView } from "./executions/TimelinePane";
+     import { MachinePanel } from "./workflows/MachinePanel";
+     const panel = (f, selection) =>
+       renderToString(<MachinePanel graph={f.task.graph} selection={selection} taken={takenByRow(f.task.timeline.visited)} onSelect={() => {}} />);
      export const render = (f) => ({
        overview: renderToString(<SessionsOverview overview={f.overview} onOpen={() => {}} />),
        session: renderToString(<SessionLanes timeline={f.session} nowMs={f.now} onTask={() => {}} />),
        task: renderToString(<TaskTimelineView view={f.task} />),
+       review: panel(f, { kind: "state", machine: "workflow", name: "review" }),
+       edge: panel(f, { kind: "edge", machine: "workflow", from: "implement", event: "submit_work" }),
+       marker: panel(f, { kind: "marker", machine: "workflow", to: "landed" }),
        plan: renderToString(<PlanChart plan={f.plan} nowMs={f.now} offsetMin={0} />),
      });`,
   );
@@ -172,7 +179,7 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
   const ev = (over) => ({ at_ms: T, source: "workflow", id: 1, task: "task:a", event: "submit_work", from: "implement", to: "review", actor: "swarm-implementer@agent-x", role: "implementer", reason: null, detail: null, ...over });
   const summary = { session: "s-1", state: "live", cwd: "/w", started_at_ms: T - H, ended_at_ms: null, claims: 1, last_event_ms: T, stalled: true, stalled_for_ms: 31 * 60_000 };
   const state = (name, initial = false) => ({ name, initial, settled: false, awaits_input: false, next_role: null, next_step: null });
-  const edge = (from, event, to) => ({ from, event, to, reconciled: false, guarded: false, planned: false, roles: [], fired_by: "implementer" });
+  const edge = (from, event, to) => ({ from, event, to, reconciled: false, guarded: false, planned: false, roles: [], fired_by: "implementer", guard: null, command: null });
   const graph = {
     strategy: "default:design-reviewed",
     graph: "reviewed-design",
@@ -194,6 +201,7 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
       ],
     },
     lifecycle: { states: [state("open", true)], transitions: [] },
+    role_ops: {},
   };
   const f = {
     now: T + H,
@@ -262,13 +270,22 @@ test("the timeline renders a session's swimlanes, a task's path and a plan's cha
   assert.match(html.task, /class="machine-edge"[^>]*data-visited="true"/);
   assert.match(html.task, /submit_work ×2/);
   assert.match(html.task, /class="machine-state" data-state="review"[^>]*data-visited="true"/);
-  assert.match(html.task, /<th>taken<\/th>/);
+  // No transitions table under the picture, and nothing picked until a click.
+  assert.doesNotMatch(html.task, /machine-table|<table[^>]*>\s*<thead>\s*<tr>\s*<th>from/);
+  assert.doesNotMatch(html.task, /class="machine-panel"/);
   // Keyed by (from, event): the untaken row between the same states is not inked.
-  assert.match(html.task, /<g class="machine-edge"><path [^>]*><\/path><text [^>]*>submit_systemic</);
-  assert.match(html.task, /<tr data-visited="true"><td>implement<\/td><td>submit_work<\/td>/);
-  assert.match(html.task, /<tr><td>implement<\/td><td>submit_systemic<\/td>/);
-  // An override is one row whatever its destination: its count is summed.
-  assert.match(html.task, /<td>review<\/td><td>override<\/td><td>\(stated\)<\/td><td>[^<]*<\/td><td>3<\/td>/);
+  assert.match(html.task, /<g class="machine-edge" role="button"[^>]*aria-label="implement --submit_systemic--&gt; review"/);
+  assert.doesNotMatch(html.task, /<g class="machine-edge" data-visited="true"[^>]*aria-label="implement --submit_systemic/);
+  assert.match(html.task, /<g class="machine-edge" data-visited="true"[^>]*aria-label="implement --submit_work--&gt; review"/);
+  // How often each row was taken is in the panels now: a state's leaves count its edges, and an
+  // override — one row whatever its destination — is summed, under the rows the picture omits.
+  assert.match(html.review, /aria-label="Not drawn"[\s\S]*review --override--&gt; \(stated\)[\s\S]*taken ×3/);
+  assert.match(html.review, /the operator names the destination/);
+  assert.match(html.edge, /<dt>taken<\/dt><dd>×2<\/dd>/);
+  assert.match(html.edge, /<dt>fired by<\/dt><dd>implementer<\/dd>/);
+  // A folded step is counted against its source on the marker's panel.
+  assert.match(html.marker, /review<\/button><span class="muted"> · unguarded · implementer · taken ×1<\/span>/);
+  assert.match(html.marker, /implement<\/button><span class="muted"> · unguarded · implementer<\/span>/, "an untaken source has no count");
   // A move this graph has no row for is listed, not dropped.
   assert.match(html.task, /design --approve_design--&gt; implement ×1/);
   // A step folded into an observed marker is inked on the marker, not lost from the picture.

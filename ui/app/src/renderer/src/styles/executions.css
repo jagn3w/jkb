@@ -176,9 +176,17 @@
   stroke-width: 2.25;
 }
 
-.machine-table tr[data-visited="true"] td {
+.machine-row[data-taken="true"] {
   color: var(--ink);
   font-weight: 600;
+}
+
+/* A picked part's rows, under the task's picture. */
+.timeline-task .machine-panel {
+  border: var(--hairline-width) solid var(--hairline);
+  border-radius: var(--radius);
+  margin: var(--space-2) 0;
+  max-width: 640px;
 }
 
 .visited-off-table {

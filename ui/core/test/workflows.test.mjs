@@ -2,6 +2,8 @@
 //! a save sends, and the two layouts. Runs against `dist/`.
 
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import test from "node:test";
 
 import {
@@ -13,12 +15,18 @@ import {
   decodeWorkflowGraph,
   draftOf,
   editBetween,
+  eventsFiredBy,
   isAgentName,
   layered,
   machineDrawing,
   markerSources,
   placeholdersOf,
+  rowKey,
+  sameSelection,
   saveRequest,
+  selectionIn,
+  stateRows,
+  takenByRow,
   workflowOps,
 } from "../dist/index.js";
 
@@ -317,4 +325,95 @@ test("the graph answer decodes, with absent optionals as null", () => {
     false,
   );
   assert.equal(decodeWorkflowGraph(ok({ result: "workflow_graph", graph: { strategy: "x" } })).ok, false);
+});
+
+test("a state's rows are what leaves it, what arrives, and what is not drawn", () => {
+  const d = machineDrawing(sixPhase);
+  const ev = (rows) => rows.map((t) => `${t.from}|${t.event}|${t.to}`);
+  const implement = stateRows(d, "implement");
+  assert.deepEqual(ev(implement.leaves), ["implement|submit_work|review"]);
+  assert.deepEqual(ev(implement.arrives), ["design_review|approve_design|implement"]);
+  assert.deepEqual(ev(implement.listed), ["implement|override|null", "implement|note|implement"], "its override and its self-loop, in table order");
+  // A marker's rows arrive at its target, after the drawn edges into it.
+  const landed = stateRows(d, "landed");
+  assert.deepEqual(landed.leaves, []);
+  assert.deepEqual(ev(landed.arrives), PHASES.map((p) => `${p}|observed_landed|landed`));
+  assert.deepEqual(landed.listed, []);
+  // Each row is the table's own object.
+  assert.ok(implement.leaves.every((t) => sixPhase.transitions.includes(t)));
+});
+
+test("every row of every machine is reachable from some state's panel", () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "..", "app", "test", "fixtures", "workflow-graphs.json"), "utf8"));
+  const machines = Object.values(fixture).flatMap((g) => [g.workflow, g.lifecycle]);
+  assert.equal(machines.length, 6);
+  for (const m of [...machines, machine, sixPhase]) {
+    const d = machineDrawing(m);
+    const reached = new Set(
+      m.states.flatMap((s) => {
+        const r = stateRows(d, s.name);
+        return [...r.leaves, ...r.arrives, ...r.listed];
+      }),
+    );
+    for (const t of m.transitions) assert.ok(reached.has(t), `${t.from} --${t.event}--> ${t.to} is in no state's panel`);
+  }
+});
+
+test("a selection survives a strategy switch only if it still names something drawn", () => {
+  const d = machineDrawing(sixPhase);
+  assert.equal(selectionIn(d, { kind: "state", machine: "workflow", name: "review" }), true);
+  assert.equal(selectionIn(d, { kind: "state", machine: "workflow", name: "systemic_review" }), false);
+  assert.equal(selectionIn(d, { kind: "edge", machine: "workflow", from: "review", event: "review_passed" }), true);
+  // A row that is listed or collapsed is not an edge of the picture.
+  assert.equal(selectionIn(d, { kind: "edge", machine: "workflow", from: "implement", event: "override" }), false);
+  assert.equal(selectionIn(d, { kind: "edge", machine: "workflow", from: "implement", event: "observed_landed" }), false);
+  assert.equal(selectionIn(d, { kind: "marker", machine: "workflow", to: "landed" }), true);
+  assert.equal(selectionIn(d, { kind: "marker", machine: "workflow", to: "landable" }), false);
+});
+
+test("two selections are the same only for the same part of the same machine", () => {
+  const s = { kind: "state", machine: "workflow", name: "review" };
+  assert.equal(sameSelection(s, { name: "review", machine: "workflow", kind: "state" }), true, "key order does not matter");
+  assert.equal(sameSelection(s, { ...s, machine: "lifecycle" }), false);
+  assert.equal(sameSelection(s, { kind: "marker", machine: "workflow", to: "review" }), false);
+  assert.equal(sameSelection({ kind: "edge", machine: "workflow", from: "a", event: "x" }, { kind: "edge", machine: "workflow", from: "a", event: "y" }), false);
+  assert.equal(sameSelection(undefined, undefined), true);
+  assert.equal(sameSelection(s, undefined), false);
+});
+
+test("a role's events are those the strategy lets it fire, once each", () => {
+  assert.deepEqual(eventsFiredBy(sixPhase, "operator"), ["submit_design", "approve_design", "submit_work", "request_changes", "override"]);
+  assert.deepEqual(eventsFiredBy(sixPhase, "designer"), []);
+});
+
+test("a task's moves count per row, an override's destinations summed", () => {
+  const taken = takenByRow([
+    { from: "review", event: "override", to: "design", count: 1 },
+    { from: "review", event: "override", to: "implement", count: 2 },
+    { from: "implement", event: "submit_work", to: "review", count: 2 },
+  ]);
+  assert.equal(taken.get(rowKey("review", "override")), 3);
+  assert.equal(taken.get(rowKey("implement", "submit_work")), 2);
+  assert.equal(taken.size, 2);
+});
+
+test("a row's guard and command are jkb's words, absent ones null; every role's op classes come with the graph", () => {
+  const worded = {
+    ...machine,
+    transitions: machine.transitions.map((t, i) => (i === 1 ? { ...t, guard: "a landing is recorded", command: "jkb workflow observe <uid>" } : t)),
+  };
+  const g = decodeWorkflowGraph(
+    ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "d", workflow: worded, lifecycle: machine, role_ops: { operator: ["read"] } } }),
+  );
+  assert.equal(g.ok, true);
+  assert.equal(g.value.workflow.transitions[1].guard, "a landing is recorded");
+  assert.equal(g.value.workflow.transitions[1].command, "jkb workflow observe <uid>");
+  assert.equal(g.value.workflow.transitions[0].guard, null, "an older jkb's row has no guard words");
+  assert.equal(g.value.workflow.transitions[0].command, null);
+  assert.deepEqual(g.value.role_ops, { operator: ["read"] });
+  const older = decodeWorkflowGraph(ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "d", workflow: machine, lifecycle: machine } }));
+  assert.deepEqual(older.value.role_ops, {});
+  const bad = (graph) => decodeWorkflowGraph(ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "d", workflow: machine, lifecycle: machine, ...graph } })).ok;
+  assert.equal(bad({ role_ops: { operator: "read" } }), false);
+  assert.equal(bad({ workflow: { ...machine, transitions: [{ ...machine.transitions[0], guard: 3 }] } }), false);
 });
