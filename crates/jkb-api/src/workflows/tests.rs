@@ -395,6 +395,77 @@ fn the_lifecycle_names_who_lands_and_who_overrides() {
     }
 }
 
+#[test]
+fn each_row_says_what_its_guard_checks_and_how_it_fires() {
+    let kb = Kb::new();
+    let g = match ok(&kb.op, json!({ "op": "workflow.graph" })) {
+        Response::WorkflowGraph { graph } => *graph,
+        other => panic!("{other:?}"),
+    };
+    // A guard is described exactly where a row has one, on both machines.
+    for t in g
+        .workflow
+        .transitions
+        .iter()
+        .chain(&g.lifecycle.transitions)
+    {
+        assert_eq!(
+            t.guard.is_some(),
+            t.guarded,
+            "{} --{}--> {:?}",
+            t.from,
+            t.event,
+            t.guard
+        );
+    }
+    let edge = |from: &str, event: &str| {
+        g.workflow
+            .transitions
+            .iter()
+            .find(|t| t.from == from && t.event == event)
+            .unwrap()
+            .clone()
+    };
+    // The review guards read the strategy's `repeated_area` (two rounds, one file, by default).
+    let repeated = edge("review", "review_repeated");
+    assert!(
+        repeated
+            .guard
+            .as_deref()
+            .unwrap()
+            .contains("the newest 2 rounds all flagged must-fixes in the same file"),
+        "{repeated:?}"
+    );
+    // The same event is unguarded where its row is: reopening a task already at work.
+    assert_eq!(edge("implement", "reopen").guard, None);
+    assert!(edge("landed", "reopen").guard.is_some());
+    // An act is fired by name, an observation by observing.
+    assert_eq!(
+        edge("implement", "submit_work").command.as_deref(),
+        Some("jkb workflow fire <uid> submit_work")
+    );
+    assert_eq!(
+        edge("review", "review_passed").command.as_deref(),
+        Some("jkb workflow observe <uid>")
+    );
+    assert!(g.workflow.transitions.iter().all(|t| t.command.is_some()));
+    assert!(g.lifecycle.transitions.iter().all(|t| t.command.is_none()));
+    // Every role's op classes, the same answer an agent template of that role carries.
+    let (agents, roles) = match ok(&kb.op, json!({ "op": "workflow.agents" })) {
+        Response::WorkflowAgents { agents, roles } => (agents, roles),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(g.role_ops.keys().cloned().collect::<Vec<_>>(), {
+        let mut r = roles;
+        r.sort();
+        r
+    });
+    for a in &agents {
+        assert_eq!(g.role_ops[&a.role], a.role_ops, "{}", a.name);
+    }
+    assert!(!g.role_ops["operator"].is_empty());
+}
+
 /// One swarm run's principals on one database: the main session (the container credential's ceiling,
 /// the coordinator), and attested subagents of the types `scripts/setup.sh` maps — `jkb-reviewer` to
 /// the reviewer, `jkb-implementer` to the implementer (pinned against the script by

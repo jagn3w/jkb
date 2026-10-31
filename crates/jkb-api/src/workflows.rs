@@ -310,6 +310,14 @@ pub struct GraphEdge {
     /// decides), the roles (a workflow act, the lifecycle's `land` per the strategy's `lands`
     /// toggle, its `override` per who holds `task.set --status`), or `no one`.
     pub fired_by: String,
+    /// What its guard checks, in plain words; `None` for an unguarded row. The workflow machine's
+    /// review guards read the strategy's `repeated_area`.
+    #[serde(default)]
+    pub guard: Option<String>,
+    /// The command that fires it, `<uid>` standing for the task (`jkb workflow fire <uid> <event>`,
+    /// or `jkb workflow observe <uid>` for an observation); the workflow machine only.
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 /// One machine.
@@ -342,14 +350,32 @@ pub struct GraphView {
     pub workflow: MachineView,
     /// The task lifecycle machine (statuses).
     pub lifecycle: MachineView,
+    /// Every role, with the jkb op classes it may run (`jkb role matrix`): the permissions a
+    /// phase's actor holds, whether or not an agent template acts as it.
+    #[serde(default)]
+    pub role_ops: BTreeMap<String, Vec<String>>,
 }
 
-/// `roles` answers who may fire an act, or `None` for an event no role fires (jkb applies it).
-fn machine_view(
+/// What a machine's rows say beyond the table: per event, who may fire it (`None` for an event no
+/// role fires, which jkb applies), what its guard checks, and the command that fires it.
+struct Rows<R, G, C> {
+    roles: R,
+    guard: G,
+    command: C,
+}
+
+/// `next` answers who acts in a state and what they do. A row's guard is described only where the
+/// row has one, here rather than in each machine's closure.
+fn machine_view<R, G, C>(
     table: &Table,
     next: impl Fn(&str) -> Option<(String, String)>,
-    roles: impl Fn(&str) -> Option<Vec<String>>,
-) -> MachineView {
+    rows: &Rows<R, G, C>,
+) -> MachineView
+where
+    R: Fn(&str) -> Option<Vec<String>>,
+    G: Fn(&str) -> Option<String>,
+    C: Fn(&str) -> Option<String>,
+{
     MachineView {
         states: table
             .states
@@ -370,7 +396,11 @@ fn machine_view(
             .transitions
             .iter()
             .map(|t| {
-                let fired = if t.reconciled { None } else { roles(t.event) };
+                let fired = if t.reconciled {
+                    None
+                } else {
+                    (rows.roles)(t.event)
+                };
                 let fired_by = match &fired {
                     _ if t.reconciled => "observed".to_owned(),
                     None => "applied".to_owned(),
@@ -386,10 +416,82 @@ fn machine_view(
                     planned: t.planned,
                     roles: fired.unwrap_or_default(),
                     fired_by,
+                    guard: if t.guarded {
+                        (rows.guard)(t.event)
+                    } else {
+                        None
+                    },
+                    command: (rows.command)(t.event),
                 }
             })
             .collect(),
     }
+}
+
+/// The strategy's workflow machine: who acts in each phase, who may fire each act, what each guard
+/// checks under the strategy's attributes, and the command that fires each event.
+fn workflow_view(spec: &StrategySpec) -> MachineView {
+    machine_view(
+        &spec.graph.machine().table(),
+        |state| {
+            Phase::parse(state).map(|p| {
+                let (role, step) = spec.next_actor(p);
+                (role.as_str().to_owned(), step.to_owned())
+            })
+        },
+        &Rows {
+            roles: |event: &str| {
+                WorkflowEvent::parse(event).map(|e| {
+                    <Role as jkb_rbac::Role>::ALL
+                        .iter()
+                        .filter(|r| spec.authorize(&[**r], e).is_allowed())
+                        .map(|r| r.as_str().to_owned())
+                        .collect()
+                })
+            },
+            guard: |event: &str| {
+                WorkflowEvent::parse(event)
+                    .and_then(|e| e.describe_guard(&spec.attributes.repeated_area))
+            },
+            command: |event: &str| WorkflowEvent::parse(event).map(WorkflowEvent::command),
+        },
+    )
+}
+
+/// The task lifecycle machine, under the strategy. Two lifecycle acts have a role that fires them:
+/// landing, which the strategy's `lands` toggle decides (what `rbac` checks `task.land` against),
+/// and the operator's override, which is `task.set --status` and so whoever holds that op class.
+/// Every other row jkb applies as part of the op that moves it.
+fn lifecycle_view(spec: &StrategySpec) -> MachineView {
+    machine_view(
+        &jkb_core::lifecycle::machine().table(),
+        |_| None,
+        &Rows {
+            roles: |event: &str| match event {
+                "land" => Some(
+                    <Role as jkb_rbac::Role>::ALL
+                        .iter()
+                        .filter(|r| spec.may_land(&[**r]).is_allowed())
+                        .map(|r| r.as_str().to_owned())
+                        .collect(),
+                ),
+                "override" => Some(
+                    OP_GRANTS
+                        .roles_for(OpPermission::TaskStatus)
+                        .into_iter()
+                        .map(|r| r.as_str().to_owned())
+                        .collect(),
+                ),
+                _ => None,
+            },
+            guard: |event: &str| {
+                jkb_core::lifecycle::TaskEvent::parse(event)
+                    .and_then(jkb_core::lifecycle::TaskEvent::describe_guard)
+                    .map(str::to_owned)
+            },
+            command: |_: &str| None,
+        },
+    )
 }
 
 /// `workflow.graph`: the machines of a task's strategy (`uid`), a named one (`strategy`), or the
@@ -435,49 +537,8 @@ pub fn graph(
             (source, spec, None, None, None)
         }
     };
-    let workflow = machine_view(
-        &spec.graph.machine().table(),
-        |state| {
-            Phase::parse(state).map(|p| {
-                let (role, step) = spec.next_actor(p);
-                (role.as_str().to_owned(), step.to_owned())
-            })
-        },
-        |event| {
-            WorkflowEvent::parse(event).map(|e| {
-                <Role as jkb_rbac::Role>::ALL
-                    .iter()
-                    .filter(|r| spec.authorize(&[**r], e).is_allowed())
-                    .map(|r| r.as_str().to_owned())
-                    .collect()
-            })
-        },
-    );
-    // Two lifecycle acts have a role that fires them: landing, which the strategy's `lands` toggle
-    // decides (what `rbac` checks `task.land` against), and the operator's override, which is
-    // `task.set --status` and so whoever holds that op class. Every other row jkb applies as part
-    // of the op that moves it.
-    let lifecycle = machine_view(
-        &jkb_core::lifecycle::machine().table(),
-        |_| None,
-        |event| match event {
-            "land" => Some(
-                <Role as jkb_rbac::Role>::ALL
-                    .iter()
-                    .filter(|r| spec.may_land(&[**r]).is_allowed())
-                    .map(|r| r.as_str().to_owned())
-                    .collect(),
-            ),
-            "override" => Some(
-                OP_GRANTS
-                    .roles_for(OpPermission::TaskStatus)
-                    .into_iter()
-                    .map(|r| r.as_str().to_owned())
-                    .collect(),
-            ),
-            _ => None,
-        },
-    );
+    let workflow = workflow_view(&spec);
+    let lifecycle = lifecycle_view(&spec);
     Ok(GraphView {
         strategy: source,
         graph: spec.graph.as_str().to_owned(),
@@ -489,6 +550,10 @@ pub fn graph(
         status,
         workflow,
         lifecycle,
+        role_ops: <Role as jkb_rbac::Role>::ALL
+            .iter()
+            .map(|r| (r.as_str().to_owned(), role_ops(*r)))
+            .collect(),
     })
 }
 

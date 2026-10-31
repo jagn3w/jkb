@@ -341,3 +341,127 @@ fn the_coordinator_s_base_permits_are_exactly_these() {
         ]
     );
 }
+
+/// A verdict as something comparable: `None` to allow, the denial's sentence to refuse.
+fn verdict(v: jkb_fsm::Verdict<WorkflowEvent>) -> Option<String> {
+    match v {
+        jkb_fsm::Verdict::Allow => None,
+        jkb_fsm::Verdict::Deny(d) => Some(d.reason),
+    }
+}
+
+#[test]
+fn one_guard_per_event() {
+    // `describe_guard` is keyed by event: that is only sound while every guarded row of an event
+    // answers every observation the same way.
+    for &g in GraphId::ALL {
+        let m = g.machine();
+        for &e in <WorkflowEvent as jkb_fsm::Event>::ALL {
+            let guards: Vec<_> = m
+                .transitions
+                .iter()
+                .filter(|t| t.event == e)
+                .filter_map(|t| t.guard)
+                .collect();
+            for f in contexts() {
+                let answers: Vec<_> = guards.iter().map(|guard| verdict(guard(&f))).collect();
+                assert!(
+                    answers.windows(2).all(|w| w[0] == w[1]),
+                    "{} rows of {} disagree at {f:?}",
+                    e.as_str(),
+                    g.as_str()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_guarded_row_says_what_its_guard_checks() {
+    let area = super::strategy::RepeatedArea::default();
+    let mut guarded_events = Vec::new();
+    for &g in GraphId::ALL {
+        for t in g.machine().transitions {
+            if t.guard.is_some() {
+                assert!(
+                    t.event.describe_guard(&area).is_some(),
+                    "{} --{}--> in {} is guarded but says nothing about it",
+                    t.from.as_str(),
+                    t.event.as_str(),
+                    g.as_str()
+                );
+                guarded_events.push(t.event);
+            }
+        }
+    }
+    // And no description outlives its guard.
+    for &e in <WorkflowEvent as jkb_fsm::Event>::ALL {
+        assert_eq!(
+            e.describe_guard(&area).is_some(),
+            guarded_events.contains(&e),
+            "{}",
+            e.as_str()
+        );
+    }
+}
+
+#[test]
+fn the_repeated_review_guard_reads_the_strategy_s_attribute() {
+    use super::strategy::{AreaScope, RepeatedArea};
+    let two_files = RepeatedArea {
+        scope: AreaScope::File,
+        rounds: 2,
+    };
+    let said = WorkflowEvent::ReviewRepeated
+        .describe_guard(&two_files)
+        .unwrap();
+    assert!(
+        said.contains("the newest 2 rounds all flagged must-fixes in the same file"),
+        "{said}"
+    );
+    let three_dirs = RepeatedArea {
+        scope: AreaScope::Directory,
+        rounds: 3,
+    };
+    let said = WorkflowEvent::ReviewFailed
+        .describe_guard(&three_dirs)
+        .unwrap();
+    assert!(
+        said.contains("but not the newest 3 rounds all flagged must-fixes in the same directory"),
+        "{said}"
+    );
+}
+
+#[test]
+fn each_event_names_the_command_that_fires_it() {
+    assert_eq!(
+        WorkflowEvent::SubmitWork.command(),
+        "jkb workflow fire <uid> submit_work"
+    );
+    assert_eq!(
+        WorkflowEvent::SubmitSystemic.command(),
+        "jkb workflow fire <uid> submit_systemic --reason <why>"
+    );
+    assert_eq!(
+        WorkflowEvent::Override.command(),
+        "jkb workflow fire <uid> override --to <phase> --reason <why>"
+    );
+    for e in [
+        WorkflowEvent::ReviewPassed,
+        WorkflowEvent::ReviewFailed,
+        WorkflowEvent::ReviewRepeated,
+        WorkflowEvent::ObservedLanded,
+        WorkflowEvent::ObservedCancelled,
+    ] {
+        assert_eq!(e.command(), "jkb workflow observe <uid>", "{}", e.as_str());
+    }
+    // Every reason an event needs is in its command.
+    for &e in <WorkflowEvent as jkb_fsm::Event>::ALL {
+        assert_eq!(
+            e.command().contains("--reason"),
+            e.needs_reason(),
+            "{}",
+            e.as_str()
+        );
+    }
+}

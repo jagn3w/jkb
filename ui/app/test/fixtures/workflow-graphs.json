@@ -47,9 +47,11 @@
       ],
       "transitions": [
         {
+          "command": null,
           "event": "start",
           "fired_by": "applied",
           "from": "open",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -57,9 +59,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "start",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -67,9 +71,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "start",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -77,9 +83,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "submit_for_review",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -87,9 +95,11 @@
           "to": "needs_review"
         },
         {
+          "command": null,
           "event": "request_changes",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -97,9 +107,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "submit_for_review",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -107,9 +119,11 @@
           "to": "needs_review"
         },
         {
+          "command": null,
           "event": "request_changes",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -117,9 +131,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "land",
           "fired_by": "operator, coordinator",
           "from": "in_progress",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -130,9 +146,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "land",
           "fired_by": "operator, coordinator",
           "from": "needs_review",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -143,9 +161,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "land",
           "fired_by": "operator, coordinator",
           "from": "done",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -156,9 +176,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "abandon",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": "the session has no uncommitted changes",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -166,9 +188,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "abandon",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": "the session has no uncommitted changes",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -176,9 +200,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "abandon",
           "fired_by": "applied",
           "from": "open",
+          "guard": "the session has no uncommitted changes",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -186,9 +212,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "open",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -196,9 +224,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -206,9 +236,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -216,9 +248,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -226,9 +260,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "reopen",
           "fired_by": "applied",
           "from": "done",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -236,9 +272,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "reopen",
           "fired_by": "applied",
           "from": "open",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -246,9 +284,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "reopen",
           "fired_by": "applied",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -256,9 +296,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "in_progress",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -266,9 +308,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "needs_review",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -276,9 +320,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "done",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -286,9 +332,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "observed_owner_gone",
           "fired_by": "observed",
           "from": "open",
+          "guard": "something holds the claim, and its owner is proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -296,9 +344,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "observed_owner_gone",
           "fired_by": "observed",
           "from": "in_progress",
+          "guard": "something holds the claim, and its owner is proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -306,9 +356,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "observed_owner_gone",
           "fired_by": "observed",
           "from": "needs_review",
+          "guard": "something holds the claim, and its owner is proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -316,9 +368,11 @@
           "to": "needs_review"
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "open",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -329,9 +383,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -342,9 +398,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -355,9 +413,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "done",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -368,9 +428,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -381,9 +443,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "open",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -391,9 +455,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "in_progress",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -401,9 +467,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "needs_review",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -411,9 +479,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "done",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -421,9 +491,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "cancelled",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -433,6 +505,68 @@
       ]
     },
     "phase": null,
+    "role_ops": {
+      "coordinator": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "workflow",
+        "grant",
+        "design",
+        "design_approve"
+      ],
+      "designer": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "workflow",
+        "design",
+        "design_approve"
+      ],
+      "implementer": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "task_claim",
+        "workflow"
+      ],
+      "operator": [
+        "read",
+        "hook",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "review",
+        "land",
+        "workflow",
+        "design",
+        "design_approve",
+        "grant",
+        "attest",
+        "exec_request",
+        "admin"
+      ],
+      "reviewer": [
+        "read",
+        "hook",
+        "exec_request",
+        "review",
+        "workflow",
+        "design_approve"
+      ],
+      "systemic_reviewer": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "workflow"
+      ]
+    },
     "spec": {
       "attributes": {
         "repeated_area": {
@@ -523,9 +657,11 @@
       ],
       "transitions": [
         {
+          "command": "jkb workflow fire <uid> submit_design",
           "event": "submit_design",
           "fired_by": "operator, coordinator, designer",
           "from": "design",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -537,9 +673,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> approve_design",
           "event": "approve_design",
           "fired_by": "operator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -549,9 +687,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> reject_design",
           "event": "reject_design",
           "fired_by": "operator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -561,9 +701,11 @@
           "to": "design"
         },
         {
+          "command": "jkb workflow fire <uid> submit_work",
           "event": "submit_work",
           "fired_by": "operator, coordinator, implementer",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -575,9 +717,11 @@
           "to": "review"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "review_passed",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a review round was filed since the work was submitted and found no must-fix; the work has not landed and the task is not cancelled",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -585,9 +729,11 @@
           "to": "landable"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "review_failed",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, but not the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -595,9 +741,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "review_repeated",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, and the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -605,9 +753,11 @@
           "to": "systemic_review"
         },
         {
+          "command": "jkb workflow fire <uid> submit_systemic --reason <why>",
           "event": "submit_systemic",
           "fired_by": "operator, coordinator, systemic_reviewer",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -619,9 +769,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> systemic_redesign --reason <why>",
           "event": "systemic_redesign",
           "fired_by": "operator, coordinator, systemic_reviewer",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -633,9 +785,11 @@
           "to": "design"
         },
         {
+          "command": "jkb workflow fire <uid> rework",
           "event": "rework",
           "fired_by": "operator, coordinator",
           "from": "landable",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -646,9 +800,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "design",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -656,9 +812,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "design_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -666,9 +824,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "implement",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -676,9 +836,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -686,9 +848,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "systemic_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -696,9 +860,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "landable",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -706,9 +872,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "design",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -716,9 +884,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "design_review",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -726,9 +896,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "implement",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -736,9 +908,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "review",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -746,9 +920,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "systemic_review",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -756,9 +932,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "landable",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -766,9 +944,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "design",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -779,9 +959,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -792,9 +974,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -805,9 +989,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -818,9 +1004,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -831,9 +1019,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "landable",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -844,9 +1034,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> reopen",
           "event": "reopen",
           "fired_by": "operator",
           "from": "landed",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
           "guarded": true,
           "planned": false,
           "reconciled": false,
@@ -856,9 +1048,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> reopen",
           "event": "reopen",
           "fired_by": "operator",
           "from": "cancelled",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
           "guarded": true,
           "planned": false,
           "reconciled": false,
@@ -868,9 +1062,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> reopen",
           "event": "reopen",
           "fired_by": "operator",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -880,9 +1076,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "design",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -892,9 +1090,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -904,9 +1104,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -916,9 +1118,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -928,9 +1132,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -940,9 +1146,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "landable",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -952,9 +1160,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "landed",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -964,9 +1174,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1026,9 +1238,11 @@
       ],
       "transitions": [
         {
+          "command": null,
           "event": "start",
           "fired_by": "applied",
           "from": "open",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -1036,9 +1250,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "start",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -1046,9 +1262,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "start",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -1056,9 +1274,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "submit_for_review",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1066,9 +1286,11 @@
           "to": "needs_review"
         },
         {
+          "command": null,
           "event": "request_changes",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1076,9 +1298,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "submit_for_review",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1086,9 +1310,11 @@
           "to": "needs_review"
         },
         {
+          "command": null,
           "event": "request_changes",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1096,9 +1322,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "land",
           "fired_by": "operator",
           "from": "in_progress",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -1108,9 +1336,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "land",
           "fired_by": "operator",
           "from": "needs_review",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -1120,9 +1350,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "land",
           "fired_by": "operator",
           "from": "done",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1132,9 +1364,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "abandon",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": "the session has no uncommitted changes",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -1142,9 +1376,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "abandon",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": "the session has no uncommitted changes",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -1152,9 +1388,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "abandon",
           "fired_by": "applied",
           "from": "open",
+          "guard": "the session has no uncommitted changes",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -1162,9 +1400,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "open",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1172,9 +1412,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1182,9 +1424,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1192,9 +1436,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1202,9 +1448,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "reopen",
           "fired_by": "applied",
           "from": "done",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1212,9 +1460,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "reopen",
           "fired_by": "applied",
           "from": "open",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1222,9 +1472,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "reopen",
           "fired_by": "applied",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1232,9 +1484,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "in_progress",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -1242,9 +1496,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "needs_review",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -1252,9 +1508,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "done",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -1262,9 +1520,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "observed_owner_gone",
           "fired_by": "observed",
           "from": "open",
+          "guard": "something holds the claim, and its owner is proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -1272,9 +1532,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "observed_owner_gone",
           "fired_by": "observed",
           "from": "in_progress",
+          "guard": "something holds the claim, and its owner is proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -1282,9 +1544,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "observed_owner_gone",
           "fired_by": "observed",
           "from": "needs_review",
+          "guard": "something holds the claim, and its owner is proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -1292,9 +1556,11 @@
           "to": "needs_review"
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "open",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1305,9 +1571,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1318,9 +1586,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1331,9 +1601,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "done",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1344,9 +1616,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -1357,9 +1631,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "open",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -1367,9 +1643,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "in_progress",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -1377,9 +1655,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "needs_review",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -1387,9 +1667,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "done",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -1397,9 +1679,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "cancelled",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -1409,6 +1693,68 @@
       ]
     },
     "phase": null,
+    "role_ops": {
+      "coordinator": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "workflow",
+        "grant",
+        "design",
+        "design_approve"
+      ],
+      "designer": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "workflow",
+        "design",
+        "design_approve"
+      ],
+      "implementer": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "task_claim",
+        "workflow"
+      ],
+      "operator": [
+        "read",
+        "hook",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "review",
+        "land",
+        "workflow",
+        "design",
+        "design_approve",
+        "grant",
+        "attest",
+        "exec_request",
+        "admin"
+      ],
+      "reviewer": [
+        "read",
+        "hook",
+        "exec_request",
+        "review",
+        "workflow",
+        "design_approve"
+      ],
+      "systemic_reviewer": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "workflow"
+      ]
+    },
     "spec": {
       "attributes": {
         "repeated_area": {
@@ -1499,9 +1845,11 @@
       ],
       "transitions": [
         {
+          "command": "jkb workflow fire <uid> submit_design",
           "event": "submit_design",
           "fired_by": "operator, coordinator, designer",
           "from": "design",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1513,9 +1861,11 @@
           "to": "design_review"
         },
         {
+          "command": "jkb workflow fire <uid> approve_design",
           "event": "approve_design",
           "fired_by": "operator, coordinator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1526,9 +1876,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> reject_design",
           "event": "reject_design",
           "fired_by": "operator, coordinator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1539,9 +1891,11 @@
           "to": "design"
         },
         {
+          "command": "jkb workflow fire <uid> submit_work",
           "event": "submit_work",
           "fired_by": "operator, coordinator, implementer",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1553,9 +1907,11 @@
           "to": "review"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "review_passed",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a review round was filed since the work was submitted and found no must-fix; the work has not landed and the task is not cancelled",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1563,9 +1919,11 @@
           "to": "landable"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "review_failed",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, but not the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1573,9 +1931,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "review_repeated",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, and the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1583,9 +1943,11 @@
           "to": "systemic_review"
         },
         {
+          "command": "jkb workflow fire <uid> submit_systemic --reason <why>",
           "event": "submit_systemic",
           "fired_by": "operator, coordinator, systemic_reviewer",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1597,9 +1959,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> systemic_redesign --reason <why>",
           "event": "systemic_redesign",
           "fired_by": "operator, coordinator, systemic_reviewer",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1611,9 +1975,11 @@
           "to": "design"
         },
         {
+          "command": "jkb workflow fire <uid> rework",
           "event": "rework",
           "fired_by": "operator, coordinator",
           "from": "landable",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1624,9 +1990,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "design",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1634,9 +2002,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "design_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1644,9 +2014,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "implement",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1654,9 +2026,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1664,9 +2038,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "systemic_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1674,9 +2050,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "landable",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1684,9 +2062,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "design",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1694,9 +2074,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "design_review",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1704,9 +2086,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "implement",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1714,9 +2098,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "review",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1724,9 +2110,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "systemic_review",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1734,9 +2122,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "landable",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -1744,9 +2134,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "design",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1757,9 +2149,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1770,9 +2164,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1783,9 +2179,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1796,9 +2194,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1809,9 +2209,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "landable",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1822,9 +2224,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> reopen",
           "event": "reopen",
           "fired_by": "operator",
           "from": "landed",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
           "guarded": true,
           "planned": false,
           "reconciled": false,
@@ -1834,9 +2238,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> reopen",
           "event": "reopen",
           "fired_by": "operator",
           "from": "cancelled",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
           "guarded": true,
           "planned": false,
           "reconciled": false,
@@ -1846,9 +2252,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> reopen",
           "event": "reopen",
           "fired_by": "operator",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1858,9 +2266,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "design",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1870,9 +2280,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1882,9 +2294,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1894,9 +2308,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1906,9 +2322,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1918,9 +2336,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "landable",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1930,9 +2350,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "landed",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -1942,9 +2364,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2004,9 +2428,11 @@
       ],
       "transitions": [
         {
+          "command": null,
           "event": "start",
           "fired_by": "applied",
           "from": "open",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -2014,9 +2440,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "start",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -2024,9 +2452,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "start",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -2034,9 +2464,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "submit_for_review",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2044,9 +2476,11 @@
           "to": "needs_review"
         },
         {
+          "command": null,
           "event": "request_changes",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2054,9 +2488,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "submit_for_review",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2064,9 +2500,11 @@
           "to": "needs_review"
         },
         {
+          "command": null,
           "event": "request_changes",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2074,9 +2512,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "land",
           "fired_by": "operator",
           "from": "in_progress",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -2086,9 +2526,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "land",
           "fired_by": "operator",
           "from": "needs_review",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -2098,9 +2540,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "land",
           "fired_by": "operator",
           "from": "done",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2110,9 +2554,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "abandon",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": "the session has no uncommitted changes",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -2120,9 +2566,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "abandon",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": "the session has no uncommitted changes",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -2130,9 +2578,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "abandon",
           "fired_by": "applied",
           "from": "open",
+          "guard": "the session has no uncommitted changes",
           "guarded": true,
           "planned": true,
           "reconciled": false,
@@ -2140,9 +2590,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "open",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2150,9 +2602,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2160,9 +2614,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2170,9 +2626,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "cancel",
           "fired_by": "applied",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2180,9 +2638,11 @@
           "to": "cancelled"
         },
         {
+          "command": null,
           "event": "reopen",
           "fired_by": "applied",
           "from": "done",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2190,9 +2650,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "reopen",
           "fired_by": "applied",
           "from": "open",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2200,9 +2662,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "reopen",
           "fired_by": "applied",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2210,9 +2674,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "in_progress",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -2220,9 +2686,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "needs_review",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -2230,9 +2698,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "done",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -2240,9 +2710,11 @@
           "to": "done"
         },
         {
+          "command": null,
           "event": "observed_owner_gone",
           "fired_by": "observed",
           "from": "open",
+          "guard": "something holds the claim, and its owner is proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -2250,9 +2722,11 @@
           "to": "open"
         },
         {
+          "command": null,
           "event": "observed_owner_gone",
           "fired_by": "observed",
           "from": "in_progress",
+          "guard": "something holds the claim, and its owner is proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -2260,9 +2734,11 @@
           "to": "in_progress"
         },
         {
+          "command": null,
           "event": "observed_owner_gone",
           "fired_by": "observed",
           "from": "needs_review",
+          "guard": "something holds the claim, and its owner is proven gone",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -2270,9 +2746,11 @@
           "to": "needs_review"
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "open",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2283,9 +2761,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "in_progress",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2296,9 +2776,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "needs_review",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2309,9 +2791,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "done",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2322,9 +2806,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "override",
           "fired_by": "operator, coordinator",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": true,
           "reconciled": false,
@@ -2335,9 +2821,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "open",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -2345,9 +2833,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "in_progress",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -2355,9 +2845,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "needs_review",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -2365,9 +2857,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "done",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -2375,9 +2869,11 @@
           "to": null
         },
         {
+          "command": null,
           "event": "set_from_file",
           "fired_by": "observed",
           "from": "cancelled",
+          "guard": "the task is backed by a synced file that states a status for it",
           "guarded": true,
           "planned": true,
           "reconciled": true,
@@ -2387,6 +2883,68 @@
       ]
     },
     "phase": null,
+    "role_ops": {
+      "coordinator": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "workflow",
+        "grant",
+        "design",
+        "design_approve"
+      ],
+      "designer": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "workflow",
+        "design",
+        "design_approve"
+      ],
+      "implementer": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "task_claim",
+        "workflow"
+      ],
+      "operator": [
+        "read",
+        "hook",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "review",
+        "land",
+        "workflow",
+        "design",
+        "design_approve",
+        "grant",
+        "attest",
+        "exec_request",
+        "admin"
+      ],
+      "reviewer": [
+        "read",
+        "hook",
+        "exec_request",
+        "review",
+        "workflow",
+        "design_approve"
+      ],
+      "systemic_reviewer": [
+        "read",
+        "hook",
+        "exec_request",
+        "task_write",
+        "workflow"
+      ]
+    },
     "spec": {
       "attributes": {
         "repeated_area": {
@@ -2476,9 +3034,11 @@
       ],
       "transitions": [
         {
+          "command": "jkb workflow fire <uid> submit_design",
           "event": "submit_design",
           "fired_by": "operator, coordinator, designer",
           "from": "design",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2490,9 +3050,11 @@
           "to": "design_review"
         },
         {
+          "command": "jkb workflow fire <uid> approve_design",
           "event": "approve_design",
           "fired_by": "operator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2502,9 +3064,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> reject_design",
           "event": "reject_design",
           "fired_by": "operator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2514,9 +3078,11 @@
           "to": "design"
         },
         {
+          "command": "jkb workflow fire <uid> submit_work",
           "event": "submit_work",
           "fired_by": "operator, coordinator, implementer",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2528,9 +3094,11 @@
           "to": "review"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "review_passed",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a review round was filed since the work was submitted and found no must-fix; the work has not landed and the task is not cancelled",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2538,9 +3106,11 @@
           "to": "landable"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "review_failed",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, but not the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2548,9 +3118,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "review_repeated",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, and the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2558,9 +3130,11 @@
           "to": "systemic_review"
         },
         {
+          "command": "jkb workflow fire <uid> submit_systemic --reason <why>",
           "event": "submit_systemic",
           "fired_by": "operator, coordinator, systemic_reviewer",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2572,9 +3146,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> systemic_redesign --reason <why>",
           "event": "systemic_redesign",
           "fired_by": "operator, coordinator, systemic_reviewer",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2586,9 +3162,11 @@
           "to": "design"
         },
         {
+          "command": "jkb workflow fire <uid> rework",
           "event": "rework",
           "fired_by": "operator, coordinator",
           "from": "landable",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2599,9 +3177,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "design",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2609,9 +3189,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "design_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2619,9 +3201,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "implement",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2629,9 +3213,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2639,9 +3225,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "systemic_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2649,9 +3237,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_landed",
           "fired_by": "observed",
           "from": "landable",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2659,9 +3249,11 @@
           "to": "landed"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "design",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2669,9 +3261,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "design_review",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2679,9 +3273,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "implement",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2689,9 +3285,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "review",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2699,9 +3297,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "systemic_review",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2709,9 +3309,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow observe <uid>",
           "event": "observed_cancelled",
           "fired_by": "observed",
           "from": "landable",
+          "guard": "the task is cancelled and its work has not landed",
           "guarded": true,
           "planned": false,
           "reconciled": true,
@@ -2719,9 +3321,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "design",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2732,9 +3336,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2745,9 +3351,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2758,9 +3366,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2771,9 +3381,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2784,9 +3396,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> cancel",
           "event": "cancel",
           "fired_by": "operator, coordinator",
           "from": "landable",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2797,9 +3411,11 @@
           "to": "cancelled"
         },
         {
+          "command": "jkb workflow fire <uid> reopen",
           "event": "reopen",
           "fired_by": "operator",
           "from": "landed",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
           "guarded": true,
           "planned": false,
           "reconciled": false,
@@ -2809,9 +3425,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> reopen",
           "event": "reopen",
           "fired_by": "operator",
           "from": "cancelled",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
           "guarded": true,
           "planned": false,
           "reconciled": false,
@@ -2821,9 +3439,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> reopen",
           "event": "reopen",
           "fired_by": "operator",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2833,9 +3453,11 @@
           "to": "implement"
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "design",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2845,9 +3467,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "design_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2857,9 +3481,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "implement",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2869,9 +3495,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2881,9 +3509,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "systemic_review",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2893,9 +3523,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "landable",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2905,9 +3537,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "landed",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,
@@ -2917,9 +3551,11 @@
           "to": null
         },
         {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
           "event": "override",
           "fired_by": "operator",
           "from": "cancelled",
+          "guard": null,
           "guarded": false,
           "planned": false,
           "reconciled": false,

@@ -367,6 +367,72 @@ fn stated(f: &WorkflowFacts) -> Option<Phase> {
     f.stated
 }
 
+impl WorkflowEvent {
+    /// What this event's guard checks, in plain words, for a person reading the graph (the app's
+    /// Lifecycle pane): `None` for an event no row guards. `area` is the strategy's
+    /// `repeated_area` attribute, which the review guards read.
+    ///
+    /// Keyed by event because every guarded row of one event carries the same guard here, which
+    /// `one_guard_per_event` pins; a row of the event that is unguarded (`implement --reopen-->
+    /// implement`) checks nothing, so a caller shows this only for a guarded row.
+    #[must_use]
+    pub fn describe_guard(self, area: &strategy::RepeatedArea) -> Option<String> {
+        let live = "the work has not landed and the task is not cancelled";
+        let fresh = "a review round was filed since the work was submitted";
+        let unit = match area.scope {
+            strategy::AreaScope::File => "file",
+            strategy::AreaScope::Directory => "directory",
+        };
+        let repeated = format!(
+            "the newest {} rounds all flagged must-fixes in the same {unit}",
+            area.rounds
+        );
+        Some(match self {
+            Self::ReviewPassed => format!("{fresh} and found no must-fix; {live}"),
+            Self::ReviewFailed => {
+                format!("{fresh} and found must-fixes, but not {repeated}; {live}")
+            }
+            Self::ReviewRepeated => format!("{fresh} and found must-fixes, and {repeated}; {live}"),
+            Self::ObservedLanded => {
+                "a landing is recorded for the work (a `done` checkbox is not a landing)".to_owned()
+            }
+            Self::ObservedCancelled => {
+                "the task is cancelled and its work has not landed".to_owned()
+            }
+            Self::Reopen => "the task itself is back to work: no landing speaks for it and its \
+                             status is neither done nor cancelled (`jkb task set <uid> --status \
+                             open` first)"
+                .to_owned(),
+            Self::SubmitDesign
+            | Self::ApproveDesign
+            | Self::RejectDesign
+            | Self::SubmitWork
+            | Self::SubmitSystemic
+            | Self::SystemicRedesign
+            | Self::Rework
+            | Self::Cancel
+            | Self::Override => return None,
+        })
+    }
+
+    /// The command that fires this event (`<uid>` stands for the task): `jkb workflow fire` for an
+    /// act, with the reason or destination it needs; `jkb workflow observe` for an observation,
+    /// which takes the one step the facts call for.
+    #[must_use]
+    pub fn command(self) -> String {
+        match (jkb_fsm::Event::kind(self), self) {
+            (EventKind::Reconciled, _) => "jkb workflow observe <uid>".to_owned(),
+            (_, Self::Override) => {
+                "jkb workflow fire <uid> override --to <phase> --reason <why>".to_owned()
+            }
+            (_, e) if e.needs_reason() => {
+                format!("jkb workflow fire <uid> {} --reason <why>", e.as_str())
+            }
+            (_, e) => format!("jkb workflow fire <uid> {}", e.as_str()),
+        }
+    }
+}
+
 // -------------------------------------------------------------------------------------------
 // Graphs
 // -------------------------------------------------------------------------------------------
