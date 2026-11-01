@@ -205,3 +205,130 @@
   stroke: var(--ink-faint);
   stroke-dasharray: 1 2;
 }
+
+/* The request queue. The one alert colour is for what stops a run (the tree moved, the base is
+ * unverified); everything a session wrote is monospace, and an escape is drawn inverted so it is
+ * never read as the text around it. */
+.requests-pane .pane-body {
+  padding: var(--space-3);
+  font-size: var(--text-md);
+}
+
+.request-card {
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.request-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.request-facts dt {
+  color: var(--ink-muted);
+}
+
+.request-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.request-argv {
+  margin: 0;
+  padding-left: 3ch;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.request-argv code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.esc {
+  background: var(--ink);
+  color: var(--bg);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.exec-pre {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  max-height: 40em;
+  overflow: auto;
+  border: var(--hairline-width) solid var(--hairline);
+  padding: var(--space-1) var(--space-2);
+  white-space: pre;
+}
+
+.exec-diff .diff-add {
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+}
+
+.exec-diff .diff-del {
+  color: var(--ink-muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--hairline-strong);
+}
+
+.exec-diff .diff-meta,
+.exec-diff .diff-hunk {
+  color: var(--ink-faint);
+}
+
+.request-verdict,
+.request-unverified,
+.request-blocked,
+.request-said {
+  color: var(--alert);
+}
+
+.request-banner {
+  font-weight: 600;
+}
+
+.request-actions {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin-top: var(--space-2);
+}
+
+.request-decline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+
+.request-decline textarea {
+  font: inherit;
+  width: 100%;
+}
+
+.request-files {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  max-height: 16em;
+  overflow: auto;
+}
+
+.history-row {
+  border-top: var(--hairline-width) solid var(--hairline);
+  padding: var(--space-1) 0;
+}
+
+.request-card button.link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}

@@ -23,9 +23,9 @@
 
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { accessSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeSync } from "node:fs";
+import { accessSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, readSync, statSync, writeSync } from "node:fs";
 import { uptime } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import {
   EXEC_MAX_CHUNK_BYTES,
@@ -36,9 +36,16 @@ import {
   decodeExecRequests,
   escapeArg,
   execId,
+  parseBaseOutput,
+  parseDiffOutput,
   parseRunnerName,
+  previewVerdict,
   runnerName,
+  samePin,
+  TREE_CHANGED,
   type ApiError,
+  type BaseAnswer,
+  type DiffAnswer,
   type ExecPin,
   type ExecView,
   type OpRequest,
@@ -46,7 +53,7 @@ import {
   type Outcome,
 } from "@jkb/core";
 
-import type { ExecPreview, ExecStarted } from "../shared/bridge";
+import type { ExecPreview, ExecStarted, ProgramFile } from "../shared/bridge";
 import { containerPathOf, hostPathOf, parseSpec, type TerminalResult, type TerminalRoots, type TerminalSpec } from "../shared/terminal";
 import type { RunFile } from "./update";
 import { dockerSearchPath, PATH_KEEP_IN_HOME, type OnceHandle, type OnceRun } from "./terminals";
@@ -71,6 +78,12 @@ export const UNKNOWN_BEGIN_WAIT_MS = 60_000;
 
 /** How long `jkb exec pin` may take: a walk and a blake3 of the work tree. */
 export const PIN_TIMEOUT_MS = 2 * 60_000;
+
+/** How long `jkb exec base` may take: one `git ls-remote` over the network. */
+export const BASE_TIMEOUT_MS = 30_000;
+
+/** The most patch `jkb exec diff` prints for the queue (`jkb_cli::exec_cli::DIFF_MAX_BYTES`). */
+export const DIFF_MAX_BYTES = 2 * 1024 * 1024;
 
 /** What `jkb exec pin --json` answered. */
 export type PinAnswer =
@@ -166,11 +179,6 @@ export function refuseReasonFor(pinReason: string): string {
   return pinReason === "dir_gone" || pinReason === "audit_refused" ? pinReason : "tree_changed";
 }
 
-/** Whether two pins are the same pin, "none" included. */
-function samePin(a: ExecPin | null | undefined, b: ExecPin | null | undefined): boolean {
-  if (a === null || a === undefined || b === null || b === undefined) return (a ?? null) === (b ?? null);
-  return a.head === b.head && a.changes === b.changes;
-}
 
 /** What the runner reaches outside itself. */
 export interface ExecRunnerDeps {
@@ -178,6 +186,16 @@ export interface ExecRunnerDeps {
   op(request: OpRequest): Promise<Outcome<OpResponse>>;
   /** `jkb exec pin --dir <hostDir> --json` by the host jkb. */
   pin(hostDir: string): Promise<PinAnswer>;
+  /**
+   * `jkb exec base --dir <hostDir> --json` by the host jkb: the base verified on the host (`git
+   * ls-remote` on the audited remote URL, else the clean clone). Absent: every preview says the base
+   * is unverified.
+   */
+  base?(hostDir: string): Promise<BaseAnswer>;
+  /** `jkb exec diff --dir <hostDir> --base <sha> --json` by the host jkb. Absent: no diff is shown. */
+  diff?(hostDir: string, base: string): Promise<DiffAnswer>;
+  /** The program file at `path`, read without following a link (`readProgramFile`). */
+  readProgram?(path: string): ProgramFile;
   readonly roots: TerminalRoots;
   isDirectory(path: string): boolean;
   /**
@@ -346,10 +364,67 @@ export class ExecRunner {
     return { ok: true, value: prepared };
   }
 
-  /** What Run would do now, for the queue to show before it is clicked. Changes nothing. */
+  /**
+   * What Run would do now, for the queue to show before it is clicked. Changes nothing.
+   *
+   * Pin, diff, pin: `prepare` takes the first pin, the diff carries the pin of exactly the tree it
+   * showed, and a last pin is taken after it. Unless all three are the request's, the tree moved and
+   * the verdict says Run will refuse — here, in main, so a window cannot say otherwise. The diff is
+   * against the base the host verified, or, failing that, the request's own `HEAD` label, with the
+   * base marked unverified.
+   */
   async preview(rawId: unknown): Promise<TerminalResult<ExecPreview>> {
     const id = execId(rawId);
     if (id === undefined) return { ok: false, error: `not a run request id: ${JSON.stringify(rawId)}` };
+    const shown = await this.previewOnce(id);
+    if (!shown.ok) return shown;
+    const v = shown.value;
+    if (v.request.state !== "pending" || v.hostDir === undefined || v.pin.state === "refused" || v.pin.state === "error") return shown;
+    const pin1 = v.pin.state === "match" ? (v.request.pin ?? null) : v.pin.now;
+    const extra = await this.reviewTree(v.request, v.hostDir, v.program);
+    const pin2 = await this.deps.pin(v.hostDir);
+    const pinAfter = pin2.kind === "pinned" ? pin2.pin : undefined;
+    const diffPin = extra.diff?.state === "shown" ? extra.diff.pin : undefined;
+    let verdict = previewVerdict(v.request.pin, [pin1, diffPin, pinAfter]);
+    // The diff saw a file change under it, or the last pin could not be taken: the tree moved.
+    if ((extra.diff?.state === "refused" && extra.diff.reason === "tree_changed") || pin2.kind === "refused") {
+      verdict = { state: "changed", message: TREE_CHANGED };
+    }
+    const problem = v.problem ?? (verdict.state === "changed" ? verdict.message : undefined);
+    return {
+      ok: true,
+      value: { ...v, ...extra, verdict, ...(problem === undefined ? {} : { problem }) },
+    };
+  }
+
+  /** The base, the diff and the program file, for a pending request in a resolved directory. */
+  private async reviewTree(
+    request: ExecView,
+    hostDir: string,
+    program: string | undefined,
+  ): Promise<Pick<ExecPreview, "base" | "diff" | "programFile">> {
+    if (request.pin === undefined) return {};
+    const base: BaseAnswer = this.deps.base === undefined ? { state: "unverified", message: "this app cannot verify a base" } : await this.deps.base(hostDir);
+    const against = base.state === "verified" ? base.sha : request.pin.head;
+    const diff: DiffAnswer | undefined = this.deps.diff === undefined ? undefined : await this.deps.diff(hostDir, against);
+    const top = diff?.state === "shown" ? diff.top : undefined;
+    // The program file: argv[0] as a path, shown when it lies in the repository.
+    const argv0 = request.argv[0] ?? "";
+    const file = program ?? (argv0.includes("/") ? (argv0.startsWith("/") ? hostPathOf(argv0, this.deps.roots) : join(hostDir, argv0)) : undefined);
+    let programFile: ProgramFile | undefined;
+    if (file !== undefined && top !== undefined && this.deps.readProgram !== undefined) {
+      const dir = this.deps.realpath(dirname(file));
+      const real = dir === undefined ? undefined : join(dir, basename(file));
+      if (real !== undefined && real.startsWith(`${top}/`)) programFile = this.deps.readProgram(real);
+    }
+    return {
+      base,
+      ...(diff === undefined ? {} : { diff: { ...diff, against } }),
+      ...(programFile === undefined ? {} : { programFile }),
+    };
+  }
+
+  private async previewOnce(id: string): Promise<TerminalResult<ExecPreview>> {
     const p = await this.prepare(id);
     const facts: Partial<Prepared> = p.ok ? p.value : { ...(p.stopped.partial ?? {}) };
     const request = p.ok ? p.value.request : p.stopped.request;
@@ -847,6 +922,87 @@ export function machinePin(home: string, run: RunFile): (hostDir: string) => Pro
     const r = await run(jkb, ["--json", "exec", "pin", "--dir", hostDir], PIN_TIMEOUT_MS);
     return parsePinOutput(r.code, r.stdout, r.stderr);
   };
+}
+
+/** `jkb exec base` by the host jkb, the clean clone (`cloneDir`) consulted when the remote cannot be asked. */
+export function machineBase(home: string, run: RunFile, cloneDir: string): (hostDir: string) => Promise<BaseAnswer> {
+  const jkb = join(home, HOST_JKB_IN_HOME);
+  return async (hostDir) => {
+    if (!hostJkbOk(jkb)) return { state: "unverified", message: `no jkb at ${jkb}` };
+    const r = await run(jkb, ["--json", "exec", "base", "--dir", hostDir, ...(isDir(cloneDir) ? ["--clone", cloneDir] : [])], BASE_TIMEOUT_MS);
+    return parseBaseOutput(r.code, r.stdout, r.stderr);
+  };
+}
+
+/** `jkb exec diff` by the host jkb, the clean clone offered as a second source of the base's objects. */
+export function machineDiff(home: string, run: RunFile, cloneDir: string): (hostDir: string, base: string) => Promise<DiffAnswer> {
+  const jkb = join(home, HOST_JKB_IN_HOME);
+  return async (hostDir, base) => {
+    if (!hostJkbOk(jkb)) return { state: "error", message: `no jkb at ${jkb}` };
+    const r = await run(
+      jkb,
+      ["--json", "exec", "diff", "--dir", hostDir, "--base", base, "--max", String(DIFF_MAX_BYTES), ...(isDir(cloneDir) ? ["--objects-from", cloneDir] : [])],
+      PIN_TIMEOUT_MS,
+    );
+    return parseDiffOutput(r.code, r.stdout, r.stderr);
+  };
+}
+
+function hostJkbOk(jkb: string): boolean {
+  try {
+    accessSync(jkb, constants.X_OK);
+    return statSync(jkb).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function isDir(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** How much of a program file the queue shows. */
+export const PROGRAM_SHOWN_BYTES = 256 * 1024;
+
+/**
+ * The program file at `path` as the queue shows it, read without following a link: a link is shown
+ * as one (its target's text), never read through.
+ */
+export function readProgramFile(path: string): ProgramFile {
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return { path, kind: "absent" };
+  }
+  if (st.isSymbolicLink()) {
+    try {
+      return { path, kind: "link", target: readlinkSync(path) };
+    } catch {
+      return { path, kind: "absent" };
+    }
+  }
+  if (!st.isFile()) return { path, kind: "other" };
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  } catch {
+    return { path, kind: "absent" };
+  }
+  try {
+    const f = fstatSync(fd);
+    if (!f.isFile()) return { path, kind: "other" };
+    const len = Math.min(f.size, PROGRAM_SHOWN_BYTES);
+    const buf = Buffer.alloc(len);
+    const n = readSync(fd, buf, 0, len, 0);
+    return { path, kind: "file", text: buf.subarray(0, n).toString("utf8"), truncated: f.size > PROGRAM_SHOWN_BYTES };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** A bare program name, found as run.sh finds its own: each absolute line of path-keep, then its fixed PATH. */

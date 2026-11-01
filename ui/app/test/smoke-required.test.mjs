@@ -11,7 +11,7 @@ import * as path from "node:path";
 import test, { after } from "node:test";
 
 /** Every file that launches the app in Electron (they share electron-harness.mjs). */
-const SMOKES = ["smoke.test.mjs", "lifecycle-smoke.test.mjs"];
+const SMOKES = ["smoke.test.mjs", "lifecycle-smoke.test.mjs", "requests-smoke.test.mjs"];
 
 const empty = fs.mkdtempSync(path.join(os.tmpdir(), "jkb-no-electron-"));
 after(() => fs.rmSync(empty, { recursive: true, force: true }));

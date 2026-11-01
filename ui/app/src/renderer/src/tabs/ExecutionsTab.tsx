@@ -1,3 +1,4 @@
+import { RequestsPane } from "../executions/RequestsPane";
 import { TimelinePane } from "../executions/TimelinePane";
 
 /**
@@ -5,8 +6,8 @@ import { TimelinePane } from "../executions/TimelinePane";
  * section is the lifecycle timeline — which sessions hold which tasks and which have stalled, each
  * task's path through its strategy, each plan's progress — read from facts jkb already records.
  *
- * The body is a column of sections, each its own region under the one bar, so the run-request
- * queue (the design's second job) is a second section beside the timeline rather than a new tab.
+ * The body is a column of sections, each its own region under the one bar: the run-request queue
+ * (the design's second job) first, where a waiting session is answered, then the timeline.
  */
 export function ExecutionsTab(): React.JSX.Element {
   return (
@@ -15,6 +16,7 @@ export function ExecutionsTab(): React.JSX.Element {
         <h1>Executions</h1>
       </header>
       <div className="executions-body">
+        <RequestsPane />
         <TimelinePane />
       </div>
     </div>

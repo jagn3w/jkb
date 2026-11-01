@@ -7,6 +7,8 @@
 // in the preload and in main's handlers together; nothing reaches the renderer any other way.
 
 import type {
+  BaseAnswer,
+  DiffAnswer,
   ExecPin,
   ExecView,
   ContainerAction,
@@ -50,6 +52,10 @@ export const BRIDGE_CHANNELS = {
   sessionsPlace: "jkb:sessions:place",
   execRun: "jkb:exec:run",
   execPreview: "jkb:exec:preview",
+  execSubscribe: "jkb:exec:subscribe",
+  execUnsubscribe: "jkb:exec:unsubscribe",
+  /** main → renderer: a run request was made or moved, or the feed's standing changed. */
+  execEvent: "jkb:exec:event",
 } as const;
 
 /** What the renderer may know about where it runs. Nothing secret: no token, no token path. */
@@ -179,9 +185,41 @@ export interface ExecPreview {
     | { readonly state: "differs"; readonly now: ExecPin | null }
     | { readonly state: "refused"; readonly reason: string; readonly message: string }
     | { readonly state: "error"; readonly message: string };
-  /** Why Run would not start now, when it would not. */
+  /**
+   * The base the diff is read against: verified on the host, or unverified (and then the diff is
+   * against the request's own `HEAD` label, which the container could have moved). Absent for a
+   * directory in no repository, or when the request could not be resolved.
+   */
+  readonly base?: BaseAnswer;
+  /** The pinned tree against the base, with the commit it was diffed against. */
+  readonly diff?: DiffAnswer & { readonly against: string };
+  /** The program file, when `argv[0]` is a path in the repository. */
+  readonly programFile?: ProgramFile;
+  /**
+   * Main's verdict on the tree, pin → diff → pin: `changed` (Run will refuse, and is disabled),
+   * `match`, or `no_repo`. Absent when the preview stopped before it (see `problem`).
+   */
+  readonly verdict?: { readonly state: "match" } | { readonly state: "no_repo" } | { readonly state: "changed"; readonly message: string };
+  /** Why Run would not start now, when it would not. Run is disabled while there is one. */
   readonly problem?: string;
 }
+
+/** A program file as the queue shows it: read without following a link, capped. */
+export type ProgramFile =
+  | { readonly path: string; readonly kind: "file"; readonly text: string; readonly truncated: boolean }
+  | { readonly path: string; readonly kind: "link"; readonly target: string }
+  | { readonly path: string; readonly kind: "absent" | "other" };
+
+/**
+ * What main tells a window about the run-request index (`exec/requests`, the operator's own group).
+ * - `changed`: request `id` was made or moved to `state`; re-read the queue.
+ * - `gap`, `error`, `live`: the feed's standing, as for a design topic.
+ */
+export type ExecFeedEvent =
+  | { readonly topic: string; readonly kind: "changed"; readonly id: string; readonly state: string }
+  | { readonly topic: string; readonly kind: "gap"; readonly message: string }
+  | { readonly topic: string; readonly kind: "error"; readonly message: string }
+  | { readonly topic: string; readonly kind: "live" };
 
 /** What Run started: the terminal the window opens ONCE, in its drawer, with no Restart. */
 export interface ExecStarted {
@@ -211,6 +249,14 @@ export interface ExecBridge {
    * resolves to anything else, it is refused rather than run somewhere the operator was not shown.
    */
   run(id: string, shown: { readonly hostDir: string; readonly program?: string }): Promise<TerminalResult<ExecStarted>>;
+  /**
+   * Hear the run-request index. Resolves once main's group is on it: read the queue after that, and
+   * no change falls between the read and the feed.
+   */
+  subscribe(): Promise<Outcome<null>>;
+  unsubscribe(): void;
+  /** Hear every exec event for this window. Returns the unsubscribe. */
+  onEvent(listener: (event: ExecFeedEvent) => void): () => void;
 }
 
 /** `window.jkb`: everything the renderer can ask of the main process. */

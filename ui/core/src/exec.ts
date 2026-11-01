@@ -306,3 +306,263 @@ export function escapeArg(arg: string): string {
   }
   return out;
 }
+
+/**
+ * One argument as the request queue shows it, where the operator decides: [`escapeArg`]'s text with
+ * every non-ASCII character also spelt `\u{…}` — so a homoglyph (Cyrillic `а` for Latin `a`) cannot
+ * pass for the letter it looks like — and a trailing space as `␠`. Unambiguous because `␠` itself is
+ * non-ASCII, so a literal one is spelt `\u{2420}`; an empty argument is `∅` for the same reason.
+ * `glyphs` is the argument as [`escapeArg`] shows it, alongside, when the two differ by more than the
+ * trailing spaces: what the characters look like.
+ */
+export interface ShownArg {
+  readonly text: string;
+  readonly glyphs?: string;
+}
+
+export function showArg(arg: string): ShownArg {
+  if (arg === "") return { text: "∅" };
+  const trailing = arg.length - arg.replace(/ +$/, "").length;
+  const body = arg.slice(0, arg.length - trailing);
+  const marks = "␠".repeat(trailing);
+  let text = "";
+  for (const ch of escapeArg(body)) {
+    const cp = ch.codePointAt(0) as number;
+    text += cp > 0x7e ? `\\u{${cp.toString(16).padStart(4, "0")}}` : ch;
+  }
+  text += marks;
+  const glyphs = escapeArg(body) + marks;
+  return glyphs === text ? { text } : { text, glyphs };
+}
+
+/** A run of shown text: as it is, or an escape standing for characters that may not show as themselves. */
+export interface Segment {
+  readonly text: string;
+  readonly escaped: boolean;
+}
+
+/**
+ * Text that is not an argument — a diff, a run's output, a reason — as segments for an escaped
+ * `<pre>`: the characters [`escapeArg`] escapes become `\u{…}` (or `\r`) segments marked `escaped`,
+ * which the renderer draws apart, so a literal `\u{202e}` in the text is never mistaken for an escape.
+ * Newlines and tabs stay as they are; `\r\n` becomes a newline. Never HTML: the renderer puts each
+ * segment in as text.
+ */
+export function escapeSegments(text: string): Segment[] {
+  const out: Segment[] = [];
+  let plain = "";
+  const push = (seg: string): void => {
+    if (plain !== "") out.push({ text: plain, escaped: false });
+    plain = "";
+    out.push({ text: seg, escaped: true });
+  };
+  const chars = [...text.replaceAll("\r\n", "\n")];
+  for (const ch of chars) {
+    if (ch === "\n" || ch === "\t") plain += ch;
+    else if (ch === "\r") push("\\r");
+    else if (HIDDEN.test(ch)) push(`\\u{${(ch.codePointAt(0) as number).toString(16).padStart(4, "0")}}`);
+    else plain += ch;
+  }
+  if (plain !== "") out.push({ text: plain, escaped: false });
+  return out;
+}
+
+/** A duration in the queue's words: `90s`, `15m`, `2h 5m`. */
+export function durationText(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 120) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 120) return `${m}m`;
+  return `${Math.floor(m / 60)}h${m % 60 === 0 ? "" : ` ${m % 60}m`}`;
+}
+
+/** A pending request as the queue shows it. Every string the requester chose is escaped here. */
+export interface RequestView {
+  readonly id: string;
+  readonly state: string;
+  readonly session: string;
+  readonly role: string;
+  readonly agentType?: string;
+  readonly task?: string;
+  /** The reason, escaped. */
+  readonly reason: readonly Segment[];
+  readonly target: "host" | "container" | string;
+  /** The directory as asked, and which side's path it is. */
+  readonly dir: string;
+  readonly dirSide: string;
+  readonly timeout: string;
+  readonly argv: readonly ShownArg[];
+  /** The pin it was asked with, or none (not in a repository). */
+  readonly pin?: ExecPin;
+  /** How long until it expires unanswered (pending only). */
+  readonly expiresIn?: string;
+}
+
+export function requestView(v: ExecView, now: number): RequestView {
+  return {
+    id: v.id,
+    state: v.state,
+    session: escapeArg(v.session),
+    role: escapeArg(v.role),
+    ...(v.agent_type === undefined ? {} : { agentType: escapeArg(v.agent_type) }),
+    ...(v.task === undefined ? {} : { task: escapeArg(v.task) }),
+    reason: escapeSegments(v.reason),
+    target: v.target,
+    dir: escapeArg(v.dir),
+    dirSide: v.dir_side,
+    timeout: durationText(v.timeout_ms),
+    argv: v.argv.map(showArg),
+    ...(v.pin === undefined ? {} : { pin: v.pin }),
+    ...(v.state === "pending" ? { expiresIn: durationText(Math.max(0, v.expires_at - now)) } : {}),
+  };
+}
+
+/** How a request that left the queue ended, in one line: `exited 0`, `declined`, `refused (tree_changed)`. */
+export function outcomeText(v: Pick<ExecView, "state" | "outcome" | "exit_status" | "refuse_reason">): string {
+  switch (v.state) {
+    case "finished":
+      if (v.outcome === "exited") return `exited ${v.exit_status ?? "?"}`;
+      if (v.outcome === "signalled") return `killed by signal ${v.exit_status ?? "?"}`;
+      if (v.outcome === "timed_out") return "timed out";
+      return v.outcome ?? "finished";
+    case "refused":
+      return `refused (${v.refuse_reason ?? "?"})`;
+    default:
+      return v.state;
+  }
+}
+
+/** The states the history lists: everything that left the queue for good. */
+export const EXEC_ENDED_STATES: readonly string[] = ["finished", "declined", "refused", "expired"];
+
+/** A finished request's stored tail as text (its bytes decoded as UTF-8), or `undefined`. */
+export function tailText(v: ExecView): string | undefined {
+  const b64 = v.output?.tail_b64;
+  if (b64 === undefined || b64 === "") return undefined;
+  const bytes = base64ToBytes(b64);
+  if (bytes === undefined) return undefined;
+  const t = new OutputText();
+  return t.push(bytes) + t.end();
+}
+
+// ---- the preview: the base, the diff, the verdict --------------------------------------------
+
+/** What `jkb exec base --json` answered. */
+export type BaseAnswer =
+  | { readonly state: "verified"; readonly sha: string; readonly ref: string; readonly source: string; readonly url: string }
+  | { readonly state: "unverified"; readonly message: string }
+  | { readonly state: "no_repo" };
+
+const OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+function lastJson(stdout: string): Record<string, unknown> | undefined {
+  const line = stdout.trim().split("\n").pop() ?? "";
+  try {
+    const v: unknown = JSON.parse(line);
+    return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `jkb exec base --json`'s output. A fault (no object, an exit with no answer) is `unverified` with why. */
+export function parseBaseOutput(code: number | null, stdout: string, stderr: string): BaseAnswer {
+  const o = lastJson(stdout);
+  if (code === 0 && o !== undefined) {
+    if ("repo" in o && o["repo"] === null) return { state: "no_repo" };
+    const b = o["base"] as Record<string, unknown> | undefined;
+    if (typeof b === "object" && b !== null && typeof b["sha"] === "string" && OID.test(b["sha"]) && typeof b["ref"] === "string") {
+      return { state: "verified", sha: b["sha"], ref: b["ref"], source: String(b["source"] ?? ""), url: String(b["url"] ?? "") };
+    }
+    const u = o["unverified"] as Record<string, unknown> | undefined;
+    if (typeof u === "object" && u !== null) return { state: "unverified", message: String(u["message"] ?? "") };
+  }
+  const why = stderr.trim().split("\n").slice(-4).join("\n");
+  return { state: "unverified", message: `jkb exec base ${code === null ? "did not finish" : `failed (exit ${code})`}${why ? `: ${why}` : ""}` };
+}
+
+/** One changed path in a diff: git's status letter (`I`: tracked on the base, ignored here, outside the pin). */
+export interface DiffFile {
+  readonly status: string;
+  readonly path: string;
+}
+
+/** What `jkb exec diff --json` answered. */
+export type DiffAnswer =
+  | {
+      readonly state: "shown";
+      readonly base: string;
+      readonly top: string;
+      readonly pin: ExecPin;
+      readonly files: readonly DiffFile[];
+      readonly filesTruncated: boolean;
+      readonly patch: string;
+      readonly truncated: boolean;
+    }
+  | { readonly state: "no_repo" }
+  | { readonly state: "refused"; readonly reason: string; readonly message: string }
+  | { readonly state: "error"; readonly message: string };
+
+/** `jkb exec diff --json`'s output. */
+export function parseDiffOutput(code: number | null, stdout: string, stderr: string): DiffAnswer {
+  const o = lastJson(stdout);
+  if (o !== undefined) {
+    const r = o["refused"] as Record<string, unknown> | undefined;
+    if (typeof r === "object" && r !== null && typeof r["reason"] === "string") {
+      return { state: "refused", reason: r["reason"], message: String(r["message"] ?? "") };
+    }
+    if (code === 0 && "repo" in o && o["repo"] === null) return { state: "no_repo" };
+    const files = o["files"];
+    const pin = o["pin"];
+    if (
+      code === 0 &&
+      isPin(pin) &&
+      typeof o["patch"] === "string" &&
+      typeof o["base"] === "string" &&
+      Array.isArray(files) &&
+      files.every((f) => typeof f === "object" && f !== null && typeof f.status === "string" && typeof f.path === "string")
+    ) {
+      return {
+        state: "shown",
+        base: o["base"],
+        top: String(o["top"] ?? ""),
+        pin,
+        files: (files as DiffFile[]).map((f) => ({ status: f.status, path: f.path })),
+        filesTruncated: o["files_truncated"] === true,
+        patch: o["patch"],
+        truncated: o["truncated"] === true,
+      };
+    }
+  }
+  const why = stderr.trim().split("\n").slice(-6).join("\n");
+  return { state: "error", message: `jkb exec diff ${code === null ? "did not finish" : `failed (exit ${code})`}${why ? `: ${why}` : ""}` };
+}
+
+/** Whether two pins are the same pin, "none" (no repository) included. */
+export function samePin(a: ExecPin | null | undefined, b: ExecPin | null | undefined): boolean {
+  if (a === null || a === undefined || b === null || b === undefined) return (a ?? null) === (b ?? null);
+  return a.head === b.head && a.changes === b.changes;
+}
+
+/** The sentence the queue shows when Run would refuse: the tree moved since the request. */
+export const TREE_CHANGED = "Tree changed since the request: Run will refuse";
+
+/**
+ * The preview's verdict on the tree: the pin taken before the diff, the diff's own and the one taken
+ * after (pin → diff → pin) must all be the request's. `null` in `seen` is "no repository"; an
+ * `undefined` one was not taken (an error said elsewhere) and is skipped.
+ */
+export function previewVerdict(
+  requested: ExecPin | null | undefined,
+  seen: readonly (ExecPin | null | undefined)[],
+): { readonly state: "match" } | { readonly state: "no_repo" } | { readonly state: "changed"; readonly message: string } {
+  const taken = seen.filter((p) => p !== undefined);
+  if (taken.some((p) => !samePin(p, requested))) return { state: "changed", message: TREE_CHANGED };
+  return requested === undefined || requested === null ? { state: "no_repo" } : { state: "match" };
+}
+
+/** What the queue says where a diff would be, for a directory in no repository. */
+export const NOT_IN_A_REPOSITORY = "Not in a repository: no tree pin, no diff.";
+
+/** `jkb_core::exec::INDEX_TOPIC`: where jkb announces each request made and each move. */
+export const EXEC_INDEX_TOPIC = "exec/requests";

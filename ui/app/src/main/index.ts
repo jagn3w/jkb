@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   BUILD_EXIT,
+  APP_SRC_IN_HOME,
   REMOTE_VAR,
   TOKEN_FILE_VAR,
   daemonUrl,
@@ -50,7 +51,8 @@ import type { TerminalResult, TerminalRoots } from "../shared/terminal";
 import { ContainerKit, machineKit } from "./container";
 import { DaemonClient } from "./daemon";
 import { DesignFeeds } from "./designFeeds";
-import { ExecRunner, bootId, machineFindProgram, machinePin } from "./execRun";
+import { ExecFeed } from "./execFeed";
+import { ExecRunner, bootId, machineBase, machineDiff, machineFindProgram, machinePin, readProgramFile } from "./execRun";
 import { rendererSource } from "./devRenderer";
 import { gitPlace } from "./gitPlace";
 import { NotifyFeed } from "./notifyFeed";
@@ -138,6 +140,11 @@ const updater = new AppUpdater(accountHome(), machineRunner(accountHome(), proce
 const execRunner = new ExecRunner({
   op: (request) => daemon.op(request),
   pin: machinePin(accountHome(), machineRunner(accountHome(), process.env)),
+  // The base is verified on the host: `git ls-remote` on the audited remote URL, else Code Factory's
+  // own clean clone — never the request repository's `origin/main`, which the container can write.
+  base: machineBase(accountHome(), machineRunner(accountHome(), process.env), join(accountHome(), APP_SRC_IN_HOME)),
+  diff: machineDiff(accountHome(), machineRunner(accountHome(), process.env), join(accountHome(), APP_SRC_IN_HOME)),
+  readProgram: readProgramFile,
   roots: terminalRoots,
   isDirectory: (p) => terminalEnvironment.isDirectory(p),
   realpath: (p) => {
@@ -187,10 +194,21 @@ const notifyFeed = new NotifyFeed(
   { log: (message) => process.stderr.write(`code-factory: ${message}\n`) },
 );
 
+/** The run-request feed: the app's own (operator) group on `exec/requests`, one for every window. */
+const execFeed = new ExecFeed(
+  (request, options) => daemon.op(request, options),
+  (owner, event) => {
+    const contents = webContents.fromId(owner);
+    if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.execEvent, event);
+  },
+  { log: (message) => process.stderr.write(`code-factory: ${message}\n`) },
+);
+
 /** Every feed a window can hold, ended together when it closes or reloads. */
 function closeFeeds(owner?: number): void {
   designFeeds.closeAll(owner);
   notifyFeed.closeAll(owner);
+  execFeed.closeAll(owner);
 }
 
 /** The windows this process created: the only senders the bridge answers. */
@@ -326,6 +344,13 @@ function registerBridge(): void {
   ipcMain.handle(BRIDGE_CHANNELS.execRun, (event, id: unknown, shown: unknown) => {
     assertTrusted(event);
     return execRunner.run(event.sender.id, id, shown);
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.execSubscribe, (event) => {
+    assertTrusted(event);
+    return execFeed.join(event.sender.id);
+  });
+  ipcMain.on(BRIDGE_CHANNELS.execUnsubscribe, (event) => {
+    if (isTrusted(event)) execFeed.leave(event.sender.id);
   });
 }
 
@@ -550,7 +575,7 @@ app.on("will-quit", (event) => {
   if (leftNotify) return;
   leftNotify = true;
   event.preventDefault();
-  void notifyFeed.leaveAll(LEAVE_WAIT_MS).finally(() => app.exit(0));
+  void Promise.allSettled([notifyFeed.leaveAll(LEAVE_WAIT_MS), execFeed.leaveAll(LEAVE_WAIT_MS)]).finally(() => app.exit(0));
 });
 
 app.on("window-all-closed", () => {

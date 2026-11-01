@@ -20,8 +20,18 @@ import {
   decodeExecView,
   decodeOutputFrame,
   encodeOutputChunks,
+  EXEC_INDEX_TOPIC,
+  NOT_IN_A_REPOSITORY,
+  TREE_CHANGED,
   escapeArg,
+  escapeSegments,
   execExitCode,
+  outcomeText,
+  parseBaseOutput,
+  parseDiffOutput,
+  previewVerdict,
+  requestView,
+  showArg,
   execId,
   parseRunnerName,
   rendererOpRefusal,
@@ -197,4 +207,99 @@ test("an argument escapes one code point of every hidden category, by Unicode pr
     assert.equal(escapeArg(`a${ch}b`), `a${shown}b`, category);
   }
   assert.equal(escapeArg("./scripts/check.sh a b"), "./scripts/check.sh a b", "U+0020 is a space like any other");
+});
+
+test("the index topic is jkb_core::exec::INDEX_TOPIC", () => {
+  const m = /pub const INDEX_TOPIC: &str = "([^"]+)";/.exec(coreExec);
+  assert.ok(m);
+  assert.equal(m[1], EXEC_INDEX_TOPIC);
+});
+
+test("an argument in the queue: every hidden and every non-ASCII character spelt out, a trailing space shown", () => {
+  const table = [
+    ["rm‮-rf", "rm\\u{202e}-rf", "an RLO"],
+    ["a‍b", "a\\u{200d}b", "a ZWJ"],
+    ["a\tb", "a\\tb", "a tab"],
+    ["\x1b[2J", "\\u{001b}[2J", "a clear-screen escape"],
+    ["a\u0000b", "a\\u{0000}b", "a NUL"],
+    ["make ", "make␠", "a trailing space"],
+    ["x  ", "x␠␠", "two trailing spaces"],
+    ["аdd", "\\u{0430}dd", "a Cyrillic а passing for a Latin a"],
+    ["␠", "\\u{2420}", "a literal ␠ is not a trailing space"],
+    ["", "∅", "an empty argument"],
+    ["plain/path.sh", "plain/path.sh", "plain ASCII"],
+  ];
+  for (const [arg, text, what] of table) assert.equal(showArg(arg).text, text, what);
+  // The glyph is shown alongside where the text spelt a character out.
+  assert.deepEqual(showArg("\u0430dd"), { text: "\\u{0430}dd", glyphs: "\u0430dd" });
+  assert.equal(showArg("make ").glyphs, undefined, "a trailing space alone needs no glyph");
+  assert.equal(showArg("plain").glyphs, undefined);
+});
+
+test("text that is not an argument is escaped into marked segments, newlines kept", () => {
+  assert.deepEqual(escapeSegments("a\u202eb\r\nc\td"), [
+    { text: "a", escaped: false },
+    { text: "\\u{202e}", escaped: true },
+    { text: "b\nc\td", escaped: false },
+  ]);
+  assert.deepEqual(escapeSegments("x\ry"), [
+    { text: "x", escaped: false },
+    { text: "\\r", escaped: true },
+    { text: "y", escaped: false },
+  ]);
+  // A literal escape spelt in the text is plain text, never marked.
+  assert.deepEqual(escapeSegments("\\u{202e}"), [{ text: "\\u{202e}", escaped: false }]);
+});
+
+test("the request view model escapes every field a session chose", () => {
+  const v = {
+    id: "exec-3", topic: "exec/3", state: "pending", target: "host", dir: "/w/r\u202e", dir_side: "container",
+    argv: ["sh", "-c", "echo \u0430 "], reason: "need \u001b[2Jdocker", session: "s\u200b1", role: "implementer",
+    agent_type: "implementer", task: "task:x", timeout_ms: 90_000, created_at: 0, expires_at: 7_200_000,
+    pin: { head: "a".repeat(40), changes: "b".repeat(64) },
+  };
+  const r = requestView(v, 3_600_000);
+  assert.equal(r.session, "s\\u{200b}1");
+  assert.equal(r.dir, "/w/r\\u{202e}");
+  assert.deepEqual(r.argv.map((a) => a.text), ["sh", "-c", "echo \\u{0430}␠"]);
+  assert.ok(r.reason.some((s) => s.escaped && s.text === "\\u{001b}"));
+  assert.equal(r.timeout, "90s");
+  assert.equal(r.expiresIn, "60m");
+  assert.equal(requestView({ ...v, state: "declined" }, 0).expiresIn, undefined);
+  assert.equal(outcomeText({ state: "finished", outcome: "exited", exit_status: 2 }), "exited 2");
+  assert.equal(outcomeText({ state: "refused", refuse_reason: "tree_changed" }), "refused (tree_changed)");
+  assert.equal(outcomeText({ state: "declined" }), "declined");
+});
+
+test("the preview's verdict: all pins the request's, one that differs, no repository", () => {
+  const p = { head: "a".repeat(40), changes: "b".repeat(64) };
+  const q = { head: "a".repeat(40), changes: "c".repeat(64) };
+  assert.deepEqual(previewVerdict(p, [p, p, p]), { state: "match" });
+  assert.deepEqual(previewVerdict(p, [p, q, p]), { state: "changed", message: TREE_CHANGED });
+  assert.deepEqual(previewVerdict(p, [p, p, q]), { state: "changed", message: TREE_CHANGED }, "moved after the diff");
+  assert.deepEqual(previewVerdict(p, [null]), { state: "changed", message: TREE_CHANGED }, "the repository went away");
+  assert.deepEqual(previewVerdict(undefined, [null, undefined, null]), { state: "no_repo" });
+  assert.deepEqual(previewVerdict(p, [p, undefined, p]), { state: "match" }, "a pin not taken is said elsewhere");
+  assert.equal(NOT_IN_A_REPOSITORY, "Not in a repository: no tree pin, no diff.");
+});
+
+test("jkb exec base and jkb exec diff are read as answers or faults", () => {
+  const sha = "d".repeat(40);
+  assert.deepEqual(parseBaseOutput(0, JSON.stringify({ dir: "/r", base: { sha, ref: "refs/heads/main", source: "ls-remote", url: "u" } }), ""), {
+    state: "verified", sha, ref: "refs/heads/main", source: "ls-remote", url: "u",
+  });
+  assert.deepEqual(parseBaseOutput(0, JSON.stringify({ dir: "/r", unverified: { message: "offline" } }), ""), { state: "unverified", message: "offline" });
+  assert.deepEqual(parseBaseOutput(0, JSON.stringify({ dir: "/r", repo: null }), ""), { state: "no_repo" });
+  assert.equal(parseBaseOutput(0, JSON.stringify({ base: { sha: "HEAD", ref: "x" } }), "").state, "unverified", "a base that is not an object id");
+  assert.match(parseBaseOutput(1, "", "boom").message, /failed \(exit 1\): boom/);
+  const pin = { head: "a".repeat(40), changes: "b".repeat(64) };
+  const shown = parseDiffOutput(0, JSON.stringify({ dir: "/r", top: "/r", base: sha, pin, files: [{ status: "M", path: "a" }], files_truncated: false, patch: "+x", truncated: true }), "");
+  assert.equal(shown.state, "shown");
+  assert.equal(shown.truncated, true);
+  assert.deepEqual(shown.files, [{ status: "M", path: "a" }]);
+  assert.deepEqual(parseDiffOutput(1, JSON.stringify({ dir: "/r", refused: { reason: "tree_changed", message: "moved" } }), ""), {
+    state: "refused", reason: "tree_changed", message: "moved",
+  });
+  assert.deepEqual(parseDiffOutput(0, JSON.stringify({ dir: "/r", repo: null }), ""), { state: "no_repo" });
+  assert.equal(parseDiffOutput(1, "", "no base").state, "error");
 });
