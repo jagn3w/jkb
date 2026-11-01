@@ -58,6 +58,10 @@ const bridge: JkbBridge = {
   sessions: {
     place: (cwd) => ipcRenderer.invoke(BRIDGE_CHANNELS.sessionsPlace, cwd),
   },
+  exec: {
+    preview: (id) => ipcRenderer.invoke(BRIDGE_CHANNELS.execPreview, id),
+    run: (id) => ipcRenderer.invoke(BRIDGE_CHANNELS.execRun, id),
+  },
 };
 
 contextBridge.exposeInMainWorld("jkb", bridge);

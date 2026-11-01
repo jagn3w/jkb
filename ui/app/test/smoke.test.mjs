@@ -96,7 +96,7 @@ test("the renderer has no Node, only the bridge", { skip }, async () => {
     process: typeof globalThis.process,
     bridge: Object.keys(window.jkb).sort(),
   }));
-  assert.deepEqual(globals, { require: "undefined", process: "undefined", bridge: ["container", "design", "hello", "info", "notify", "op", "sessions", "terminal"] });
+  assert.deepEqual(globals, { require: "undefined", process: "undefined", bridge: ["container", "design", "exec", "hello", "info", "notify", "op", "sessions", "terminal"] });
 });
 
 test("the daemon's status is shown, and an absent daemon reads unreachable", { skip }, async () => {

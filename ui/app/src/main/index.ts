@@ -23,6 +23,7 @@ import {
   daemonUrl,
   failed,
   portOf,
+  rendererOp,
   tokenPath,
   updateSummary,
   type OpRequest,
@@ -48,6 +49,7 @@ import type { TerminalResult, TerminalRoots } from "../shared/terminal";
 import { ContainerKit, machineKit } from "./container";
 import { DaemonClient } from "./daemon";
 import { DesignFeeds } from "./designFeeds";
+import { ExecRunner, bootId, machineFindProgram, machinePin } from "./execRun";
 import { rendererSource } from "./devRenderer";
 import { gitPlace } from "./gitPlace";
 import { NotifyFeed } from "./notifyFeed";
@@ -102,9 +104,11 @@ const spawnPty: SpawnPty = (file, args, options) => {
   return ptyModule.spawn(file, args, options);
 };
 
+const terminalEnvironment = machineEnvironment(terminalRoots, process.env, loginShell());
+
 const terminals = new TerminalHost(
   spawnPty,
-  machineEnvironment(terminalRoots, process.env, loginShell()),
+  terminalEnvironment,
   (owner, event) => {
     const contents = webContents.fromId(owner);
     if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.terminalEvent, event);
@@ -123,6 +127,26 @@ const updater = new AppUpdater(accountHome(), machineRunner(accountHome(), proce
   exe: app.getPath("exe"),
   platform: process.platform,
   commit: builtCommit(join(__dirname, "..")),
+});
+
+/**
+ * Run requests (the Executions design): main reads the request, recomputes its pin with the host's
+ * own jkb (`~/.cargo/bin/jkb` under the ACCOUNT's home, run with git's repository selection scrubbed),
+ * begins it, and issues the terminal to the window for one open. The renderer only names an id.
+ */
+const execRunner = new ExecRunner({
+  op: (request) => daemon.op(request),
+  pin: machinePin(accountHome(), machineRunner(accountHome(), process.env)),
+  roots: terminalRoots,
+  isDirectory: (p) => terminalEnvironment.isDirectory(p),
+  findHostProgram: machineFindProgram(accountHome()),
+  docker: () => terminalEnvironment.docker(),
+  issueOnce: (owner, spec, run) => terminals.issueOnce(owner, spec, run),
+  processAlive: (pid) => terminalEnvironment.processAlive(pid),
+  pid: process.pid,
+  boot: bootId(),
+  home: accountHome(),
+  log: (message) => process.stderr.write(`code-factory: ${message}\n`),
 });
 
 /** Set by an update that staged a build: install it as this process quits, relaunching or not. */
@@ -197,7 +221,9 @@ function registerBridge(): void {
   ipcMain.handle(BRIDGE_CHANNELS.op, (event, request: unknown) => {
     assertTrusted(event);
     if (!isOpRequest(request)) return failed("bad_request", "an op is an object with a string `op`");
-    return daemon.op(request);
+    // A run starts only through `execRun`, which reads the request and recomputes its pin itself:
+    // the runner's own ops are refused here (`EXEC_RUNNER_OPS`).
+    return rendererOp(request, (r) => daemon.op(r));
   });
   ipcMain.handle(BRIDGE_CHANNELS.info, (event): AppInfo => {
     assertTrusted(event);
@@ -273,6 +299,17 @@ function registerBridge(): void {
   ipcMain.handle(BRIDGE_CHANNELS.sessionsPlace, (event, cwd: unknown) => {
     assertTrusted(event);
     return gitPlace(cwd, terminalRoots);
+  });
+
+  // Run requests: the renderer names an id; main does the rest (`execRun.ts`) and issues the terminal
+  // spec to this window for ONE open.
+  ipcMain.handle(BRIDGE_CHANNELS.execPreview, (event, id: unknown) => {
+    assertTrusted(event);
+    return execRunner.preview(id);
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.execRun, (event, id: unknown) => {
+    assertTrusted(event);
+    return execRunner.run(event.sender.id, id);
   });
 }
 
@@ -456,6 +493,8 @@ if (refusal !== undefined) {
     registerBridge();
     createWindow();
     void notePendingInstall();
+    // Runs a quit or a crash left `running`: their PTYs died with that app.
+    void execRunner.reconcile();
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });

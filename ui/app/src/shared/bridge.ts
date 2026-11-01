@@ -7,6 +7,8 @@
 // in the preload and in main's handlers together; nothing reaches the renderer any other way.
 
 import type {
+  ExecPin,
+  ExecView,
   ContainerAction,
   ContainerResult,
   ContainerStatus,
@@ -46,6 +48,8 @@ export const BRIDGE_CHANNELS = {
   /** main → renderer: a session's notification moved, or the feed's standing changed. */
   notifyEvent: "jkb:notify:event",
   sessionsPlace: "jkb:sessions:place",
+  execRun: "jkb:exec:run",
+  execPreview: "jkb:exec:preview",
 } as const;
 
 /** What the renderer may know about where it runs. Nothing secret: no token, no token path. */
@@ -153,6 +157,46 @@ export interface SessionsBridge {
   place(cwd: string): Promise<TerminalResult<GitPlace>>;
 }
 
+/** What Run would do for a request now (main's `ExecRunner.preview`): shown before Run is clicked. */
+export interface ExecPreview {
+  readonly request: ExecView;
+  /** Each argument escaped (control and invisible characters shown), one per line. */
+  readonly argvShown: readonly string[];
+  readonly hostDir?: string;
+  readonly containerDir?: string;
+  /** The host program the run starts, as an absolute path (a host run only). */
+  readonly program?: string;
+  /** The run's timeout. */
+  readonly timeoutMs: number;
+  /** The tree pin recomputed now, against the request's. */
+  readonly pin:
+    | { readonly state: "match" }
+    | { readonly state: "differs"; readonly now: ExecPin | null }
+    | { readonly state: "refused"; readonly reason: string; readonly message: string }
+    | { readonly state: "error"; readonly message: string };
+  /** Why Run would not start now, when it would not. */
+  readonly problem?: string;
+}
+
+/** What Run started: the terminal the window opens ONCE, in its drawer, with no Restart. */
+export interface ExecStarted {
+  readonly id: string;
+  readonly spec: TerminalSpec;
+  readonly timeoutMs: number;
+}
+
+/**
+ * `window.jkb.exec`: running a run request (the Executions design). The renderer names a request id
+ * and nothing else: main reads the request, recomputes the pin, begins it and builds the terminal
+ * itself. The generic `op` refuses the runner's own ops (`EXEC_RUNNER_OPS`).
+ */
+export interface ExecBridge {
+  /** What Run would do now. Changes nothing. */
+  preview(id: string): Promise<TerminalResult<ExecPreview>>;
+  /** Run request `id`: the spec to open once, or why nothing started (refused, expired, already run). */
+  run(id: string): Promise<TerminalResult<ExecStarted>>;
+}
+
 /** `window.jkb`: everything the renderer can ask of the main process. */
 export interface JkbBridge {
   /** `GET /v1/hello`: whether the daemon is reachable, and which schema and ops it serves. */
@@ -171,4 +215,6 @@ export interface JkbBridge {
   readonly notify: NotifyBridge;
   /** Where sessions run. */
   readonly sessions: SessionsBridge;
+  /** Running run requests. */
+  readonly exec: ExecBridge;
 }
