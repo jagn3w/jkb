@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 d91be9db91c1c7c39d301657c881eef88d1bcf16c84ed5623c06fb0ec5483ac1) -->
+<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 b9f9e3be952a7671f5a3c6aaf3c5ac6230eb3262c9ee124cbad553dc865e70f4) -->
 # Agents and roles
 
 jkb is driven by agents as much as by people: a task swarm that schedules, implements, reviews
@@ -1655,7 +1655,24 @@ The pin does not cover everything a run reads, and this is accepted for now. Fil
 (`target/`, `node_modules/`, build output) are outside it, and `check.sh` runs them. And the
 container can change a file between the pin check and the moment the run reads it. Closing both
 means running from a private host copy of the pinned tree, which costs a cold build per run and
-keeps the run's effects out of the session's directory; revisit that if a request ever needs it. State under `.git` other than the read-only `config` and `hooks` (index, refs, objects, `info/`) is
+keeps the run's effects out of the session's directory; revisit that if a request ever needs it. The
+directory itself is resolved before anything else (links and `..` followed): one the container named
+must resolve under the host's real repos root, or the request is refused as directory gone, and the
+resolved path is what the operator sees, what the pin covers and where the run starts; a pin of any
+other directory refuses the request; the pin's directory is compared by identity (device and inode),
+not spelling. Run names what the preview showed, the resolved directory and host program, and a
+request that now resolves to anything else is refused (tree changed). A host run starts through a
+fixed launcher main builds: it enters the directory with `cd -P` and runs the program only if the
+directory's inode, read with `/bin/ls`, is the one recorded when it was resolved and pinned, and main
+checks device and inode again just before the spawn. A relative program runs as `./<path>` from the
+verified directory, so it is never read as an option. A directory swapped for a link, or for another
+directory, after the pin runs nothing: the launcher prints a refusal carrying a per-run nonce and
+exits 125, and the request ends interrupted; only that line with that exit counts as a refusal, so a
+program's own output cannot pass for one. The operator is shown the program, never the launcher. The
+pin is recomputed by the host's own `~/.cargo/bin/jkb`, the
+binary `setup.sh` installs. A request is refused only for an identified cause (the directory does not
+exist, the audit's own finding, or a tree the pin will not cover, including a repository with no
+commit); a fault on the host refuses nothing, and the request stays pending with the error shown. State under `.git` other than the read-only `config` and `hooks` (index, refs, objects, `info/`) is
 not pinned either: a run whose scripts consult git in that repository acts on container-written
 state, which no run today executes. A link's target outside the tree is pinned and shown; the file
 it names is not.
@@ -1667,8 +1684,16 @@ host program. The renderer names a request id. Main reads the request from jkb, 
 and builds the terminal spec itself (`issueHost`), so a window cannot turn an approval into a
 different argv. The terminal runs once (no Restart), and one run per request is taken
 synchronously from the click, as `ActionGate` does for the Container tab. The environment is
-`hostEnv`'s fixed environment, not the app's, plus `JKB_EXEC_REQUEST=<id>`. Each run has a
-timeout, shown before Run is clicked.
+`hostEnv`'s fixed environment, not the app's, without git's repository selection, plus
+`JKB_EXEC_REQUEST=<id>`. A host program is named by its resolved absolute path (relative to the
+resolved directory, or a bare name found where `run.sh` looks), and the preview shows that path and
+every argument with each control, format, private-use, unassigned, separator and default-ignorable
+character escaped. The renderer's generic op channel refuses the runner's own ops (`exec.begin`,
+`exec.output`, `exec.finish`, `exec.refuse`); a run whose terminal does not open within 30 seconds
+ends as interrupted; and an `exec.begin` whose outcome stays unknown keeps the click's gate held until
+the daemon answers, then ends the run as interrupted if it took. Each run has a timeout, shown before
+Run is clicked: at the timeout main sends SIGTERM to the process group and SIGKILL ten seconds later.
+Runs an earlier app instance left `running` are ended as interrupted at the next start.
 
 ### Output goes straight to the session
 
@@ -1676,7 +1701,7 @@ timeout, shown before Run is clicked.
 arrives: the decision, the output streamed as it is produced, and the exit status, which becomes
 its own exit status. Main publishes the run's output to that topic as the terminal shows it, so
 the operator and the session see the same bytes. The row keeps the last 256 KiB and the exit
-status; the full output goes to a log under `~/.jkb/logs`. `--no-wait` returns the request id at
+status; the full output goes to `~/.jkb/logs/exec/exec-<n>.log`. While the daemon is unreachable main buffers up to 4 MiB of output; past that the rest goes to the log only, and the stream says how much it missed and where the log is. `--no-wait` returns the request id at
 once, and `jkb exec status <id>` reads the outcome later.
 
 ### A request's states
