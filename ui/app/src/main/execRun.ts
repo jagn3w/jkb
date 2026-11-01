@@ -96,6 +96,31 @@ export function noDiffProblem(diff: DiffAnswer | undefined): string {
   return `No diff could be shown, so Run waits until one can: ${why}`;
 }
 
+/** How many previews run at once (a preview pins twice, asks the remote and diffs a whole tree). */
+export const PREVIEWS_AT_ONCE = 2;
+
+/** A counting semaphore: `acquire` waits, first come first served, while `limit` are held. */
+export class Semaphore {
+  private held = 0;
+  private readonly waiting: (() => void)[] = [];
+
+  constructor(private readonly limit: number) {}
+
+  acquire(): Promise<void> {
+    if (this.held < this.limit) {
+      this.held++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.waiting.push(resolve));
+  }
+
+  release(): void {
+    const next = this.waiting.shift();
+    if (next !== undefined) next();
+    else this.held--;
+  }
+}
+
 /** What `jkb exec pin --json` answered. */
 export type PinAnswer =
   | { readonly kind: "pinned"; readonly pin: ExecPin | null; readonly dir?: string }
@@ -203,8 +228,11 @@ export interface ExecRunnerDeps {
    * is unverified.
    */
   base?(hostDir: string): Promise<BaseAnswer>;
-  /** `jkb exec diff --dir <hostDir> --base <sha> --json` by the host jkb. Absent: no diff is shown. */
-  diff?(hostDir: string, base: string): Promise<DiffAnswer>;
+  /**
+   * `jkb exec diff --dir <hostDir> --base <sha> [--program <path>] --json` by the host jkb. Absent:
+   * no diff is shown.
+   */
+  diff?(hostDir: string, base: string, program?: string): Promise<DiffAnswer>;
   /** The program file at `path`, read without following a link (`readProgramFile`). */
   readProgram?(path: string): ProgramFile;
   readonly roots: TerminalRoots;
@@ -266,6 +294,8 @@ type Stopped = { readonly refuse?: string; readonly error: string; readonly requ
 export class ExecRunner {
   /** Requests this app has begun, or is between the click and `exec.begin` for. */
   private readonly taken = new Set<string>();
+  /** The previews running now; the rest wait ([`PREVIEWS_AT_ONCE`]). */
+  private readonly previews = new Semaphore(PREVIEWS_AT_ONCE);
   readonly runner: string;
 
   constructor(private readonly deps: ExecRunnerDeps) {
@@ -387,6 +417,17 @@ export class ExecRunner {
   async preview(rawId: unknown): Promise<TerminalResult<ExecPreview>> {
     const id = execId(rawId);
     if (id === undefined) return { ok: false, error: `not a run request id: ${JSON.stringify(rawId)}` };
+    // At most `PREVIEWS_AT_ONCE` previews run together, the rest wait their turn: each spawns host
+    // jkb and git over a whole tree, and how many requests are pending is up to the sessions.
+    await this.previews.acquire();
+    try {
+      return await this.previewNow(id);
+    } finally {
+      this.previews.release();
+    }
+  }
+
+  private async previewNow(id: string): Promise<TerminalResult<ExecPreview>> {
     const shown = await this.previewOnce(id);
     if (!shown.ok) return shown;
     const v = shown.value;
@@ -422,16 +463,17 @@ export class ExecRunner {
     if (request.pin === undefined) return {};
     const base: BaseAnswer = this.deps.base === undefined ? { state: "unverified", message: "this app cannot verify a base" } : await this.deps.base(hostDir);
     const against = base.state === "verified" ? base.sha : request.pin.head;
-    const diff: DiffAnswer | undefined = this.deps.diff === undefined ? undefined : await this.deps.diff(hostDir, against);
-    const top = diff?.state === "shown" ? diff.top : undefined;
-    // The program file: argv[0] as a path, shown when it lies in the repository.
+    // The program file: argv[0] as a path, its directory resolved, its last component never followed.
     const argv0 = request.argv[0] ?? "";
     const file = program ?? (argv0.includes("/") ? (argv0.startsWith("/") ? hostPathOf(argv0, this.deps.roots) : join(hostDir, argv0)) : undefined);
+    const fileDir = file === undefined ? undefined : this.deps.realpath(dirname(file));
+    const real = file === undefined || fileDir === undefined ? undefined : join(fileDir, basename(file));
+    const diff: DiffAnswer | undefined = this.deps.diff === undefined ? undefined : await this.deps.diff(hostDir, against, real);
+    const top = diff?.state === "shown" ? diff.top : undefined;
+    // Shown when it lies in the repository, marked with whether the pin covers it.
     let programFile: ProgramFile | undefined;
-    if (file !== undefined && top !== undefined && this.deps.readProgram !== undefined) {
-      const dir = this.deps.realpath(dirname(file));
-      const real = dir === undefined ? undefined : join(dir, basename(file));
-      if (real !== undefined && real.startsWith(`${top}/`)) programFile = this.deps.readProgram(real);
+    if (real !== undefined && top !== undefined && real.startsWith(`${top}/`) && this.deps.readProgram !== undefined) {
+      programFile = { ...this.deps.readProgram(real), pinned: diff?.state === "shown" && diff.programPinned === true };
     }
     return {
       base,
@@ -945,24 +987,61 @@ export function machineBase(home: string, run: RunFile, cloneDir: string): (host
   const jkb = join(home, HOST_JKB_IN_HOME);
   return async (hostDir) => {
     if (!hostJkbOk(jkb)) return { state: "unverified", message: `no jkb at ${jkb}` };
-    const r = await run(jkb, ["--json", "exec", "base", "--dir", hostDir, ...(isDir(cloneDir) ? ["--clone", cloneDir] : [])], BASE_TIMEOUT_MS);
+    const trust = trustedRemotes(home).flatMap((url) => ["--trust", url]);
+    const r = await run(jkb, ["--json", "exec", "base", "--dir", hostDir, ...(isDir(cloneDir) ? ["--clone", cloneDir] : []), ...trust], BASE_TIMEOUT_MS);
     return parseBaseOutput(r.code, r.stdout, r.stderr);
   };
 }
 
 /** `jkb exec diff` by the host jkb, the clean clone offered as a second source of the base's objects. */
-export function machineDiff(home: string, run: RunFile, cloneDir: string): (hostDir: string, base: string) => Promise<DiffAnswer> {
+export function machineDiff(home: string, run: RunFile, cloneDir: string): (hostDir: string, base: string, program?: string) => Promise<DiffAnswer> {
   const jkb = join(home, HOST_JKB_IN_HOME);
-  return async (hostDir, base) => {
+  return async (hostDir, base, program) => {
     if (!hostJkbOk(jkb)) return { state: "error", message: `no jkb at ${jkb}` };
     const r = await run(
       jkb,
-      ["--json", "exec", "diff", "--dir", hostDir, "--base", base, "--max", String(DIFF_MAX_BYTES), ...(isDir(cloneDir) ? ["--objects-from", cloneDir] : [])],
+      [
+        "--json", "exec", "diff", "--dir", hostDir, "--base", base, "--max", String(DIFF_MAX_BYTES),
+        ...(isDir(cloneDir) ? ["--objects-from", cloneDir] : []),
+        ...(program === undefined ? [] : ["--program", program]),
+      ],
       PIN_TIMEOUT_MS,
     );
     return parseDiffOutput(r.code, r.stdout, r.stderr);
   };
 }
+
+/**
+ * The remotes the operator trusts beyond the clean clone's: one URL per line of
+ * `~/.jkb/trusted-remotes` under the ACCOUNT's home (blank lines and `#` comments skipped). The dev
+ * container mounts only `~/.jkb/claude-memory` and `~/.jkb/logs`, so it cannot write this file; it
+ * is read without following a link, and anything not a plain file reads as no list.
+ */
+export function trustedRemotes(home: string): string[] {
+  const path = join(home, TRUSTED_REMOTES_IN_HOME);
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  } catch {
+    return [];
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > 64 * 1024) return [];
+    const buf = Buffer.alloc(st.size);
+    readSync(fd, buf, 0, st.size, 0);
+    return buf
+      .toString("utf8")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l !== "" && !l.startsWith("#") && !l.startsWith("-"));
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** The operator's list of trusted remotes, under the account's home. */
+export const TRUSTED_REMOTES_IN_HOME = ".jkb/trusted-remotes";
 
 function hostJkbOk(jkb: string): boolean {
   try {

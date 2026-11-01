@@ -502,21 +502,10 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
                 super::rbac_cli::attest(&cmd);
                 Ok(())
             }
-            Command::Exec {
-                cmd: ExecCmd::Pin { dir, against },
-            } => super::exec_cli::pin(&dir, against.as_deref(), cli.json),
-            Command::Exec {
-                cmd: ExecCmd::Base { dir, clone },
-            } => super::exec_cli::base(&dir, clone.as_deref(), cli.json),
-            Command::Exec {
-                cmd:
-                    ExecCmd::Diff {
-                        dir,
-                        base,
-                        objects_from,
-                        max,
-                    },
-            } => super::exec_cli::diff(&dir, &base, &objects_from, max, cli.json),
+            Command::Exec { cmd } => match super::exec_cli::no_database(&cmd, cli.json) {
+                Some(done) => done,
+                None => bail!("internal: a NoDatabase exec command with no remote dispatch"),
+            },
             _ => bail!("internal: a NoDatabase command with no remote dispatch"),
         },
         Support::Ported => {

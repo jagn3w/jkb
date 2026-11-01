@@ -332,3 +332,8 @@
   text-decoration: underline;
   cursor: pointer;
 }
+
+.history-argv {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

@@ -1,5 +1,7 @@
 import { escapeSegments, type Segment } from "@jkb/core";
 
+import { diffLineKinds } from "./queue";
+
 /**
  * Text that came from a session or a repository, shown as text — never as HTML: each segment is a
  * React text child, and an escape (a control, bidi or invisible character) is drawn apart, so it is
@@ -30,28 +32,18 @@ export function EscapedPre({ text, className }: { readonly text: string; readonl
   );
 }
 
-/** A unified diff, escaped line by line and coloured by its first character. */
+/** A unified diff, escaped line by line and coloured by what each line is. */
 export function DiffPre({ patch }: { readonly patch: string }): React.JSX.Element {
   const lines = patch.split("\n");
+  const kinds = diffLineKinds(lines);
   return (
     <pre className="exec-pre exec-diff">
-      {lines.map((line, i) => {
-        const kind = line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ") || line.startsWith("index ")
-          ? "meta"
-          : line.startsWith("@@")
-            ? "hunk"
-            : line.startsWith("+")
-              ? "add"
-              : line.startsWith("-")
-                ? "del"
-                : "ctx";
-        return (
-          <div key={i} className={`diff-${kind}`}>
-            <Segments segments={escapeSegments(line)} />
-            {"\n"}
-          </div>
-        );
-      })}
+      {lines.map((line, i) => (
+        <div key={i} className={`diff-${kinds[i] ?? "ctx"}`}>
+          <Segments segments={escapeSegments(line)} />
+          {"\n"}
+        </div>
+      ))}
     </pre>
   );
 }

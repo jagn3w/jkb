@@ -9,7 +9,7 @@ use jkb_api::{Backend, LocalBackend, Request, Response};
 use jkb_core::exec::{self, Ask, ExecTarget, Finished, Outcome, RefuseReason, Requester};
 use jkb_core::Db;
 
-use super::{check_visible, exit_code, parse_timeout, wait, TargetArg};
+use super::{check_visible, escape_for_terminal, exit_code, parse_timeout, wait, TargetArg};
 
 fn requested(db: &Db, argv: &str) -> (i64, ExecView) {
     let argv = argv.to_owned();
@@ -599,4 +599,14 @@ fn frames_published_through_the_ops_reach_the_waiter_byte_for_byte() {
     assert_eq!(out.as_bytes(), text, "the frames, not the row's tail");
     assert!(!err.contains("did not reach this stream"), "{err}");
     assert!(err.contains("/logs/exec-1.log"), "{err}");
+}
+
+/// A patch printed for a person cannot move the cursor, erase lines or reorder text.
+#[test]
+fn a_patch_printed_to_a_terminal_is_escaped() {
+    assert_eq!(
+        escape_for_terminal("+ok\n\x1b[1A\x1b[2K\trm\u{202e}x\u{85}\u{7f}"),
+        "+ok\n\\u{001b}[1A\\u{001b}[2K\trm\\u{202e}x\\u{0085}\\u{007f}"
+    );
+    assert_eq!(escape_for_terminal("plain é 漢\n"), "plain é 漢\n");
 }

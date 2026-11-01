@@ -827,7 +827,7 @@ proptest! {
                 pending.remove(&key);
             }
         }
-        let (rows, _) = db.write_txn("t", move |c, m| list(c, m, Filter { state: Some(ExecState::Pending), session: None }, None, now)).unwrap();
+        let (rows, _) = db.write_txn("t", move |c, m| list(c, m, Filter { state: Some(ExecState::Pending), ..Filter::default() }, None, now)).unwrap();
         prop_assert_eq!(rows.len(), pending.len());
     }
 }
@@ -1066,16 +1066,7 @@ fn a_request_notifies_and_every_decision_withdraws_it() {
     let d = req(&db, &who("s1"), &ask(&["d"], Some(pin(1))), T0 + 8).row;
     // Expired lazily by the next call after its time.
     db.write_txn("t", |c, m| {
-        list(
-            c,
-            m,
-            Filter {
-                state: None,
-                session: None,
-            },
-            None,
-            T0 + 8 + EXPIRES_AFTER_MS,
-        )
+        list(c, m, Filter::default(), None, T0 + 8 + EXPIRES_AFTER_MS)
     })
     .unwrap();
     assert_eq!(get_row(&db, d.id).state, ExecState::Expired);
@@ -1166,4 +1157,102 @@ fn the_index_announces_each_request_and_move_to_its_group() {
     assert!(db
         .write_txn("t", |c, m| super::index_group_delete(c, m, "code-factory"))
         .unwrap());
+}
+
+/// A `claude/notify` that cannot take another message — filled by anyone holding `Hook`, or by a
+/// stalled notifier — stops nothing: a request is made, declined, expired lazily, and expired by its
+/// session's end, each committed, with the notification simply not sent.
+#[test]
+fn a_full_notification_topic_stops_no_request_decision_or_expiry() {
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        let spec = TopicSpec {
+            max_messages: 1,
+            ..TopicSpec::default()
+        };
+        mq::topic_create(c, m, crate::notify::TOPIC, &spec, T0)?;
+        mq::group_create(
+            c,
+            m,
+            crate::notify::TOPIC,
+            "stalled",
+            mq::Start::FromStart,
+            T0,
+        )?;
+        mq::send(
+            c,
+            m,
+            crate::notify::TOPIC,
+            &Draft {
+                key: "k".to_owned(),
+                kind: "filler".to_owned(),
+                payload: serde_json::json!({}),
+                ttl_ms: None,
+                producer: "p".to_owned(),
+            },
+            T0,
+        )
+    })
+    .unwrap();
+    let a = req(&db, &who("s1"), &ask(&["a"], None), T0).row;
+    db.write_txn("t", move |c, m| decline(c, m, a.id, "no", T0 + 1))
+        .unwrap();
+    assert_eq!(get_row(&db, a.id).state, ExecState::Declined);
+    let b = req(&db, &who("s1"), &ask(&["b"], None), T0 + 2).row;
+    db.write_txn("t", |c, m| {
+        list(c, m, Filter::default(), None, T0 + 2 + EXPIRES_AFTER_MS)
+    })
+    .unwrap();
+    assert_eq!(get_row(&db, b.id).state, ExecState::Expired);
+    let t = T0 + 3 + EXPIRES_AFTER_MS;
+    let c_ = req(&db, &who("s2"), &ask(&["c"], None), t).row;
+    db.write_txn("t", move |c, m| {
+        let p = Process {
+            session: "s2",
+            pid: "10",
+            instance: "h",
+        };
+        claude_session::started(c, m, &p, "/w", "startup", t)?;
+        claude_session::ended(c, m, &p, "exit", t + 1)?;
+        expire_if_ended(c, m, "s2", t + 1)
+    })
+    .unwrap();
+    assert_eq!(get_row(&db, c_.id).state, ExecState::Expired);
+    assert_eq!(
+        notifications(&db).len(),
+        1,
+        "only the filler: nothing more fitted"
+    );
+}
+
+/// Newest first, a page at a time down from the newest id: what the operator's history reads, so a
+/// long history shows its newest requests rather than its oldest.
+#[test]
+fn a_list_reads_newest_first_down_from_its_cursor() {
+    let db = Db::open_in_memory().unwrap();
+    let ids: Vec<i64> = (0..super::PAGE + 5)
+        .map(|n| {
+            req(&db, &who("s"), &ask(&[&format!("a{n}")], None), T0)
+                .row
+                .id
+        })
+        .collect();
+    let newest = Filter {
+        newest_first: true,
+        ..Filter::default()
+    };
+    let (page, next) = db
+        .write_txn("t", move |c, m| list(c, m, newest, None, T0))
+        .unwrap();
+    assert_eq!(page.len(), super::PAGE);
+    assert_eq!(page[0].id, *ids.last().unwrap());
+    assert!(page.windows(2).all(|w| w[0].id > w[1].id));
+    let (rest, more) = db
+        .write_txn("t", move |c, m| list(c, m, newest, next, T0))
+        .unwrap();
+    assert_eq!(
+        rest.iter().map(|r| r.id).collect::<Vec<_>>(),
+        ids[..5].iter().rev().copied().collect::<Vec<_>>()
+    );
+    assert_eq!(more, None);
 }

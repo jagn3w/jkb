@@ -14,13 +14,13 @@ import type { ExecPreview, ExecStarted } from "../../../shared/bridge";
 import { useNavigation } from "../navigation";
 import { useTerminals } from "../terminal/TerminalProvider";
 import { DiffPre, EscapedPre, Segments } from "./Escaped";
-import { ClickGate, declineOp, history, listAll, runBlocked } from "./queue";
+import { ClickGate, MAX_PAGES, declineOp, history, historyFull, listAll, runBlocked } from "./queue";
 
 const op = (request: Parameters<typeof window.jkb.op>[0]) => window.jkb.op(request);
 
 type Loaded =
   | { readonly kind: "loading" }
-  | { readonly kind: "loaded"; readonly open: readonly ExecView[]; readonly ended: readonly ExecView[] }
+  | { readonly kind: "loaded"; readonly open: readonly ExecView[]; readonly ended: readonly ExecView[]; readonly openCut: boolean }
   | { readonly kind: "failed"; readonly message: string };
 
 /**
@@ -42,14 +42,23 @@ export function RequestsPane(): React.JSX.Element {
 
   const reload = useCallback(async () => {
     const mine = ++reads.current;
-    const [pending, running, all] = await Promise.all([listAll(op, "pending"), listAll(op, "running"), listAll(op, undefined)]);
+    const [pending, running, all] = await Promise.all([
+      listAll(op, "pending"),
+      listAll(op, "running"),
+      listAll(op, undefined, { newest: true, enough: historyFull }),
+    ]);
     if (mine !== reads.current) return;
     if (!pending.ok || !running.ok || !all.ok) {
       const e = !pending.ok ? pending.error : !running.ok ? running.error : !all.ok ? all.error : undefined;
       setLoaded({ kind: "failed", message: e?.message ?? "could not read the run requests" });
       return;
     }
-    setLoaded({ kind: "loaded", open: [...pending.value, ...running.value], ended: history(all.value) });
+    setLoaded({
+      kind: "loaded",
+      open: [...pending.value.requests, ...running.value.requests],
+      ended: history(all.value.requests),
+      openCut: pending.value.cut || running.value.cut,
+    });
   }, []);
 
   useEffect(() => {
@@ -90,6 +99,11 @@ export function RequestsPane(): React.JSX.Element {
         )}
         {loaded.kind === "loaded" && (
           <>
+            {loaded.openCut && (
+              <p className="request-banner" role="status">
+                More requests are waiting than the {MAX_PAGES} pages read here; the oldest are shown. Answer some, then refresh.
+              </p>
+            )}
             {loaded.open.length === 0 && <p className="muted">No request is waiting.</p>}
             {loaded.open.map((v) => (
               <RequestCard key={v.id} request={v} gate={gate.current} onDone={() => void reload()} />
@@ -104,6 +118,11 @@ export function RequestsPane(): React.JSX.Element {
       </div>
     </section>
   );
+}
+
+/** At most 400 characters, then `…` (non-ASCII, so never part of shown argument text). */
+function shortened(text: string): string {
+  return text.length > 400 ? `${text.slice(0, 400)}…` : text;
 }
 
 function Target({ target }: { readonly target: string }): React.JSX.Element {
@@ -300,9 +319,12 @@ function Preview({ preview, error }: { readonly preview: ExecPreview | undefined
         </p>
       )}
       {programFile !== undefined && (
-        <details className="request-program" open>
+        <details className="request-program" open={programFile.pinned === true}>
           <summary>
             Program file <code>{escapeArg(programFile.path)}</code>
+            {programFile.pinned !== true && (
+              <strong className="request-unverified"> outside the pin: can change before Run, so this is not reviewed code</strong>
+            )}
           </summary>
           {programFile.kind === "file" && (
             <>
@@ -329,9 +351,15 @@ function Preview({ preview, error }: { readonly preview: ExecPreview | undefined
               </li>
             ))}
           </ul>
+          {diff.filesTruncated && (
+            <p className="request-banner" role="status">
+              The list of changed paths was cut: more paths changed than are listed above.
+            </p>
+          )}
           {diff.truncated && (
             <p className="request-banner" role="status">
-              The diff is longer than the 2 MiB shown and was cut. The list of paths above is complete.
+              The diff is longer than the 2 MiB shown and was cut.
+              {diff.filesTruncated ? " Neither it nor the list of paths is complete." : " The list of paths above is complete."}
             </p>
           )}
           {diff.patch === "" ? <p className="muted">No changes against the base.</p> : <DiffPre patch={diff.patch} />}
@@ -360,7 +388,9 @@ function HistoryRow({ request }: { readonly request: ExecView }): React.JSX.Elem
   return (
     <details className="history-row" onToggle={(e) => (e.currentTarget.open ? void open() : undefined)}>
       <summary>
-        <strong>{view.id}</strong> <Target target={view.target} /> {outcomeText(v)} <code>{view.argv.map((a) => a.text).join(" ").slice(0, 160)}</code>
+        <strong>{view.id}</strong> <Target target={view.target} /> {outcomeText(v)}{" "}
+        {/* `·` never occurs in shown argument text (it would be spelt `\u{00b7}`), so it separates. */}
+        <code className="history-argv">{shortened(view.argv.map((a) => a.text).join(" · "))}</code>
       </summary>
       <dl className="request-facts">
         <dt>Asked by</dt>

@@ -296,6 +296,9 @@ test("jkb exec base and jkb exec diff are read as answers or faults", () => {
   const shown = parseDiffOutput(0, JSON.stringify({ dir: "/r", top: "/r", base: sha, pin, files: [{ status: "M", path: "a" }], files_truncated: false, patch: "+x", truncated: true }), "");
   assert.equal(shown.state, "shown");
   assert.equal(shown.truncated, true);
+  assert.equal(shown.programPinned, undefined, "no program asked about");
+  const asked = parseDiffOutput(0, JSON.stringify({ dir: "/r", top: "/r", base: sha, pin, files: [], patch: "", truncated: false, program_pinned: false }), "");
+  assert.equal(asked.programPinned, false);
   assert.deepEqual(shown.files, [{ status: "M", path: "a" }]);
   assert.deepEqual(parseDiffOutput(1, JSON.stringify({ dir: "/r", refused: { reason: "tree_changed", message: "moved" } }), ""), {
     state: "refused", reason: "tree_changed", message: "moved",

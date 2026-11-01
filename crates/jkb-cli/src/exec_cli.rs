@@ -114,9 +114,15 @@ pub enum ExecCmd {
         /// The directory.
         #[arg(long, default_value = ".")]
         dir: PathBuf,
-        /// A clean clone of the same remote, consulted when the remote cannot be asked.
+        /// A clean clone of the same remote, consulted when the remote cannot be asked. Its remote
+        /// is trusted.
         #[arg(long)]
         clone: Option<PathBuf>,
+        /// A remote URL the operator trusts (Code Factory passes `~/.jkb/trusted-remotes`). The
+        /// directory's `origin` must be one of these or the clone's, or the base is unverified and
+        /// nothing is asked of the network.
+        #[arg(long)]
+        trust: Vec<String>,
     },
     /// The tree a request's pin covers, diffed against a verified base commit (`jkb exec base`):
     /// tracked changes and untracked files alike, read as the pin reads them. Opens no database.
@@ -136,6 +142,9 @@ pub enum ExecCmd {
         /// The most bytes of patch printed; past it the patch is cut and `truncated` is set.
         #[arg(long, default_value_t = DIFF_MAX_BYTES)]
         max: usize,
+        /// A program path to ask about: `program_pinned` says whether the pin covers it.
+        #[arg(long)]
+        program: Option<PathBuf>,
     },
 }
 
@@ -206,13 +215,14 @@ fn expect_view(r: Response) -> Result<ExecView> {
 pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
     match cmd {
         ExecCmd::Pin { dir, against } => pin(&dir, against.as_deref(), json),
-        ExecCmd::Base { dir, clone } => base(&dir, clone.as_deref(), json),
+        ExecCmd::Base { dir, clone, trust } => base(&dir, clone.as_deref(), &trust, json),
         ExecCmd::Diff {
             dir,
             base,
             objects_from,
             max,
-        } => diff(&dir, &base, &objects_from, max, json),
+            program,
+        } => diff(&dir, &base, &objects_from, max, program.as_deref(), json),
         ExecCmd::Request {
             target,
             dir,
@@ -311,6 +321,7 @@ pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
                     Request::ExecList {
                         state: state.clone(),
                         after,
+                        newest_first: false,
                     },
                 )? {
                     Response::ExecRequests { requests, next } => {
@@ -505,15 +516,33 @@ pub fn pin(dir: &Path, against: Option<&Path>, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The `jkb exec` verbs that open no database — `pin`, `base`, `diff` — run here, before any database
+/// or daemon is reached, in any mode; `None` for any other verb.
+#[must_use]
+pub fn no_database(cmd: &ExecCmd, json: bool) -> Option<Result<()>> {
+    Some(match cmd {
+        ExecCmd::Pin { dir, against } => pin(dir, against.as_deref(), json),
+        ExecCmd::Base { dir, clone, trust } => base(dir, clone.as_deref(), trust, json),
+        ExecCmd::Diff {
+            dir,
+            base,
+            objects_from,
+            max,
+            program,
+        } => diff(dir, base, objects_from, *max, program.as_deref(), json),
+        _ => return None,
+    })
+}
+
 /// `jkb exec base`: run before any database or daemon is reached.
 ///
 /// # Errors
 /// An unreadable directory, the audit's refusal, or git not running. A base that cannot be verified
 /// is an answer (`unverified`), not an error.
-pub fn base(dir: &Path, clone: Option<&Path>, json: bool) -> Result<()> {
+pub fn base(dir: &Path, clone: Option<&Path>, trust: &[String], json: bool) -> Result<()> {
     let dir = std::fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
     let clone = clone.map(std::fs::canonicalize).transpose()?;
-    match crate::gitrepo::trusted_base(&dir, clone.as_deref()) {
+    match crate::gitrepo::trusted_base(&dir, clone.as_deref(), trust) {
         Ok(Some(b)) => {
             if json {
                 println!(
@@ -567,6 +596,7 @@ pub fn diff(
     base: &str,
     objects_from: &[PathBuf],
     max: usize,
+    program: Option<&Path>,
     json: bool,
 ) -> Result<()> {
     let dir = std::fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
@@ -575,7 +605,7 @@ pub fn diff(
         .map(std::fs::canonicalize)
         .collect::<std::io::Result<Vec<_>>>()
         .context("resolving --objects-from")?;
-    let d = match crate::gitrepo::tree_diff(&dir, base, &objects_from, max) {
+    let d = match crate::gitrepo::tree_diff(&dir, base, &objects_from, max, program) {
         Ok(Some(d)) => d,
         Ok(None) => {
             if json {
@@ -613,19 +643,49 @@ pub fn diff(
             serde_json::json!({
                 "dir": dir, "top": d.top, "base": d.base, "pin": Pin::from(d.pin),
                 "files": files, "files_truncated": d.files_truncated,
-                "patch": d.patch, "truncated": d.truncated,
+                "patch": d.patch, "truncated": d.truncated, "program_pinned": d.program_pinned,
             })
         );
     } else {
         for (status, path) in &d.files {
             println!("{status}\t{path:?}");
         }
-        print!("{}", d.patch);
+        print!("{}", escape_for_terminal(&d.patch));
+        if d.program_pinned == Some(false) {
+            println!("[jkb: the program is outside the pin: it can change before Run]");
+        }
         if d.truncated {
             println!("\n[jkb: the diff is longer than {max} bytes and was cut here]");
         }
     }
     Ok(())
+}
+
+/// Text from a repository as a terminal may be handed it: every control character but a newline
+/// and a tab (C0, DEL, C1), and every bidi or invisible formatting character, as `\u{…}`, so file
+/// content cannot move the cursor, erase lines or reorder what the operator reads.
+fn escape_for_terminal(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let invisible = matches!(
+            c,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        );
+        if (c.is_control() && c != '\n' && c != '\t') || invisible {
+            let _ = write!(out, "\\u{{{:04x}}}", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// A request, for a person: every argument on its own line, escaped.

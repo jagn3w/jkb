@@ -881,7 +881,7 @@ test("the program file is shown when argv[0] is a path in the repository, a link
   assert.match(pa.value.programFile.text, /echo/);
   const b = d.add({ dir: h.repo, argv: ["./via-link"] });
   const pb = await runner.preview(b.id);
-  assert.deepEqual(pb.value.programFile, { path: path.join(h.repo, "via-link"), kind: "link", target: "/etc/passwd" });
+  assert.deepEqual(pb.value.programFile, { path: path.join(h.repo, "via-link"), kind: "link", target: "/etc/passwd", pinned: false });
   const c = d.add({ dir: h.repo, argv: ["/bin/true"] });
   assert.equal((await runner.preview(c.id)).value.programFile, undefined, "a program outside the repository is not shown as one");
 });
@@ -909,9 +909,95 @@ test("Decline requires a note; one click per request, Run and Decline alike", ()
   assert.equal(gate.take("exec-1"), true);
 });
 
-test("the history lists what left the queue, newest first", () => {
-  const rows = ["pending", "finished", "declined", "running", "refused", "expired"].map((state, i) => ({ id: `exec-${i + 1}`, state }));
+test("the history lists what left the queue, from a newest-first read", () => {
+  const rows = ["pending", "finished", "declined", "running", "refused", "expired"].map((state, i) => ({ id: `exec-${i + 1}`, state })).reverse();
   assert.deepEqual(queue.history(rows).map((r) => r.id), ["exec-6", "exec-5", "exec-3", "exec-2"]);
+});
+
+test("the history is read newest first and stops once it has enough; the pending read says when it was cut", async () => {
+  const sent = [];
+  let made = 0;
+  const page = (n, next) => ({ ok: true, value: { result: "exec_requests", requests: Array.from({ length: n }, (_, i) => ({ id: `exec-${100000 - made++}`, topic: "t", state: "finished", target: "host", dir: "/", dir_side: "host", argv: ["x"], session: "s", role: "r", timeout_ms: 1 })), ...(next === undefined ? {} : { next }) } });
+  const op = async (r) => {
+    sent.push(r);
+    return page(100, 100000 - made - 1);
+  };
+  const got = await queue.listAll(op, undefined, { newest: true, enough: queue.historyFull });
+  assert.equal(got.ok, true);
+  assert.equal(sent.length, 1, "fifty finished requests are enough");
+  assert.equal(sent[0].newest_first, true);
+  assert.equal(queue.history(got.value.requests)[0].id, "exec-100000");
+  sent.length = 0;
+  const all = await queue.listAll(op, "pending");
+  assert.equal(all.value.cut, true, "more pages than MAX_PAGES");
+  assert.equal(sent.length, queue.MAX_PAGES);
+  assert.equal(sent[0].newest_first, undefined);
+});
+
+test("a diff's header lines are only between `diff ` and the first `@@`", () => {
+  const lines = ["diff --git a/x b/x", "index 1..2", "--- a/x", "+++ b/x", "@@ -1 +1 @@", "+++i;", "--- guard", " ctx", "-gone"];
+  assert.deepEqual(queue.diffLineKinds(lines), ["meta", "meta", "meta", "meta", "hunk", "add", "del", "ctx", "del"]);
+});
+
+test("previews run at most two at a time; the rest wait their turn", async () => {
+  const h = home();
+  let running = 0;
+  let most = 0;
+  const { d, runner } = rig({
+    h,
+    deps: {
+      base: verified,
+      diff: async (dir) => {
+        running++;
+        most = Math.max(most, running);
+        await new Promise((r) => setTimeout(r, 40));
+        running--;
+        return shownDiff(PIN, dir);
+      },
+    },
+  });
+  const rows = Array.from({ length: 6 }, () => d.add({ dir: h.repo, argv: ["/bin/true"] }));
+  const all = await Promise.all(rows.map((r) => runner.preview(r.id)));
+  assert.ok(all.every((p) => p.ok && p.value.verdict.state === "match"));
+  assert.equal(most, exec.PREVIEWS_AT_ONCE);
+  assert.equal(exec.PREVIEWS_AT_ONCE, 2);
+});
+
+test("a program file the pin does not cover is marked so, never as reviewed code", async () => {
+  const h = home();
+  fs.writeFileSync(path.join(h.repo, "go.sh"), "echo ok\n", { mode: 0o755 });
+  const asked = [];
+  for (const pinned of [true, false]) {
+    const { d, runner } = rig({
+      h,
+      deps: {
+        base: verified,
+        diff: async (dir, base, program) => {
+          asked.push(program);
+          return { ...shownDiff(PIN, dir), programPinned: pinned };
+        },
+        readProgram: exec.readProgramFile,
+      },
+    });
+    const row = d.add({ dir: h.repo, argv: ["./go.sh"] });
+    const p = await runner.preview(row.id);
+    assert.equal(p.value.programFile.pinned, pinned);
+  }
+  assert.deepEqual(asked, [path.join(h.repo, "go.sh"), path.join(h.repo, "go.sh")], "the host jkb is asked about the resolved program");
+});
+
+test("the trusted remotes come from ~/.jkb/trusted-remotes, read without following a link, and reach jkb exec base", async () => {
+  const h = home({ answer: { dir: "/r", unverified: { message: "x" } } });
+  fs.mkdirSync(path.join(h.h, ".jkb"), { recursive: true });
+  const file = path.join(h.h, ".jkb", "trusted-remotes");
+  fs.writeFileSync(file, "# mine\ngit@github.com:me/a.git\n\n  https://h/b.git  \n-oEvil\n");
+  assert.deepEqual(exec.trustedRemotes(h.h), ["git@github.com:me/a.git", "https://h/b.git"]);
+  await exec.machineBase(h.h, update.machineRunner(h.h, process.env), path.join(h.h, "no-clone"))(h.repo);
+  assert.equal(h.pinCalls()[0], `--json exec base --dir ${h.repo} --trust git@github.com:me/a.git --trust https://h/b.git`);
+  fs.rmSync(file);
+  fs.writeFileSync(path.join(h.h, "elsewhere"), "https://planted/x\n");
+  fs.symlinkSync(path.join(h.h, "elsewhere"), file);
+  assert.deepEqual(exec.trustedRemotes(h.h), [], "a link is no list");
 });
 
 test("the exec feed hears only exec.changed with an id and a state", () => {
@@ -935,9 +1021,11 @@ test("machineDiff asks the host jkb for the diff with the cap Rust sets, offerin
   const r = await exec.machineDiff(h.h, update.machineRunner(h.h, process.env), clone)(h.repo, BASE_SHA);
   assert.equal(r.state, "shown");
   assert.deepEqual(h.pinCalls(), [`--json exec diff --dir ${h.repo} --base ${BASE_SHA} --max ${exec.DIFF_MAX_BYTES} --objects-from ${clone}`]);
+  await exec.machineDiff(h.h, update.machineRunner(h.h, process.env), clone)(h.repo, BASE_SHA, "/r/go.sh");
+  assert.match(h.pinCalls()[1], / --program \/r\/go\.sh$/);
   const b = await exec.machineBase(h.h, update.machineRunner(h.h, process.env), path.join(h.h, "no-clone"))(h.repo);
   assert.equal(b.state, "unverified", "a diff object is no base");
-  assert.equal(h.pinCalls()[1], `--json exec base --dir ${h.repo}`, "no --clone when there is none");
+  assert.equal(h.pinCalls()[2], `--json exec base --dir ${h.repo}`, "no --clone, and no --trust, when there are none");
 });
 
 test("a request in a repository whose diff could not be produced cannot be run; an unverified base with a diff can", async () => {

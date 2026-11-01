@@ -396,6 +396,8 @@ pub struct Filter<'a> {
     pub state: Option<ExecState>,
     /// Only this session's rows.
     pub session: Option<&'a str>,
+    /// Newest first: pages run down from the newest id, and the cursor is the id to continue below.
+    pub newest_first: bool,
 }
 
 fn validation(why: impl Into<String>) -> crate::Error {
@@ -1350,8 +1352,9 @@ pub fn output_of(conn: &Connection, id: i64) -> Result<Option<Output>> {
         .optional()?)
 }
 
-/// A page of requests after id `after`, oldest first, after expiring whatever came due. Returns the
-/// rows and, when there are more, the id to continue after.
+/// A page of requests after id `after`, oldest first — or, with [`Filter::newest_first`], below id
+/// `after`, newest first — after expiring whatever came due. Returns the rows and, when there are
+/// more, the id to continue from.
 ///
 /// # Errors
 /// A database error, or a row this jkb cannot read.
@@ -1364,15 +1367,29 @@ pub fn list(
 ) -> Result<(Vec<ExecRow>, Option<i64>)> {
     settle(conn, meta, now)?;
     let fetch = i64::try_from(PAGE + 1).unwrap_or(i64::MAX);
-    let raw: Vec<RawRow> = conn
-        .prepare_cached(&format!(
+    let sql = if filter.newest_first {
+        format!(
+            "SELECT {COLUMNS} FROM exec_requests \
+             WHERE id < ?1 AND (?2 IS NULL OR state = ?2) AND (?3 IS NULL OR session = ?3) \
+             ORDER BY id DESC LIMIT ?4"
+        )
+    } else {
+        format!(
             "SELECT {COLUMNS} FROM exec_requests \
              WHERE id > ?1 AND (?2 IS NULL OR state = ?2) AND (?3 IS NULL OR session = ?3) \
              ORDER BY id LIMIT ?4"
-        ))?
+        )
+    };
+    let from = if filter.newest_first {
+        after.unwrap_or(i64::MAX)
+    } else {
+        after.unwrap_or(0)
+    };
+    let raw: Vec<RawRow> = conn
+        .prepare_cached(&sql)?
         .query_map(
             params![
-                after.unwrap_or(0),
+                from,
                 filter.state.map(ExecState::as_str),
                 filter.session,
                 fetch

@@ -370,6 +370,7 @@ pub fn list(
     principal: &Principal,
     state_: Option<&str>,
     after: Option<i64>,
+    newest_first: bool,
     now: i64,
 ) -> Result<(Vec<ExecView>, Option<i64>), ApiError> {
     let reader = reader(principal)?;
@@ -378,6 +379,7 @@ pub fn list(
         let filter = exec::Filter {
             state: state_,
             session: reader.as_deref(),
+            newest_first,
         };
         let (rows, next) = exec::list(c, m, filter, after, now)?;
         let views = rows

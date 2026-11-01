@@ -1738,31 +1738,12 @@ fn run(cli: Cli) -> Result<()> {
         return design_export::check_files(repo.as_deref(), cli.json);
     }
 
-    // `jkb exec pin` is git and a hash: no database, no daemon, in any mode.
-    if let Command::Exec {
-        cmd: exec_cli::ExecCmd::Pin { dir, against },
-    } = &cli.command
-    {
-        return exec_cli::pin(dir, against.as_deref(), cli.json);
-    }
-    // ...and so are `jkb exec base` and `jkb exec diff`, which Code Factory runs on the host.
-    if let Command::Exec {
-        cmd: exec_cli::ExecCmd::Base { dir, clone },
-    } = &cli.command
-    {
-        return exec_cli::base(dir, clone.as_deref(), cli.json);
-    }
-    if let Command::Exec {
-        cmd:
-            exec_cli::ExecCmd::Diff {
-                dir,
-                base,
-                objects_from,
-                max,
-            },
-    } = &cli.command
-    {
-        return exec_cli::diff(dir, base, objects_from, *max, cli.json);
+    // `jkb exec pin`, `base` and `diff` are git and a hash: no database, no daemon, in any mode
+    // (Code Factory runs `base` and `diff` on the host).
+    if let Command::Exec { cmd } = &cli.command {
+        if let Some(done) = exec_cli::no_database(cmd, cli.json) {
+            return done;
+        }
     }
 
     // (2) With JKB_REMOTE set this process must never open a database — on the dev container's

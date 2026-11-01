@@ -544,9 +544,13 @@ pub enum Request {
         /// Only requests in this state.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<String>,
-        /// Continue after this: the `next` of the previous page.
+        /// Continue from this: the `next` of the previous page.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         after: Option<i64>,
+        /// Newest first: pages run down from the newest request, and `after` is the id to continue
+        /// below.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        newest_first: bool,
     },
     /// A run request's messages after seq `after` — how its requester follows it. The topic is
     /// reserved: no `mq.*` op reads it ([`exec::follow`]).
@@ -4275,9 +4279,20 @@ impl LocalBackend {
             Request::ExecStatus { id } => Response::ExecRequest {
                 request: exec::status(db, actor, principal, &id, now)?,
             },
-            Request::ExecList { state, after } => {
-                let (requests, next) =
-                    exec::list(db, actor, principal, state.as_deref(), after, now)?;
+            Request::ExecList {
+                state,
+                after,
+                newest_first,
+            } => {
+                let (requests, next) = exec::list(
+                    db,
+                    actor,
+                    principal,
+                    state.as_deref(),
+                    after,
+                    newest_first,
+                    now,
+                )?;
                 Response::ExecRequests { requests, next }
             }
             Request::ExecFollow { id, after, max } => Response::Messages {

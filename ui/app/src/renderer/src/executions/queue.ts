@@ -45,29 +45,76 @@ export class ClickGate {
   }
 }
 
-/** The most pages of `exec.list` the queue reads at once (100 requests a page). */
+/** The most pages of `exec.list` the queue reads at once (up to 100 requests a page). */
 export const MAX_PAGES = 20;
 
-/** Every request in `state` (or all), page by page, up to `MAX_PAGES`. */
+/** Requests listed, and whether the read stopped at `MAX_PAGES` with more left unread. */
+export interface Listed {
+  readonly requests: readonly ExecView[];
+  readonly cut: boolean;
+}
+
+/**
+ * Every request in `state` (or all), page by page, up to `MAX_PAGES` — oldest first, or newest first
+ * when `newest` — stopping early once `enough` says the rows read so far suffice.
+ */
 export async function listAll(
   op: (request: OpRequest) => Promise<Outcome<OpResponse>>,
   state: string | undefined,
-): Promise<Outcome<readonly ExecView[]>> {
+  options: { readonly newest?: boolean; readonly enough?: (rows: readonly ExecView[]) => boolean } = {},
+): Promise<Outcome<Listed>> {
   const out: ExecView[] = [];
   let after: number | undefined;
   for (let page = 0; page < MAX_PAGES; page++) {
-    const r = await op({ op: "exec.list", ...(state === undefined ? {} : { state }), ...(after === undefined ? {} : { after }) });
+    const r = await op({
+      op: "exec.list",
+      ...(state === undefined ? {} : { state }),
+      ...(after === undefined ? {} : { after }),
+      ...(options.newest === true ? { newest_first: true } : {}),
+    });
     if (!r.ok) return r;
     const d = decodeExecRequests(r.value);
     if (!d.ok) return d;
     out.push(...d.value.requests);
-    if (d.value.next === undefined) break;
+    if (d.value.next === undefined) return { ok: true, value: { requests: out, cut: false } };
+    if (options.enough?.(out) === true) return { ok: true, value: { requests: out, cut: false } };
     after = d.value.next;
   }
-  return { ok: true, value: out };
+  return { ok: true, value: { requests: out, cut: true } };
 }
 
-/** The history: requests that left the queue for good, newest first, at most `limit`. */
-export function history(all: readonly ExecView[], limit = 50): readonly ExecView[] {
-  return all.filter((v) => EXEC_ENDED_STATES.includes(v.state)).reverse().slice(0, limit);
+/** How many requests the history shows. */
+export const HISTORY_SHOWN = 50;
+
+/** The history from a newest-first read: requests that left the queue for good, at most `limit`. */
+export function history(newestFirst: readonly ExecView[], limit = HISTORY_SHOWN): readonly ExecView[] {
+  return newestFirst.filter((v) => EXEC_ENDED_STATES.includes(v.state)).slice(0, limit);
+}
+
+/** Whether a newest-first read holds enough of the history to show. */
+export function historyFull(rows: readonly ExecView[]): boolean {
+  return history(rows).length >= HISTORY_SHOWN;
+}
+
+/**
+ * How each line of a unified diff is drawn: `diff `, `index `, `---` and `+++` are a file's header
+ * only between its `diff ` line and its first `@@`; inside a hunk a line starting `+++` is an added
+ * `++…` line, and `---` a removed `--…` one.
+ */
+export function diffLineKinds(lines: readonly string[]): readonly ("meta" | "hunk" | "add" | "del" | "ctx")[] {
+  let header = false;
+  return lines.map((line) => {
+    if (line.startsWith("diff ")) {
+      header = true;
+      return "meta";
+    }
+    if (line.startsWith("@@")) {
+      header = false;
+      return "hunk";
+    }
+    if (header) return "meta";
+    if (line.startsWith("+")) return "add";
+    if (line.startsWith("-")) return "del";
+    return "ctx";
+  });
 }

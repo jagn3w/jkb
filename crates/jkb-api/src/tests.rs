@@ -694,6 +694,7 @@ fn samples() -> Vec<Request> {
         Request::ExecList {
             state: None,
             after: None,
+            newest_first: false,
         },
         Request::ExecFollow {
             id: "exec-1".into(),

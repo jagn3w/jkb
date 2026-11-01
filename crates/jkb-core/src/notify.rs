@@ -707,13 +707,28 @@ fn heard(conn: &Connection) -> Result<bool> {
     }
 }
 
+/// A direct send's outcome, where a topic that cannot take the message — full, or too small for it —
+/// is "not sent" rather than an error: the caller's own write (a run request, its decision, an
+/// expiry inside a session's end) is the fact, and a notification only a hint. Anyone holding `Hook`
+/// can fill `claude/notify`, and a stalled notifier does it benignly; neither may stop a request
+/// being made, answered or expired.
+fn sent_softly(sent: Result<i64>) -> Result<bool> {
+    match sent {
+        Ok(_) => Ok(true),
+        Err(crate::Error::Queue(QueueError::QueueFull { .. } | QueueError::TooLarge { .. })) => {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Post notification `id` for a producer outside the session machine ([`crate::exec`]'s run
 /// requests), in the caller's transaction, under [`TOPIC`]'s rule that a topic nobody reads is not
 /// written to. The body is shortened to [`MAX_BODY_CHARS`] rather than refused. Returns whether it
-/// was sent.
+/// was sent; a topic that cannot take it is "not sent" ([`sent_softly`]).
 ///
 /// # Errors
-/// A send's own refusal (a full topic), or a database error.
+/// A malformed message, or a database error.
 pub(crate) fn post_direct(
     conn: &Connection,
     meta: &WriteMeta,
@@ -726,7 +741,7 @@ pub(crate) fn post_direct(
     if !heard(conn)? {
         return Ok(false);
     }
-    mq::send(
+    sent_softly(mq::send(
         conn,
         meta,
         TOPIC,
@@ -744,15 +759,15 @@ pub(crate) fn post_direct(
             producer: "jkb".to_owned(),
         },
         now,
-    )?;
-    Ok(true)
+    ))
 }
 
 /// Withdraw notification `id` posted by [`post_direct`], under the same rule. Withdrawing one never
-/// posted (nobody was reading then) is harmless to a consumer. Returns whether it was sent.
+/// posted (nobody was reading then) is harmless to a consumer. Returns whether it was sent; a topic
+/// that cannot take it is "not sent" ([`sent_softly`]).
 ///
 /// # Errors
-/// A send's own refusal (a full topic), or a database error.
+/// A malformed message, or a database error.
 pub(crate) fn withdraw_direct(
     conn: &Connection,
     meta: &WriteMeta,
@@ -763,7 +778,7 @@ pub(crate) fn withdraw_direct(
     if !heard(conn)? {
         return Ok(false);
     }
-    mq::send(
+    sent_softly(mq::send(
         conn,
         meta,
         TOPIC,
@@ -775,8 +790,7 @@ pub(crate) fn withdraw_direct(
             producer: "jkb".to_owned(),
         },
         now,
-    )?;
-    Ok(true)
+    ))
 }
 
 fn outcome_to_applied(

@@ -498,6 +498,8 @@ export type DiffAnswer =
       readonly filesTruncated: boolean;
       readonly patch: string;
       readonly truncated: boolean;
+      /** For the program asked about: whether the pin covers it (absent when none was asked about). */
+      readonly programPinned?: boolean;
     }
   | { readonly state: "no_repo" }
   | { readonly state: "refused"; readonly reason: string; readonly message: string }
@@ -531,6 +533,7 @@ export function parseDiffOutput(code: number | null, stdout: string, stderr: str
         filesTruncated: o["files_truncated"] === true,
         patch: o["patch"],
         truncated: o["truncated"] === true,
+        ...(typeof o["program_pinned"] === "boolean" ? { programPinned: o["program_pinned"] } : {}),
       };
     }
   }

@@ -205,10 +205,17 @@ export interface ExecPreview {
 }
 
 /** A program file as the queue shows it: read without following a link, capped. */
-export type ProgramFile =
+export type ProgramFile = (
   | { readonly path: string; readonly kind: "file"; readonly text: string; readonly truncated: boolean }
   | { readonly path: string; readonly kind: "link"; readonly target: string }
-  | { readonly path: string; readonly kind: "absent" | "other" };
+  | { readonly path: string; readonly kind: "absent" | "other" }
+) & {
+  /**
+   * Whether the pin covers it. One that is not (under an ignored directory) can change between the
+   * preview and Run unnoticed, so it is not reviewed code.
+   */
+  readonly pinned?: boolean;
+};
 
 /**
  * What main tells a window about the run-request index (`exec/requests`, the operator's own group).
