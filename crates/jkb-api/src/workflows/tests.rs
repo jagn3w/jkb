@@ -642,8 +642,6 @@ enum Path {
     Legacy,
     /// A task at `design` the gate holds back: a designer writes its design, and builds nothing.
     Design,
-    /// `design_review`: the operator's. Skipped, and never settled, so an approval is built later.
-    Parked,
     /// `systemic_review`, left by an earlier run: a group of one, straight to a systemic reviewer.
     Systemic,
 }
@@ -659,36 +657,57 @@ enum Gate {
     HandPicked,
 }
 
-/// What step 1 reads of a task: its namespace (`jkb task show`), its phase and its last history
-/// line (`jkb workflow show`), and whether it carries `design=approved`.
-struct Seen {
-    namespace: String,
-    phase: String,
-    last: String,
-    tagged: bool,
+/// `swarm-coordinator` step 1's reads, in order: the phases each asks for, and its tag terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Read {
+    /// A, build: every phase past design that a run drives.
+    Build,
+    /// B, legacy: at `design`, tagged approved.
+    Legacy,
+    /// C, design: at `design`, untagged — limited to the designers left.
+    Design,
 }
 
-/// `swarm-coordinator` step 1's admission table. `None` leaves the task out. Pinned against the
+impl Read {
+    const ALL: [Self; 3] = [Self::Build, Self::Legacy, Self::Design];
+
+    /// The read's own terms, exactly as the template spells them.
+    fn terms(self) -> &'static str {
+        match self {
+            Self::Build => "phase:implement,review,landable,systemic_review",
+            Self::Legacy => "phase:design tag:design=approved",
+            Self::Design => "phase:design -tag:design=approved",
+        }
+    }
+}
+
+/// The terms every read adds: nothing this run settled, and no review finding.
+fn every_read() -> String {
+    format!("-tag:swarm-settled={OWNER} -tag:finding=review")
+}
+
+/// What step 1b reads of a task the frontier offered: its phase and its last history line (`jkb
+/// workflow show`).
+struct Seen {
+    phase: String,
+    last: String,
+}
+
+/// `swarm-coordinator` step 1b's routing table, for a task `read` offered. Pinned against the
 /// template's text by `jkb-core`'s agents tests, and against what jkb lets step 3 do by
 /// `step_one_admits_exactly_the_phases_step_three_can_drive`.
-fn admission(task: &Seen, gate: Gate) -> Option<Path> {
-    let finding = task.namespace.starts_with("repos/")
-        && task.namespace.split('/').nth(2) == Some("codereviews");
-    if finding {
-        return None;
-    }
+fn route(task: &Seen, read: Read, gate: Gate) -> Path {
     // A design turned down goes to a designer whatever the gate, the tag or a hand-pick says.
     let turned_down = ["reject_design", "systemic_redesign"]
         .iter()
         .any(|e| task.last.split_whitespace().nth(1) == Some(e));
-    match task.phase.as_str() {
-        "implement" | "review" | "landable" => Some(Path::Workflow),
-        "design" if turned_down => Some(Path::Design),
-        "design" if task.tagged || gate != Gate::On => Some(Path::Legacy),
-        "design" => Some(Path::Design),
-        "design_review" => Some(Path::Parked),
-        "systemic_review" => Some(Path::Systemic),
-        _ => None,
+    match (read, task.phase.as_str()) {
+        (Read::Build, "systemic_review") => Path::Systemic,
+        (Read::Build, _) => Path::Workflow,
+        (Read::Legacy | Read::Design, _) if turned_down => Path::Design,
+        // With the gate on, read C's tasks are the ones it holds back.
+        (Read::Design, _) if gate == Gate::On => Path::Design,
+        (Read::Legacy | Read::Design, _) => Path::Legacy,
     }
 }
 
@@ -819,37 +838,50 @@ impl Swarm {
         self.start_group_on(Path::Workflow);
     }
 
-    /// What step 1 reads of `uid`, through the coordinator's own calls.
+    /// What step 1b reads of `uid`, through the coordinator's own call.
     fn seen(&self, uid: &str) -> Seen {
-        let (namespace, tagged) = match self.coordinator(json!({ "op": "task.show", "uid": uid })) {
-            Response::Task { task, .. } => (
-                task.item.namespace.unwrap_or_default(),
-                task.item
-                    .tags
-                    .iter()
-                    .any(|t| t.facet == "design" && t.value == "approved"),
-            ),
+        match self.coordinator(json!({ "op": "workflow.show", "uid": uid })) {
+            Response::Workflow { workflow } => Seen {
+                phase: workflow.phase,
+                last: workflow.history.last().cloned().unwrap_or_default(),
+            },
             other => panic!("{other:?}"),
-        };
-        let (phase, last) = match self.coordinator(json!({ "op": "workflow.show", "uid": uid })) {
-            Response::Workflow { workflow } => (
-                workflow.phase,
-                workflow.history.last().cloned().unwrap_or_default(),
-            ),
-            other => panic!("{other:?}"),
-        };
-        Seen {
-            namespace,
-            phase,
-            last,
-            tagged,
         }
+    }
+
+    /// The uids step 1's `read` returns, in the frontier's order, as the coordinator makes it.
+    fn read(&self, read: Read, limit: usize) -> Vec<String> {
+        let r = self.coordinator(json!({ "op": "task.ready",
+            "dsl": format!("{} {}", read.terms(), every_read()), "limit": limit }));
+        let items = match r {
+            Response::Items { items, .. } => items,
+            other => panic!("{other:?}"),
+        };
+        items.into_iter().map(|i| i.uid).collect()
+    }
+
+    /// The first of step 1's reads that offers `uid`, if any.
+    fn offered_by(&self, uid: &str) -> Option<Read> {
+        Read::ALL
+            .into_iter()
+            .find(|&r| self.read(r, 100).iter().any(|u| u == uid))
+    }
+
+    /// Step 1 and 1b for `uid`: the read that offers it, routed. `None`: no read offers it.
+    fn admission(&self, uid: &str, gate: Gate) -> Option<Path> {
+        let read = self.offered_by(uid)?;
+        Some(route(&self.seen(uid), read, gate))
+    }
+
+    /// Whether any of the run's reads offers the lead.
+    fn in_frontier(&self) -> bool {
+        self.offered_by(&self.lead).is_some()
     }
 
     /// `swarm-coordinator` step 1 admits the lead on `path` in a scope-mode run (the gate on), and
     /// step 2 claims it (which starts it), tags its repository and records it as the group's lead.
     fn start_group_on(&self, path: Path) {
-        assert_eq!(admission(&self.seen(&self.lead), Gate::On), Some(path));
+        assert_eq!(self.admission(&self.lead, Gate::On), Some(path));
         self.coordinator(json!({ "op": "task.claim", "uid": self.lead, "owner": OWNER }));
         self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
                                  "facet_value": format!("repo={REPO}"), "mode": "set" }));
@@ -877,30 +909,16 @@ impl Swarm {
         assert!(m.moved && m.phase == "design_review", "{m:?}");
     }
 
-    /// `swarm-coordinator`'s DESIGNING A TASK around the designer: claim, then reopen and release on
-    /// its report, and tag it PARKED.
+    /// `swarm-coordinator`'s DESIGNING A TASK around the designer: claim, record the budget's count,
+    /// then reopen and release on its report. Nothing tags the submitted design: no read offers
+    /// `design_review`.
     fn coordinator_designs(&self, agent: &str, design: &str) {
         self.coordinator(json!({ "op": "task.claim", "uid": self.lead, "owner": OWNER }));
+        self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
+                                 "facet_value": format!("swarm-designed={OWNER}"), "mode": "set" }));
         self.designer_designs(agent, design);
         self.coordinator(json!({ "op": "task.set", "uid": self.lead, "status": "open" }));
         self.coordinator(json!({ "op": "task.release", "uid": self.lead, "owner": OWNER }));
-        self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
-                                 "facet_value": format!("swarm-parked={OWNER}"), "mode": "set" }));
-    }
-
-    /// RE-CHECK THE PARKED: a parked lead no longer at `design_review` is untagged for the frontier.
-    fn coordinator_rechecks_parked(&self) {
-        if self.phase() != "design_review" {
-            self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
-                                     "facet_value": format!("swarm-parked={OWNER}"), "mode": "rm" }));
-        }
-    }
-
-    /// Whether the run's frontier query, settled and parked tasks excluded, offers the lead.
-    fn in_frontier(&self) -> bool {
-        let r = self.coordinator(json!({ "op": "task.ready",
-            "dsl": format!("-tag:swarm-settled={OWNER} -tag:swarm-parked={OWNER}"), "limit": 100 }));
-        serde_json::to_string(&r).unwrap().contains(&self.lead)
     }
 
     /// The lead's body.
@@ -1153,10 +1171,10 @@ fn a_systemic_review_sends_the_cause_back_to_the_same_implementer() {
 }
 
 /// Step 4b's redesign exit: `systemic_redesign` puts the lead back at `design`, the group pauses
-/// with its claim held, and a designer whose FEEDBACK is the reason writes a revised design, parked
-/// at `design_review` for the operator. A paused group is out of the frontier whatever its tags say
-/// (it is claimed), so no new group builds it; once the operator approves, the re-check resumes the
-/// same group on its implementer.
+/// with its claim held, and a designer whose FEEDBACK is the reason writes a revised design, left at
+/// `design_review` for the operator. A paused group is out of every read whatever its phase (it is
+/// claimed), so no new group builds it; once the operator approves, the coordinator's check of the
+/// paused lead's phase resumes the same group on its implementer.
 #[test]
 fn a_systemic_redesign_pauses_the_group_for_a_designer_and_resumes_it_once_approved() {
     let s = Swarm::new();
@@ -1179,30 +1197,33 @@ fn a_systemic_redesign_pauses_the_group_for_a_designer_and_resumes_it_once_appro
         json!({ "op": "task.tag", "uid": s.lead, "facet_value": "design=approved", "mode": "set" }),
     );
     for gate in [Gate::On, Gate::Off, Gate::HandPicked] {
-        assert_eq!(
-            admission(&s.seen(&s.lead), gate),
-            Some(Path::Design),
-            "{gate:?}"
-        );
+        for read in [Read::Legacy, Read::Design] {
+            assert_eq!(
+                route(&s.seen(&s.lead), read, gate),
+                Path::Design,
+                "{gate:?} {read:?}"
+            );
+        }
     }
-    // The group keeps its claim through the redesign: the designer works on it as it is.
-    assert!(s.claimed_by(OWNER));
-    let revised =
-        format!("Design (revised; it replaces every earlier Design section above): {cause}");
-    s.designer_designs("d1", &revised);
-    s.coordinator(json!({ "op": "task.tag", "uid": s.lead,
-                          "facet_value": format!("swarm-parked={OWNER}"), "mode": "set" }));
+    // The group keeps its claim through the redesign: the designer works on it as it is, and no
+    // read offers it.
     assert!(s.claimed_by(OWNER));
     assert!(
         !s.in_frontier(),
         "a paused group is not offered to a new group"
     );
-    s.coordinator_rechecks_parked();
+    s.coordinator(json!({ "op": "task.tag", "uid": s.lead,
+                          "facet_value": format!("swarm-designed={OWNER}"), "mode": "set" }));
+    let revised =
+        format!("Design (revised; it replaces every earlier Design section above): {cause}");
+    s.designer_designs("d1", &revised);
+    // Awaiting approval: still the group's, and in no read — with no tag to say so.
+    assert!(s.claimed_by(OWNER));
+    assert_eq!(s.phase(), "design_review");
     assert!(!s.in_frontier(), "still awaiting approval");
-    // Approved: the re-check finds the paused group at `implement` and resumes it — reopened for
-    // the same implementer, which the coordinator continues rather than replaces.
+    // Approved: the check of the paused lead's phase finds it at `implement` and resumes the group —
+    // reopened for the same implementer, which the coordinator continues rather than replaces.
     s.operator_fires("approve_design", None);
-    s.coordinator_rechecks_parked();
     assert_eq!(s.phase(), "implement");
     assert!(
         !s.in_frontier(),
@@ -1226,14 +1247,10 @@ fn a_task_an_earlier_run_left_at_systemic_review_is_taken_up_by_the_next() {
     // The earlier run stops: its claim is released, and nothing settles the task.
     s.coordinator(json!({ "op": "task.set", "uid": s.lead, "status": "open" }));
     s.coordinator(json!({ "op": "task.release", "uid": s.lead, "owner": OWNER }));
-    // The next run's frontier offers it, and step 1b routes it to step 4b.
-    assert!(s.in_frontier());
+    // The next run's read A offers it, and step 1b routes it to step 4b.
+    assert_eq!(s.offered_by(&s.lead), Some(Read::Build));
     for gate in [Gate::On, Gate::Off, Gate::HandPicked] {
-        assert_eq!(
-            admission(&s.seen(&s.lead), gate),
-            Some(Path::Systemic),
-            "{gate:?}"
-        );
+        assert_eq!(s.admission(&s.lead, gate), Some(Path::Systemic), "{gate:?}");
     }
     s.start_group_on(Path::Systemic);
     assert!(s.claimed_by(OWNER));
@@ -1340,11 +1357,11 @@ fn a_resubmission_from_landable_reworks_first() {
     assert_eq!(s.phase(), "review");
 }
 
-/// Step 1 admits exactly the phases step 3 can drive — from each WORKFLOW phase the template's calls
-/// reach `review` — and from every phase it leaves out, and from `design`, those calls are refused.
-/// So a task at `design_review` is excluded, a task at `systemic_review` goes to a systemic reviewer
-/// rather than being rebuilt (or landed past its systemic review as a non-lead), and a task at
-/// `design` can only go the legacy way.
+/// Step 1 reads exactly the phases step 3 can drive — from each WORKFLOW phase the template's calls
+/// reach `review` — and from every phase no read offers, and from `design`, those calls are refused.
+/// So no read offers a task at `design_review`, `landed` or `cancelled`, a task at `systemic_review`
+/// goes to a systemic reviewer rather than being rebuilt (or landed past its systemic review as a
+/// non-lead), and a task at `design` can only go the legacy way.
 #[test]
 fn step_one_admits_exactly_the_phases_step_three_can_drive() {
     let refused = |s: &Swarm, event: &str| {
@@ -1368,14 +1385,20 @@ fn step_one_admits_exactly_the_phases_step_three_can_drive() {
             s.operator_fires("override", Some(phase));
         }
         assert_eq!(s.phase(), phase);
-        // Ungated, so `design` is admitted at all: the table by phase alone.
-        match admission(&s.seen(&s.lead), Gate::Off) {
+        // Ungated, so `design` is read at all: the reads by phase alone.
+        let admitted = s.admission(&s.lead, Gate::Off);
+        assert_eq!(
+            admitted.is_none(),
+            ["design_review", "landed", "cancelled"].contains(&phase),
+            "{phase}: {admitted:?}"
+        );
+        match admitted {
             Some(Path::Workflow) => {
                 s.start_group();
                 s.coordinator_submits();
                 assert_eq!(s.phase(), "review", "from {phase}");
             }
-            Some(Path::Legacy | Path::Design | Path::Parked | Path::Systemic) | None => {
+            Some(Path::Legacy | Path::Design | Path::Systemic) | None => {
                 assert!([
                     "design",
                     "design_review",
@@ -1392,36 +1415,51 @@ fn step_one_admits_exactly_the_phases_step_three_can_drive() {
 }
 
 /// The design gate is one rule: approved in jkb (a phase past design, no tag needed) takes the
-/// workflow path on a gated run; still at `design`, the tag, a hand-pick or no gate takes the legacy
-/// path, and the gate holds back the rest. A review finding — at `design`, under the repository's
-/// `codereviews/` — is never admitted, on any path, so no run builds a must-fix another implementer
-/// is fixing.
+/// workflow path on a gated run, from read A; still at `design`, the tag (read B), a hand-pick or no
+/// gate takes the legacy path, and the gate holds back the rest (read C). A review finding — at
+/// `design`, tagged `finding=review` when filed — is in no read, so no run builds a must-fix
+/// another implementer is fixing, nor starts a designer on one.
 #[test]
 fn step_one_admits_by_phase_or_tag_and_never_a_finding() {
     let gates = [Gate::On, Gate::Off, Gate::HandPicked];
-    // Approved in jkb, untagged: the gated frontier no longer filters on the tag, and step 1 admits it.
+    // Approved in jkb, untagged: read A offers it.
     let approved = Swarm::new();
-    let seen = approved.seen(&approved.lead);
-    assert!(!seen.tagged);
+    assert_eq!(approved.offered_by(&approved.lead), Some(Read::Build));
     for gate in gates {
-        assert_eq!(admission(&seen, gate), Some(Path::Workflow), "{gate:?}");
+        assert_eq!(
+            approved.admission(&approved.lead, gate),
+            Some(Path::Workflow),
+            "{gate:?}"
+        );
     }
-    // At `design`, untagged: held back by the gate only, for a designer.
+    // At `design`, untagged: read C, held back by the gate only, for a designer.
     let untagged = Swarm::at_design();
-    let seen = untagged.seen(&untagged.lead);
-    assert_eq!(admission(&seen, Gate::On), Some(Path::Design));
-    assert_eq!(admission(&seen, Gate::Off), Some(Path::Legacy));
-    assert_eq!(admission(&seen, Gate::HandPicked), Some(Path::Legacy));
-    // ...and tagged: legacy on a gated run too.
+    assert_eq!(untagged.offered_by(&untagged.lead), Some(Read::Design));
+    assert_eq!(
+        untagged.admission(&untagged.lead, Gate::On),
+        Some(Path::Design)
+    );
+    assert_eq!(
+        untagged.admission(&untagged.lead, Gate::Off),
+        Some(Path::Legacy)
+    );
+    assert_eq!(
+        untagged.admission(&untagged.lead, Gate::HandPicked),
+        Some(Path::Legacy)
+    );
+    // ...and tagged: read B, legacy on a gated run too.
     ok(
         &untagged.kb.op,
         json!({ "op": "task.tag", "uid": untagged.lead, "facet_value": "design=approved", "mode": "set" }),
     );
-    let seen = untagged.seen(&untagged.lead);
-    assert_eq!(admission(&seen, Gate::On), Some(Path::Legacy));
+    assert_eq!(untagged.offered_by(&untagged.lead), Some(Read::Legacy));
+    assert_eq!(
+        untagged.admission(&untagged.lead, Gate::On),
+        Some(Path::Legacy)
+    );
 
-    // A finding the swarm's reviewer filed: an ordinary open task at `design`, which only its
-    // namespace tells apart — left out on every path, even tagged.
+    // A finding the swarm's reviewer filed: an ordinary open task at `design`, which its filing tag
+    // keeps out of every read, even tagged approved.
     let s = Swarm::new();
     s.start_group();
     s.implementer_works();
@@ -1432,28 +1470,28 @@ fn step_one_admits_by_phase_or_tag_and_never_a_finding() {
         &s.kb.op,
         json!({ "op": "task.tag", "uid": finding, "facet_value": "design=approved", "mode": "set" }),
     );
-    let seen = s.seen(finding);
-    assert_eq!(seen.phase, "design");
-    assert!(
-        seen.namespace
-            .starts_with(&format!("repos/{REPO}/codereviews/")),
-        "{}",
-        seen.namespace
-    );
+    assert_eq!(s.seen(finding).phase, "design");
     for gate in gates {
-        assert_eq!(admission(&seen, gate), None, "{gate:?}");
+        assert_eq!(s.admission(finding, gate), None, "{gate:?}");
     }
+    // ...which is the filing tag's doing: without it, read B would offer it.
+    ok(
+        &s.kb.op,
+        json!({ "op": "task.tag", "uid": finding, "facet_value": "finding=review", "mode": "rm" }),
+    );
+    assert_eq!(s.offered_by(finding), Some(Read::Legacy));
 }
 
 /// Under a swarm a designer writes the design and the operator approves it. A task the gate holds
 /// back goes to a `jkb-designer`, with exactly the calls `swarm-designer` and the coordinator's
-/// DESIGNING A TASK make: it lands at `design_review`, PARKED. The coordinator cannot submit a design
-/// itself, nor the designer approve one. Approved, the next frontier builds it on the workflow path;
-/// rejected, it is back at `design` with the operator's notes last in its history, for a designer.
+/// DESIGNING A TASK make: it lands at `design_review`, where no read offers it — with no tag and no
+/// re-check. The coordinator cannot submit a design itself, nor the designer approve one. Rejected,
+/// read C offers it again for a designer, with the operator's notes last in its history; approved,
+/// read A offers it and it is built on the workflow path.
 #[test]
-fn a_task_the_gate_holds_back_is_designed_parked_and_then_built() {
+fn a_task_the_gate_holds_back_is_designed_left_to_the_operator_and_then_built() {
     let s = Swarm::at_design();
-    assert_eq!(admission(&s.seen(&s.lead), Gate::On), Some(Path::Design));
+    assert_eq!(s.admission(&s.lead, Gate::On), Some(Path::Design));
     // jkb holds the coordinator to scheduling: the design is not its to submit.
     let refused = Swarm::moved(
         s.coordinator(json!({ "op": "workflow.fire", "uid": s.lead, "event": "submit_design" })),
@@ -1464,19 +1502,28 @@ fn a_task_the_gate_holds_back_is_designed_parked_and_then_built() {
         why.contains("holds coordinator") && why.contains("allowed: operator, designer"),
         "{why}"
     );
-    assert!(s.in_frontier());
     s.coordinator_designs("d1", "Design: the approach");
     assert!(s.body().contains("Design: the approach"));
     match ok(&s.kb.op, json!({ "op": "task.show", "uid": s.lead })) {
-        Response::Task { task, .. } => assert_eq!(task.item.status.as_deref(), Some("open")),
+        Response::Task { task, .. } => {
+            assert_eq!(task.item.status.as_deref(), Some("open"));
+            // The only tag the swarm wrote on it is the budget's count.
+            let swarm_tags: Vec<&str> = task
+                .item
+                .tags
+                .iter()
+                .filter(|t| t.facet.starts_with("swarm-"))
+                .map(|t| t.facet.as_str())
+                .collect();
+            assert_eq!(swarm_tags, ["swarm-designed"]);
+        }
         other => panic!("{other:?}"),
     }
-    assert_eq!(admission(&s.seen(&s.lead), Gate::On), Some(Path::Parked));
-    // Parked: open and unclaimed, yet kept out of the frontier, so parked tasks never fill its limit;
-    // a re-check while it still awaits approval leaves it out.
-    assert!(!s.in_frontier(), "a parked task is out of the frontier");
-    s.coordinator_rechecks_parked();
-    assert!(!s.in_frontier(), "still awaiting approval");
+    // Open and unclaimed at `design_review`, yet in no read: the phase keeps it out, so tasks
+    // awaiting approval never fill a read's limit.
+    assert_eq!(s.phase(), "design_review");
+    assert_eq!(s.admission(&s.lead, Gate::On), None);
+    assert!(!s.in_frontier(), "a design awaiting approval is in no read");
     // A designer does not approve its own design.
     let refused = Swarm::moved(ok(
         &s.as_agent(Some(("d1", "jkb-designer"))),
@@ -1487,28 +1534,17 @@ fn a_task_the_gate_holds_back_is_designed_parked_and_then_built() {
         "{refused:?}"
     );
 
-    // Rejected with notes: back to a designer, the notes the last history line.
+    // Rejected with notes: back in read C at once, for a designer, the notes the last history line.
     s.operator_fires_with("reject_design", "name the files");
-    let w = match s.coordinator(json!({ "op": "workflow.show", "uid": s.lead })) {
-        Response::Workflow { workflow } => workflow,
-        other => panic!("{other:?}"),
-    };
-    for gate in [Gate::On, Gate::Off, Gate::HandPicked] {
-        assert_eq!(
-            admission(&s.seen(&s.lead), gate),
-            Some(Path::Design),
-            "{gate:?}"
-        );
-    }
-    let last = w.history.last().unwrap();
+    let last = s.last_history();
     assert!(
         last.contains("reject_design") && last.contains("name the files"),
         "{last}"
     );
-    // The re-check gives it back to the frontier, for a designer whose revision supersedes the
-    // rejected design: the last Design section governs.
-    s.coordinator_rechecks_parked();
-    assert!(s.in_frontier(), "a rejected design is routed again");
+    assert_eq!(s.offered_by(&s.lead), Some(Read::Design));
+    for gate in [Gate::On, Gate::Off, Gate::HandPicked] {
+        assert_eq!(s.admission(&s.lead, gate), Some(Path::Design), "{gate:?}");
+    }
     let revised =
         "Design (revised; it replaces every earlier Design section above): name the files";
     s.coordinator_designs("d2", revised);
@@ -1519,16 +1555,75 @@ fn a_task_the_gate_holds_back_is_designed_parked_and_then_built() {
     );
     assert!(!s.in_frontier());
 
-    // Approved mid-run: the re-check gives it back, and the next frontier builds it on the workflow
-    // path, no tag needed.
+    // Approved mid-run: read A offers it, and it is built on the workflow path, no tag needed.
     s.operator_fires("approve_design", None);
-    s.coordinator_rechecks_parked();
-    assert!(s.in_frontier(), "an approved design is built");
+    assert_eq!(s.offered_by(&s.lead), Some(Read::Build));
     s.start_group();
     s.implementer_works();
     s.coordinator_submits();
     s.reviewer_records("r1", 1, None);
     assert_eq!(s.coordinator_observes(), "landable");
+}
+
+/// The designer budget caps the tasks one run designs, in total. A run with a budget of 1 over three
+/// tasks at `design` reads C at its one designer left, designs that task, and then stops reading C:
+/// the other two stay at `design`, untagged and unsettled, and the report counts them as left for
+/// want of budget.
+#[test]
+fn a_designer_budget_of_one_designs_one_task_and_reports_the_rest() {
+    let s = Swarm::at_design();
+    let mut tasks = vec![s.lead.clone()];
+    for text in ["the second", "the third"] {
+        match ok(&s.kb.op, json!({ "op": "task.add", "text": text })) {
+            Response::Added { added } => tasks.push(added.uid),
+            other => panic!("{other:?}"),
+        }
+    }
+    let budget = 1;
+    let designers_left = || {
+        let designed = match s.coordinator(json!({ "op": "kb.query", "count": true,
+            "dsl": format!("kind:task tag:swarm-designed={OWNER}") }))
+        {
+            Response::Count { count } => count,
+            other => panic!("{other:?}"),
+        };
+        budget - designed
+    };
+    // Reads A and B are empty; read C, at the designers left, offers exactly one.
+    assert!(s.read(Read::Build, 100).is_empty());
+    assert!(s.read(Read::Legacy, 100).is_empty());
+    let c = s.read(Read::Design, designers_left());
+    assert_eq!(c.len(), 1, "{c:?}");
+    assert_eq!(
+        c[0], s.lead,
+        "the frontier's order: the oldest first among equals"
+    );
+    s.coordinator_designs("d1", "Design: the one the budget allows");
+    assert_eq!(s.phase(), "design_review");
+    // The budget is spent, by a count that survives a compaction: read C is not read again, and
+    // reads A and B are empty, so the run stops.
+    assert_eq!(designers_left(), 0);
+    assert!(s.read(Read::Build, 100).is_empty());
+    assert!(s.read(Read::Legacy, 100).is_empty());
+    // The report: two at `design` left undesigned, read C's terms counted.
+    let left = match s.coordinator(json!({ "op": "kb.query", "count": true,
+        "dsl": format!("kind:task is:ready {} {}", Read::Design.terms(), every_read()) }))
+    {
+        Response::Count { count } => count,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(left, 2);
+    // Neither was written to: no settle tag, no count.
+    for uid in &tasks[1..] {
+        match ok(&s.kb.op, json!({ "op": "task.show", "uid": uid })) {
+            Response::Task { task, .. } => assert!(
+                !task.item.tags.iter().any(|t| t.facet.starts_with("swarm-")),
+                "{uid}: {:?}",
+                task.item.tags
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
 }
 
 /// A task still at `design` that the design gate let through is built on the legacy path: the same

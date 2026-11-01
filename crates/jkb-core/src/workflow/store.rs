@@ -281,18 +281,37 @@ pub struct Current {
     pub history: Vec<WorkflowRow>,
 }
 
+/// The current phase of the row aliased `i` (an `items` row, or any row with its `id`), as one SQL
+/// expression: the latest workflow row's `to_phase`, or `design` for a task with no workflow row yet.
+///
+/// **The one definition.** [`current`] reads a task's phase through it, and the query DSL's
+/// `phase:`/`-phase:` terms ([`crate::query::Query::phases`]) match it, so the phase a query selects
+/// on is the phase `jkb workflow show` prints. A row at the current phase (`pin_strategy`,
+/// `set_strategy`) carries that phase as its `to_phase`, so the latest row is always right.
+/// `idx_workflow_transitions_item (item_id, id)` serves the subquery.
+pub(crate) const CURRENT_PHASE_SQL: &str =
+    "coalesce((SELECT t.to_phase FROM workflow_transitions t \
+     WHERE t.item_id = i.id ORDER BY t.id DESC LIMIT 1), 'design')";
+
+/// `task`'s phase name through [`CURRENT_PHASE_SQL`]. The id is bound as a one-row `i`, not read
+/// from `items`, so a history whose item was removed (the log has no cascade) still answers.
+fn current_phase_name(conn: &Connection, task: ItemId) -> Result<String> {
+    let sql = format!("SELECT {CURRENT_PHASE_SQL} FROM (SELECT ?1 AS id) i");
+    Ok(conn
+        .prepare_cached(&sql)?
+        .query_row([task.get()], |r| r.get(0))?)
+}
+
 /// Where `task`'s workflow stands.
 ///
 /// # Errors
-/// [`Error::Types`] for a stored spec this binary cannot read (refused, never ignored), or a
-/// database error.
+/// [`Error::Types`] for a stored spec or phase this binary cannot read (refused, never ignored), or
+/// a database error.
 pub fn current(conn: &Connection, task: ItemId) -> Result<Current> {
     let history = history(conn, task)?;
-    let phase = match history.last() {
-        Some(r) => Phase::parse(&r.to_phase)
-            .ok_or_else(|| invalid(format!("an unknown workflow phase `{}`", r.to_phase)))?,
-        None => Phase::Design,
-    };
+    let name = current_phase_name(conn, task)?;
+    let phase = Phase::parse(&name)
+        .ok_or_else(|| invalid(format!("an unknown workflow phase `{name}`")))?;
     let pinned = history.iter().rev().find_map(|r| {
         r.spec
             .as_ref()

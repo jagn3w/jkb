@@ -111,7 +111,10 @@ enum Command {
     },
     /// Run a structured query and list the matching items.
     Query {
-        /// Query DSL terms, e.g. `kind:task is:ready ns:tasks/**`.
+        /// Query DSL terms, e.g. `kind:task is:ready ns:tasks/**`. `phase:<p>[,<p>…]` matches a
+        /// task's workflow phase (`design`, `design_review`, `implement`, `review`,
+        /// `systemic_review`, `landable`, `landed`, `cancelled`; no workflow yet is `design`), and
+        /// `-phase:…` excludes those phases.
         #[arg(required = true, num_args = 1..)]
         terms: Vec<String>,
         /// Maximum number of results.
@@ -2032,7 +2035,7 @@ ORIENT (read-only)
   jkb recent [path]           most-recently-updated items — what changed lately.
   jkb find [path] --kind K --tag f=v --status S   structured search (typed; → query DSL).
   jkb grep <pat> [path] [-i -l -c]   literal-substring content search; exit 1 on no match.
-  jkb query "<DSL>"           full query DSL (kind: tag: status: ns: is:ready due<= …).
+  jkb query "<DSL>"           full query DSL (kind: tag: status: phase: ns: is:ready due<= …).
   jkb search "<terms>" --route hybrid   ranked vector/FTS retrieval (needs the embedder).
       Pick by what you already know: `find`/`query` when you know the KIND/TAG/STATUS,
       `grep` for a LITERAL string in content, `search` for fuzzy/semantic ranking.

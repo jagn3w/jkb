@@ -2,6 +2,7 @@
 //!
 //! Grammar (whitespace-separated tokens; `"…"` groups spaces):
 //! `kind:<k>`/`kind:<a>,<b>` (negate with `-kind:…`) `status:<s>` `resolution:<r>`
+//! `phase:<p>`/`phase:<a>,<b>` (the workflow phase; negate with `-phase:…`)
 //! `priority<op><n>` `due<op><date>`/`due:today` `tag:<facet><op><value>` (negate with `-tag:…`)
 //! `ns:<path>`/`ns:<path>/**` (comma-unions, repeatable)
 //! `is:ready`/`is:frontier`/`is:tombstone`/`is:claimed`/`is:unclaimed`
@@ -67,6 +68,10 @@ pub fn parse(input: &str) -> Result<Query> {
                 ));
             }
             query.resolution = Some(v.to_owned());
+        } else if let Some(v) = token.strip_prefix("-phase:") {
+            query.exclude_phases.extend(parse_phases(v, &token)?);
+        } else if let Some(v) = token.strip_prefix("phase:") {
+            query.phases.extend(parse_phases(v, &token)?);
         } else if let Some(v) = token.strip_prefix("-tag:") {
             query.exclude_tags.push(parse_tag(v, &token)?);
         } else if let Some(v) = token.strip_prefix("tag:") {
@@ -74,25 +79,7 @@ pub fn parse(input: &str) -> Result<Query> {
         } else if let Some(v) = token.strip_prefix("ns:") {
             parse_ns(v, &token, &mut scopes)?;
         } else if let Some(v) = token.strip_prefix("is:") {
-            match v {
-                "ready" => query.ready = true,
-                // `is:frontier` bundles the claim filter so handing out work is safe by
-                // default (mirroring `is:ready`); a coordinator wanting the whole frontier
-                // including in-flight units builds the `Query` directly.
-                "frontier" => {
-                    query.frontier = true;
-                    query.claimed = Some(false);
-                }
-                "tombstone" => query.tombstone = true,
-                "claimed" => query.claimed = Some(true),
-                "unclaimed" => query.claimed = Some(false),
-                _ => {
-                    return Err(bad(
-                        &token,
-                        "the `is:` predicates are ready, frontier, tombstone, claimed, unclaimed",
-                    ))
-                }
-            }
+            parse_is(v, &token, &mut query)?;
         } else if let Some(v) = token.strip_prefix("blocks:") {
             query.blocks = Some(non_empty(v, &token, "blocks")?.to_owned());
         } else if let Some((op, val)) = strip_keyword_op(&token, "priority") {
@@ -145,6 +132,45 @@ fn parse_tag(payload: &str, token: &str) -> Result<TagPred> {
         op,
         value: value.to_owned(),
     })
+}
+
+/// Apply an `is:` predicate to `query`.
+fn parse_is(predicate: &str, token: &str, query: &mut Query) -> Result<()> {
+    match predicate {
+        "ready" => query.ready = true,
+        // `is:frontier` bundles the claim filter so handing out work is safe by default (mirroring
+        // `is:ready`); a coordinator wanting the whole frontier including in-flight units builds the
+        // `Query` directly.
+        "frontier" => {
+            query.frontier = true;
+            query.claimed = Some(false);
+        }
+        "tombstone" => query.tombstone = true,
+        "claimed" => query.claimed = Some(true),
+        "unclaimed" => query.claimed = Some(false),
+        _ => {
+            return Err(bad(
+                token,
+                "the `is:` predicates are ready, frontier, tombstone, claimed, unclaimed",
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Parse a `phase:`/`-phase:` payload: a comma list of workflow phases, each one jkb knows.
+fn parse_phases(payload: &str, token: &str) -> Result<Vec<String>> {
+    let mut phases = Vec::new();
+    for part in non_empty(payload, token, "phase")?.split(',') {
+        if part.is_empty() {
+            return Err(bad(token, "empty phase in `phase:a,b`"));
+        }
+        if let Some(why) = super::phase_problem(part) {
+            return Err(bad(token, &why));
+        }
+        phases.push(part.to_owned());
+    }
+    Ok(phases)
 }
 
 /// Parse `ns:` payload — comma-separated paths, each exact or a `/**` subtree.
@@ -288,6 +314,40 @@ mod tests {
         assert!(err.contains("dead_end"), "{err}");
         let err = parse("is:blocked").unwrap_err().to_string();
         assert!(err.contains("frontier"), "{err}");
+    }
+
+    #[test]
+    fn parses_phase_terms_as_lists_and_negations() {
+        let q = parse("phase:implement,review,landable -phase:design_review phase:systemic_review")
+            .unwrap();
+        assert_eq!(
+            q.phases,
+            ["implement", "review", "landable", "systemic_review"],
+            "repeated `phase:` terms add to one any-of list"
+        );
+        assert_eq!(q.exclude_phases, ["design_review"]);
+        assert!(q.fts.is_none() && q.tags.is_empty());
+        let q = parse("phase:design").unwrap();
+        assert_eq!(q.phases, ["design"]);
+        assert!(q.exclude_phases.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_or_empty_phase_is_refused_naming_the_phases() {
+        for bad in [
+            "phase:desing",
+            "-phase:implement,shipped",
+            "phase:",
+            "phase:design,",
+        ] {
+            let err = parse(bad).unwrap_err().to_string();
+            assert!(err.contains(bad), "{bad}: {err}");
+        }
+        let err = parse("phase:desing").unwrap_err().to_string();
+        assert!(
+            err.contains("design_review") && err.contains("systemic_review"),
+            "{err}"
+        );
     }
 
     #[test]

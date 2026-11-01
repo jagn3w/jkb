@@ -202,6 +202,21 @@ fn the_packaged_templates_are_what_the_coordinators_fill() {
     for c in ["swarm-coordinator", "review-coordinator"] {
         assert_eq!(get(c).def.role, Role::Coordinator, "{c}");
     }
+    // `/task-swarm` fills the swarm's coordinator, the designer budget included.
+    assert_eq!(get("swarm-coordinator").version, 5);
+    assert_eq!(
+        placeholders(&get("swarm-coordinator").def.template).unwrap(),
+        [
+            "designers",
+            "group_cap",
+            "integration",
+            "integration_worktree",
+            "owner",
+            "repo",
+            "retry_cap",
+            "scope_block"
+        ]
+    );
     // The shared reviewer contract is a fragment the round's reviewer and its children include.
     assert!(get("review-contract").def.fragment);
     for r in ["review-reviewer", "review-area"] {
@@ -256,13 +271,11 @@ fn the_swarm_templates_drive_the_workflow() {
     // Step 1 admits exactly the phases step 3 drives, plus `design` on the legacy path; the rest are
     // left out. `jkb-api`'s swarm-loop tests pin the same table against what jkb lets step 3 do.
     for row in [
-        "  implement, review, landable   a WORKFLOW task",
-        "  design                        a LEGACY task",
-        "  design_review                 PARKED",
-        "  systemic_review               a SYSTEMIC task",
-        "  anything else                 left out (landed, cancelled)",
+        "  implement, review, landable   a WORKFLOW task (read A)",
+        "  design                        a LEGACY task (read B, or read C with the gate OFF)",
+        "  systemic_review               a SYSTEMIC task (read A)",
     ] {
-        assert!(coord.contains(row), "step 1's admission table: {row}");
+        assert!(coord.contains(row), "step 1b's routing table: {row}");
     }
     assert!(coord.contains("never a mix"));
     // Whoever verifies a fix closes its finding: the coordinator, after a clean round.
@@ -270,9 +283,9 @@ fn the_swarm_templates_drive_the_workflow() {
     assert!(coord[closing..].contains("jkb task set <finding uid> --status done"));
     assert!(closing < at("5. THE MERGE QUEUE"));
     // No run builds a finding, and approval in jkb needs no tag.
-    assert!(coord.contains("First leave out every review finding"));
-    assert!(coord.contains("repos/<repo>/codereviews/"));
-    assert!(coord.contains("so it needs no `design=approved` tag"));
+    assert!(coord.contains("No run builds a finding"));
+    assert!(coord.contains("-tag:finding=review"));
+    assert!(coord.contains("so it needs no `design=approved`\n"));
     // An eject puts a `landable` lead back to `implement`, or the next submit is refused.
     let arm = &coord[at("- eject:")..];
     let rework = arm.find("jkb workflow fire <lead uid> rework").unwrap();
@@ -286,12 +299,12 @@ fn the_swarm_templates_drive_the_workflow() {
 }
 
 /// Under a swarm a designer writes the design and the operator approves it: the coordinator routes a
-/// task the gate holds back to a `swarm-designer` started as a `jkb-designer`, parks a task awaiting
-/// approval without settling it (so the approval, once given, is built by a later frontier), stops
-/// when only parked tasks are left, and reports them to the operator. `jkb-api`'s swarm-loop test
-/// makes the same calls as the same principals.
+/// task the gate holds back to a `swarm-designer` started as a `jkb-designer`, and leaves a task
+/// awaiting approval to the operator without tagging or settling it: no frontier read offers
+/// `design_review`, so an approval or a rejection given mid-run reaches a later read by phase alone.
+/// `jkb-api`'s swarm-loop test makes the same calls as the same principals.
 #[test]
-fn the_swarm_designs_what_the_gate_holds_back_and_parks_it_for_approval() {
+fn the_swarm_designs_what_the_gate_holds_back_and_leaves_it_to_the_operator() {
     let agents = packaged().unwrap();
     let get = |n: &str| agents.iter().find(|a| a.name == n).unwrap();
     let des = &get("swarm-designer").def.template;
@@ -321,14 +334,16 @@ fn the_swarm_designs_what_the_gate_holds_back_and_parks_it_for_approval() {
         .iter()
         .any(|h| h == "swarm-designer"));
     let at = |s: &str| at_in(coord, s);
-    // Routed by the phase, after the findings are left out and before anything is grouped.
-    assert!(at("First leave out every review finding") < at("1b. ROUTE BY PHASE"));
+    // Read by phase, then routed, before anything is grouped.
+    assert!(at("1. READ THE FRONTIER, BY PHASE") < at("1b. ROUTE BY PHASE"));
     assert!(at("1b. ROUTE BY PHASE") < at("GROUP what you build"));
-    assert!(coord.contains("`jkb workflow show <uid> --json` gives its `phase`"));
-    assert!(coord.contains("A task the gate holds back goes to a DESIGNER"));
-    let designing = &coord[at("DESIGNING A TASK")..at("GROUP what you build")];
+    assert!(coord.contains("`jkb workflow show <uid> --json` gives each task's `phase`"));
+    assert!(coord.contains("task the gate holds back (read C) goes to a DESIGNER"));
+    let designing =
+        &coord[at("\nDESIGNING A TASK, one designer per task")..at("GROUP what you build")];
     for step in [
         "jkb task claim <uid> --owner '{{owner}}'",
+        "jkb task tag set <uid> swarm-designed={{owner}}",
         "jkb workflow agent show swarm-designer",
         "subagent type `jkb-designer`",
         "RESULT: submitted <uid>",
@@ -338,36 +353,37 @@ fn the_swarm_designs_what_the_gate_holds_back_and_parks_it_for_approval() {
     ] {
         assert!(designing.contains(step), "DESIGNING A TASK: {step}");
     }
-    // A parked task is never settled, or an approval given mid-run is never built; and it is not
-    // "left out", which would settle it.
-    let parked = &coord[at("  design_review                 PARKED")..at("  anything else ")];
-    assert!(parked.contains("never claim or settle it"), "{parked}");
-    assert!(coord.contains("A PARKED task is not left out: it is tagged PARKED, never SETTLED."));
-    // ...but it is kept out of the frontier, or parked tasks fill its limit and the stop rule ends
-    // the run with the tasks behind them never read; and re-checked before every read, so an
-    // approval or a rejection given mid-run is routed again.
-    for rule in [
-        "`jkb task tag set <uid>\nswarm-parked={{owner}}`",
-        "`-tag:swarm-parked={{owner}}`",
-        "tag:swarm-parked={{owner}}' --limit 1000",
-        "`jkb task tag rm <uid> swarm-parked={{owner}}`",
+    assert!(
+        at_in(designing, "jkb task claim") < at_in(designing, "swarm-designed=")
+            && at_in(designing, "swarm-designed=") < at_in(designing, "jkb workflow agent show"),
+        "the budget's count is recorded before the designer starts"
+    );
+    // A submitted design is the operator's: no tag, no settling, no re-check before each read. The
+    // parked-tag machinery existed only because the query could not test a phase.
+    for gone in [
+        "swarm-parked",
+        "PARKED",
+        "RE-CHECK THE PARKED",
+        "tag:swarm-parked",
+        "holds only PARKED",
     ] {
-        assert!(coord.contains(rule), "the parked rule: {rule}");
+        assert!(
+            !coord.contains(gone),
+            "the parked machinery is gone: {gone}"
+        );
     }
-    assert!(at("RE-CHECK THE PARKED. ") < at("1. READ THE FRONTIER"));
     let continuing = &coord[at("\nCONTINUING\n")..at("\nREPORT\n")];
-    assert!(continuing.contains("RE-CHECK THE PARKED and read the frontier again"));
-    // The stop rule: the frontier, parked tasks excluded, is empty after a re-check.
-    assert!(continuing.contains("the frontier, read after a re-check, is empty"));
-    assert!(!coord.contains("holds only PARKED"));
+    // The stop rule: every read empty, read C only while the budget lasts.
+    assert!(continuing.contains("reads A, B and C (C only\nwhile DESIGNERS LEFT is above 0"));
     // After a compaction the designer's report may be gone: the phase says whether it submitted.
     assert!(continuing.contains("At `design_review` it was submitted"));
     let report = &coord[at("\nREPORT\n")..];
     assert!(
-        report.contains("\"awaiting your design approval\""),
+        report.contains("\"awaiting your design\napproval\""),
         "{report}"
     );
-    assert!(report.contains("task tagged `swarm-parked={{owner}}`"));
+    assert!(report.contains("`jkb query --global --json 'kind:task phase:design_review <SCOPE>'`"));
+    assert!(report.contains("marking those\nthis run's designers wrote"));
     // A redesign after a rejection supersedes the rejected one, and the implementer reads the last.
     assert!(des.contains("it replaces every earlier Design section above"));
     assert!(get("swarm-implementer")
@@ -376,6 +392,89 @@ fn the_swarm_designs_what_the_gate_holds_back_and_parks_it_for_approval() {
         .contains("the LAST governs"));
     // The coordinator writes no design: the NEVER rule it is not held to by jkb.
     assert!(coord.contains("- Edit code or a task's design"));
+}
+
+/// The frontier is three reads by phase, approved work first: a broad scope's few approved tasks
+/// sorted past `--limit 100` behind hundreds at `design`, so a gated run admitted nothing (review
+/// round 4). Every read leaves out what the run settled and every review finding by tag, none
+/// offers `design_review`, and the design read is limited to the designers the budget has left.
+/// Each read's terms are ones jkb's own parser accepts.
+#[test]
+fn the_coordinator_reads_the_frontier_in_three_reads_by_phase() {
+    let agents = packaged().unwrap();
+    let coord = &agents
+        .iter()
+        .find(|a| a.name == "swarm-coordinator")
+        .unwrap()
+        .def
+        .template;
+    let at = |s: &str| coord.find(s).unwrap_or_else(|| panic!("{s}"));
+    let step = &coord[at("1. READ THE FRONTIER, BY PHASE")..at("1b. ROUTE BY PHASE")];
+    let every = "-tag:swarm-settled={{owner}} -tag:finding=review";
+    assert!(step.contains(&format!("\n  {every}\n")), "{step}");
+    let reads = [
+        (
+            "  A, build    ",
+            "phase:implement,review,landable,systemic_review",
+            "--limit 100",
+        ),
+        (
+            "  B, legacy   ",
+            "phase:design tag:design=approved",
+            "--limit 100",
+        ),
+        (
+            "  C, design   ",
+            "phase:design -tag:design=approved",
+            "--limit <DESIGNERS LEFT>",
+        ),
+    ];
+    let mut last = 0;
+    for (label, terms, limit) in reads {
+        let line = step
+            .lines()
+            .find(|l| l.starts_with(label))
+            .unwrap_or_else(|| panic!("read {label}"));
+        assert!(line.contains(terms) && line.ends_with(limit), "{line}");
+        assert!(step.find(label).unwrap() > last, "reads in order: {label}");
+        last = step.find(label).unwrap();
+        // jkb parses the read as the coordinator will send it.
+        let q = crate::query::parse(&format!("{terms} {}", every.replace("{{owner}}", "box:1")))
+            .unwrap_or_else(|e| panic!("{terms}: {e}"));
+        assert!(
+            !q.phases.iter().any(|p| p == "design_review"),
+            "no read offers a design awaiting the operator: {terms}"
+        );
+        for facet in ["swarm-settled", "finding"] {
+            assert!(
+                q.exclude_tags.iter().any(|t| t.facet == facet),
+                "{terms}: -tag:{facet}"
+            );
+        }
+    }
+    assert!(step.contains("Read A first, so approved work is never hidden"));
+    assert!(step.contains("Read C only while\nDESIGNERS LEFT is above 0"));
+    // The budget: a placeholder, counted by a tag so it survives a compaction, and its refusal the
+    // only settling of a task the run did not build.
+    assert!(
+        coord.contains("  designer budget       {{designers}} tasks designed in this whole run")
+    );
+    assert!(coord.contains("'kind:task tag:swarm-designed={{owner}}'"));
+    let routing = &coord[at("1b. ROUTE BY PHASE")..at("\nDESIGNING A TASK, one designer per task")];
+    assert!(routing.contains("THE BUDGET REFUSES a designer when DESIGNERS LEFT is 0"));
+    assert!(routing.contains("tag it SETTLED, or that read offers it again"));
+    assert!(routing.contains("From read C\nwith the gate on, leave it untagged"));
+    // Nothing else is settled without being built: a held-back design is out of every read already.
+    assert!(!coord.contains("Tag every task you leave out SETTLED"));
+    let report = &coord[at("\nREPORT\n")..];
+    assert!(report.contains("of its budget of {{designers}}"));
+    assert!(report.contains("in uid mode each task you named that no read took"));
+    assert!(report.contains("<every read's terms> <read\nC's terms>"));
+    assert!(report.contains("left undesigned\nfor want of budget"));
+    // A paused group is still known by its claim and its lead's phase, and resumed before a read.
+    let paused = &coord[at("RESUMING A PAUSED GROUP")..at("- systemic_review (nothing moved)")];
+    assert!(paused.contains("before every frontier read"));
+    assert!(paused.contains("a lead claimed by '{{owner}}' at `design_review`"));
 }
 
 /// A task whose review keeps failing in one area goes to a systemic reviewer, never round the loop
@@ -435,19 +534,21 @@ fn the_swarm_sends_a_repeated_area_to_a_systemic_reviewer() {
         "- design (systemic_redesign): the fix changes the design, so the group PAUSES.",
         "claim nothing",
         "neither reopen nor release",
-        "tag the lead PARKED",
+        "the lead is at `design_review`, still claimed by '{{owner}}'",
         "RESUMING A PAUSED GROUP",
         "- systemic_review (nothing moved)",
     ] {
         assert!(step.contains(rule), "step 4b: {rule}");
     }
-    // The parked re-check knows a paused group by its claim, and resumes it rather than waiting for
-    // a frontier that never offers it.
-    assert!(coord.contains("A parked task claimed by '{{owner}}' is the lead of a PAUSED group"));
+    // A paused group is known by its claim and its lead's phase, and resumed rather than waiting for
+    // a frontier that never offers it (it is claimed).
+    assert!(step.contains(
+        "for each PAUSED\n  group's lead (a lead claimed by '{{owner}}' at `design_review`)"
+    ));
     // A design turned down goes to a designer whatever the gate says, so a redesigned task is never
     // built on its superseded design by a later run.
     let design_row =
-        &coord[at("  design                        a LEGACY task")..at("  design_review ")];
+        &coord[at("  design                        a LEGACY task")..at("  systemic_review ")];
     assert!(
         design_row.contains("`reject_design` or a\n                                `systemic_redesign`, whatever the gate says"),
         "{design_row}"
@@ -455,7 +556,8 @@ fn the_swarm_sends_a_repeated_area_to_a_systemic_reviewer() {
     // A task an earlier run left at `systemic_review` is not left out (every later run would settle
     // it, and the stall would persist): step 1b takes it, as a group of one, straight to step 4b,
     // whose exits start an implementer on its branch since it has none of this run's.
-    let row = &coord[at("  systemic_review               a SYSTEMIC task")..at("  design_review ")];
+    let row =
+        &coord[at("  systemic_review               a SYSTEMIC task")..at("THE BUDGET REFUSES")];
     for rule in [
         "group of one",
         "start no implementer",
@@ -463,8 +565,6 @@ fn the_swarm_sends_a_repeated_area_to_a_systemic_reviewer() {
     ] {
         assert!(row.contains(rule), "step 1b's systemic row: {rule}");
     }
-    assert!(!coord[at("  anything else ")..]
-        .starts_with("  anything else                 left out (systemic_review"));
     for rule in [
         "NO IMPLEMENTER OF YOURS: a SYSTEMIC group never had one in this run",
         "the branch the lead's `branch=` tag names",
@@ -477,6 +577,7 @@ fn the_swarm_sends_a_repeated_area_to_a_systemic_reviewer() {
     let continuing = &coord[at("\nCONTINUING\n")..at("\nREPORT\n")];
     assert!(continuing.contains("A PAUSED group is not in\nflight"));
     assert!(continuing.contains("A lead at `systemic_review` has a systemic reviewer at\nwork"));
+    assert!(continuing.contains("A lead at `design_review` is a PAUSED group's lead."));
     let report = &coord[at("\nREPORT\n")..];
     assert!(report.contains("each systemic review (its exit and its CAUSE)"));
     assert!(report.contains("a PAUSED group's lead as a systemic redesign"));
@@ -564,11 +665,11 @@ fn the_scope_rule_carves_out_exactly_the_findings_the_coordinator_closes() {
     assert!(never.contains("on any task but a finding you close as CLOSING FINDINGS says"));
 }
 
-/// `/task-swarm` no longer gates the frontier on the `design=approved` tag: a task approved in jkb
-/// carries no tag, and the query DSL cannot test a phase, so the coordinator's step 1 applies the
-/// gate and `scope_block` says whether it is on.
+/// `/task-swarm` reads the frontier by phase, as the coordinator does: the scout makes the same
+/// three reads, `scope_block` says how to make one and whether the gate is on, the designer budget
+/// is a flag passed to the template, and nothing parks a task by tag any more.
 #[test]
-fn the_slash_command_leaves_the_design_gate_to_step_one() {
+fn the_slash_command_reads_the_frontier_by_phase_with_a_designer_budget() {
     let md = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.claude/commands/task-swarm.md"),
@@ -578,33 +679,56 @@ fn the_slash_command_leaves_the_design_gate_to_step_one() {
         !md.contains("<GATE>"),
         "a frontier query still gates on the tag"
     );
-    assert!(
-        md.contains("Read the frontier with `jkb task next --global --json '<SCOPE>' --limit 100`")
-    );
+    assert!(md.contains(
+        "Make each read with `jkb task next --global --json\n  '<SCOPE> <the read's terms>' --limit <the read's limit>`"
+    ));
+    for read in [
+        "'<SCOPE> -tag:finding=review phase:implement,review,landable,systemic_review' --limit 100",
+        "'<SCOPE> -tag:finding=review phase:design tag:design=approved' --limit 100",
+        "'kind:task is:ready <SCOPE> -tag:finding=review phase:design -tag:design=approved'",
+        "'kind:task <SCOPE> phase:design_review'",
+    ] {
+        assert!(md.contains(read), "the scout's read: {read}");
+    }
     assert!(md.contains("The design gate is ON"));
     assert!(md.contains("The design gate is OFF"));
     assert!(md.contains("no run builds a finding"));
-    // The step it names is the coordinator's routing step, which starts the designers and parks
-    // what awaits approval; the preview and the relay say so too.
-    assert!(md.contains("coordinator's step 1b"));
-    assert!(
-        !md.contains("step 1 admits"),
-        "the admission table moved to step 1b"
-    );
-    assert!(md.contains("starts a designer for every other task at `design`"));
+    assert!(md.contains("tagged `finding=review`, which `jkb task review file` sets"));
+    // A finding named by uid is refused and said to be one (review round 4's nit), not previewed as
+    // legacy and then dropped.
+    assert!(md.contains("a finding named by uid is refused and reported as one"));
+    assert!(md.contains("leave it and report it as a finding\n  you named"));
+    // The budget: parsed, previewed, and passed to the template.
+    assert!(md.contains("[--designers <n>]"));
+    assert!(md.contains("- `--designers <n>` → `DESIGNERS=<n>`"));
+    assert!(md.contains("Default 3; `0` designs nothing."));
+    assert!(md.contains("--var designers=\"${DESIGNERS:-3}\""));
+    assert!(md.contains(
+        "the designer budget (`DESIGNERS`), how many tasks at `design` the gate holds back"
+    ));
+    // No parking by tag, no re-check.
+    for gone in [
+        "swarm-parked",
+        "parked",
+        "re-checks",
+        "DSL cannot test a workflow phase",
+    ] {
+        assert!(!md.contains(gone), "{gone}");
+    }
+    // The step it names is the coordinator's routing step, which starts the designers.
+    assert!(md.contains("step 1b (ROUTE BY PHASE)"));
     assert!(md.contains("`jkb-designer`"));
     assert!(md.contains("awaiting your design approval"));
     // The systemic reviewer, and what its two exits do to the group.
     assert!(md.contains("`jkb-systemic-reviewer`"));
-    assert!(md.contains("`systemic_review` goes to a systemic reviewer"));
+    assert!(md.contains("`systemic_review`\ngoes to a systemic reviewer"));
     assert!(!md.contains("`systemic_review` stops the group"));
     // A turned-down design goes to a designer on every path, and the slash command says so wherever
     // it names the legacy path for a hand-pick or an ungated run.
     assert!(md.contains("Neither the tag, a hand-pick nor\n`--no-design-gate` builds a task whose design was turned down"));
-    assert_eq!(md.matches("unless its design was turned down").count(), 2);
+    assert!(md.contains("legacy path, unless its design was turned down.\""));
+    assert!(md.contains("on the legacy path, unless its\n  design was turned down.\""));
     assert!(md.contains("go on the legacy path unless their design was\n  turned down"));
-    assert!(md.contains("per task whose design was\n  turned down, one systemic reviewer per task at `systemic_review`"));
-    assert!(md.contains("`systemic_review` goes\nto a systemic reviewer"));
 }
 
 /// The workers' subagent types: rendered from the packaged file, prefixed like everything the
