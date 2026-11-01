@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 b9f9e3be952a7671f5a3c6aaf3c5ac6230eb3262c9ee124cbad553dc865e70f4) -->
+<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 cfbe327a05707878e7d1093403df8c79305840cb4254028e64494ccd01689752) -->
 # Agents and roles
 
 jkb is driven by agents as much as by people: a task swarm that schedules, implements, reviews
@@ -1303,7 +1303,7 @@ reporting a moved submodule commit). `checkout` and `switch` run `--quiet` too, 
 report of local changes enters every populated submodule, and a branch can bring a submodule only
 the target tree's `.gitmodules` names (measured: the planted filter ran on `checkout --detach` and
 `switch`, not with `--quiet`). And jkb's git runs only the subcommands measured not to enter a
-submodule (`SAFE_SUBCOMMANDS`; `add -A`, `stash`, `cherry-pick` and `diff-index` did), refused at
+submodule (`SAFE_SUBCOMMANDS`; `add -A`, `stash`, `cherry-pick` and `diff-index` did; `ls-remote`, `pack-objects`, `index-pack` and `fast-import` were measured in for the Executions diff, `ls-remote` under `GIT_ALLOW_PROTOCOL=https:ssh` with a hostile repository config running nothing), refused at
 runtime otherwise, so a new subcommand arrives with its own measurement. The cost: a submodule's
 uncommitted edits no longer make a checkout read dirty, and a graft carries only the submodule's
 commit anyway.
@@ -1634,19 +1634,30 @@ shows the operator:
 
 - the argv, one argument per line, with control characters and invisible characters escaped;
 - the directory and target;
-- the program file, when `argv[0]` is a path inside the repository;
-- the diff from `origin/main` as the host's own clean clone holds it, never the request
-  directory's refs or objects, to the pinned bytes. This is the code the operator is about to run
+- the program file, when `argv[0]` is a path inside the repository: a link is shown as a link, never followed, and a file the pin does not cover is marked "outside the pin: can change before Run" rather than shown as reviewed code;
+- the diff to the pinned bytes from a base verified on the host: the default branch's tip by
+  `git ls-remote` on the repository's origin, but only when that origin is the clean clone's remote
+  or a line of `~/.jkb/trusted-remotes` (a file the container cannot write; it starts empty, and the
+  operator adds remotes by hand), with the clean clone as the fallback. The base's objects may come
+  from the request repository, but only after `index-pack --fsck-objects` re-names them by hash in a
+  throwaway repository, so a forged object leaves the base missing, never different. Any other remote
+  is never contacted: the diff is against the request's `HEAD` label under **base unverified (remote
+  chosen by the repository)**, and stays runnable. The patch is diffed with `--text`, so a NUL byte
+  cannot hide a file, and `jkb exec diff` prints it escaped. Every `.gitignore` the pin applied is
+  part of the diffed tree, so a change to the ignore rules shows as a change. A tracked file the rules
+  exclude is listed `I`, and left out of the patch, only when the pin's walk judged that exact path (or
+  an ignored parent) ignored and it is a file or link reached through real directories. The file list
+  (up to 10,000 paths) is complete or says it was cut; a patch over 2 MiB is cut with a banner and Run
+  stays enabled; and a request in a repository whose diff cannot be produced cannot be Run. This is the code the operator is about to run
   that nobody has reviewed yet. It is rendered on the host from the same walk that computed the
   pin, over raw bytes with no attribute, filter or diff driver applied, so a `.gitattributes` in
   the tree cannot hide a file's content from the operator.
 
 When Run is clicked, main recomputes the pin. Any difference refuses the run and the request is
 marked `refused: tree changed`. The session may ask again, and the new request is reviewed fresh.
-So does the review: a request whose pin the host cannot reproduce is refused before its diff is
-shown. The pinned tree's `.gitignore` files must be `origin/main`'s, byte for byte; a request that
-changes the ignore rules is refused, because the files a new rule hides would not be shown. Land
-that change first.
+The preview pins, diffs and pins again; if any pin differs from the request's, it says **Tree changed
+since the request: Run will refuse** and disables Run. Previews run two at a time, so a session that
+files many requests cannot flood the host.
 A host run also runs the hooks-off git audit on the repository first, and a refused audit refuses
 the run. A directory outside any repository gets no tree pin, and the tab says so in place of a
 diff.
@@ -1701,7 +1712,13 @@ Runs an earlier app instance left `running` are ended as interrupted at the next
 arrives: the decision, the output streamed as it is produced, and the exit status, which becomes
 its own exit status. Main publishes the run's output to that topic as the terminal shows it, so
 the operator and the session see the same bytes. The row keeps the last 256 KiB and the exit
-status; the full output goes to `~/.jkb/logs/exec/exec-<n>.log`. While the daemon is unreachable main buffers up to 4 MiB of output; past that the rest goes to the log only, and the stream says how much it missed and where the log is. `--no-wait` returns the request id at
+status; the full output goes to `~/.jkb/logs/exec/exec-<n>.log`. The Executions tab's history shows the
+newest 50 ended requests with their outcome, exit status, note, log path and escaped tail (`exec.list`
+with `newest_first`). A new request posts a sticky notification (`exec-<n>`: the requester and the
+reason, never the argv) in the same transaction, and any decision withdraws it; a full notification
+topic drops it rather than refusing the request. Every request and every move is announced on the
+reserved `exec/requests` topic, which only the operator may read and only jkb may send on, and the
+tab re-reads on each announcement. While the daemon is unreachable main buffers up to 4 MiB of output; past that the rest goes to the log only, and the stream says how much it missed and where the log is. `--no-wait` returns the request id at
 once, and `jkb exec status <id>` reads the outcome later.
 
 ### A request's states
