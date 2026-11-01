@@ -25,10 +25,12 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   the whole group, then files its findings and records the round in jkb (`jkb role bind`, `jkb task
   review file`, `jkb task review record`). Its role comes from the operator's agent-type map
   (`jkb-reviewer` → `reviewer`), never from a grant the coordinator mints.
-- **Workflow.** The coordinator reads the frontier by workflow phase, in up to three reads: first
-  the tasks past design (`implement`, `review`, `landable`, `systemic_review`), then the tasks at
-  `design` tagged `design=approved`, then the other tasks at `design`, limited to the designers the
-  budget has left. Every read leaves out review findings (tagged `finding=review` when filed) and
+- **Workflow.** The coordinator reads the frontier by workflow phase, in up to four reads: first
+  the tasks past design (`implement`, `review`, `landable`, `systemic_review`), then the tasks this
+  run designed whose design you rejected (tagged `swarm-designed=<owner>`; a re-design uses no
+  budget, so this read is never limited by it), then the tasks at `design` tagged
+  `design=approved`, then the other tasks at `design`, limited to the designers the budget has
+  left. Every read leaves out review findings (tagged `finding=review` when filed) and
   what the run has settled. It admits a group only if every task in it is admitted. A task at
   `implement`, `review` or `landable` is a *workflow* task. A task still at `design` that the run's design gate let through
   (the `design=approved` tag, a hand-pick by uid, or `--no-design-gate`), and whose design was never
@@ -112,8 +114,9 @@ not in it. Ask whether to continue.
 
 ## 3. Scout and preview
 
-In scope mode, the coordinator's three reads, as counts and lists (every read leaves out review
-findings):
+In scope mode, the coordinator's reads, as counts and lists (every read leaves out review
+findings). Its re-design read is empty before the run starts: it holds only tasks the run itself
+designed, so the scout skips it.
 
 ```sh
 jkb task next --global --json '<SCOPE> -tag:finding=review phase:implement,review,landable,systemic_review' --limit 100   # A, build

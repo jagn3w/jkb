@@ -374,7 +374,7 @@ fn the_swarm_designs_what_the_gate_holds_back_and_leaves_it_to_the_operator() {
     }
     let continuing = &coord[at("\nCONTINUING\n")..at("\nREPORT\n")];
     // The stop rule: every read empty, read C only while the budget lasts.
-    assert!(continuing.contains("reads A, B and C (C only\nwhile DESIGNERS LEFT is above 0"));
+    assert!(continuing.contains("reads A, R, B and C (C\nonly while DESIGNERS LEFT is above 0"));
     // After a compaction the designer's report may be gone: the phase says whether it submitted.
     assert!(continuing.contains("At `design_review` it was submitted"));
     let report = &coord[at("\nREPORT\n")..];
@@ -394,13 +394,15 @@ fn the_swarm_designs_what_the_gate_holds_back_and_leaves_it_to_the_operator() {
     assert!(coord.contains("- Edit code or a task's design"));
 }
 
-/// The frontier is three reads by phase, approved work first: a broad scope's few approved tasks
-/// sorted past `--limit 100` behind hundreds at `design`, so a gated run admitted nothing (review
-/// round 4). Every read leaves out what the run settled and every review finding by tag, none
-/// offers `design_review`, and the design read is limited to the designers the budget has left.
-/// Each read's terms are ones jkb's own parser accepts.
+/// The frontier is read by phase, approved work first: a broad scope's few approved tasks sorted past
+/// `--limit 100` behind hundreds at `design`, so a gated run admitted nothing (review round 4). Every
+/// read leaves out what the run settled and every review finding by tag, none offers
+/// `design_review`, and the design read is limited to the designers the budget has left. A design
+/// the operator rejects mid-run has a read of its own, at any budget, which B and C leave out: read
+/// C alone would not offer it at 0, and at 1 could offer a new task first. Each read's terms are
+/// ones jkb's own parser accepts.
 #[test]
-fn the_coordinator_reads_the_frontier_in_three_reads_by_phase() {
+fn the_coordinator_reads_the_frontier_by_phase() {
     let agents = packaged().unwrap();
     let coord = &agents
         .iter()
@@ -414,18 +416,23 @@ fn the_coordinator_reads_the_frontier_in_three_reads_by_phase() {
     assert!(step.contains(&format!("\n  {every}\n")), "{step}");
     let reads = [
         (
-            "  A, build    ",
+            "  A, build      ",
             "phase:implement,review,landable,systemic_review",
             "--limit 100",
         ),
         (
-            "  B, legacy   ",
-            "phase:design tag:design=approved",
+            "  R, re-design  ",
+            "phase:design tag:swarm-designed={{owner}}",
             "--limit 100",
         ),
         (
-            "  C, design   ",
-            "phase:design -tag:design=approved",
+            "  B, legacy     ",
+            "phase:design tag:design=approved -tag:swarm-designed={{owner}}",
+            "--limit 100",
+        ),
+        (
+            "  C, design     ",
+            "phase:design -tag:design=approved -tag:swarm-designed={{owner}}",
             "--limit <DESIGNERS LEFT>",
         ),
     ];
@@ -439,8 +446,16 @@ fn the_coordinator_reads_the_frontier_in_three_reads_by_phase() {
         assert!(step.find(label).unwrap() > last, "reads in order: {label}");
         last = step.find(label).unwrap();
         // jkb parses the read as the coordinator will send it.
-        let q = crate::query::parse(&format!("{terms} {}", every.replace("{{owner}}", "box:1")))
+        let q = crate::query::parse(&format!("{terms} {every}").replace("{{owner}}", "box:1"))
             .unwrap_or_else(|e| panic!("{terms}: {e}"));
+        // R and the two it is carved out of never offer the same task.
+        let designed =
+            |t: &crate::query::TagPred| t.facet == "swarm-designed" && t.value == "box:1";
+        if label.starts_with("  R") {
+            assert!(q.tags.iter().any(designed), "{terms}");
+        } else if label.starts_with("  B") || label.starts_with("  C") {
+            assert!(q.exclude_tags.iter().any(designed), "{terms}");
+        }
         assert!(
             !q.phases.iter().any(|p| p == "design_review"),
             "no read offers a design awaiting the operator: {terms}"
@@ -453,7 +468,11 @@ fn the_coordinator_reads_the_frontier_in_three_reads_by_phase() {
         }
     }
     assert!(step.contains("Read A first, so approved work is never hidden"));
-    assert!(step.contains("Read C only while\nDESIGNERS LEFT is above 0"));
+    assert!(step.contains("Read R next, at\nany budget"));
+    assert!(step.contains("Read C only while DESIGNERS LEFT is above 0."));
+    assert!(coord.contains(
+        "Every task of\n                                read R is one: it goes to a designer"
+    ));
     // The budget: a placeholder, counted by a tag so it survives a compaction, and its refusal the
     // only settling of a task the run did not build.
     assert!(
@@ -468,6 +487,7 @@ fn the_coordinator_reads_the_frontier_in_three_reads_by_phase() {
     assert!(!coord.contains("Tag every task you leave out SETTLED"));
     let report = &coord[at("\nREPORT\n")..];
     assert!(report.contains("of its budget of {{designers}}"));
+    assert!(report.contains("a rejected design is not left for want\nof budget"));
     assert!(report.contains("in uid mode each task you named that no read took"));
     assert!(report.contains("<every read's terms> <read\nC's terms>"));
     assert!(report.contains("left undesigned\nfor want of budget"));
@@ -707,6 +727,7 @@ fn the_slash_command_reads_the_frontier_by_phase_with_a_designer_budget() {
     assert!(md.contains("- `--designers <n>` → `DESIGNERS=<n>`"));
     assert!(md.contains("Default 3; `0` designs nothing."));
     assert!(md.contains("A paused group's redesign (below) is\n  exempt"));
+    assert!(md.contains("(tagged `swarm-designed=<owner>`; a re-design uses no\n  budget, so this read is never limited by it)"));
     assert!(md.contains("(always\n  started, whatever the designer budget has left)"));
     assert!(md.contains("--var designers=\"${DESIGNERS:-3}\""));
     assert!(md.contains(

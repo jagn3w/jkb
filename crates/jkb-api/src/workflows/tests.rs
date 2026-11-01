@@ -630,6 +630,8 @@ struct Swarm {
     kb: Kb,
     hook: LocalBackend,
     tool: std::cell::Cell<u32>,
+    /// The run's designer budget (`--designers`).
+    budget: std::cell::Cell<usize>,
     lead: String,
 }
 
@@ -662,24 +664,33 @@ enum Gate {
 enum Read {
     /// A, build: every phase past design that a run drives.
     Build,
-    /// B, legacy: at `design`, tagged approved.
+    /// R, re-design: at `design`, given a designer by this run — a design the operator rejected.
+    /// At any budget: a re-design uses none.
+    Redesign,
+    /// B, legacy: at `design`, tagged approved, not this run's design.
     Legacy,
-    /// C, design: at `design`, untagged — limited to the designers left.
+    /// C, design: at `design`, untagged, not this run's design — limited to the designers left.
     Design,
 }
 
 impl Read {
-    const ALL: [Self; 3] = [Self::Build, Self::Legacy, Self::Design];
+    const ALL: [Self; 4] = [Self::Build, Self::Redesign, Self::Legacy, Self::Design];
 
-    /// The read's own terms, exactly as the template spells them.
-    fn terms(self) -> &'static str {
+    /// The read's own terms, exactly as the template spells them (`{{owner}}` filled).
+    fn terms(self) -> String {
         match self {
-            Self::Build => "phase:implement,review,landable,systemic_review",
-            Self::Legacy => "phase:design tag:design=approved",
-            Self::Design => "phase:design -tag:design=approved",
+            Self::Build => "phase:implement,review,landable,systemic_review".to_owned(),
+            Self::Redesign => format!("phase:design tag:swarm-designed={OWNER}"),
+            Self::Legacy => format!("phase:design tag:design=approved -tag:swarm-designed={OWNER}"),
+            Self::Design => {
+                format!("phase:design -tag:design=approved -tag:swarm-designed={OWNER}")
+            }
         }
     }
 }
+
+/// `/task-swarm`'s default designer budget.
+const DEFAULT_DESIGNERS: usize = 3;
 
 /// The terms every read adds: nothing this run settled, and no review finding.
 fn every_read() -> String {
@@ -704,6 +715,8 @@ fn route(task: &Seen, read: Read, gate: Gate) -> Path {
     match (read, task.phase.as_str()) {
         (Read::Build, "systemic_review") => Path::Systemic,
         (Read::Build, _) => Path::Workflow,
+        // Every task of read R had its design turned down this run.
+        (Read::Redesign, _) => Path::Design,
         (Read::Legacy | Read::Design, _) if turned_down => Path::Design,
         // With the gate on, read C's tasks are the ones it holds back.
         (Read::Design, _) if gate == Gate::On => Path::Design,
@@ -793,6 +806,7 @@ impl Swarm {
             kb,
             hook,
             tool: std::cell::Cell::new(0),
+            budget: std::cell::Cell::new(DEFAULT_DESIGNERS),
             lead,
         }
     }
@@ -860,16 +874,35 @@ impl Swarm {
         items.into_iter().map(|i| i.uid).collect()
     }
 
-    /// The first of step 1's reads that offers `uid`, if any.
+    /// DESIGNERS LEFT: the budget less the tasks this run tagged as given a designer.
+    fn designers_left(&self) -> usize {
+        self.budget.get().saturating_sub(self.designed())
+    }
+
+    /// The limit step 1 reads `read` at, or `None` when it is not read: read C at DESIGNERS LEFT,
+    /// and not at all at 0, with the gate on; everything else at 100.
+    fn limit(&self, read: Read, gate: Gate) -> Option<usize> {
+        match (read, gate) {
+            (Read::Design, Gate::On) => Some(self.designers_left()).filter(|&n| n > 0),
+            _ => Some(100),
+        }
+    }
+
+    /// The first of step 1's reads that offers `uid` on a gated run, at the limits it reads them at.
     fn offered_by(&self, uid: &str) -> Option<Read> {
-        Read::ALL
-            .into_iter()
-            .find(|&r| self.read(r, 100).iter().any(|u| u == uid))
+        self.offered_by_under(uid, Gate::On)
+    }
+
+    fn offered_by_under(&self, uid: &str, gate: Gate) -> Option<Read> {
+        Read::ALL.into_iter().find(|&r| {
+            self.limit(r, gate)
+                .is_some_and(|n| self.read(r, n).iter().any(|u| u == uid))
+        })
     }
 
     /// Step 1 and 1b for `uid`: the read that offers it, routed. `None`: no read offers it.
     fn admission(&self, uid: &str, gate: Gate) -> Option<Path> {
-        let read = self.offered_by(uid)?;
+        let read = self.offered_by_under(uid, gate)?;
         Some(route(&self.seen(uid), read, gate))
     }
 
@@ -1544,14 +1577,14 @@ fn a_task_the_gate_holds_back_is_designed_left_to_the_operator_and_then_built() 
         "{refused:?}"
     );
 
-    // Rejected with notes: back in read C at once, for a designer, the notes the last history line.
+    // Rejected with notes: back in read R at once, for a designer, the notes the last history line.
     s.operator_fires_with("reject_design", "name the files");
     let last = s.last_history();
     assert!(
         last.contains("reject_design") && last.contains("name the files"),
         "{last}"
     );
-    assert_eq!(s.offered_by(&s.lead), Some(Read::Design));
+    assert_eq!(s.offered_by(&s.lead), Some(Read::Redesign));
     for gate in [Gate::On, Gate::Off, Gate::HandPicked] {
         assert_eq!(s.admission(&s.lead, gate), Some(Path::Design), "{gate:?}");
     }
@@ -1589,8 +1622,8 @@ fn a_designer_budget_of_one_designs_one_task_and_reports_the_rest() {
             other => panic!("{other:?}"),
         }
     }
-    let budget = 1;
-    let designers_left = || budget - s.designed();
+    s.budget.set(1);
+    let designers_left = || s.designers_left();
     // Reads A and B are empty; read C, at the designers left, offers exactly one.
     assert!(s.read(Read::Build, 100).is_empty());
     assert!(s.read(Read::Legacy, 100).is_empty());
@@ -1628,6 +1661,65 @@ fn a_designer_budget_of_one_designs_one_task_and_reports_the_rest() {
     }
 }
 
+/// A design the operator rejects mid-run gets its free re-design even when the budget is spent: read
+/// R offers it at any budget, while read C — which leaves it out — is not read at 0, so a new task at
+/// `design` stays unoffered. Read C alone (capped at DESIGNERS LEFT, skipped at 0) never offered the
+/// rejected task, the run stopped, and the report counted it as left for want of budget.
+#[test]
+fn a_design_rejected_mid_run_is_redesigned_on_a_spent_budget() {
+    let s = Swarm::at_design();
+    let new = match ok(
+        &s.kb.op,
+        json!({ "op": "task.add", "text": "a new design task" }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    s.budget.set(1);
+    assert_eq!(
+        s.read(Read::Design, s.designers_left()),
+        vec![s.lead.clone()]
+    );
+    s.coordinator_designs("d1", "Design: the first try");
+    assert_eq!(s.designers_left(), 0);
+    // Spent: read C is not read, so the new task is offered by nothing.
+    assert_eq!(s.limit(Read::Design, Gate::On), None);
+    assert_eq!(s.offered_by(&new), None);
+    assert!(
+        s.read(Read::Redesign, 100).is_empty(),
+        "nothing rejected yet"
+    );
+    // Rejected: read R offers it, at a spent budget, and step 1b sends it to a designer.
+    s.operator_fires_with("reject_design", "name the files");
+    assert_eq!(s.read(Read::Redesign, 100), vec![s.lead.clone()]);
+    assert_eq!(s.offered_by(&s.lead), Some(Read::Redesign));
+    assert_eq!(s.admission(&s.lead, Gate::On), Some(Path::Design));
+    assert_eq!(
+        s.offered_by(&new),
+        None,
+        "the budget still refuses a new design"
+    );
+    // Read C leaves it out at any budget, so the two reads never offer one task twice, and the
+    // report's count of read C's tasks does not call it left for want of budget.
+    s.budget.set(10);
+    assert!(!s.read(Read::Design, 100).contains(&s.lead));
+    s.budget.set(1);
+    // The re-design uses no budget: the count is unchanged.
+    s.coordinator_designs(
+        "d2",
+        "Design (revised; it replaces every earlier Design section above): files",
+    );
+    assert_eq!(s.designed(), 1);
+    assert_eq!(s.phase(), "design_review");
+    let left = match s.coordinator(json!({ "op": "kb.query", "count": true,
+        "dsl": format!("kind:task is:ready {} {}", Read::Design.terms(), every_read()) }))
+    {
+        Response::Count { count } => count,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(left, 1, "only the new task is left for want of budget");
+}
+
 /// A PAUSED group's redesign is exempt from the designer budget: its work is already built and
 /// reviewed, and the budget is for starting new designs. With a budget of 0 — which designs nothing
 /// new — a `systemic_redesign` still gets its designer, the count stays at 0, and once approved the
@@ -1640,8 +1732,8 @@ fn a_paused_groups_redesign_runs_on_a_budget_of_zero() {
         s.systemic_reviewer_fires("sr1", "systemic_redesign", "the design is wrong"),
         "design"
     );
-    let budget = 0;
-    assert_eq!(budget - s.designed(), 0, "no designer left for new designs");
+    s.budget.set(0);
+    assert_eq!(s.designers_left(), 0, "no designer left for new designs");
     // Step 4b starts it anyway, claiming and tagging nothing.
     assert!(s.claimed_by(OWNER));
     s.designer_designs(

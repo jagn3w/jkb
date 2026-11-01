@@ -12,6 +12,11 @@
 -- Not changelogged, like V023's moves: there is no transaction to undo, and the tag is ordinary
 -- content an operator may remove.
 
+-- The facet is declared as `tag::apply` declares one (`define_facet`, a string), so the tag rows
+-- below have the definition every applied facet has.
+INSERT INTO tag_defs (facet, value_kind) VALUES ('finding', 'string')
+ON CONFLICT(facet) DO NOTHING;
+
 INSERT OR IGNORE INTO tag_applications (item_id, facet, value)
 SELECT f.item_id, 'finding', 'review'
 FROM review_filings f

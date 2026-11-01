@@ -1173,5 +1173,13 @@ mod edges_namespaces_autoincrement_tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(tagged, [1, 2, 6]);
+        let kind: String = conn
+            .query_row(
+                "SELECT value_kind FROM tag_defs WHERE facet = 'finding'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the facet is declared");
+        assert_eq!(kind, "string");
     }
 }
