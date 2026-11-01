@@ -533,6 +533,7 @@ fn the_swarm_sends_a_repeated_area_to_a_systemic_reviewer() {
         "send the CAUSE and the last NOTES to the same implementer",
         "- design (systemic_redesign): the fix changes the design, so the group PAUSES.",
         "claim nothing",
+        "it is EXEMPT from the\n  designer budget, so tag nothing `swarm-designed=` and start it whatever DESIGNERS LEFT says",
         "neither reopen nor release",
         "the lead is at `design_review`, still claimed by '{{owner}}'",
         "RESUMING A PAUSED GROUP",
@@ -565,6 +566,9 @@ fn the_swarm_sends_a_repeated_area_to_a_systemic_reviewer() {
     ] {
         assert!(row.contains(rule), "step 1b's systemic row: {rule}");
     }
+    // ...and nothing gives a paused group up for want of budget.
+    assert!(!step.contains("redesign left for want of budget"), "{step}");
+    assert!(coord.contains("a PAUSED group's redesign is exempt\n  (step 4b)"));
     for rule in [
         "NO IMPLEMENTER OF YOURS: a SYSTEMIC group never had one in this run",
         "the branch the lead's `branch=` tag names",
@@ -702,6 +706,8 @@ fn the_slash_command_reads_the_frontier_by_phase_with_a_designer_budget() {
     assert!(md.contains("[--designers <n>]"));
     assert!(md.contains("- `--designers <n>` → `DESIGNERS=<n>`"));
     assert!(md.contains("Default 3; `0` designs nothing."));
+    assert!(md.contains("A paused group's redesign (below) is\n  exempt"));
+    assert!(md.contains("(always\n  started, whatever the designer budget has left)"));
     assert!(md.contains("--var designers=\"${DESIGNERS:-3}\""));
     assert!(md.contains(
         "the designer budget (`DESIGNERS`), how many tasks at `design` the gate holds back"

@@ -1079,6 +1079,16 @@ impl Swarm {
         }
     }
 
+    /// The designer budget's count: the tasks this run tagged as given a designer.
+    fn designed(&self) -> usize {
+        match self.coordinator(json!({ "op": "kb.query", "count": true,
+            "dsl": format!("kind:task tag:swarm-designed={OWNER}") }))
+        {
+            Response::Count { count } => count,
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// Whether `owner` holds the lead's claim.
     fn claimed_by(&self, owner: &str) -> bool {
         match ok(&self.kb.op, json!({ "op": "task.claims" })) {
@@ -1212,13 +1222,13 @@ fn a_systemic_redesign_pauses_the_group_for_a_designer_and_resumes_it_once_appro
         !s.in_frontier(),
         "a paused group is not offered to a new group"
     );
-    s.coordinator(json!({ "op": "task.tag", "uid": s.lead,
-                          "facet_value": format!("swarm-designed={OWNER}"), "mode": "set" }));
+    // Exempt from the designer budget: claimed nothing, tagged nothing.
     let revised =
         format!("Design (revised; it replaces every earlier Design section above): {cause}");
     s.designer_designs("d1", &revised);
     // Awaiting approval: still the group's, and in no read — with no tag to say so.
     assert!(s.claimed_by(OWNER));
+    assert_eq!(s.designed(), 0, "a paused group's redesign uses no budget");
     assert_eq!(s.phase(), "design_review");
     assert!(!s.in_frontier(), "still awaiting approval");
     // Approved: the check of the paused lead's phase finds it at `implement` and resumes the group —
@@ -1580,15 +1590,7 @@ fn a_designer_budget_of_one_designs_one_task_and_reports_the_rest() {
         }
     }
     let budget = 1;
-    let designers_left = || {
-        let designed = match s.coordinator(json!({ "op": "kb.query", "count": true,
-            "dsl": format!("kind:task tag:swarm-designed={OWNER}") }))
-        {
-            Response::Count { count } => count,
-            other => panic!("{other:?}"),
-        };
-        budget - designed
-    };
+    let designers_left = || budget - s.designed();
     // Reads A and B are empty; read C, at the designers left, offers exactly one.
     assert!(s.read(Read::Build, 100).is_empty());
     assert!(s.read(Read::Legacy, 100).is_empty());
@@ -1624,6 +1626,37 @@ fn a_designer_budget_of_one_designs_one_task_and_reports_the_rest() {
             other => panic!("{other:?}"),
         }
     }
+}
+
+/// A PAUSED group's redesign is exempt from the designer budget: its work is already built and
+/// reviewed, and the budget is for starting new designs. With a budget of 0 — which designs nothing
+/// new — a `systemic_redesign` still gets its designer, the count stays at 0, and once approved the
+/// group resumes.
+#[test]
+fn a_paused_groups_redesign_runs_on_a_budget_of_zero() {
+    let s = Swarm::new();
+    s.reach_systemic_review();
+    assert_eq!(
+        s.systemic_reviewer_fires("sr1", "systemic_redesign", "the design is wrong"),
+        "design"
+    );
+    let budget = 0;
+    assert_eq!(budget - s.designed(), 0, "no designer left for new designs");
+    // Step 4b starts it anyway, claiming and tagging nothing.
+    assert!(s.claimed_by(OWNER));
+    s.designer_designs(
+        "d1",
+        "Design (revised; it replaces every earlier Design section above): fixed",
+    );
+    assert_eq!(s.phase(), "design_review");
+    assert_eq!(s.designed(), 0, "the redesign did not count");
+    assert!(s.claimed_by(OWNER));
+    s.operator_fires("approve_design", None);
+    s.coordinator(json!({ "op": "task.set", "uid": s.lead, "status": "in_progress" }));
+    s.implementer_works();
+    s.coordinator_submits();
+    s.reviewer_records("r3", 3, None);
+    assert_eq!(s.coordinator_observes(), "landable");
 }
 
 /// A task still at `design` that the design gate let through is built on the legacy path: the same

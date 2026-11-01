@@ -13,7 +13,8 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   read builds it; rejected, it is back at `design` for a designer. A rejected task's revised design
   is appended under a heading that supersedes the earlier one, and the last Design section governs.
   A run starts designers on at most `--designers <n>` tasks in all (default 3; `0` designs nothing),
-  because each design costs your review at `design_review`.
+  because each design costs your review at `design_review`. A paused group's redesign (below) is
+  exempt: its work is already built and reviewed, and the budget is for starting new designs.
   Its role comes from the operator's agent-type map (`jkb-designer` → `designer`). The coordinator
   cannot submit a design itself: jkb gives it no `submit_design`.
 - **Groups.** The coordinator reads the ready frontier and groups overlapping tasks, at most 4
@@ -51,7 +52,8 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   it instead of sending the work round the loop again. It finds the cause, records it in the task
   (`Systemic cause: …`), and fires exactly one exit with a written reason: `submit_systemic` sends
   the cause back to the same implementer, and `systemic_redesign` sends the task back to design. Then
-  the group pauses with its claims, branch and implementer kept: a designer revises the design, the
+  the group pauses with its claims, branch and implementer kept: a designer revises the design (always
+  started, whatever the designer budget has left), the
   task waits at `design_review` for you, and once you approve it the same implementer carries on. A
   paused group still awaiting your approval when the run stops is released and listed as awaiting
   your design approval. Its role comes from the operator's agent-type map (`jkb-systemic-reviewer` →
