@@ -1745,6 +1745,25 @@ fn run(cli: Cli) -> Result<()> {
     {
         return exec_cli::pin(dir, against.as_deref(), cli.json);
     }
+    // ...and so are `jkb exec base` and `jkb exec diff`, which Code Factory runs on the host.
+    if let Command::Exec {
+        cmd: exec_cli::ExecCmd::Base { dir, clone },
+    } = &cli.command
+    {
+        return exec_cli::base(dir, clone.as_deref(), cli.json);
+    }
+    if let Command::Exec {
+        cmd:
+            exec_cli::ExecCmd::Diff {
+                dir,
+                base,
+                objects_from,
+                max,
+            },
+    } = &cli.command
+    {
+        return exec_cli::diff(dir, base, objects_from, *max, cli.json);
+    }
 
     // (2) With JKB_REMOTE set this process must never open a database — on the dev container's
     // kernel that is the host's `jkb.db`, which a process on each side of the bind corrupts — so

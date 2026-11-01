@@ -106,7 +106,41 @@ pub enum ExecCmd {
         #[arg(long)]
         against: Option<PathBuf>,
     },
+    /// The base a request's diff is read against: the default branch of the directory's `origin`,
+    /// verified on the host with `git ls-remote` — or, when that fails, read from `--clone`, a clone
+    /// of the same remote the container cannot write. Opens no database. With `--json`, one object:
+    /// `{dir, base: {sha, ref, source, url}}`, `{dir, unverified: {message}}`, or `{dir, repo: null}`.
+    Base {
+        /// The directory.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// A clean clone of the same remote, consulted when the remote cannot be asked.
+        #[arg(long)]
+        clone: Option<PathBuf>,
+    },
+    /// The tree a request's pin covers, diffed against a verified base commit (`jkb exec base`):
+    /// tracked changes and untracked files alike, read as the pin reads them. Opens no database.
+    /// With `--json`, one object: `{dir, top, base, pin, files, files_truncated, patch, truncated}`,
+    /// `{dir, repo: null}`, or `{dir, refused: {reason, message}}` (`tree_changed`, `unpinnable`).
+    Diff {
+        /// The directory.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// The base commit: a full object id.
+        #[arg(long)]
+        base: String,
+        /// Another repository to copy the base's objects from when the directory's has none (the
+        /// clean clone the base came from).
+        #[arg(long)]
+        objects_from: Vec<PathBuf>,
+        /// The most bytes of patch printed; past it the patch is cut and `truncated` is set.
+        #[arg(long, default_value_t = DIFF_MAX_BYTES)]
+        max: usize,
+    },
 }
+
+/// `jkb exec diff`'s default cap: 2 MiB of patch.
+pub const DIFF_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 /// `90s`, `15m`, `2h`, or bare seconds, as milliseconds.
 fn parse_timeout(s: &str) -> Result<i64, String> {
@@ -172,6 +206,13 @@ fn expect_view(r: Response) -> Result<ExecView> {
 pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
     match cmd {
         ExecCmd::Pin { dir, against } => pin(&dir, against.as_deref(), json),
+        ExecCmd::Base { dir, clone } => base(&dir, clone.as_deref(), json),
+        ExecCmd::Diff {
+            dir,
+            base,
+            objects_from,
+            max,
+        } => diff(&dir, &base, &objects_from, max, json),
         ExecCmd::Request {
             target,
             dir,
@@ -460,6 +501,129 @@ pub fn pin(dir: &Path, against: Option<&Path>, json: bool) -> Result<()> {
     }
     if drift.is_some_and(|d| !d.is_empty()) {
         bail!("this request changes the ignore rules; land that change first");
+    }
+    Ok(())
+}
+
+/// `jkb exec base`: run before any database or daemon is reached.
+///
+/// # Errors
+/// An unreadable directory, the audit's refusal, or git not running. A base that cannot be verified
+/// is an answer (`unverified`), not an error.
+pub fn base(dir: &Path, clone: Option<&Path>, json: bool) -> Result<()> {
+    let dir = std::fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
+    let clone = clone.map(std::fs::canonicalize).transpose()?;
+    match crate::gitrepo::trusted_base(&dir, clone.as_deref()) {
+        Ok(Some(b)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "dir": dir, "base": {
+                        "sha": b.sha, "ref": b.ref_name, "source": b.source.as_str(), "url": b.url,
+                    } })
+                );
+            } else {
+                println!(
+                    "{} {} (from {}, {})",
+                    b.sha,
+                    b.ref_name,
+                    b.url,
+                    b.source.as_str()
+                );
+            }
+            Ok(())
+        }
+        Ok(None) => {
+            if json {
+                println!("{}", serde_json::json!({ "dir": dir, "repo": null }));
+            } else {
+                println!("{} is in no repository: no base", dir.display());
+            }
+            Ok(())
+        }
+        Err(e) if e.is::<crate::gitrepo::BaseUnverified>() => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "dir": dir, "unverified": { "message": e.to_string() } })
+                );
+            } else {
+                println!("base unverified: {e}");
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `jkb exec diff`: run before any database or daemon is reached.
+///
+/// # Errors
+/// An unreadable directory, a malformed base, a base with no objects here, the audit's refusal, or
+/// git failing. With `--json` an identified refusal (the tree moved, or cannot be pinned) is printed
+/// as one object before the command fails.
+pub fn diff(
+    dir: &Path,
+    base: &str,
+    objects_from: &[PathBuf],
+    max: usize,
+    json: bool,
+) -> Result<()> {
+    let dir = std::fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
+    let objects_from = objects_from
+        .iter()
+        .map(std::fs::canonicalize)
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("resolving --objects-from")?;
+    let d = match crate::gitrepo::tree_diff(&dir, base, &objects_from, max) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            if json {
+                println!("{}", serde_json::json!({ "dir": dir, "repo": null }));
+            } else {
+                println!("{} is in no repository: no diff", dir.display());
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            let reason = if in_chain::<crate::gitrepo::TreeMoved>(&e) {
+                Some("tree_changed")
+            } else if in_chain::<crate::gitrepo::NotPinnable>(&e) {
+                Some("unpinnable")
+            } else {
+                None
+            };
+            if let (true, Some(r)) = (json, reason) {
+                println!(
+                    "{}",
+                    serde_json::json!({ "dir": dir, "refused": { "reason": r, "message": format!("{e:#}") } })
+                );
+            }
+            return Err(e);
+        }
+    };
+    if json {
+        let files: Vec<serde_json::Value> = d
+            .files
+            .iter()
+            .map(|(status, path)| serde_json::json!({ "status": status, "path": path }))
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "dir": dir, "top": d.top, "base": d.base, "pin": Pin::from(d.pin),
+                "files": files, "files_truncated": d.files_truncated,
+                "patch": d.patch, "truncated": d.truncated,
+            })
+        );
+    } else {
+        for (status, path) in &d.files {
+            println!("{status}\t{path:?}");
+        }
+        print!("{}", d.patch);
+        if d.truncated {
+            println!("\n[jkb: the diff is longer than {max} bytes and was cut here]");
+        }
     }
     Ok(())
 }

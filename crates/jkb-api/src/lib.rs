@@ -3721,6 +3721,13 @@ impl LocalBackend {
                 } else {
                     Start::FromNow
                 };
+                // The run-request index is reserved; its groups are the operator's alone
+                // (`exec::index_group_create`). Anyone else is refused by `mq`, as for any `exec/`.
+                if exec_index(principal, &topic) {
+                    return Ok(created(db.write_txn(actor, move |c, m| {
+                        jkb_core::exec::index_group_create(c, m, &group, start, now)
+                    })?));
+                }
                 created(db.write_txn(actor, move |c, m| {
                     mq::group_create(c, m, &topic, &group, start, now)
                 })?)
@@ -3734,7 +3741,15 @@ impl LocalBackend {
                 // Asked with a read first: an idle subscriber polls several times a second, and a
                 // poll that hands nothing over and has no touch due must not take the write lock.
                 let (t, g) = (topic.clone(), group.clone());
-                if !db.read(move |c| mq::poll_needed(c, &t, &g, max, after, now))? {
+                let index = exec_index(principal, &topic);
+                let needed = db.read(move |c| {
+                    if index {
+                        jkb_core::exec::index_poll_needed(c, &g, max, after, now)
+                    } else {
+                        mq::poll_needed(c, &t, &g, max, after, now)
+                    }
+                })?;
+                if !needed {
                     return Ok(Response::Messages {
                         messages: Vec::new(),
                     });
@@ -3742,20 +3757,41 @@ impl LocalBackend {
                 Response::Messages {
                     messages: db
                         .write_txn(actor, move |c, m| {
-                            mq::poll(c, m, &topic, &group, max, after, now)
+                            if index {
+                                jkb_core::exec::index_poll(c, m, &group, max, after, now)
+                            } else {
+                                mq::poll(c, m, &topic, &group, max, after, now)
+                            }
                         })?
                         .into_iter()
                         .map(Message::from)
                         .collect(),
                 }
             }
-            Request::MqGroupDelete { topic, group } => Response::GroupDeleted {
-                deleted: db.write_txn(actor, move |c, m| mq::group_delete(c, m, &topic, &group))?,
-            },
-            Request::MqAck { topic, group, seq } => Response::Position {
-                position: db
-                    .write_txn(actor, move |c, m| mq::ack(c, m, &topic, &group, seq, now))?,
-            },
+            Request::MqGroupDelete { topic, group } => {
+                let index = exec_index(principal, &topic);
+                Response::GroupDeleted {
+                    deleted: db.write_txn(actor, move |c, m| {
+                        if index {
+                            jkb_core::exec::index_group_delete(c, m, &group)
+                        } else {
+                            mq::group_delete(c, m, &topic, &group)
+                        }
+                    })?,
+                }
+            }
+            Request::MqAck { topic, group, seq } => {
+                let index = exec_index(principal, &topic);
+                Response::Position {
+                    position: db.write_txn(actor, move |c, m| {
+                        if index {
+                            jkb_core::exec::index_ack(c, m, &group, seq, now)
+                        } else {
+                            mq::ack(c, m, &topic, &group, seq, now)
+                        }
+                    })?,
+                }
+            }
             Request::MqCompact { force } => {
                 let r = db.write_txn(actor, move |c, m| mq::compact(c, m, now, force))?;
                 Response::Compacted {
@@ -5110,6 +5146,13 @@ impl LocalBackend {
             }
         })
     }
+}
+
+/// Whether an `mq` group, poll or ack on `topic` is the operator's on the run-request index
+/// ([`jkb_core::exec::INDEX_TOPIC`]): the one reserved topic a consumer group may be kept on, and
+/// only by the operator. Anyone else's falls through to `mq`, which refuses every `exec/` topic.
+fn exec_index(principal: &rbac::Principal, topic: &str) -> bool {
+    topic == jkb_core::exec::INDEX_TOPIC && principal.is_operator()
 }
 
 #[cfg(test)]

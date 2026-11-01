@@ -428,3 +428,83 @@ fn a_session_s_end_expires_its_requests_only_from_the_harness_or_itself() {
     );
     assert_eq!(state(&g.id), "expired");
 }
+
+/// The run-request index (`exec/requests`) is the operator's to keep a group on — the app's live
+/// queue — and nobody else's: a session or the container's credential is refused every queue
+/// operation on it, as on any `exec/` topic, and the hints carry no argv.
+#[test]
+fn the_request_index_is_read_by_the_operator_alone() {
+    let kb = Kb::new();
+    let s1 = kb.ticket("s1", None, "t1");
+    let container = kb.as_token(&kb.container);
+    let topic = jkb_core::exec::INDEX_TOPIC;
+    for who in [&s1, &container] {
+        for op in [
+            json!({ "op": "mq.group_create", "topic": topic, "group": "code-factory" }),
+            json!({ "op": "mq.poll", "topic": topic, "group": "code-factory", "max": 10 }),
+            json!({ "op": "mq.ack", "topic": topic, "group": "code-factory", "seq": 1 }),
+            json!({ "op": "mq.group_delete", "topic": topic, "group": "code-factory" }),
+            json!({ "op": "mq.send", "topic": topic, "key": "k", "kind": "exec.changed",
+                    "payload": {}, "producer": "p" }),
+        ] {
+            let c = code(who, &op);
+            assert!(
+                matches!(c, ErrorCode::Invalid | ErrorCode::Forbidden),
+                "{op}: {c:?}"
+            );
+        }
+    }
+    ok(
+        &kb.op,
+        &json!({ "op": "mq.group_create", "topic": topic, "group": "code-factory" }),
+    );
+    let (r, _) = requested(ok(&s1, &ask(&["make", "secret-arg"])));
+    ok(
+        &kb.op,
+        &json!({ "op": "exec.decline", "id": r.id, "note": "no" }),
+    );
+    let poll = json!({ "op": "mq.poll", "topic": topic, "group": "code-factory", "max": 10 });
+    let messages = match ok(&kb.op, &poll) {
+        Response::Messages { messages } => messages,
+        other => panic!("{other:?}"),
+    };
+    let seen: Vec<(Value, Value)> = messages
+        .iter()
+        .map(|m| (m.payload["id"].clone(), m.payload["state"].clone()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (json!(r.id), json!("pending")),
+            (json!(r.id), json!("declined"))
+        ]
+    );
+    assert!(messages
+        .iter()
+        .all(|m| !m.payload.to_string().contains("secret-arg")));
+    // The operator may still not SEND there: only jkb's own record does.
+    assert_eq!(
+        code(
+            &kb.op,
+            &json!({ "op": "mq.send", "topic": topic, "key": "k", "kind": "exec.changed",
+                     "payload": {}, "producer": "p" })
+        ),
+        ErrorCode::Invalid
+    );
+    let seq = messages.last().unwrap().seq;
+    ok(
+        &kb.op,
+        &json!({ "op": "mq.ack", "topic": topic, "group": "code-factory", "seq": seq }),
+    );
+    match ok(&kb.op, &poll) {
+        Response::Messages { messages } => assert!(messages.is_empty()),
+        other => panic!("{other:?}"),
+    }
+    match ok(
+        &kb.op,
+        &json!({ "op": "mq.group_delete", "topic": topic, "group": "code-factory" }),
+    ) {
+        Response::GroupDeleted { deleted } => assert!(deleted),
+        other => panic!("{other:?}"),
+    }
+}

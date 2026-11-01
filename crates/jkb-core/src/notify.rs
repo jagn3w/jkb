@@ -696,6 +696,89 @@ fn send(
     )
 }
 
+/// Whether anything reads [`TOPIC`]: it exists and has a consumer group. A topic setup never created
+/// is "nobody reads it", not an error — for a producer that is not a session's hook (a run request,
+/// [`crate::exec`]), whose own write must not fail because a notifier was never installed.
+fn heard(conn: &Connection) -> Result<bool> {
+    match mq::group_count(conn, TOPIC) {
+        Ok(n) => Ok(n > 0),
+        Err(crate::Error::Queue(QueueError::NoSuchTopic(_))) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Post notification `id` for a producer outside the session machine ([`crate::exec`]'s run
+/// requests), in the caller's transaction, under [`TOPIC`]'s rule that a topic nobody reads is not
+/// written to. The body is shortened to [`MAX_BODY_CHARS`] rather than refused. Returns whether it
+/// was sent.
+///
+/// # Errors
+/// A send's own refusal (a full topic), or a database error.
+pub(crate) fn post_direct(
+    conn: &Connection,
+    meta: &WriteMeta,
+    id: &str,
+    session: &str,
+    subtitle: &str,
+    body: &str,
+    now: i64,
+) -> Result<bool> {
+    if !heard(conn)? {
+        return Ok(false);
+    }
+    mq::send(
+        conn,
+        meta,
+        TOPIC,
+        &Draft {
+            key: format!("notification/{id}"),
+            kind: KIND_POST.to_owned(),
+            payload: json!({
+                "id": id,
+                "session": session,
+                "title": TITLE,
+                "subtitle": subtitle,
+                "body": body.chars().take(MAX_BODY_CHARS).collect::<String>(),
+            }),
+            ttl_ms: Some(POST_TTL_MS),
+            producer: "jkb".to_owned(),
+        },
+        now,
+    )?;
+    Ok(true)
+}
+
+/// Withdraw notification `id` posted by [`post_direct`], under the same rule. Withdrawing one never
+/// posted (nobody was reading then) is harmless to a consumer. Returns whether it was sent.
+///
+/// # Errors
+/// A send's own refusal (a full topic), or a database error.
+pub(crate) fn withdraw_direct(
+    conn: &Connection,
+    meta: &WriteMeta,
+    id: &str,
+    session: &str,
+    now: i64,
+) -> Result<bool> {
+    if !heard(conn)? {
+        return Ok(false);
+    }
+    mq::send(
+        conn,
+        meta,
+        TOPIC,
+        &Draft {
+            key: format!("notification/{id}"),
+            kind: KIND_WITHDRAW.to_owned(),
+            payload: json!({ "id": id, "session": session }),
+            ttl_ms: None,
+            producer: "jkb".to_owned(),
+        },
+        now,
+    )?;
+    Ok(true)
+}
+
 fn outcome_to_applied(
     out: &jkb_fsm::Outcome<NotifState, NotifEvent, NotifEffect>,
     sent: usize,

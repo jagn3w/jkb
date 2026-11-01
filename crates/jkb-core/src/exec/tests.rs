@@ -986,3 +986,184 @@ fn compaction_reaps_a_request_topic_s_expired_messages_with_no_group() {
     assert!(report.messages_reaped >= 1);
     assert!(messages(&db, id).is_empty());
 }
+
+// ---- the notification and the index ------------------------------------------------------------
+
+/// `claude/notify` as setup makes it, with a reader on it (a topic nobody reads is not written to).
+fn notify_topic(db: &Db) {
+    db.write_txn("t", |c, m| {
+        mq::topic_create(c, m, crate::notify::TOPIC, &TopicSpec::default(), T0)?;
+        mq::group_create(c, m, crate::notify::TOPIC, "g", mq::Start::FromStart, T0)
+    })
+    .unwrap();
+}
+
+fn notifications(db: &Db) -> Vec<mq::Delivered> {
+    db.read(|c| mq::tail(c, crate::notify::TOPIC, 100, T0))
+        .unwrap()
+}
+
+/// A request posts `exec-<id>` in its own transaction, with the requester and the reason and never
+/// the argv; every way out of `pending` withdraws it; a fold posts nothing more.
+#[test]
+fn a_request_notifies_and_every_decision_withdraws_it() {
+    let db = Db::open_in_memory().unwrap();
+    notify_topic(&db);
+    let secret = "--token=hunter2-not-for-a-banner";
+    let a = req(&db, &who("s1"), &ask(&["make", secret], Some(pin(1))), T0).row;
+    let posts = notifications(&db);
+    assert_eq!(posts.len(), 1, "{posts:?}");
+    assert_eq!(posts[0].kind, crate::notify::KIND_POST);
+    assert_eq!(posts[0].payload["id"], format!("exec-{}", a.id));
+    assert_eq!(posts[0].payload["session"], "s1");
+    let body = posts[0].payload["body"].as_str().unwrap();
+    assert!(
+        body.contains("s1") && body.contains("run the gate the sandbox cannot"),
+        "{body}"
+    );
+    assert!(
+        !posts[0].payload.to_string().contains("hunter2"),
+        "argv leaked into {posts:?}"
+    );
+    assert!(!body.contains("make"), "{body}");
+    // The same request again folds: no second notification.
+    req(
+        &db,
+        &who("s1"),
+        &ask(&["make", secret], Some(pin(1))),
+        T0 + 1,
+    );
+    assert_eq!(notifications(&db).len(), 1);
+
+    let withdrawn = |db: &Db, id: i64| {
+        notifications(db).iter().any(|d| {
+            d.kind == crate::notify::KIND_WITHDRAW && d.payload["id"] == format!("exec-{id}")
+        })
+    };
+    assert!(!withdrawn(&db, a.id));
+    db.write_txn("t", move |c, m| decline(c, m, a.id, "ask for less", T0 + 2))
+        .unwrap();
+    assert!(withdrawn(&db, a.id), "decline left the notification up");
+
+    let b = req(&db, &who("s1"), &ask(&["b"], Some(pin(1))), T0 + 3).row;
+    db.write_txn("t", move |c, m| {
+        refuse(c, m, b.id, RefuseReason::TreeChanged, T0 + 4)
+    })
+    .unwrap();
+    assert!(withdrawn(&db, b.id), "refusal left the notification up");
+
+    let c_ = req(&db, &who("s1"), &ask(&["c"], Some(pin(1))), T0 + 5).row;
+    try_begin(&db, c_.id, Some(pin(1)), "r", T0 + 6).unwrap();
+    assert!(withdrawn(&db, c_.id), "a run left the notification up");
+    let before = notifications(&db).len();
+    try_finish(&db, c_.id, "r", Outcome::Exited, Some(0), T0 + 7).unwrap();
+    assert_eq!(
+        notifications(&db).len(),
+        before,
+        "finishing a run touched the notification"
+    );
+
+    let d = req(&db, &who("s1"), &ask(&["d"], Some(pin(1))), T0 + 8).row;
+    // Expired lazily by the next call after its time.
+    db.write_txn("t", |c, m| {
+        list(
+            c,
+            m,
+            Filter {
+                state: None,
+                session: None,
+            },
+            None,
+            T0 + 8 + EXPIRES_AFTER_MS,
+        )
+    })
+    .unwrap();
+    assert_eq!(get_row(&db, d.id).state, ExecState::Expired);
+    assert!(withdrawn(&db, d.id), "expiry left the notification up");
+}
+
+fn get_row(db: &Db, id: i64) -> super::ExecRow {
+    db.read(move |c| get(c, id)).unwrap().unwrap()
+}
+
+/// With no `claude/notify` at all (setup never ran) a request is still made, and decided.
+#[test]
+fn a_request_is_made_without_a_notification_topic() {
+    let db = Db::open_in_memory().unwrap();
+    let a = req(&db, &who("s1"), &ask(&["x"], None), T0).row;
+    db.write_txn("t", move |c, m| decline(c, m, a.id, "no", T0 + 1))
+        .unwrap();
+}
+
+/// The index carries one `exec.changed {id, state}` per request and per move, to the operator's
+/// group only, with no argv; it is written only while a group reads it.
+#[test]
+fn the_index_announces_each_request_and_move_to_its_group() {
+    let db = Db::open_in_memory().unwrap();
+    // Nobody reading: nothing is written, and the topic does not even exist yet.
+    req(&db, &who("s0"), &ask(&["quiet"], None), T0);
+    db.write_txn("t", |c, m| {
+        super::index_group_create(c, m, "code-factory", mq::Start::FromNow, T0)
+    })
+    .unwrap();
+    let a = req(
+        &db,
+        &who("s1"),
+        &ask(&["make", "secret-arg"], Some(pin(1))),
+        T0 + 1,
+    )
+    .row;
+    try_begin(&db, a.id, Some(pin(1)), "r", T0 + 2).unwrap();
+    try_finish(&db, a.id, "r", Outcome::Exited, Some(0), T0 + 3).unwrap();
+    let got = db
+        .write_txn("t", |c, m| {
+            super::index_poll(c, m, "code-factory", 100, None, T0 + 4)
+        })
+        .unwrap();
+    let states: Vec<(String, String)> = got
+        .iter()
+        .map(|d| {
+            assert_eq!(d.kind, super::INDEX_KIND);
+            assert!(!d.payload.to_string().contains("secret-arg"), "{d:?}");
+            (
+                d.payload["id"].as_str().unwrap().to_owned(),
+                d.payload["state"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let id = format!("exec-{}", a.id);
+    assert_eq!(
+        states,
+        vec![
+            (id.clone(), "pending".to_owned()),
+            (id.clone(), "running".to_owned()),
+            (id, "finished".to_owned()),
+        ]
+    );
+    let seq = got.last().unwrap().seq;
+    db.write_txn("t", move |c, m| {
+        super::index_ack(c, m, "code-factory", seq, T0 + 5)
+    })
+    .unwrap();
+    assert!(db
+        .write_txn("t", |c, m| super::index_poll(
+            c,
+            m,
+            "code-factory",
+            100,
+            None,
+            T0 + 5
+        ))
+        .unwrap()
+        .is_empty());
+    // The public queue still refuses it to everyone: the operator's way in is `jkb-api`'s.
+    let e = db
+        .write_txn("t", |c, m| {
+            mq::group_create(c, m, super::INDEX_TOPIC, "x", mq::Start::FromNow, T0)
+        })
+        .unwrap_err();
+    assert!(matches!(e, Error::Queue(QueueError::Invalid { .. })), "{e}");
+    assert!(db
+        .write_txn("t", |c, m| super::index_group_delete(c, m, "code-factory"))
+        .unwrap());
+}

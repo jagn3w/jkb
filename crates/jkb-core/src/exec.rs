@@ -119,6 +119,26 @@ const TOPIC_MAX_BYTES: i64 = 8 * 1024 * 1024;
 /// A request topic's message TTL: a day.
 const TOPIC_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
+/// The index topic: one `exec.changed {id, state}` hint per request made and per move, so the
+/// operator's app re-reads the queue when something changed rather than polling it. Reserved like a
+/// request's own topic ([`mq::RESERVED_PREFIXES`]): only this module sends on it, and the only
+/// consumer groups on it are the operator's, through [`index_group_create`] and its siblings, which
+/// `jkb-api` serves to the operator alone. A hint carries an id and a state, never argv or a reason:
+/// the record is read for those.
+pub const INDEX_TOPIC: &str = "exec/requests";
+
+/// The kind of every message on [`INDEX_TOPIC`].
+pub const INDEX_KIND: &str = "exec.changed";
+
+/// The index topic's byte cap. A hint is under a hundred bytes.
+const INDEX_MAX_BYTES: i64 = 4 * 1024 * 1024;
+
+/// A request's notification id on `claude/notify` ([`crate::notify`]): `exec-<id>`, its wire id.
+#[must_use]
+pub fn notification_id(id: i64) -> String {
+    wire_id(id)
+}
+
 macro_rules! word_enum {
     ($(#[$doc:meta])* $name:ident { $( $(#[$vdoc:meta])* $variant:ident => $s:literal ),+ $(,)? }) => {
         $(#[$doc])*
@@ -672,6 +692,65 @@ fn publish(
     }
 }
 
+fn index_spec() -> TopicSpec {
+    TopicSpec {
+        max_bytes: INDEX_MAX_BYTES,
+        default_ttl_ms: Some(TOPIC_TTL_MS),
+        ..TopicSpec::default()
+    }
+}
+
+/// [`INDEX_TOPIC`], created if it is not there yet.
+fn ensure_index(conn: &Connection, meta: &WriteMeta, now: i64) -> Result<()> {
+    mq::topic_create_reserved(conn, meta, INDEX_TOPIC, &index_spec(), now)?;
+    Ok(())
+}
+
+/// Announce `row`'s state on [`INDEX_TOPIC`] — only while a group reads it, by `claude/notify`'s rule
+/// that a topic nobody reads is not written to, and never failing what it announces: a full topic
+/// drops the hint (the record is the answer).
+fn announce(conn: &Connection, meta: &WriteMeta, row: &ExecRow, now: i64) -> Result<()> {
+    let groups = match mq::group_count_reserved(conn, INDEX_TOPIC) {
+        Ok(n) => n,
+        Err(crate::Error::Queue(QueueError::NoSuchTopic(_))) => 0,
+        Err(e) => return Err(e),
+    };
+    if groups == 0 {
+        return Ok(());
+    }
+    let draft = Draft {
+        key: INDEX_TOPIC.to_owned(),
+        kind: INDEX_KIND.to_owned(),
+        payload: json!({ "id": row.wire_id(), "state": row.state.as_str() }),
+        ttl_ms: None,
+        producer: "jkb".to_owned(),
+    };
+    match mq::send_reserved(conn, meta, INDEX_TOPIC, &draft, now) {
+        Ok(_) | Err(crate::Error::Queue(QueueError::QueueFull { .. })) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The notification a new request posts: who asked, and why — never the argv, because a
+/// notification is not where a request is reviewed (the Executions tab is).
+fn notification_body(row: &ExecRow) -> String {
+    let who = &row.requester;
+    let kind = who
+        .agent_type
+        .as_deref()
+        .map(|t| format!(", {t}"))
+        .unwrap_or_default();
+    let why = if row.ask.reason.is_empty() {
+        ".".to_owned()
+    } else {
+        format!(": {}", row.ask.reason)
+    };
+    format!(
+        "{} ({}{kind}) asks to run a command{why}",
+        who.session, who.role
+    )
+}
+
 fn decision_payload(row: &ExecRow) -> Value {
     let mut p = json!({ "id": row.wire_id(), "state": row.state.as_str() });
     if let Some(note) = &row.note {
@@ -719,6 +798,18 @@ fn moved(
             false,
         )?;
     }
+    // Every way out of `pending` — run, decline, refusal, expiry — takes its notification down, in
+    // the same transaction as the move: no caller has to remember to.
+    if before.get("state").and_then(Value::as_str) == Some(ExecState::Pending.as_str()) {
+        crate::notify::withdraw_direct(
+            conn,
+            meta,
+            &notification_id(id),
+            &row.requester.session,
+            now,
+        )?;
+    }
+    announce(conn, meta, &row, now)?;
     Ok(Some(row))
 }
 
@@ -847,10 +938,19 @@ pub fn request(
             ..TopicSpec::default()
         };
         mq::topic_create_reserved(conn, meta, &topic(id), &spec, now)?;
-        return Ok(Requested {
-            row: must_get(conn, id)?,
-            folded: false,
-        });
+        let row = must_get(conn, id)?;
+        // Every way of asking notifies, because it is done here, in the request's own transaction.
+        crate::notify::post_direct(
+            conn,
+            meta,
+            &notification_id(id),
+            &row.requester.session,
+            &format!("Run request {}", row.wire_id()),
+            &notification_body(&row),
+            now,
+        )?;
+        announce(conn, meta, &row, now)?;
+        return Ok(Requested { row, folded: false });
     }
     // The fold: the one pending row the partial unique index let this insert collide with.
     let id: i64 = conn
@@ -1377,6 +1477,73 @@ pub fn expire_session(
         }
     }
     Ok(n)
+}
+
+/// Put the operator's consumer group `group` on [`INDEX_TOPIC`], creating the topic if need be.
+/// Only `jkb-api` calls this, for the operator; idempotent as [`mq::group_create`] is.
+///
+/// # Errors
+/// A malformed group name, or a database error.
+pub fn index_group_create(
+    conn: &Connection,
+    meta: &WriteMeta,
+    group: &str,
+    start: mq::Start,
+    now: i64,
+) -> Result<mq::Created> {
+    ensure_index(conn, meta, now)?;
+    mq::group_create_reserved(conn, meta, INDEX_TOPIC, group, start, now)
+}
+
+/// Take the operator's group `group` off [`INDEX_TOPIC`]; `false` when it was not there.
+///
+/// # Errors
+/// As [`mq::group_delete`].
+pub fn index_group_delete(conn: &Connection, meta: &WriteMeta, group: &str) -> Result<bool> {
+    mq::group_delete_reserved(conn, meta, INDEX_TOPIC, group)
+}
+
+/// [`mq::poll`] on [`INDEX_TOPIC`], for the operator's group.
+///
+/// # Errors
+/// As [`mq::poll`].
+pub fn index_poll(
+    conn: &Connection,
+    meta: &WriteMeta,
+    group: &str,
+    max: usize,
+    after: Option<i64>,
+    now: i64,
+) -> Result<Vec<mq::Delivered>> {
+    mq::poll_reserved(conn, meta, INDEX_TOPIC, group, max, after, now)
+}
+
+/// [`mq::poll_needed`] on [`INDEX_TOPIC`], for the operator's group.
+///
+/// # Errors
+/// As [`mq::poll_needed`].
+pub fn index_poll_needed(
+    conn: &Connection,
+    group: &str,
+    max: usize,
+    after: Option<i64>,
+    now: i64,
+) -> Result<bool> {
+    mq::poll_needed_reserved(conn, INDEX_TOPIC, group, max, after, now)
+}
+
+/// [`mq::ack`] on [`INDEX_TOPIC`], for the operator's group.
+///
+/// # Errors
+/// As [`mq::ack`].
+pub fn index_ack(
+    conn: &Connection,
+    meta: &WriteMeta,
+    group: &str,
+    seq: i64,
+    now: i64,
+) -> Result<i64> {
+    mq::ack_reserved(conn, meta, INDEX_TOPIC, group, seq, now)
 }
 
 #[cfg(test)]

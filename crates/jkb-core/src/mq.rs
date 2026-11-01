@@ -463,7 +463,13 @@ fn consumed_through(conn: &Connection, topic_id: i64) -> Result<Option<i64>> {
 /// # Errors
 /// [`QueueError::NoSuchTopic`], or a database error.
 pub fn group_count(conn: &Connection, topic: &str) -> Result<i64> {
-    let (topic_id, _) = topic_row(conn, topic)?;
+    check_unreserved(topic)?;
+    group_count_reserved(conn, topic)
+}
+
+/// [`group_count`] without the reserved-prefix refusal — for the module that owns the prefix.
+pub(crate) fn group_count_reserved(conn: &Connection, topic: &str) -> Result<i64> {
+    let (topic_id, _) = topic_row_any(conn, topic)?;
     Ok(conn
         .prepare_cached("SELECT COUNT(*) FROM mq_groups WHERE topic_id = ?1")?
         .query_row([topic_id], |r| r.get(0))?)
@@ -492,8 +498,10 @@ pub fn topic_create(
 /// list them. `exec/<id>` is a run request's topic ([`crate::exec`]): its `exec.end` is what the
 /// requesting session exits with, so a `Hook` holder able to send there could forge another
 /// session's "finished 0"; and its output and decisions are that session's, read through
-/// `exec::follow`, which holds a reader to the requester. A reserved topic has no consumer groups,
-/// so [`compact`] reaps its expired messages by age alone — the row it announces is the record.
+/// `exec::follow`, which holds a reader to the requester. `exec/requests` (`exec::INDEX_TOPIC`) is
+/// the one reserved topic with consumer groups — the operator's, kept through the `*_reserved`
+/// group, poll and ack functions, which only [`crate::exec`] calls. Either way [`compact`] reaps a
+/// reserved topic's expired messages by age alone — what they announce is a row, the record.
 pub const RESERVED_PREFIXES: &[&str] = &["exec/"];
 
 /// Refuse a reserved topic ([`RESERVED_PREFIXES`]) to the public create and send.
@@ -734,6 +742,20 @@ fn make_room(
 /// [`QueueError::NoSuchTopic`], [`QueueError::Invalid`] for the name, or a database error.
 pub fn group_create(
     conn: &Connection,
+    meta: &WriteMeta,
+    topic: &str,
+    group: &str,
+    start: Start,
+    now: i64,
+) -> Result<Created> {
+    check_unreserved(topic)?;
+    group_create_reserved(conn, meta, topic, group, start, now)
+}
+
+/// [`group_create`] without the reserved-prefix refusal — for the module that owns the prefix, on a
+/// reserved topic it keeps consumer groups on ([`crate::exec::INDEX_TOPIC`]).
+pub(crate) fn group_create_reserved(
+    conn: &Connection,
     _meta: &WriteMeta,
     topic: &str,
     group: &str,
@@ -741,7 +763,7 @@ pub fn group_create(
     now: i64,
 ) -> Result<Created> {
     check_name("group name", group)?;
-    let (topic_id, _) = topic_row(conn, topic)?;
+    let (topic_id, _) = topic_row_any(conn, topic)?;
     let position: i64 = match start {
         Start::FromStart => 0,
         Start::FromNow => conn
@@ -770,14 +792,21 @@ pub fn group_create(
 ///
 /// # Errors
 /// [`QueueError::NoSuchTopic`], [`QueueError::Invalid`] for the name, or a database error.
-pub fn group_delete(
+pub fn group_delete(conn: &Connection, meta: &WriteMeta, topic: &str, group: &str) -> Result<bool> {
+    check_unreserved(topic)?;
+    group_delete_reserved(conn, meta, topic, group)
+}
+
+/// [`group_delete`] without the reserved-prefix refusal — for the module that owns the prefix, on a
+/// reserved topic it keeps consumer groups on ([`crate::exec::INDEX_TOPIC`]).
+pub(crate) fn group_delete_reserved(
     conn: &Connection,
     _meta: &WriteMeta,
     topic: &str,
     group: &str,
 ) -> Result<bool> {
     check_name("group name", group)?;
-    let (topic_id, _) = topic_row(conn, topic)?;
+    let (topic_id, _) = topic_row_any(conn, topic)?;
     let removed = conn
         .prepare_cached("DELETE FROM mq_groups WHERE topic_id = ?1 AND name = ?2")?
         .execute(params![topic_id, group])?;
@@ -799,6 +828,21 @@ pub fn group_delete(
 /// a payload that does not parse, or a database error.
 pub fn poll(
     conn: &Connection,
+    meta: &WriteMeta,
+    topic: &str,
+    group: &str,
+    max: usize,
+    after: Option<i64>,
+    now: i64,
+) -> Result<Vec<Delivered>> {
+    check_unreserved(topic)?;
+    poll_reserved(conn, meta, topic, group, max, after, now)
+}
+
+/// [`poll`] without the reserved-prefix refusal — for the module that owns the prefix, on a
+/// reserved topic it keeps consumer groups on ([`crate::exec::INDEX_TOPIC`]).
+pub(crate) fn poll_reserved(
+    conn: &Connection,
     _meta: &WriteMeta,
     topic: &str,
     group: &str,
@@ -807,7 +851,7 @@ pub fn poll(
     now: i64,
 ) -> Result<Vec<Delivered>> {
     check_batch(max)?;
-    let (topic_id, _) = topic_row(conn, topic)?;
+    let (topic_id, _) = topic_row_any(conn, topic)?;
     let position = group_position(conn, topic, topic_id, group)?.max(after.unwrap_or(0));
     conn.prepare_cached(
         "UPDATE mq_groups SET last_poll_at = ?1 WHERE topic_id = ?2 AND name = ?3",
@@ -940,8 +984,22 @@ pub fn poll_needed(
     after: Option<i64>,
     now: i64,
 ) -> Result<bool> {
+    check_unreserved(topic)?;
+    poll_needed_reserved(conn, topic, group, max, after, now)
+}
+
+/// [`poll_needed`] without the reserved-prefix refusal — for the module that owns the prefix, on a
+/// reserved topic it keeps consumer groups on ([`crate::exec::INDEX_TOPIC`]).
+pub(crate) fn poll_needed_reserved(
+    conn: &Connection,
+    topic: &str,
+    group: &str,
+    max: usize,
+    after: Option<i64>,
+    now: i64,
+) -> Result<bool> {
     check_batch(max)?;
-    let (topic_id, spec) = topic_row(conn, topic)?;
+    let (topic_id, spec) = topic_row_any(conn, topic)?;
     let (position, last_poll_at): (i64, Option<i64>) = conn
         .prepare_cached(
             "SELECT position, last_poll_at FROM mq_groups WHERE topic_id = ?1 AND name = ?2",
@@ -973,13 +1031,27 @@ pub fn poll_needed(
 /// error.
 pub fn ack(
     conn: &Connection,
+    meta: &WriteMeta,
+    topic: &str,
+    group: &str,
+    seq: i64,
+    now: i64,
+) -> Result<i64> {
+    check_unreserved(topic)?;
+    ack_reserved(conn, meta, topic, group, seq, now)
+}
+
+/// [`ack`] without the reserved-prefix refusal — for the module that owns the prefix, on a
+/// reserved topic it keeps consumer groups on ([`crate::exec::INDEX_TOPIC`]).
+pub(crate) fn ack_reserved(
+    conn: &Connection,
     _meta: &WriteMeta,
     topic: &str,
     group: &str,
     seq: i64,
     now: i64,
 ) -> Result<i64> {
-    let (topic_id, _) = topic_row(conn, topic)?;
+    let (topic_id, _) = topic_row_any(conn, topic)?;
     let position = group_position(conn, topic, topic_id, group)?;
     let newest: Option<i64> = conn
         .prepare_cached("SELECT MAX(seq) FROM mq_messages WHERE topic_id = ?1")?

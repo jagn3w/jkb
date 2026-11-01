@@ -105,6 +105,27 @@ const SAFE_SUBCOMMANDS: &[&str] = &[
     // pinned tree's `.gitignore` files: no submodule, no index entries, no config but `git init`'s.
     // Never run in a request repository.
     "check-ignore",
+    // Only as `trusted_base` runs it: `ls-remote --symref -- <url> HEAD`, the URL the audited
+    // config names, with `GIT_ALLOW_PROTOCOL=https:ssh` (which outranks every `protocol.*` setting)
+    // and the URL itself refused unless it is https, ssh or scp-like with no `<transport>::` and no
+    // leading `-`. It reads no index and no work tree, so it cannot enter a submodule (measured on
+    // git 2.51.1 by `jkb_s_git_does_not_run_a_submodule_s_config`), and what it executes is the
+    // transport alone: ssh (the operator's own, from the environment and the global config — a
+    // repository's `core.sshCommand` is refused by the audit first) or git's own https helper. A
+    // hostile config was measured by `ls_remote_runs_nothing_a_repository_names`: an `ext::` URL,
+    // a dash-led URL, an ssh host that is an option, `url.*.insteadOf` and `core.sshCommand` each
+    // ran nothing.
+    "ls-remote",
+    // Only as `tree_diff` runs it in a REQUEST repository: `rev-list --objects --no-walk <base>`
+    // piped to `pack-objects --stdout`, with replace refs and lazy fetches off. Object plumbing: no
+    // index, no work tree, no submodule (measured on git 2.51.1 by
+    // `jkb_s_git_does_not_run_a_submodule_s_config`). Its bytes are not trusted: they are indexed
+    // by `index-pack` in the diff's own repository, which names every object by its own hash.
+    "pack-objects",
+    // Only in the diff's own throwaway repository (`DiffRepo`), which holds nothing but the base's
+    // objects and the pinned tree's: no work tree, no config but `git init`'s.
+    "index-pack",
+    "fast-import",
 ];
 
 /// Where the subcommand is in `args`: past any leading `-c <key>=<value>` pairs, the one global
@@ -2482,7 +2503,7 @@ const PIN_FRAMING: &[u8] = b"jkb-tree-pin/v3\n";
 
 /// One pinned path's kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum PinKind {
+pub(crate) enum PinKind {
     /// A regular file with no owner execute bit.
     File,
     /// A regular file with the owner execute bit (git's rule for the executable mode).
@@ -2492,7 +2513,7 @@ enum PinKind {
 }
 
 impl PinKind {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::File => "file",
             Self::Exec => "exec",
@@ -2510,6 +2531,11 @@ pub struct PinnedTree {
     /// holds this to its clean clone's own set ([`ignore_rules_drift`]): the rules that leave files
     /// out of the pin must be the ones already on main.
     pub gitignores: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// The repository's top level, which every pinned path is relative to.
+    pub top: PathBuf,
+    /// Every pinned path, in byte order, with its kind and its digest — what the pin hashed, and
+    /// what [`tree_diff`] diffs.
+    pub(crate) entries: Vec<(Vec<u8>, PinKind, Vec<u8>)>,
 }
 
 /// How a pinned tree's `.gitignore` set differs from main's ([`ignore_rules_drift`]).
@@ -2830,6 +2856,8 @@ pub fn pin_tree(dir: &Path) -> Result<Option<PinnedTree>> {
             changes: hasher.finalize().to_hex().to_string(),
         },
         gitignores: walk.gitignores,
+        entries: walk.pinned,
+        top,
     }))
 }
 
@@ -2949,6 +2977,694 @@ impl PinWalk<'_> {
         }
         Ok(())
     }
+}
+
+// ---- the trusted base and the diff a run request is reviewed against ----------------------------
+
+/// The empty tree, in each object format: what `GIT_ATTR_SOURCE` points the diff's attributes at, so
+/// no `.gitattributes` from either tree (`-diff`, a `diff=` driver) changes what the operator sees.
+const EMPTY_TREE_SHA1: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const EMPTY_TREE_SHA256: &str = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321";
+
+/// Where a trusted base came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseSource {
+    /// The remote itself, asked by `git ls-remote` on the host.
+    LsRemote,
+    /// The host's clean clone of the same remote (Code Factory's, for jkb).
+    Clone,
+}
+
+impl BaseSource {
+    /// The wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LsRemote => "ls-remote",
+            Self::Clone => "clone",
+        }
+    }
+}
+
+/// A base the host verified: the remote's default branch, from the remote or from a clone the
+/// container cannot write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedBase {
+    /// The commit.
+    pub sha: String,
+    /// The ref it is the tip of (`refs/heads/main`).
+    pub ref_name: String,
+    pub source: BaseSource,
+    /// The remote URL it was asked of.
+    pub url: String,
+}
+
+/// Why no base could be verified — said to the operator above the diff, never a failure of the
+/// preview.
+#[derive(Debug)]
+pub struct BaseUnverified(pub String);
+
+impl std::fmt::Display for BaseUnverified {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BaseUnverified {}
+
+fn is_oid(s: &str) -> bool {
+    matches!(s.len(), 40 | 64)
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Whether `url` is one `ls-remote` may be asked of on the host: `https://`, `ssh://`, or scp-like
+/// `[user@]host:path` — never a `<transport>::<address>` (git runs `git-remote-<transport>`, and
+/// `ext::` runs any command), never a local path (its `upload-pack` reads a repository's config
+/// nothing audited), never one that starts with `-` (an option). `GIT_ALLOW_PROTOCOL` enforces the
+/// same on git's side; this says why in words, before anything is spawned.
+fn remote_url_problem(url: &str) -> Option<String> {
+    if url.is_empty() {
+        return Some("the remote has no URL".to_owned());
+    }
+    if url.starts_with('-') || url.contains("::") || url.chars().any(char::is_control) {
+        return Some(format!("{url:?} is not a URL jkb asks the network about"));
+    }
+    if url.starts_with("https://") || url.starts_with("ssh://") {
+        return None;
+    }
+    if url.contains("://") {
+        return Some(format!(
+            "{url:?}: only https and ssh remotes are asked (plain http and git:// can be answered \
+             by anyone on the path)"
+        ));
+    }
+    // scp-like: a host part with no `/` before the first `:`.
+    match url.split_once(':') {
+        Some((host, path)) if !host.is_empty() && !host.contains('/') && !path.is_empty() => {
+            if host.rsplit('@').next().is_some_and(|h| h.starts_with('-')) {
+                Some(format!("{url:?}: the host is an option"))
+            } else {
+                None
+            }
+        }
+        _ => Some(format!(
+            "{url:?} is a local path, not a remote the host can verify against"
+        )),
+    }
+}
+
+/// `remote.origin.url` of the repository containing `dir`, from its audited config.
+fn origin_url(dir: &Path) -> Result<Option<String>> {
+    Ok(git(dir, &["config", "--get", "remote.origin.url"])?.filter(|u| !u.is_empty()))
+}
+
+/// The same remote, spelt either way: trailing `/` and `.git` aside.
+fn same_remote(a: &str, b: &str) -> bool {
+    let norm = |u: &str| {
+        let u = u.trim_end_matches('/');
+        u.strip_suffix(".git").unwrap_or(u).to_owned()
+    };
+    norm(a) == norm(b)
+}
+
+/// `git ls-remote --symref -- <url> HEAD` in `dir`, hooks off and audited, network protocols held
+/// to https and ssh, no prompt: the remote's default branch and its tip.
+fn ls_remote_head(dir: &Path, url: &str) -> Result<(String, String)> {
+    if let Some(why) = remote_url_problem(url) {
+        return Err(BaseUnverified(why).into());
+    }
+    let out = ls_remote(dir, url)?;
+    if !out.status.success() {
+        return Err(BaseUnverified(format!(
+            "git ls-remote {url} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+        .into());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut branch = None;
+    let mut tip = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("ref: ") {
+            if let Some((r, "HEAD")) = rest.split_once('\t') {
+                branch = Some(r.to_owned());
+            }
+        } else if let Some((sha, "HEAD")) = line.split_once('\t') {
+            tip = Some(sha.to_owned());
+        }
+    }
+    match (tip, branch) {
+        (Some(sha), Some(r)) if is_oid(&sha) && r.starts_with("refs/heads/") => Ok((sha, r)),
+        _ => Err(BaseUnverified(format!(
+            "git ls-remote {url} named no default branch and tip: {}",
+            text.trim()
+        ))
+        .into()),
+    }
+}
+
+/// The `ls-remote` spawn itself, with no word about the URL: git's own protocol policy is what
+/// this holds to https and ssh (`GIT_ALLOW_PROTOCOL` outranks any `protocol.*` config), and the
+/// audit what keeps a repository's config from naming a program. Measured apart from
+/// [`remote_url_problem`] by `ls_remote_runs_nothing_a_repository_names`.
+fn ls_remote(dir: &Path, url: &str) -> Result<std::process::Output> {
+    let args = [
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "protocol.ssh.allow=always",
+        "ls-remote",
+        "--symref",
+        "--",
+        url,
+        "HEAD",
+    ];
+    checked(dir, &args)?;
+    git_cmd(dir, &args)
+        .env("GIT_ALLOW_PROTOCOL", "https:ssh")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("running `git ls-remote`")
+}
+
+/// The base a run request's diff is read against: the default branch of the repository's `origin`,
+/// verified on the host — asked of the remote itself (`ls-remote`), or, when that fails, read from
+/// `clone`, a clone of the same remote the dev container cannot write (Code Factory's own, for jkb).
+/// Never `refs/remotes/origin/*` in the request repository: that is in `.git/`, which the container
+/// can write, and pointing it at `HEAD` would make the diff show nothing.
+///
+/// `Ok(None)` when `dir` is in no repository.
+///
+/// # Errors
+/// [`BaseUnverified`] naming why no base could be verified (no remote, an unaskable URL, the network
+/// down and no clone of it); the audit's refusal; git not running.
+pub fn trusted_base(dir: &Path, clone: Option<&Path>) -> Result<Option<TrustedBase>> {
+    if root(dir)?.is_none() {
+        return Ok(None);
+    }
+    let Some(url) = origin_url(dir)? else {
+        return Err(BaseUnverified(format!(
+            "{} has no `origin` remote to verify a base against",
+            dir.display()
+        ))
+        .into());
+    };
+    let asked = match ls_remote_head(dir, &url) {
+        Ok((sha, ref_name)) => {
+            return Ok(Some(TrustedBase {
+                sha,
+                ref_name,
+                source: BaseSource::LsRemote,
+                url,
+            }))
+        }
+        Err(e) if e.is::<BaseUnverified>() => e,
+        Err(e) => return Err(e),
+    };
+    if let Some(clone) = clone {
+        if root(clone)?.is_some() && origin_url(clone)?.is_some_and(|c| same_remote(&c, &url)) {
+            if let Some(sha) = git(
+                clone,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/remotes/origin/main^{commit}",
+                ],
+            )?
+            .filter(|s| is_oid(s))
+            {
+                return Ok(Some(TrustedBase {
+                    sha,
+                    ref_name: "refs/heads/main".to_owned(),
+                    source: BaseSource::Clone,
+                    url,
+                }));
+            }
+        }
+    }
+    Err(asked)
+}
+
+/// What a run request's diff showed: the pinned tree against a verified base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeDiff {
+    /// The repository's top level.
+    pub top: PathBuf,
+    /// The base commit, as asked.
+    pub base: String,
+    /// The pin of the tree diffed — every byte of it re-read and held to the walk's digest.
+    pub pin: jkb_core::exec::TreePin,
+    /// Every changed path and its status letter (`git diff --name-status`), complete up to
+    /// [`MAX_DIFF_FILES`]: what a truncated patch cannot hide.
+    pub files: Vec<(String, String)>,
+    pub files_truncated: bool,
+    /// The patch, up to the cap it was asked for.
+    pub patch: String,
+    pub truncated: bool,
+}
+
+/// The status [`tree_diff`] lists a path with when the base tracks it and the work tree has it, but
+/// the rules ignore it: outside the pin, so not diffed.
+pub const IGNORED_STATUS: &str = "I";
+
+/// The most changed paths [`tree_diff`] lists.
+pub const MAX_DIFF_FILES: usize = 10_000;
+
+/// [`tree_diff`]'s refusal when the tree moved while it was being diffed.
+#[derive(Debug)]
+pub struct TreeMoved(pub String);
+
+impl std::fmt::Display for TreeMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TreeMoved {}
+
+/// The diff's own bare repository, in which nothing of the request repository takes part but the
+/// objects `index-pack` named by their own hash and the bytes the pin's walk read. Deleted with the
+/// guard.
+struct DiffRepo {
+    dir: PathBuf,
+}
+
+impl DiffRepo {
+    fn new(sha256: bool) -> Result<Self> {
+        let token = jkb_core::roles::fresh_token().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let name: String = token
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(24)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("jkb-exec-diff-{name}"));
+        fs::create_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let repo = Self { dir };
+        let format = if sha256 {
+            "--object-format=sha256"
+        } else {
+            "--object-format=sha1"
+        };
+        // Not through `checked`: the directory is not a repository until this runs, and it is ours.
+        let out = git_cmd(&repo.dir, &["init", "-q", "--bare", format])
+            .output()
+            .context("running `git init` for the diff")?;
+        anyhow::ensure!(
+            out.status.success(),
+            "`git init` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Ok(repo)
+    }
+
+    /// A git command here, audited and hooks-off, with no attributes and no replace refs. A bare
+    /// repository's tree-to-tree diff reads no in-tree `.gitattributes` (measured, git 2.51.1, by
+    /// `the_diff_cannot_be_hidden_by_attributes_ignores_or_replace_refs`); `GIT_ATTR_SOURCE` at the
+    /// empty tree also overrides an `attr.tree` in the operator's global config.
+    fn cmd(&self, args: &[&str], sha256: bool) -> Result<Command> {
+        checked(&self.dir, args)?;
+        let mut cmd = git_cmd(&self.dir, args);
+        cmd.env(
+            "GIT_ATTR_SOURCE",
+            if sha256 {
+                EMPTY_TREE_SHA256
+            } else {
+                EMPTY_TREE_SHA1
+            },
+        )
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+        Ok(cmd)
+    }
+}
+
+impl Drop for DiffRepo {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Copy `base` and every object its tree reaches from the repository at `source` into `repo`:
+/// `rev-list | pack-objects` there, `index-pack --fsck-objects` here (`--strict` also wants the parents, which are not copied). Whether `base` arrived is asked
+/// afterwards, of `repo`, where an object exists only under the name its bytes hash to — so a
+/// forged loose object, a planted pack or a replace ref in `source` makes the base absent, never
+/// different.
+fn import_base(repo: &DiffRepo, source: &Path, base: &str, sha256: bool) -> Result<bool> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let list_args = [
+        "rev-list",
+        "--objects",
+        "--no-walk",
+        "--no-object-names",
+        base,
+    ];
+    checked(source, &list_args)?;
+    let listed = git_cmd(source, &list_args)
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("running `git rev-list` for the base")?;
+    if !listed.status.success() || listed.stdout.is_empty() {
+        return Ok(false);
+    }
+    let pack_args = ["pack-objects", "--stdout", "-q"];
+    checked(source, &pack_args)?;
+    let mut pack = git_cmd(source, &pack_args)
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("running `git pack-objects` for the base")?;
+    let mut stdin = pack.stdin.take().context("pack-objects' stdin")?;
+    let list = listed.stdout;
+    let writer = std::thread::spawn(move || stdin.write_all(&list));
+    let pack_out = pack.stdout.take().context("pack-objects' stdout")?;
+    let index = repo
+        .cmd(&["index-pack", "--stdin", "--fsck-objects"], sha256)?
+        .stdin(Stdio::from(pack_out))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("running `git index-pack` for the base")?;
+    let packed = pack.wait().context("waiting for `git pack-objects`")?;
+    let _ = writer.join();
+    if !packed.success() || !index.status.success() {
+        return Ok(false);
+    }
+    let peeled = format!("{base}^{{commit}}");
+    let found = repo
+        .cmd(&["rev-parse", "--verify", "--quiet", &peeled], sha256)?
+        .output()
+        .context("running `git rev-parse` for the base")?;
+    Ok(found.status.success() && String::from_utf8_lossy(&found.stdout).trim() == base)
+}
+
+/// A path as `fast-import` reads one: always quoted, C-style, every byte that is not printable
+/// ASCII (and `"`, `\`) as an octal escape — so no path can end its line or start a command.
+fn fast_import_path(path: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(path.len() + 2);
+    out.push(b'"');
+    for &b in path {
+        if b == b'"' || b == b'\\' || !(0x20..0x7f).contains(&b) {
+            out.extend_from_slice(format!("\\{b:03o}").as_bytes());
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'"');
+    out
+}
+
+/// A writer that hashes what passes through it.
+struct Tee<'a, W> {
+    inner: &'a mut W,
+    hasher: blake3::Hasher,
+}
+
+impl<W: std::io::Write> std::io::Write for Tee<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// One regular file's `data` command for `fast-import`: its bytes, read without following a link,
+/// streamed through a hash held to `digest` (the walk's) — [`TreeMoved`] if they differ.
+fn feed_file(out: &mut impl std::io::Write, abs: &Path, digest: &[u8]) -> Result<()> {
+    use rustix::fs::{Mode, OFlags};
+    let moved = || TreeMoved(format!("{} changed while it was diffed", abs.display()));
+    let fd = rustix::fs::open(
+        abs,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| moved())?;
+    let mut file = fs::File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(moved().into());
+    }
+    let size = meta.len();
+    out.write_all(format!("\ndata {size}\n").as_bytes())?;
+    let mut hashing = Tee {
+        inner: out,
+        hasher: blake3::Hasher::new(),
+    };
+    let copied = std::io::copy(&mut std::io::Read::take(&mut file, size), &mut hashing)?;
+    if copied != size || hashing.hasher.finalize().as_bytes().as_slice() != digest {
+        return Err(moved().into());
+    }
+    Ok(())
+}
+
+/// Feed the pinned tree to `fast-import` as one commit on `refs/jkb/pinned`: each entry's bytes
+/// read again without following a link, each held to the digest the walk took. A file that changed
+/// in between refuses the diff ([`TreeMoved`]) rather than showing bytes the pin did not cover.
+fn import_pinned(repo: &DiffRepo, tree: &PinnedTree, sha256: bool) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::process::Stdio;
+    let mut child = repo
+        .cmd(&["fast-import", "--quiet", "--done"], sha256)?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running `git fast-import` for the pinned tree")?;
+    let mut stdin = child.stdin.take().context("fast-import's stdin")?;
+    let fed: Result<()> = (|| {
+        stdin.write_all(b"commit refs/jkb/pinned\ncommitter jkb <jkb> 0 +0000\ndata 0\n")?;
+        // Every `.gitignore` the walk applied is in the tree, even one its own rules ignore, so a
+        // rule that hides a change is itself shown as a change.
+        let pinned: std::collections::HashSet<&[u8]> =
+            tree.entries.iter().map(|(p, _, _)| p.as_slice()).collect();
+        for (path, bytes) in &tree.gitignores {
+            if pinned.contains(path.as_slice()) {
+                continue;
+            }
+            stdin.write_all(b"M 100644 inline ")?;
+            stdin.write_all(&fast_import_path(path))?;
+            stdin.write_all(format!("\ndata {}\n", bytes.len()).as_bytes())?;
+            stdin.write_all(bytes)?;
+            stdin.write_all(b"\n")?;
+        }
+        for (path, kind, digest) in &tree.entries {
+            let abs = tree.top.join(std::ffi::OsStr::from_bytes(path));
+            let mode = match kind {
+                PinKind::File => "100644",
+                PinKind::Exec => "100755",
+                PinKind::Link => "120000",
+            };
+            stdin.write_all(format!("M {mode} inline ").as_bytes())?;
+            stdin.write_all(&fast_import_path(path))?;
+            if *kind == PinKind::Link {
+                let target =
+                    fs::read_link(&abs).with_context(|| format!("reading {}", abs.display()))?;
+                let target = target.as_os_str().as_bytes();
+                if target != digest.as_slice() {
+                    return Err(TreeMoved(format!(
+                        "{} changed while it was diffed",
+                        abs.display()
+                    ))
+                    .into());
+                }
+                stdin.write_all(format!("\ndata {}\n", target.len()).as_bytes())?;
+                stdin.write_all(target)?;
+            } else {
+                feed_file(&mut stdin, &abs, digest)?;
+            }
+            stdin.write_all(b"\n")?;
+        }
+        stdin.write_all(b"\ndone\n")?;
+        Ok(())
+    })();
+    drop(stdin);
+    let out = child
+        .wait_with_output()
+        .context("waiting for `git fast-import`")?;
+    fed.map_err(|e| {
+        if e.is::<TreeMoved>() {
+            e
+        } else {
+            e.context(format!(
+                "feeding `git fast-import`: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    })?;
+    anyhow::ensure!(
+        out.status.success(),
+        "`git fast-import` failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(())
+}
+
+/// Read at most `max` bytes of `child`'s stdout, then stop it: whether there was more.
+fn read_capped(mut child: std::process::Child, max: usize) -> Result<(Vec<u8>, bool)> {
+    use std::io::Read as _;
+    let mut stdout = child.stdout.take().context("the diff's stdout")?;
+    let mut buf = Vec::new();
+    let cap = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
+    (&mut stdout).take(cap).read_to_end(&mut buf)?;
+    let truncated = buf.len() > max;
+    if truncated {
+        buf.truncate(max);
+        let _ = child.kill();
+    }
+    drop(stdout);
+    let status = child.wait().context("waiting for `git diff`")?;
+    anyhow::ensure!(
+        truncated || status.success(),
+        "`git diff` failed ({status})"
+    );
+    Ok((buf, truncated))
+}
+
+/// The diff a run request is reviewed with (the Executions design): the tree its pin covers — every
+/// path the repository's own `.gitignore` files do not ignore, tracked or not, read by the pin's own
+/// walk ([`pin_tree`]) — against `base`, a commit the host verified ([`trusted_base`]).
+///
+/// **Nothing in the request repository's `.git` decides what is shown.** The base's objects are
+/// copied out of `objects_from` (the request repository first) into a throwaway repository where
+/// `index-pack` names each by its own hash, so a forged object makes the base absent rather than
+/// different; the work-tree side is the walk's bytes, each re-read without following a link and held
+/// to the digest the pin took ([`TreeMoved`] otherwise); and the diff runs there, tree against tree,
+/// `--no-ext-diff --no-textconv`, with attributes taken from the empty tree — so no `-diff` or
+/// `diff=` attribute can turn a change into "Binary files differ" or run a driver. Every
+/// `.gitignore` the walk applied is in the tree even when it ignores itself, so a rule that hides a
+/// change is shown as one. A tracked file the rules ignore is outside the pin: it is listed with
+/// [`IGNORED_STATUS`] and left out of the patch.
+///
+/// `Ok(None)` when `dir` is in no repository.
+///
+/// # Errors
+/// The pin's own refusals ([`NotPinnable`]); [`TreeMoved`]; a `base` that is not a full object id or
+/// is in none of `objects_from`; the audit's refusal; git failing.
+pub fn tree_diff(
+    dir: &Path,
+    base: &str,
+    objects_from: &[PathBuf],
+    max: usize,
+) -> Result<Option<TreeDiff>> {
+    anyhow::ensure!(
+        is_oid(base),
+        "`{base}` is not a full object id: the base is a commit the host verified, never a name"
+    );
+    let Some(tree) = pin_tree(dir)? else {
+        return Ok(None);
+    };
+    let sha256 = base.len() == 64;
+    let repo = DiffRepo::new(sha256)?;
+    let mut sources = vec![tree.top.clone()];
+    sources.extend(objects_from.iter().cloned());
+    let mut found = false;
+    for source in &sources {
+        if import_base(&repo, source, base, sha256)? {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        anyhow::bail!(
+            "the base {base} is not in {} (or its objects do not match their names): fetch it on \
+             the host",
+            sources
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    import_pinned(&repo, &tree, sha256)?;
+    let common = [
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ];
+    let mut names_args = vec!["diff"];
+    names_args.extend_from_slice(&common);
+    names_args.extend_from_slice(&[
+        "--name-status",
+        "-z",
+        "--no-renames",
+        base,
+        "refs/jkb/pinned",
+    ]);
+    let names = repo
+        .cmd(&names_args, sha256)?
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("running `git diff --name-status`")?;
+    let (names, _) = read_capped(names, 16 * 1024 * 1024)?;
+    let mut files = Vec::new();
+    let mut fields = names.split(|b| *b == 0).filter(|f| !f.is_empty());
+    let mut files_truncated = false;
+    // A path the base has and the pinned tree lacks, but which is on disk, is not deleted: the
+    // rules ignore it, so it is outside the pin. It is listed as `I` and left out of the patch,
+    // which would otherwise show it removed.
+    let mut outside: Vec<String> = Vec::new();
+    while let (Some(status), Some(path)) = (fields.next(), fields.next()) {
+        if files.len() == MAX_DIFF_FILES {
+            files_truncated = true;
+            break;
+        }
+        let mut status = String::from_utf8_lossy(status).into_owned();
+        let shown = String::from_utf8_lossy(path).into_owned();
+        if status == "D" {
+            use std::os::unix::ffi::OsStrExt as _;
+            let on_disk = tree.top.join(std::ffi::OsStr::from_bytes(path));
+            if fs::symlink_metadata(&on_disk).is_ok() {
+                IGNORED_STATUS.clone_into(&mut status);
+                if let Ok(p) = std::str::from_utf8(path) {
+                    outside.push(format!(":(exclude,literal){p}"));
+                }
+            }
+        }
+        files.push((status, shown));
+    }
+    let mut patch_args = vec!["diff"];
+    patch_args.extend_from_slice(&common);
+    patch_args.extend_from_slice(&[base, "refs/jkb/pinned"]);
+    if !outside.is_empty() {
+        patch_args.extend_from_slice(&["--", "."]);
+        patch_args.extend(outside.iter().map(String::as_str));
+    }
+    let patch = repo
+        .cmd(&patch_args, sha256)?
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("running `git diff`")?;
+    let (patch, truncated) = read_capped(patch, max)?;
+    Ok(Some(TreeDiff {
+        top: tree.top,
+        base: base.to_owned(),
+        pin: tree.pin,
+        files,
+        files_truncated,
+        patch: String::from_utf8_lossy(&patch).into_owned(),
+        truncated,
+    }))
 }
 
 /// Which ref to ask about when a branch exists both locally and on the remote. They can
@@ -5257,6 +5973,23 @@ mod tests {
             "clean descended into the submodule"
         );
         assert!(!marker.exists(), "clean entered the submodule");
+        // The run-request base and diff: `ls-remote` (asked of the child as a local path here, which
+        // the production spawn's protocol policy would refuse — this measures the subcommand) and
+        // `rev-list | pack-objects` read refs and objects, never a work tree.
+        std::fs::write(sup.join("sub/f"), "hhhh\n").unwrap();
+        let _ = super::git_run(&sup, &["ls-remote", "--", child.to_str().unwrap(), "HEAD"]);
+        let head = super::rev(&sup, "HEAD").unwrap().unwrap();
+        let _ = super::git_run(&sup, &["rev-list", "--objects", "--no-walk", &head]);
+        let _ = super::git_run(&sup, &["pack-objects", "--stdout", "-q", "--revs"]);
+        let diff = super::tree_diff(&sup, &head, &[], 1 << 20);
+        assert!(
+            diff.is_err(),
+            "the pin, and so the diff, refuses a populated submodule"
+        );
+        assert!(
+            !marker.exists(),
+            "ls-remote, pack-objects or the diff entered the submodule"
+        );
         let e = super::git_run(&sup, &["stash"]).unwrap_err().to_string();
         assert!(e.contains("does not run `git stash`"), "{e}");
     }
@@ -5938,5 +6671,279 @@ mod tests {
         let nested = pin_of(&dir);
         std::fs::write(dir.join("sub/:(top)target/f"), "z").unwrap();
         assert_ne!(pin_of(&dir), nested);
+    }
+
+    // ---- the trusted base and the diff -----------------------------------------------------------
+
+    fn commit_all(dir: &Path, msg: &str) {
+        for args in [&["add", "-A"][..], &["commit", "-qm", msg][..]] {
+            assert!(
+                fixture_git(dir, args).status().unwrap().success(),
+                "{args:?}"
+            );
+        }
+    }
+
+    fn head_of(dir: &Path) -> String {
+        super::rev(dir, "HEAD").unwrap().unwrap()
+    }
+
+    fn diff_of(dir: &Path, base: &str, max: usize) -> super::TreeDiff {
+        super::tree_diff(dir, base, &[], max).unwrap().unwrap()
+    }
+
+    /// `ls-remote`, measured against a hostile config (git 2.51.1): with the URL check bypassed —
+    /// the raw spawn, so git's own protocol policy and the audit are what is measured — an `ext::`
+    /// URL, a dash-led one and an ssh host that is an option each run nothing; a repository config
+    /// that names a program (`core.sshCommand`, `url.*.insteadOf` to an `ext::` URL) is refused by
+    /// the audit before anything is spawned; and `trusted_base` refuses each URL in words.
+    #[test]
+    fn ls_remote_runs_nothing_a_repository_names() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("r");
+        std::fs::create_dir_all(&dir).unwrap();
+        fixture(&dir);
+        let marker = t.path().join("ran");
+        let m = marker.display().to_string();
+        let set = |k: &str, v: &str| {
+            assert!(fixture_git(&dir, &["config", k, v])
+                .status()
+                .unwrap()
+                .success());
+        };
+        let unset = |k: &str| {
+            let _ = fixture_git(&dir, &["config", "--unset-all", k]).status();
+        };
+        for url in [
+            format!("ext::sh -c touch% {m}"),
+            format!("--upload-pack=touch {m}"),
+            format!("ssh://-oProxyCommand=touch% {m}/x"),
+            format!("-oProxyCommand=touch {m}:x"),
+        ] {
+            let out = super::ls_remote(&dir, &url).unwrap();
+            assert!(!out.status.success(), "{url}: {out:?}");
+            assert!(!marker.exists(), "{url} ran a program");
+            set("remote.origin.url", &url);
+            let e = super::trusted_base(&dir, None).unwrap_err();
+            assert!(e.is::<super::BaseUnverified>(), "{url}: {e:#}");
+            assert!(!marker.exists(), "{url} ran a program through trusted_base");
+        }
+        set("remote.origin.url", "ssh://example.invalid/x");
+        set("core.sshCommand", &format!("touch {m}"));
+        let e = format!("{:#}", super::trusted_base(&dir, None).unwrap_err());
+        assert!(
+            e.contains("core.sshcommand") || e.contains("core.sshCommand"),
+            "{e}"
+        );
+        assert!(!marker.exists(), "core.sshCommand ran");
+        unset("core.sshCommand");
+        set("remote.origin.url", "https://example.invalid/x");
+        set(
+            "url.ext::sh -c touch% M #.insteadOf",
+            "https://example.invalid/",
+        );
+        let e = format!("{:#}", super::trusted_base(&dir, None).unwrap_err());
+        assert!(e.contains("insteadof"), "{e}");
+        assert!(!marker.exists(), "url.insteadOf ran");
+    }
+
+    #[test]
+    fn a_remote_url_is_asked_only_over_https_or_ssh() {
+        for ok in [
+            "https://github.com/a/b.git",
+            "ssh://git@h/x",
+            "git@github.com:a/b.git",
+        ] {
+            assert_eq!(super::remote_url_problem(ok), None, "{ok}");
+        }
+        for bad in [
+            "",
+            "ext::sh -c x",
+            "fd::3",
+            "-x",
+            "http://h/x",
+            "git://h/x",
+            "file:///tmp/r",
+            "/tmp/r",
+            "../r",
+            "-o@h:x",
+            "a@-oProxyCommand=x:y",
+        ] {
+            assert!(super::remote_url_problem(bad).is_some(), "{bad:?}");
+        }
+    }
+
+    /// With the remote unreachable, a clean clone of the same remote answers; one of another remote
+    /// does not, and neither does the request repository's own `origin/main`.
+    #[test]
+    fn the_base_falls_back_to_a_clone_of_the_same_remote_only() {
+        let (_t, dir) = pin_repo();
+        let (_t2, clone) = pin_repo();
+        for d in [&dir, &clone] {
+            assert!(fixture_git(
+                d,
+                &["remote", "add", "origin", "https://127.0.0.1:9/jkb.git"]
+            )
+            .status()
+            .unwrap()
+            .success());
+        }
+        let tip = head_of(&clone);
+        assert!(
+            fixture_git(&clone, &["update-ref", "refs/remotes/origin/main", &tip])
+                .status()
+                .unwrap()
+                .success()
+        );
+        // The request repository's own tracking ref is the container's to forge.
+        let forged = head_of(&dir);
+        assert!(
+            fixture_git(&dir, &["update-ref", "refs/remotes/origin/main", &forged])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let e = super::trusted_base(&dir, None).unwrap_err();
+        assert!(e.is::<super::BaseUnverified>(), "{e:#}");
+        let b = super::trusted_base(&dir, Some(&clone)).unwrap().unwrap();
+        assert_eq!(
+            (b.sha.as_str(), b.source),
+            (tip.as_str(), super::BaseSource::Clone)
+        );
+        assert!(fixture_git(
+            &clone,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://127.0.0.1:9/other.git"
+            ]
+        )
+        .status()
+        .unwrap()
+        .success());
+        assert!(super::trusted_base(&dir, Some(&clone)).is_err());
+        let t = tempfile::tempdir().unwrap();
+        assert!(super::trusted_base(t.path(), None).unwrap().is_none());
+    }
+
+    /// The diff covers what the pin covers: a modified tracked file, a deleted one, an untracked new
+    /// one; it carries the very pin `jkb exec pin` computes; and a tracked file the rules ignore is
+    /// listed as outside the pin, not as deleted.
+    #[test]
+    fn the_diff_shows_tracked_and_untracked_changes_against_the_base() {
+        let (_t, dir) = pin_repo();
+        std::fs::write(dir.join("keep.txt"), "kept\n").unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("target/forced"), "tracked though ignored\n").unwrap();
+        commit_all(&dir, "more");
+        assert!(fixture_git(&dir, &["add", "-f", "target/forced"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(fixture_git(&dir, &["commit", "-qm", "force"])
+            .status()
+            .unwrap()
+            .success());
+        let base = head_of(&dir);
+        std::fs::write(dir.join("base.txt"), "changed-line\n").unwrap();
+        std::fs::remove_file(dir.join("keep.txt")).unwrap();
+        std::fs::write(dir.join("new.txt"), "brand-new-untracked\n").unwrap();
+        let d = diff_of(&dir, &base, 1 << 20);
+        let status = |p: &str| d.files.iter().find(|f| f.1 == p).map(|f| f.0.clone());
+        assert_eq!(status("base.txt").as_deref(), Some("M"), "{:?}", d.files);
+        assert_eq!(status("keep.txt").as_deref(), Some("D"));
+        assert_eq!(status("new.txt").as_deref(), Some("A"));
+        assert_eq!(
+            status("target/forced").as_deref(),
+            Some(super::IGNORED_STATUS)
+        );
+        assert!(
+            d.patch.contains("+changed-line") && d.patch.contains("+brand-new-untracked"),
+            "{}",
+            d.patch
+        );
+        assert!(!d.patch.contains("tracked though ignored"), "{}", d.patch);
+        assert!(!d.truncated);
+        assert_eq!(d.pin, super::tree_pin(&dir).unwrap().unwrap());
+        // A diff over its cap is cut, and says so; the file list is still complete.
+        let cut = diff_of(&dir, &base, 40);
+        assert!(cut.truncated && cut.patch.len() <= 40);
+        assert_eq!(cut.files, d.files);
+        // A base that is not a full id is never resolved as a name.
+        assert!(super::tree_diff(&dir, "HEAD", &[], 100).is_err());
+        let t = tempfile::tempdir().unwrap();
+        assert!(super::tree_diff(t.path(), &base, &[], 100)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Nothing the container can write in the tree or in `.git` hides a change: a `-diff`
+    /// attribute, a `.gitignore` that hides a new file and itself, a replace ref that makes the base
+    /// look like the work tree. Measured by mutation (git 2.51.1): without every applied
+    /// `.gitignore` in the diffed tree, `sub/.gitignore` vanishes and this fails. The other two
+    /// pass even with one guard removed, because each has two: a bare repository's tree-to-tree diff
+    /// reads no in-tree attributes at all (`GIT_ATTR_SOURCE` is there for an operator's global
+    /// `attr.tree`), and `pack-objects` copies the base's own objects whatever the replace refs say,
+    /// so `GIT_NO_REPLACE_OBJECTS` is a second lock on the same door.
+    #[test]
+    fn the_diff_cannot_be_hidden_by_attributes_ignores_or_replace_refs() {
+        let (_t, dir) = pin_repo();
+        std::fs::write(dir.join("code.rs"), "fn good() {}\n").unwrap();
+        commit_all(&dir, "code");
+        let base = head_of(&dir);
+        std::fs::write(dir.join("code.rs"), "fn evil() {}\n").unwrap();
+        std::fs::write(dir.join(".gitattributes"), "* -diff\n").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/.gitignore"), "*\n").unwrap();
+        std::fs::write(dir.join("sub/hidden.sh"), "rm -rf /\n").unwrap();
+        // The replace ref: the base's blob of code.rs replaced by the work tree's.
+        let out = fixture_git(&dir, &["rev-parse", &format!("{base}:code.rs")])
+            .output()
+            .unwrap();
+        let good = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+        let out = fixture_git(&dir, &["hash-object", "-w", "code.rs"])
+            .output()
+            .unwrap();
+        let evil = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+        assert!(fixture_git(&dir, &["replace", &good, &evil])
+            .status()
+            .unwrap()
+            .success());
+        let d = diff_of(&dir, &base, 1 << 20);
+        assert!(
+            d.patch.contains("-fn good() {}") && d.patch.contains("+fn evil() {}"),
+            "{}",
+            d.patch
+        );
+        assert!(!d.patch.contains("Binary files"), "{}", d.patch);
+        assert!(
+            d.files
+                .iter()
+                .any(|f| f.1 == "sub/.gitignore" && f.0 == "A"),
+            "{:?}",
+            d.files
+        );
+    }
+
+    /// A file that changes between the walk and the diff refuses the diff rather than showing bytes
+    /// the pin did not hash.
+    #[test]
+    fn a_file_changed_after_the_walk_refuses_the_diff() {
+        let (_t, dir) = pin_repo();
+        let tree = super::pin_tree(&dir).unwrap().unwrap();
+        std::fs::write(dir.join("run.sh"), "echo bye\n").unwrap();
+        let repo = super::DiffRepo::new(false).unwrap();
+        let e = super::import_pinned(&repo, &tree, false).unwrap_err();
+        assert!(e.is::<super::TreeMoved>(), "{e:#}");
+    }
+
+    #[test]
+    fn a_fast_import_path_cannot_end_its_line() {
+        assert_eq!(super::fast_import_path(b"a b"), b"\"a b\"".to_vec());
+        assert_eq!(
+            super::fast_import_path(b"x\n\"M 100644"),
+            b"\"x\\012\\042M 100644\"".to_vec()
+        );
     }
 }
