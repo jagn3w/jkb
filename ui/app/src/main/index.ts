@@ -12,7 +12,7 @@
 // else — a checkout's `out/`, or a package left in a checkout's `dist/` — it refuses unless
 // `JKB_APP_FROM_CHECKOUT=1` says that is deliberate.
 
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -142,7 +142,15 @@ const execRunner = new ExecRunner({
   isDirectory: (p) => terminalEnvironment.isDirectory(p),
   realpath: (p) => {
     try {
-      return realpathSync(p);
+      return realpathSync.native(p);
+    } catch {
+      return undefined;
+    }
+  },
+  identity: (p) => {
+    try {
+      const st = statSync(p, { bigint: true });
+      return { dev: st.dev.toString(), ino: st.ino.toString() };
     } catch {
       return undefined;
     }
@@ -315,9 +323,9 @@ function registerBridge(): void {
     assertTrusted(event);
     return execRunner.preview(id);
   });
-  ipcMain.handle(BRIDGE_CHANNELS.execRun, (event, id: unknown) => {
+  ipcMain.handle(BRIDGE_CHANNELS.execRun, (event, id: unknown, shown: unknown) => {
     assertTrusted(event);
-    return execRunner.run(event.sender.id, id);
+    return execRunner.run(event.sender.id, id, shown);
   });
 }
 

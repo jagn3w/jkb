@@ -108,6 +108,40 @@ export function parsePinOutput(code: number | null, stdout: string, stderr: stri
   return { kind: "error", message: `jkb exec pin ${code === null ? "did not finish" : `failed (exit ${code})`}${why ? `: ${why}` : ""}` };
 }
 
+/**
+ * What every host run starts through, so the directory it runs in is the one that was pinned, and
+ * not whatever a path names by the time the terminal opens. The container writes under the repos
+ * mount: between the pin and the spawn it can replace the directory, or a component of its path,
+ * with a link anywhere on the host, and a spawn's `cwd` would follow it. So `$1` (the directory) is
+ * entered with `cd -P`, and `$2` — its inode, taken on the host when it was resolved and pinned — must
+ * be the inode of the directory entered, or nothing runs (exit `LAUNCHER_REFUSED`, after one line
+ * starting `LAUNCHER_REFUSAL`). Only then is the program exec'd, so its PID and process group are the
+ * launcher's. A relative program is exec'd relative to that verified directory. The inode is
+ * compared by `ls -di`, which every POSIX `ls` has; main also compares the device before the spawn.
+ */
+export const HOST_LAUNCHER = [
+  'd=$1 want=$2; shift 2',
+  'cd -P -- "$d" 2>/dev/null || { printf \'jkb: refusing to run: cannot enter %s\\n\' "$d" >&2; exit 125; }',
+  'i=$(ls -di .) || { printf \'jkb: refusing to run: cannot read the inode of %s\\n\' "$d" >&2; exit 125; }',
+  'i=${i#"${i%%[! ]*}"}; i=${i%% *}',
+  '[ "$i" = "$want" ] || { printf \'jkb: refusing to run: %s is not the directory that was pinned\\n\' "$d" >&2; exit 125; }',
+  'exec "$@"',
+].join("\n");
+
+/** The launcher's exit status when it refuses, and how its one line starts. */
+export const LAUNCHER_REFUSED = 125;
+export const LAUNCHER_REFUSAL = "jkb: refusing to run:";
+
+/** A directory's identity on the host: device and inode, as decimal strings. */
+export interface DirIdentity {
+  readonly dev: string;
+  readonly ino: string;
+}
+
+function sameIdentity(a: DirIdentity | undefined, b: DirIdentity | undefined): boolean {
+  return a !== undefined && b !== undefined && a.dev === b.dev && a.ino === b.ino;
+}
+
 /** The `exec.refuse` reason a pin refusal becomes: an unpinnable tree is a pin the host cannot reproduce. */
 export function refuseReasonFor(pinReason: string): string {
   return pinReason === "dir_gone" || pinReason === "audit_refused" ? pinReason : "tree_changed";
@@ -127,8 +161,13 @@ export interface ExecRunnerDeps {
   pin(hostDir: string): Promise<PinAnswer>;
   readonly roots: TerminalRoots;
   isDirectory(path: string): boolean;
-  /** `path` with every link and `..` resolved, or `undefined` when it does not exist. */
+  /**
+   * `path` with every link and `..` resolved, or `undefined` when it does not exist — the OS's own
+   * answer (`realpathSync.native`), so its spelling is the one `jkb exec pin` and `pwd -P` give.
+   */
   realpath(path: string): string | undefined;
+  /** What `path` names now, links followed: its device and inode; `undefined` when it does not exist. */
+  identity(path: string): DirIdentity | undefined;
   /** A bare program name, found by run.sh's search (path-keep, then its fixed PATH); or `undefined`. */
   findHostProgram(name: string): string | undefined;
   /** The docker client, as a container terminal finds it, or `undefined`. */
@@ -162,6 +201,10 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 interface Prepared {
   readonly request: ExecView;
   readonly hostDir: string;
+  /** `hostDir`'s identity when it was resolved, which the pin and the launch are held to. */
+  readonly identity: DirIdentity;
+  /** The host program as the operator is shown it: an absolute path (a host run only). */
+  readonly program?: string;
   readonly containerDir?: string;
   readonly spec: TerminalSpec;
   readonly pin: PinAnswer;
@@ -215,6 +258,8 @@ export class ExecRunner {
     if (hostDir === undefined || !this.deps.isDirectory(hostDir)) {
       return stop({ refuse: "dir_gone", error: `${request.dir} is not a directory the host can reach`, request });
     }
+    const identity = this.deps.identity(hostDir);
+    if (identity === undefined) return stop({ refuse: "dir_gone", error: `${hostDir} is gone`, request });
     const reposReal = this.deps.realpath(roots.hostReposReal) ?? roots.hostReposReal;
     if (request.dir_side === "container" && hostDir !== reposReal && !hostDir.startsWith(`${reposReal}/`)) {
       return stop({ refuse: "dir_gone", error: `${request.dir} resolves to ${hostDir}, outside the repos mount the container shares`, request });
@@ -230,12 +275,17 @@ export class ExecRunner {
 
     const [program, ...args] = request.argv;
     let argv: string[];
+    let shown: string | undefined;
     if (request.target === "host") {
-      const file = program!.startsWith("/") ? program! : program!.includes("/") ? join(hostDir, program!) : this.deps.findHostProgram(program!);
+      // A relative program is exec'd by the launcher from the directory it verified; it is SHOWN
+      // joined to that directory. A bare name is found where run.sh looks.
+      const relative = !program!.startsWith("/") && program!.includes("/");
+      const file = program!.startsWith("/") ? program! : relative ? program! : this.deps.findHostProgram(program!);
       if (file === undefined) {
-        return stop({ error: `${escapeArg(program!)} is not found where run.sh looks for programs; ask for it by path`, request, partial: { hostDir } });
+        return stop({ error: `${escapeArg(program!)} is not found where run.sh looks for programs; ask for it by path`, request, partial: { hostDir, identity } });
       }
-      argv = [file, ...args];
+      shown = relative ? join(hostDir, file) : file;
+      argv = ["/bin/sh", "-c", HOST_LAUNCHER, "jkb-exec", hostDir, identity.ino, file, ...args];
     } else {
       argv = [...request.argv];
     }
@@ -246,17 +296,27 @@ export class ExecRunner {
       title: `${id}: ${escapeArg(basename(program!)).slice(0, 120)}`,
       sessionUuid: randomUUID(),
     });
-    if (!spec.ok) return stop({ error: `${id} cannot be run as a terminal: ${spec.error}`, request, partial: { hostDir } });
+    if (!spec.ok) return stop({ error: `${id} cannot be run as a terminal: ${spec.error}`, request, partial: { hostDir, identity } });
 
     const pin = await this.deps.pin(hostDir);
-    const prepared: Prepared = { request, hostDir, ...(containerDir === undefined ? {} : { containerDir }), spec: spec.value, pin };
+    const prepared: Prepared = {
+      request,
+      hostDir,
+      identity,
+      ...(shown === undefined ? {} : { program: shown }),
+      ...(containerDir === undefined ? {} : { containerDir }),
+      spec: spec.value,
+      pin,
+    };
     if (pin.kind === "refused") {
       return stop({ refuse: refuseReasonFor(pin.reason), error: `the pin could not be recomputed (${pin.reason}): ${pin.message}`, request, partial: prepared });
     }
     if (pin.kind === "error") return stop({ error: pin.message, request, partial: prepared });
-    // The pin's own canonical directory must be the one just resolved: a link retargeted in between
-    // would pin one tree and run in another.
-    if (pin.dir !== undefined && pin.dir !== hostDir) {
+    // The pin's own canonical directory must be the one just resolved, and it must still be: a link
+    // retargeted in between would pin one tree and run in another. Compared by identity, not by
+    // spelling, so a case-insensitive file system's spelling is no false "moved".
+    const now = this.deps.identity(hostDir);
+    if (!sameIdentity(now, identity) || (pin.dir !== undefined && !sameIdentity(this.deps.identity(pin.dir), identity))) {
       return stop({ refuse: "tree_changed", error: `the directory moved while it was pinned (${hostDir}, then ${pin.dir})`, request, partial: prepared });
     }
     return { ok: true, value: prepared };
@@ -282,7 +342,7 @@ export class ExecRunner {
               ? { state: "match" }
               : { state: "differs", now: pinNow.pin };
     const problem = !p.ok ? p.stopped.error : pin.state === "differs" ? "the tree changed since the request: Run refuses it (tree_changed)" : undefined;
-    const program = facts.spec?.target === "host" ? facts.spec.argv[0] : undefined;
+    const program = facts.program;
     return {
       ok: true,
       value: {
@@ -303,9 +363,18 @@ export class ExecRunner {
    * per-id gate is taken before the first await (`ActionGate`'s rule), and is never released once
    * `exec.begin` moved the request to running: one run per request from this app, whatever happens.
    */
-  async run(owner: number, rawId: unknown): Promise<TerminalResult<ExecStarted>> {
+  async run(owner: number, rawId: unknown, rawShown: unknown): Promise<TerminalResult<ExecStarted>> {
     const id = execId(rawId);
     if (id === undefined) return { ok: false, error: `not a run request id: ${JSON.stringify(rawId)}` };
+    const shown = rawShown as { hostDir?: unknown; program?: unknown } | null;
+    if (
+      typeof shown !== "object" ||
+      shown === null ||
+      typeof shown.hostDir !== "string" ||
+      (shown.program !== undefined && typeof shown.program !== "string")
+    ) {
+      return { ok: false, error: "Run names what its preview showed: the directory, and the host program for a host run" };
+    }
     if (this.taken.has(id)) return { ok: false, error: `${id} has already been run from this app` };
     this.taken.add(id);
     let begun = false;
@@ -320,6 +389,14 @@ export class ExecRunner {
         return { ok: false, error: p.stopped.error };
       }
       const { request, spec } = p.value;
+      // What runs must be what the operator was shown: a directory or program that resolves
+      // differently now — a link retargeted inside the mount, say — refuses the request.
+      if (p.value.hostDir !== shown.hostDir || p.value.program !== shown.program) {
+        const why = `it now resolves to ${p.value.hostDir}${p.value.program === undefined ? "" : ` running ${escapeArg(p.value.program)}`}, not what the preview showed`;
+        const r = await this.deps.op({ op: "exec.refuse", id, reason: "tree_changed" });
+        if (!r.ok) return { ok: false, error: `${why}; and refusing ${id} failed: ${r.error.message}` };
+        return { ok: false, error: `${id} was refused (tree_changed): ${why}` };
+      }
       const pin = p.value.pin.kind === "pinned" ? p.value.pin.pin : null;
       const started = await this.begin(id, pin);
       if (!started.ok) {
@@ -327,8 +404,9 @@ export class ExecRunner {
         return { ok: false, error: started.error };
       }
       begun = true;
-      this.issue(owner, request, spec);
-      return { ok: true, value: { id, spec, timeoutMs: request.timeout_ms } };
+      this.issue(owner, p.value);
+      const shownArgv = p.value.program === undefined ? [...request.argv] : [p.value.program, ...request.argv.slice(1)];
+      return { ok: true, value: { id, spec, argv: shownArgv, timeoutMs: request.timeout_ms } };
     } finally {
       if (!begun) this.taken.delete(id);
     }
@@ -392,8 +470,10 @@ export class ExecRunner {
   }
 
   /** Issue `spec` to `owner` for one open, and own what follows: the deadline, the timeout, the stream. */
-  private issue(owner: number, request: ExecView, spec: TerminalSpec): void {
+  private issue(owner: number, prepared: Prepared): void {
+    const { request, spec, hostDir, identity } = prepared;
     const id = request.id;
+    let refusedByLauncher: boolean | undefined;
     const t = this.timing;
     let stream: ExecStream | undefined;
     let timedOut = false;
@@ -409,6 +489,15 @@ export class ExecRunner {
     };
     const run: OnceRun = {
       env: { JKB_EXEC_REQUEST: id },
+      // At the spawn, once more: the directory is still the one pinned (the launcher checks again).
+      ...(spec.target === "host"
+        ? {
+            verify: () =>
+              sameIdentity(this.deps.identity(hostDir), identity)
+                ? undefined
+                : `${hostDir} is no longer the directory that was pinned; nothing was run`,
+          }
+        : {}),
       onOpen: (handle: OnceHandle) => {
         clearTimeout(deadline);
         stream = new ExecStream(id, this.runner, this.deps, t, true);
@@ -417,9 +506,14 @@ export class ExecRunner {
           void handle.stop(t.killGraceMs);
         }, Math.min(request.timeout_ms, EXEC_MAX_TIMEOUT_MS));
       },
-      onData: (data) => stream?.push(data),
+      onData: (data) => {
+        refusedByLauncher ??= data.startsWith(LAUNCHER_REFUSAL);
+        stream?.push(data);
+      },
       onExit: ({ exitCode, signal }) => {
-        if (timedOut) end("timed_out", signal ?? exitCode);
+        // The launcher refused (the directory was swapped at the last moment): nothing ran.
+        if (exitCode === LAUNCHER_REFUSED && refusedByLauncher === true) end("interrupted", undefined);
+        else if (timedOut) end("timed_out", signal ?? exitCode);
         else if (signal !== undefined && signal > 0) end("signalled", signal);
         else end("exited", exitCode);
       },

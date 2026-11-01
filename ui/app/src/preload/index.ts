@@ -60,7 +60,7 @@ const bridge: JkbBridge = {
   },
   exec: {
     preview: (id) => ipcRenderer.invoke(BRIDGE_CHANNELS.execPreview, id),
-    run: (id) => ipcRenderer.invoke(BRIDGE_CHANNELS.execRun, id),
+    run: (id, shown) => ipcRenderer.invoke(BRIDGE_CHANNELS.execRun, id, shown),
   },
 };
 

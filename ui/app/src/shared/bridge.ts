@@ -186,7 +186,14 @@ export interface ExecPreview {
 /** What Run started: the terminal the window opens ONCE, in its drawer, with no Restart. */
 export interface ExecStarted {
   readonly id: string;
+  /**
+   * The terminal to open. A host run's argv is main's launcher (`/bin/sh -c <launcher>`), which
+   * enters the pinned directory only if it is still that directory, then execs the program: show
+   * `argv`, not this.
+   */
   readonly spec: TerminalSpec;
+  /** The program and its arguments as they run: the resolved host program, then the request's arguments. */
+  readonly argv: readonly string[];
   readonly timeoutMs: number;
 }
 
@@ -198,8 +205,12 @@ export interface ExecStarted {
 export interface ExecBridge {
   /** What Run would do now. Changes nothing. */
   preview(id: string): Promise<TerminalResult<ExecPreview>>;
-  /** Run request `id`: the spec to open once, or why nothing started (refused, expired, already run). */
-  run(id: string): Promise<TerminalResult<ExecStarted>>;
+  /**
+   * Run request `id`: the spec to open once, or why nothing started (refused, expired, already run).
+   * `shown` is what its preview showed (`hostDir`, and `program` for a host run): if the request now
+   * resolves to anything else, it is refused rather than run somewhere the operator was not shown.
+   */
+  run(id: string, shown: { readonly hostDir: string; readonly program?: string }): Promise<TerminalResult<ExecStarted>>;
 }
 
 /** `window.jkb`: everything the renderer can ask of the main process. */

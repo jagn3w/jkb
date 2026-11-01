@@ -156,7 +156,7 @@ function environment(roots, over = {}) {
 }
 
 /** A runner over a stand-in daemon, the stand-in jkb in `h`, and a real terminal host. */
-function rig({ d = daemon(), h = home(), timing = {}, pid = process.pid, env: appEnv = process.env } = {}) {
+function rig({ d = daemon(), h = home(), timing = {}, pid = process.pid, env: appEnv = process.env, realpath, identity } = {}) {
   const roots = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: path.join(h.h, "repos"), hostReposReal: path.join(h.h, "repos"), hostHome: h.h };
   const env = environment(roots, { env: appEnv });
   const events = [];
@@ -170,11 +170,19 @@ function rig({ d = daemon(), h = home(), timing = {}, pid = process.pid, env: ap
     isDirectory: env.isDirectory,
     realpath: (p) => {
       try {
-        return fs.realpathSync(p);
+        return (realpath ?? fs.realpathSync.native)(p);
       } catch {
         return undefined;
       }
     },
+    identity: identity ?? ((p) => {
+      try {
+        const st = fs.statSync(p, { bigint: true });
+        return { dev: st.dev.toString(), ino: st.ino.toString() };
+      } catch {
+        return undefined;
+      }
+    }),
     findHostProgram: (name) => (name === "sh" ? "/bin/sh" : undefined),
     docker: () => undefined,
     issueOnce: (owner, spec, run) => {
@@ -188,6 +196,16 @@ function rig({ d = daemon(), h = home(), timing = {}, pid = process.pid, env: ap
     log: (m) => log.push(m),
     timing: { retryMs: 10, maxRetryMs: 50, ...timing },
   });
+  // The queue's click: Run with what the preview showed, unless a test names something else.
+  const runAsShown = runner.run.bind(runner);
+  runner.run = async (owner, id, shown) => {
+    if (shown === undefined) {
+      const p = await runner.preview(id);
+      const v = p.ok ? p.value : {};
+      shown = { hostDir: v.hostDir ?? "", ...(v.program === undefined ? {} : { program: v.program }) };
+    }
+    return runAsShown(owner, id, shown);
+  };
   return { d, h, host, runner, issued, events, log };
 }
 
@@ -205,12 +223,14 @@ test("a run issues exactly the stored argv, in its directory, with JKB_EXEC_REQU
   const row = d.add({ dir: h.repo, argv: ["/bin/sh", "-c", 'printf "hi from %s in %s [%s]" "$JKB_EXEC_REQUEST" "$(pwd)" "${GIT_DIR-unset}${GIT_WORK_TREE-}"; exit 3'] });
   const started = await runner.run(1, row.id);
   assert.equal(started.ok, true, started.error);
-  assert.deepEqual(started.value.spec.argv, row.argv, "exactly the stored argv");
+  assert.deepEqual(started.value.argv, row.argv, "exactly the stored argv");
+  const ino = fs.statSync(h.repo, { bigint: true }).ino.toString();
+  assert.deepEqual(started.value.spec.argv, ["/bin/sh", "-c", exec.HOST_LAUNCHER, "jkb-exec", h.repo, ino, ...row.argv], "through the launcher");
   assert.equal(started.value.spec.cwd, h.repo);
   assert.equal(started.value.spec.target, "host");
   assert.equal(started.value.timeoutMs, 900000, "the request's timeout");
   assert.deepEqual(issued, [started.value.spec]);
-  assert.deepEqual(h.pinCalls(), [`--json exec pin --dir ${h.repo}`], "the host jkb recomputed the pin");
+  assert.ok(h.pinCalls().length > 0 && h.pinCalls().every((c) => c === `--json exec pin --dir ${h.repo}`), "the host jkb recomputed the pin");
   assert.equal(d.rows.get(row.id).runner, `code-factory:${process.pid}@${BOOT}`);
 
   const opened = host.open(1, started.value.spec, 80, 24);
@@ -234,10 +254,11 @@ test("a relative program runs from the request's directory; a bare name is found
   const rel = d.add({ dir: h.repo, argv: ["./go.sh", "x"] });
   const a = await runner.run(1, rel.id);
   assert.equal(a.ok, true, a.error);
-  assert.deepEqual(a.value.spec.argv, [path.join(h.repo, "./go.sh"), "x"]);
+  assert.deepEqual(a.value.argv, [path.join(h.repo, "go.sh"), "x"], "shown joined to the directory");
+  assert.deepEqual(a.value.spec.argv.slice(-2), ["./go.sh", "x"], "exec'd from the verified directory");
   const bare = d.add({ dir: h.repo, argv: ["sh", "-c", "true"] });
   const b = await runner.run(1, bare.id);
-  assert.deepEqual(b.value.spec.argv, ["/bin/sh", "-c", "true"]);
+  assert.deepEqual(b.value.argv, ["/bin/sh", "-c", "true"]);
   const missing = d.add({ dir: h.repo, argv: ["nosuchprogram"] });
   const c = await runner.run(1, missing.id);
   assert.equal(c.ok, false);
@@ -248,7 +269,9 @@ test("a relative program runs from the request's directory; a bare name is found
 test("a second run of one request is refused while the first is live, and after it ends", async () => {
   const { d, h, host, runner, issued } = rig();
   const row = d.add({ dir: h.repo, argv: ["/bin/sh", "-c", "sleep 0.3"] });
-  const [first, second] = await Promise.all([runner.run(1, row.id), runner.run(2, row.id)]);
+  const { hostDir, program } = (await runner.preview(row.id)).value;
+  const shown = { hostDir, program };
+  const [first, second] = await Promise.all([runner.run(1, row.id, shown), runner.run(2, row.id, shown)]);
   assert.equal(first.ok, true, first.error);
   assert.equal(second.ok, false);
   assert.match(second.error, /already been run/);
@@ -358,8 +381,124 @@ test("a directory reached through a link inside the mount is shown, pinned and s
   const r = await runner.run(1, row.id);
   assert.equal(r.ok, true, r.error);
   assert.equal(r.value.spec.cwd, path.join(h.repo, "real"));
-  assert.deepEqual(r.value.spec.argv, [path.join(h.repo, "real", "go.sh")]);
+  assert.deepEqual(r.value.argv, [path.join(h.repo, "real", "go.sh")]);
   assert.ok(h.pinCalls().every((c) => c === `--json exec pin --dir ${path.join(h.repo, "real")}`), h.pinCalls().join("; "));
+});
+
+test("a directory swapped for a link after the pin and the begin, before the terminal opens, runs nothing", async () => {
+  const { d, h, host, runner } = rig();
+  const sub = path.join(h.repo, "sub");
+  fs.mkdirSync(sub);
+  const outside = path.join(h.h, "outside");
+  fs.mkdirSync(outside);
+  const ran = path.join(h.h, "ran");
+  fs.writeFileSync(path.join(outside, "go.sh"), `#!/bin/sh\ntouch ${ran}\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(sub, "go.sh"), `#!/bin/sh\ntouch ${ran}\n`, { mode: 0o755 });
+  const row = d.add({ dir: "/home/vscode/repos/r/sub", dir_side: "container", argv: ["./go.sh"], pin: PIN });
+  const r = await runner.run(1, row.id);
+  assert.equal(r.ok, true, r.error);
+  // The container swaps the directory for a link to outside the mount.
+  fs.renameSync(sub, `${sub}.old`);
+  fs.symlinkSync(outside, sub);
+  const opened = host.open(1, r.value.spec, 80, 24);
+  assert.equal(opened.ok, false);
+  assert.match(opened.error, /no longer the directory that was pinned/);
+  await until(() => row.state === "finished", "the finish");
+  assert.equal(row.outcome, "interrupted");
+  assert.equal(fs.existsSync(ran), false, "nothing ran");
+});
+
+test("a swap the spawn-time check misses is caught by the launcher: nothing runs, and the run ends interrupted", async () => {
+  const realIdentity = (p) => {
+    const st = fs.statSync(p, { bigint: true });
+    return { dev: st.dev.toString(), ino: st.ino.toString() };
+  };
+  // An identity read that keeps answering what it first saw: the race in which the swap lands after
+  // main's last look and before the launcher's.
+  const seen = new Map();
+  const identity = (p) => {
+    if (!seen.has(p)) seen.set(p, realIdentity(p));
+    return seen.get(p);
+  };
+  const { d, h, host, runner } = rig({ identity });
+  const sub = path.join(h.repo, "sub");
+  fs.mkdirSync(sub);
+  const ran = path.join(h.h, "ran");
+  fs.writeFileSync(path.join(sub, "go.sh"), `#!/bin/sh\ntouch ${ran}\n`, { mode: 0o755 });
+  const row = d.add({ dir: "/home/vscode/repos/r/sub", dir_side: "container", argv: ["./go.sh"] });
+  const r = await runner.run(1, row.id);
+  assert.equal(r.ok, true, r.error);
+  fs.renameSync(sub, `${sub}.old`);
+  fs.mkdirSync(sub);
+  fs.writeFileSync(path.join(sub, "go.sh"), `#!/bin/sh\ntouch ${ran}\n`, { mode: 0o755 });
+  assert.equal(host.open(1, r.value.spec, 80, 24).ok, true, "main's own check was fooled");
+  await until(() => row.state === "finished", "the finish");
+  assert.equal(row.outcome, "interrupted");
+  assert.match(d.outputs(row.id), /jkb: refusing to run: .* is not the directory that was pinned/);
+  assert.equal(fs.existsSync(ran), false, "nothing ran");
+});
+
+test("the launcher itself refuses a directory that is not the pinned one, and execs nothing", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const h = home();
+  const ran = path.join(h.h, "ran");
+  const ino = fs.statSync(h.repo, { bigint: true }).ino.toString();
+  const run = (dir, want) => {
+    try {
+      return { code: 0, out: execFileSync("/bin/sh", ["-c", exec.HOST_LAUNCHER, "jkb-exec", dir, want, "/bin/sh", "-c", `pwd -P; touch ${ran}`], { encoding: "utf8", stdio: "pipe" }) };
+    } catch (e) {
+      return { code: e.status, out: `${e.stdout}${e.stderr}` };
+    }
+  };
+  const ok = run(h.repo, ino);
+  assert.equal(ok.code, 0, ok.out);
+  assert.equal(ok.out.trim(), h.repo, "it runs in the verified directory");
+  fs.rmSync(ran);
+  const link = path.join(h.h, "link");
+  fs.symlinkSync(h.h, link);
+  for (const [dir, want] of [[link, ino], [h.h, ino], [path.join(h.h, "gone"), ino]]) {
+    const r = run(dir, want);
+    assert.equal(r.code, exec.LAUNCHER_REFUSED, `${dir}: ${r.out}`);
+    assert.ok(r.out.startsWith(exec.LAUNCHER_REFUSAL), r.out);
+    assert.equal(fs.existsSync(ran), false, `${dir}: nothing ran`);
+  }
+});
+
+test("a run whose directory resolves differently than its preview showed is refused", async () => {
+  const { d, h, runner, issued } = rig();
+  fs.mkdirSync(path.join(h.repo, "one"));
+  fs.mkdirSync(path.join(h.repo, "two"));
+  fs.symlinkSync(path.join(h.repo, "one"), path.join(h.repo, "alias"));
+  const row = d.add({ dir: "/home/vscode/repos/r/alias", dir_side: "container", argv: ["/bin/true"] });
+  const preview = await runner.preview(row.id);
+  assert.equal(preview.value.hostDir, path.join(h.repo, "one"));
+  fs.rmSync(path.join(h.repo, "alias"));
+  fs.symlinkSync(path.join(h.repo, "two"), path.join(h.repo, "alias"));
+  const r = await runner.run(1, row.id, { hostDir: preview.value.hostDir, program: preview.value.program });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /not what the preview showed/);
+  assert.equal(row.refuse_reason, "tree_changed");
+  assert.deepEqual(issued, []);
+  const unnamed = d.add({ dir: h.repo, argv: ["/bin/true"] });
+  const bare = await runner.run(1, unnamed.id, null);
+  assert.match(bare.error, /names what its preview showed/);
+  assert.equal(unnamed.state, "pending");
+});
+
+test("the pin's directory is compared by identity, not spelling: another spelling of the same directory is no move", async () => {
+  // A case-insensitive file system's realpath and the pin can spell one directory two ways; stand
+  // that in with a link to it, the same directory by identity.
+  const h = home();
+  const spelled = path.join(h.h, "repos", "R-other-spelling");
+  fs.symlinkSync(h.repo, spelled);
+  const answer = { dir: h.repo, pin: PIN };
+  fs.writeFileSync(path.join(h.h, ".cargo", "bin", "jkb"), `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(answer)}'\n`, { mode: 0o755 });
+  const { d, runner } = rig({ h, realpath: (p) => (p === h.repo ? spelled : fs.realpathSync.native(p)) });
+  const row = d.add({ dir: h.repo, argv: ["/bin/true"] });
+  const preview = await runner.preview(row.id);
+  assert.equal(preview.value.hostDir, spelled);
+  assert.equal(preview.value.pin.state, "match", preview.value.problem);
+  assert.equal(preview.value.problem, undefined);
 });
 
 test("a pin of another directory than the one resolved refuses the request tree_changed", async () => {

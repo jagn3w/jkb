@@ -419,6 +419,11 @@ export interface OnceRun {
    * repository selection, `GIT_SELECTION`), or `docker exec -e` for a container program.
    */
   readonly env: Readonly<Record<string, string>>;
+  /**
+   * Asked just before the spawn: why it must not start now (its directory is no longer the one that
+   * was pinned, say), or `undefined`. A refusal is `onFail`, and nothing is spawned.
+   */
+  verify?(): string | undefined;
   /** The terminal started. */
   onOpen(handle: OnceHandle): void;
   /** Output, as it is sent to the window: gathered for `FLUSH_MS`, in order. */
@@ -579,6 +584,8 @@ export class TerminalHost {
       once?.onFail(error);
       return { ok: false, error };
     };
+    const unverified = once?.verify?.();
+    if (unverified !== undefined) return failed(unverified);
     const command = commandFor(spec, this.environment, this.newTag(), spec.target === "container" ? once?.env : undefined);
     if (!command.ok) return failed(command.error);
 
