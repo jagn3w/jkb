@@ -307,13 +307,73 @@ pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
     }
 }
 
+/// Why `jkb exec pin` could not pin a directory, classified for a runner that must answer the
+/// request ([`pin_refusal`]). Each maps onto how Code Factory's runner treats the request: the first
+/// two are `exec.refuse` reasons of the same names, and an unpinnable tree is a pin the host cannot
+/// reproduce, which refuses the request too (`tree_changed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRefusal {
+    /// The directory cannot be resolved: it is gone.
+    DirGone,
+    /// The hooks-off git audit refused the repository's own config.
+    AuditRefused,
+    /// The repository's tree cannot be pinned (`gitrepo::pin_tree`'s "not pinnable", a repository
+    /// with no commit, an unreadable path, git failing).
+    Unpinnable,
+}
+
+impl PinRefusal {
+    /// The wire name, in `jkb exec pin --json`'s `refused.reason`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirGone => "dir_gone",
+            Self::AuditRefused => "audit_refused",
+            Self::Unpinnable => "unpinnable",
+        }
+    }
+}
+
+/// `dir` resolved, audited, and pinned — or which [`PinRefusal`] stopped it and why. The audit is
+/// asked on its own first, though every git call [`crate::gitrepo::pin_tree`] makes asks it again,
+/// so that its refusal is told apart from a tree that cannot be pinned: a runner refuses the request
+/// for each with its own reason.
+fn pin_refusal(
+    dir: &Path,
+) -> Result<(PathBuf, Option<crate::gitrepo::PinnedTree>), (PinRefusal, anyhow::Error)> {
+    let dir = std::fs::canonicalize(dir)
+        .with_context(|| format!("resolving {}", dir.display()))
+        .map_err(|e| (PinRefusal::DirGone, e))?;
+    crate::gitrepo::audit_repo_config(&dir).map_err(|e| (PinRefusal::AuditRefused, e))?;
+    let tree = crate::gitrepo::pin_tree(&dir).map_err(|e| (PinRefusal::Unpinnable, e))?;
+    Ok((dir, tree))
+}
+
 /// `jkb exec pin`: run before any database or daemon is reached.
+///
+/// With `--json`, a directory that cannot be pinned still prints one object on stdout —
+/// `{"dir": …, "refused": {"reason": "dir_gone"|"audit_refused"|"unpinnable", "message": …}}` —
+/// before the command fails, so a runner reads why from the output rather than from the wording of
+/// an error ([`PinRefusal`]).
 ///
 /// # Errors
 /// An unreadable directory, or a pin that cannot be computed.
 pub fn pin(dir: &Path, against: Option<&Path>, json: bool) -> Result<()> {
-    let dir = std::fs::canonicalize(dir).with_context(|| format!("resolving {}", dir.display()))?;
-    let tree = crate::gitrepo::pin_tree(&dir)?;
+    let (dir, tree) = match pin_refusal(dir) {
+        Ok(v) => v,
+        Err((reason, e)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "dir": dir,
+                        "refused": { "reason": reason.as_str(), "message": format!("{e:#}") },
+                    })
+                );
+            }
+            return Err(e);
+        }
+    };
     // The `.gitignore` files that decided what the pin leaves out — the set the host holds to main's.
     let ignores: Vec<String> = tree
         .as_ref()

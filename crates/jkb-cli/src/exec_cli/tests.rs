@@ -378,3 +378,127 @@ fn a_settled_interrupt_stands_at_the_deadline() {
     view.created_at = jkb_core::mq::now_ms() - exec::LATEST_END_MS - 60_000 + 300;
     assert_eq!(waited(&db, &view).0, super::EXIT_TIMED_OUT);
 }
+
+/// A git command for a fixture repository, isolated from the developer's own git.
+fn fixture_git(at: &Path, args: &[&str]) {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(at).args(args);
+    crate::gitrepo::fixture_env::isolate_git_env(&mut cmd);
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// `jkb exec pin --json` tells a runner WHY a directory cannot be pinned, because the runner answers
+/// each with a different refusal: a directory that is gone, a repository whose config the hooks-off
+/// audit refuses, and a tree that cannot be pinned are three answers, not one error string.
+#[test]
+fn a_pin_refusal_names_its_reason() {
+    use super::{pin_refusal, PinRefusal};
+    let t = tempfile::tempdir().unwrap();
+
+    let gone = t.path().join("gone");
+    assert_eq!(pin_refusal(&gone).unwrap_err().0, PinRefusal::DirGone);
+
+    let plain = t.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let (_, tree) = pin_refusal(&plain).expect("a directory in no repository is pinned as none");
+    assert!(tree.is_none());
+
+    let empty = t.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    fixture_git(&empty, &["init", "-q", "-b", "main"]);
+    let (reason, e) = pin_refusal(&empty).unwrap_err();
+    assert_eq!(reason, PinRefusal::Unpinnable, "{e:#}");
+
+    let repo = t.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    fixture_git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "a").unwrap();
+    fixture_git(&repo, &["add", "-A"]);
+    fixture_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "a",
+        ],
+    );
+    let (_, tree) = pin_refusal(&repo).expect("a clean repository pins");
+    assert!(tree.is_some());
+
+    fixture_git(&repo, &["config", "filter.x.clean", "touch /tmp/x"]);
+    let (reason, e) = pin_refusal(&repo).unwrap_err();
+    assert_eq!(reason, PinRefusal::AuditRefused, "{e:#}");
+    assert!(format!("{e:#}").contains("filter.x.clean"), "{e:#}");
+}
+
+/// Standard base64 with padding, as Code Factory's frame codec writes it (`@jkb/core`'s
+/// `bytesToBase64`); this crate has no base64 dependency of its own.
+fn standard_base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            out.push(if i <= c.len() {
+                char::from(A[((n >> shift) & 63) as usize])
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
+
+/// The runner's side over the wire: Code Factory begins, publishes and finishes through the
+/// `exec.*` ops (base64 frames, cut wherever the chunk limit falls — inside a UTF-8 sequence here),
+/// and the waiter prints exactly the bytes it was sent and exits with the run's status.
+#[test]
+fn frames_published_through_the_ops_reach_the_waiter_byte_for_byte() {
+    let db = Db::open_in_memory().unwrap();
+    let (_, view) = requested(&db, "make");
+    let b = LocalBackend::new(db.clone());
+    let b64 = |bytes: &[u8]| standard_base64(bytes);
+    match b
+        .call(Request::ExecBegin {
+            id: view.id.clone(),
+            recomputed_pin: None,
+            runner: "code-factory:1@boot".into(),
+        })
+        .unwrap()
+    {
+        Response::ExecBegun { begun, .. } => assert_eq!(begun, "running"),
+        other => panic!("{other:?}"),
+    }
+    let text = "build ✓ done\n".as_bytes();
+    // "✓" is three bytes; cut after its first.
+    let cut = text.iter().position(|&c| c == 0xE2).unwrap() + 1;
+    for chunk in [&text[..cut], &text[cut..]] {
+        b.call(Request::ExecOutput {
+            id: view.id.clone(),
+            runner: "code-factory:1@boot".into(),
+            chunk_b64: b64(chunk),
+        })
+        .unwrap();
+    }
+    b.call(Request::ExecFinish {
+        id: view.id.clone(),
+        runner: "code-factory:1@boot".into(),
+        outcome: "signalled".into(),
+        exit_status: Some(15),
+        tail_b64: b64(text),
+        total_bytes: i64::try_from(text.len()).unwrap(),
+        log_path: Some("/logs/exec-1.log".into()),
+    })
+    .unwrap();
+    let (code, out, err) = waited(&db, &view);
+    assert_eq!(code, 128 + 15, "{err}");
+    assert_eq!(out.as_bytes(), text);
+    assert!(err.contains("/logs/exec-1.log"), "{err}");
+}
