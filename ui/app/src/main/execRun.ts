@@ -85,6 +85,17 @@ export const BASE_TIMEOUT_MS = 30_000;
 /** The most patch `jkb exec diff` prints for the queue (`jkb_cli::exec_cli::DIFF_MAX_BYTES`). */
 export const DIFF_MAX_BYTES = 2 * 1024 * 1024;
 
+/** Why Run waits when no diff could be shown for a request in a repository. */
+export function noDiffProblem(diff: DiffAnswer | undefined): string {
+  const why =
+    diff === undefined
+      ? "this app cannot compute a diff"
+      : diff.state === "error" || diff.state === "refused"
+        ? diff.message
+        : "the directory is no longer in a repository";
+  return `No diff could be shown, so Run waits until one can: ${why}`;
+}
+
 /** What `jkb exec pin --json` answered. */
 export type PinAnswer =
   | { readonly kind: "pinned"; readonly pin: ExecPin | null; readonly dir?: string }
@@ -390,7 +401,12 @@ export class ExecRunner {
     if ((extra.diff?.state === "refused" && extra.diff.reason === "tree_changed") || pin2.kind === "refused") {
       verdict = { state: "changed", message: TREE_CHANGED };
     }
-    const problem = v.problem ?? (verdict.state === "changed" ? verdict.message : undefined);
+    // A request in a repository is run only after its diff was shown: a preview that could not
+    // produce one (the base's objects missing, the diff failing) blocks Run as a moved tree does —
+    // a `problem`, which the queue cannot click past (operator, 2026-11-01). An unverified base
+    // that still produced a diff against the HEAD label does not block; it is warned about.
+    const noDiff = v.request.pin !== undefined && extra.diff?.state !== "shown" ? noDiffProblem(extra.diff) : undefined;
+    const problem = v.problem ?? (verdict.state === "changed" ? verdict.message : noDiff);
     return {
       ok: true,
       value: { ...v, ...extra, verdict, ...(problem === undefined ? {} : { problem }) },

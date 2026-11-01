@@ -541,7 +541,7 @@ test("the pin's directory is compared by identity, not spelling: another spellin
   fs.symlinkSync(h.repo, spelled);
   const answer = { dir: h.repo, pin: PIN };
   fs.writeFileSync(path.join(h.h, ".cargo", "bin", "jkb"), `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify(answer)}'\n`, { mode: 0o755 });
-  const { d, runner } = rig({ h, realpath: (p) => (p === h.repo ? spelled : fs.realpathSync.native(p)) });
+  const { d, runner } = rig({ h, realpath: (p) => (p === h.repo ? spelled : fs.realpathSync.native(p)), deps: { diff: async (dir) => shownDiff(PIN, dir) } });
   const row = d.add({ dir: h.repo, argv: ["/bin/true"] });
   const preview = await runner.preview(row.id);
   assert.equal(preview.value.hostDir, spelled);
@@ -938,4 +938,24 @@ test("machineDiff asks the host jkb for the diff with the cap Rust sets, offerin
   const b = await exec.machineBase(h.h, update.machineRunner(h.h, process.env), path.join(h.h, "no-clone"))(h.repo);
   assert.equal(b.state, "unverified", "a diff object is no base");
   assert.equal(h.pinCalls()[1], `--json exec base --dir ${h.repo}`, "no --clone when there is none");
+});
+
+test("a request in a repository whose diff could not be produced cannot be run; an unverified base with a diff can", async () => {
+  for (const diff of [
+    async () => ({ state: "error", message: "the base eee is not in /r: fetch it on the host" }),
+    async () => ({ state: "refused", reason: "unpinnable", message: "a nested repository" }),
+    undefined,
+  ]) {
+    const r = rig({ h: home(), deps: { base: verified, ...(diff === undefined ? {} : { diff }) } });
+    const row = r.d.add({ dir: r.h.repo, argv: ["/bin/true"] });
+    const p = await r.runner.preview(row.id);
+    assert.equal(p.ok, true);
+    assert.match(p.value.problem, /No diff could be shown/);
+    assert.ok(queue.runBlocked(p.value), "Run is disabled by main's verdict");
+  }
+  const r = rig({ h: home(), deps: { base: async () => ({ state: "unverified", message: "offline" }), diff: async (dir) => shownDiff(PIN, dir) } });
+  const row = r.d.add({ dir: r.h.repo, argv: ["/bin/true"] });
+  const p = await r.runner.preview(row.id);
+  assert.equal(p.value.problem, undefined);
+  assert.equal(queue.runBlocked(p.value), undefined);
 });
