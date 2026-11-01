@@ -225,7 +225,9 @@ test("a run issues exactly the stored argv, in its directory, with JKB_EXEC_REQU
   assert.equal(started.ok, true, started.error);
   assert.deepEqual(started.value.argv, row.argv, "exactly the stored argv");
   const ino = fs.statSync(h.repo, { bigint: true }).ino.toString();
-  assert.deepEqual(started.value.spec.argv, ["/bin/sh", "-c", exec.HOST_LAUNCHER, "jkb-exec", h.repo, ino, ...row.argv], "through the launcher");
+  const nonce = started.value.spec.argv[6];
+  assert.match(nonce, /^[0-9a-f-]{36}$/, "a fresh nonce per run");
+  assert.deepEqual(started.value.spec.argv, ["/bin/sh", "-c", exec.HOST_LAUNCHER, "jkb-exec", h.repo, ino, nonce, ...row.argv], "through the launcher");
   assert.equal(started.value.spec.cwd, h.repo);
   assert.equal(started.value.spec.target, "host");
   assert.equal(started.value.timeoutMs, 900000, "the request's timeout");
@@ -255,7 +257,7 @@ test("a relative program runs from the request's directory; a bare name is found
   const a = await runner.run(1, rel.id);
   assert.equal(a.ok, true, a.error);
   assert.deepEqual(a.value.argv, [path.join(h.repo, "go.sh"), "x"], "shown joined to the directory");
-  assert.deepEqual(a.value.spec.argv.slice(-2), ["./go.sh", "x"], "exec'd from the verified directory");
+  assert.deepEqual(a.value.spec.argv.slice(-2), ["././go.sh", "x"], "exec'd from the verified directory");
   const bare = d.add({ dir: h.repo, argv: ["sh", "-c", "true"] });
   const b = await runner.run(1, bare.id);
   assert.deepEqual(b.value.argv, ["/bin/sh", "-c", "true"]);
@@ -434,7 +436,7 @@ test("a swap the spawn-time check misses is caught by the launcher: nothing runs
   assert.equal(host.open(1, r.value.spec, 80, 24).ok, true, "main's own check was fooled");
   await until(() => row.state === "finished", "the finish");
   assert.equal(row.outcome, "interrupted");
-  assert.match(d.outputs(row.id), /jkb: refusing to run: .* is not the directory that was pinned/);
+  assert.match(d.outputs(row.id), /jkb: refusing to run \[[0-9a-f-]{36}\]: .* is not the directory that was pinned/);
   assert.equal(fs.existsSync(ran), false, "nothing ran");
 });
 
@@ -443,9 +445,10 @@ test("the launcher itself refuses a directory that is not the pinned one, and ex
   const h = home();
   const ran = path.join(h.h, "ran");
   const ino = fs.statSync(h.repo, { bigint: true }).ino.toString();
-  const run = (dir, want) => {
+  const nonce = "n0nce";
+  const run = (dir, want, env = process.env) => {
     try {
-      return { code: 0, out: execFileSync("/bin/sh", ["-c", exec.HOST_LAUNCHER, "jkb-exec", dir, want, "/bin/sh", "-c", `pwd -P; touch ${ran}`], { encoding: "utf8", stdio: "pipe" }) };
+      return { code: 0, out: execFileSync("/bin/sh", ["-c", exec.HOST_LAUNCHER, "jkb-exec", dir, want, nonce, "/bin/sh", "-c", `pwd -P; touch ${ran}`], { encoding: "utf8", stdio: "pipe", env }) };
     } catch (e) {
       return { code: e.status, out: `${e.stdout}${e.stderr}` };
     }
@@ -459,8 +462,50 @@ test("the launcher itself refuses a directory that is not the pinned one, and ex
   for (const [dir, want] of [[link, ino], [h.h, ino], [path.join(h.h, "gone"), ino]]) {
     const r = run(dir, want);
     assert.equal(r.code, exec.LAUNCHER_REFUSED, `${dir}: ${r.out}`);
-    assert.ok(r.out.startsWith(exec.LAUNCHER_REFUSAL), r.out);
+    assert.ok(r.out.startsWith(exec.launcherRefusal(nonce)), r.out);
     assert.equal(fs.existsSync(ran), false, `${dir}: nothing ran`);
+  }
+  // An `ls` first on the PATH that answers the pinned inode for any directory changes nothing: the
+  // launcher runs /bin/ls.
+  const fake = path.join(h.h, "fakebin");
+  fs.mkdirSync(fake);
+  fs.writeFileSync(path.join(fake, "ls"), `#!/bin/sh\necho "${ino} ."\n`, { mode: 0o755 });
+  const fooled = run(h.h, ino, { ...process.env, PATH: `${fake}:${process.env.PATH}` });
+  assert.equal(fooled.code, exec.LAUNCHER_REFUSED, fooled.out);
+  assert.equal(fs.existsSync(ran), false, "a planted ls did not let it run");
+});
+
+test("a relative program that starts with - is the program, not an option of exec", async () => {
+  // macOS's /bin/sh (bash 3.2) read `exec -a/x make` as `exec -a /x make` and ran `make` from PATH.
+  const fake = path.join(work, `fakemake-${homes}`);
+  fs.mkdirSync(fake);
+  const wrong = path.join(fake, "wrong-ran");
+  fs.writeFileSync(path.join(fake, "make"), `#!/bin/sh\ntouch ${wrong}\n`, { mode: 0o755 });
+  const { d, h, host, runner } = rig({ env: { ...process.env, PATH: `${fake}:${process.env.PATH}` } });
+  fs.mkdirSync(path.join(h.repo, "-a"));
+  fs.writeFileSync(path.join(h.repo, "-a", "x"), '#!/bin/sh\nprintf "ran x with [%s]" "$1"\n', { mode: 0o755 });
+  const row = d.add({ dir: h.repo, argv: ["-a/x", "make"] });
+  const r = await runner.run(1, row.id);
+  assert.equal(r.ok, true, r.error);
+  assert.deepEqual(r.value.argv, [path.join(h.repo, "-a", "x"), "make"]);
+  assert.equal(host.open(1, r.value.spec, 80, 24).ok, true);
+  await until(() => row.state === "finished", "the finish");
+  assert.equal(d.outputs(row.id), "ran x with [make]");
+  assert.equal(fs.existsSync(wrong), false, "make was an argument, never a program");
+  for (const p of ["-a/x", "./x", "x/y"]) assert.ok(!exec.launchProgram(p).startsWith("-"), p);
+  assert.equal(exec.launchProgram("/abs/x"), "/abs/x");
+});
+
+test("only the launcher's own refusal, with this run's nonce, counts as nothing run", async () => {
+  const { d, h, host, runner } = rig();
+  for (const line of ["jkb: refusing to run: fake", "jkb: refusing to run [guess]: fake"]) {
+    const row = d.add({ dir: h.repo, argv: ["/bin/sh", "-c", `printf '%s\\n' '${line}'; exit 125`] });
+    const r = await runner.run(1, row.id);
+    assert.equal(r.ok, true, r.error);
+    assert.equal(host.open(1, r.value.spec, 80, 24).ok, true);
+    await until(() => row.state === "finished", "the finish");
+    assert.equal(row.outcome, "exited", line);
+    assert.equal(row.exit_status, 125, line);
   }
 });
 

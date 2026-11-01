@@ -114,23 +114,42 @@ export function parsePinOutput(code: number | null, stdout: string, stderr: stri
  * mount: between the pin and the spawn it can replace the directory, or a component of its path,
  * with a link anywhere on the host, and a spawn's `cwd` would follow it. So `$1` (the directory) is
  * entered with `cd -P`, and `$2` — its inode, taken on the host when it was resolved and pinned — must
- * be the inode of the directory entered, or nothing runs (exit `LAUNCHER_REFUSED`, after one line
- * starting `LAUNCHER_REFUSAL`). Only then is the program exec'd, so its PID and process group are the
- * launcher's. A relative program is exec'd relative to that verified directory. The inode is
- * compared by `ls -di`, which every POSIX `ls` has; main also compares the device before the spawn.
+ * be the inode of the directory entered, or nothing runs: one line, `launcherRefusal($3)`, and exit
+ * `LAUNCHER_REFUSED`. `$3` is a nonce main makes per run, so a program's own output cannot pass for
+ * the launcher's refusal. Only then is the program exec'd, so its PID and process group are the
+ * launcher's.
+ *
+ * The program it is handed never starts with `-` (`launchProgram`): `exec` in macOS's `/bin/sh`
+ * (bash 3.2) reads `-a NAME` as an option and runs the word after it from PATH instead. Every tool
+ * it runs is named absolutely (`/bin/ls`, as RUN_SH_PATH's rule wants: never the app's PATH);
+ * everything else is a builtin. The inode is read with `ls -di`, which every POSIX `ls` has; main
+ * also compares the device before the spawn.
  */
 export const HOST_LAUNCHER = [
-  'd=$1 want=$2; shift 2',
-  'cd -P -- "$d" 2>/dev/null || { printf \'jkb: refusing to run: cannot enter %s\\n\' "$d" >&2; exit 125; }',
-  'i=$(ls -di .) || { printf \'jkb: refusing to run: cannot read the inode of %s\\n\' "$d" >&2; exit 125; }',
+  'd=$1 want=$2 nonce=$3; shift 3',
+  'refuse() { printf \'jkb: refusing to run [%s]: %s\\n\' "$nonce" "$1" >&2; exit 125; }',
+  'cd -P -- "$d" 2>/dev/null || refuse "cannot enter $d"',
+  'i=$(/bin/ls -di .) || refuse "cannot read the inode of $d"',
   'i=${i#"${i%%[! ]*}"}; i=${i%% *}',
-  '[ "$i" = "$want" ] || { printf \'jkb: refusing to run: %s is not the directory that was pinned\\n\' "$d" >&2; exit 125; }',
+  '[ "$i" = "$want" ] || refuse "$d is not the directory that was pinned"',
   'exec "$@"',
 ].join("\n");
 
-/** The launcher's exit status when it refuses, and how its one line starts. */
+/** The launcher's exit status when it refuses. */
 export const LAUNCHER_REFUSED = 125;
-export const LAUNCHER_REFUSAL = "jkb: refusing to run:";
+
+/** How the launcher's refusal line starts, for the run's nonce. */
+export function launcherRefusal(nonce: string): string {
+  return `jkb: refusing to run [${nonce}]:`;
+}
+
+/**
+ * The program as the launcher execs it: an absolute path as it is; a relative one as `./<path>`, so
+ * it is found from the directory the launcher verified and never starts with `-`.
+ */
+export function launchProgram(file: string): string {
+  return file.startsWith("/") ? file : `./${file}`;
+}
 
 /** A directory's identity on the host: device and inode, as decimal strings. */
 export interface DirIdentity {
@@ -205,6 +224,8 @@ interface Prepared {
   readonly identity: DirIdentity;
   /** The host program as the operator is shown it: an absolute path (a host run only). */
   readonly program?: string;
+  /** The launcher's refusal nonce for this run (a host run only). */
+  readonly nonce?: string;
   readonly containerDir?: string;
   readonly spec: TerminalSpec;
   readonly pin: PinAnswer;
@@ -276,6 +297,7 @@ export class ExecRunner {
     const [program, ...args] = request.argv;
     let argv: string[];
     let shown: string | undefined;
+    let nonce: string | undefined;
     if (request.target === "host") {
       // A relative program is exec'd by the launcher from the directory it verified; it is SHOWN
       // joined to that directory. A bare name is found where run.sh looks.
@@ -285,7 +307,8 @@ export class ExecRunner {
         return stop({ error: `${escapeArg(program!)} is not found where run.sh looks for programs; ask for it by path`, request, partial: { hostDir, identity } });
       }
       shown = relative ? join(hostDir, file) : file;
-      argv = ["/bin/sh", "-c", HOST_LAUNCHER, "jkb-exec", hostDir, identity.ino, file, ...args];
+      nonce = randomUUID();
+      argv = ["/bin/sh", "-c", HOST_LAUNCHER, "jkb-exec", hostDir, identity.ino, nonce, launchProgram(file), ...args];
     } else {
       argv = [...request.argv];
     }
@@ -304,6 +327,7 @@ export class ExecRunner {
       hostDir,
       identity,
       ...(shown === undefined ? {} : { program: shown }),
+      ...(nonce === undefined ? {} : { nonce }),
       ...(containerDir === undefined ? {} : { containerDir }),
       spec: spec.value,
       pin,
@@ -471,7 +495,7 @@ export class ExecRunner {
 
   /** Issue `spec` to `owner` for one open, and own what follows: the deadline, the timeout, the stream. */
   private issue(owner: number, prepared: Prepared): void {
-    const { request, spec, hostDir, identity } = prepared;
+    const { request, spec, hostDir, identity, nonce } = prepared;
     const id = request.id;
     let refusedByLauncher: boolean | undefined;
     const t = this.timing;
@@ -507,7 +531,7 @@ export class ExecRunner {
         }, Math.min(request.timeout_ms, EXEC_MAX_TIMEOUT_MS));
       },
       onData: (data) => {
-        refusedByLauncher ??= data.startsWith(LAUNCHER_REFUSAL);
+        refusedByLauncher ??= nonce !== undefined && data.startsWith(launcherRefusal(nonce));
         stream?.push(data);
       },
       onExit: ({ exitCode, signal }) => {
