@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 82a263ad4905d2abb64365a2410261d820e67f4b988a1fb9c8665344fbf0cf37) -->
+<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 d91be9db91c1c7c39d301657c881eef88d1bcf16c84ed5623c06fb0ec5483ac1) -->
 # Agents and roles
 
 jkb is driven by agents as much as by people: a task swarm that schedules, implements, reviews
@@ -86,7 +86,7 @@ refuses a missing or a stray one.
 
 ### The swarm is a coordinator loop; the merge queue stays a script and names its outcome
 
-The swarm coordinator (`swarm-coordinator`, started by `/jkb-task-swarm`) reads the ready frontier,
+The swarm coordinator (`swarm-coordinator`, started by `/jkb-task-swarm`) reads the ready frontier by workflow phase (see "The design gate"),
 groups overlapping tasks, and per group starts a `jkb-implementer` (in a worktree) and then a fresh
 `jkb-reviewer`, sending request-changes and ejects back to the same implementer with SendMessage. When review flags
 the same area twice, the task moves to `systemic_review` and the coordinator starts a
@@ -135,8 +135,7 @@ between the coordinator's commands and a reviewer handed an empty contract would
 Pre-existing findings are reported, not filed as review findings; the coordinator, which holds
 task-write, files them with `jkb task add --backlog`, and `task review file` refuses one (the rule is
 in the callee, not only in the coordinator's prompt). A finding's `scope` is a closed set
-(`introduced`, `aggravated`, `pre-existing`; absent reads as introduced), so an unknown spelling is
-refused rather than filed as the change's own; merged duplicates keep the scope that holds the change
+(`introduced`, `aggravated`, `pre-existing`; absent reads as introduced), so an unknown spelling is refused rather than filed as the change's own; every finding is tagged `finding=review` as it is filed, so a frontier read leaves findings out with `-tag:finding=review`; merged duplicates keep the scope that holds the change
 responsible. A reviewer files with `jkb task review
 file --from -` and records with `jkb task review record`; an attested reviewer files only once bound
 to the task it reviews, so the coordinator finds the task working the branch and the reviewer runs
@@ -546,22 +545,21 @@ The ordering is the decision, not a step: the CLI surface first, the hook last. 
 denies raw SQL before the CLI can serve a need hard-blocks agents, so the hook was the final
 task of the fleet work, gated on the read and mutate surface being complete.
 
-## The design gate
+### The swarm reads its frontier by workflow phase
 
-Swarm implementers run headless, as Workflow sub-agents, and cannot ask the user about a design
-that has not been decided. So design is separated from implementation. Under a swarm, the coordinator starts a headless
-`jkb-designer` for each task in phase `design`, including a group paused by a `systemic_redesign`; it writes the design into the task, lists its open
-questions there and fires `submit_design`. The operator alone approves it at `design_review`
-(`approve_design`), answering the questions by approving or by rejecting with notes. `approve_design`
-is the swarm's gate; while the switch from the tag below is under way, either one admits a task to
-implementation. `/jkb-design-pass` remains the interactive path, where the operator and a session
-decide a design together.
-
-### A task is swarm-eligible only when tagged `design=approved`
-
-`/task-swarm` ANDs `tag:design=approved` into its `task next`/`query` selection, in its scout and
-in every SCHEDULER pass, whenever it runs in scope mode, so un-triaged tasks are invisible to the
-swarm. Two bypasses exist, and neither applies to a design turned down by `reject_design` or `systemic_redesign`, which always goes back to a designer: `--no-design-gate` (`cfg.designGate: false`) and explicit-uid mode,
+Every frontier read of the `/task-swarm` coordinator is `is:ready is:unclaimed` plus the run's scope,
+leaving out the run's settled tasks and review findings (tagged `finding=review` as they are filed;
+`V033` backfilled the older ones). It reads four times, in order: A,
+`phase:implement,review,landable,systemic_review`, the work to build, read first so an approved task
+is never hidden behind the tasks still at `design`; R, `phase:design tag:swarm-designed=<run owner>`,
+designs this run wrote and the operator rejected, re-designed whatever the budget has left; B,
+`phase:design tag:design=approved`, the legacy tag path while the switch to `approve_design` is under
+way; and C, `phase:design -tag:design=approved`, the tasks for designers, limited to what remains of
+the `--designers` budget (counted by task). B and C leave out R's tasks, so no task is in two reads. A
+task at `design_review` is in no read, so it waits for the operator with no tag and no re-check, and
+moves into read A, or back to R or C, once approved or rejected. Two bypasses send read C's tasks down the legacy path instead of
+to a designer, and neither applies to a design turned down by `reject_design` or `systemic_redesign`,
+which always goes back to a designer: `--no-design-gate` and explicit-uid mode,
 where the operator names the tasks.
 
 ### `/design-pass` settles a design with the user
@@ -582,9 +580,7 @@ the approved design first and follows it rather than re-deciding.
 
 ### The gate is spelled in the query DSL
 
-Use `tag:design=approved`. The `#facet=value` form is quick-add only, and `task next` silently
-drops terms that are not `tag:` or `ns:`, so `#design=approved` in a `task next` scope is parsed
-as free text and dropped, and the gate silently admits everything.
+Use `phase:<phase>` and `tag:design=approved`; a phase name is checked, and an unknown one is refused. The `#facet=value` form is quick-add only: `#design=approved` in a query is free text matched against the body, not a filter, and the gate silently admits everything.
 
 ## The code reviewer
 
