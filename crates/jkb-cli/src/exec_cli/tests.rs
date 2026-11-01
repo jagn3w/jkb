@@ -380,12 +380,51 @@ fn a_settled_interrupt_stands_at_the_deadline() {
 }
 
 /// A git command for a fixture repository, isolated from the developer's own git.
-fn fixture_git(at: &Path, args: &[&str]) {
+fn fixture_git(at: &Path, args: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     cmd.arg("-C").arg(at).args(args);
     crate::gitrepo::fixture_env::isolate_git_env(&mut cmd);
-    let out = cmd.output().unwrap();
+    cmd
+}
+
+/// Run a [`fixture_git`] command, which must succeed.
+fn git_ok(at: &Path, args: &[&str]) {
+    let out = fixture_git(at, args).output().unwrap();
     assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+/// `fixture_git` scrubs the caller's repository selection (gitrepo's `SCRUBBERS` names this test).
+#[test]
+fn the_exec_fixture_does_not_reach_another_repository() {
+    crate::gitrepo::fixture_env::assert_isolated(
+        "exec_cli fixture",
+        &fixture_git(Path::new("/somewhere"), &["status"]),
+    );
+}
+
+/// A clean one-commit repository at `at`.
+fn committed_repo(at: &Path) {
+    std::fs::create_dir_all(at).unwrap();
+    git_ok(at, &["init", "-q", "-b", "main"]);
+    std::fs::write(at.join("a.txt"), "a").unwrap();
+    git_ok(at, &["add", "-A"]);
+    git_ok(
+        at,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "a",
+        ],
+    );
+}
+
+/// Whether this process can read past a mode-000 directory (root can): the fault cases need it not to.
+fn permissions_hold(locked: &Path) -> bool {
+    std::fs::read_dir(locked).is_err()
 }
 
 /// `jkb exec pin --json` tells a runner WHY a directory cannot be pinned, because the runner answers
@@ -397,7 +436,14 @@ fn a_pin_refusal_names_its_reason() {
     let t = tempfile::tempdir().unwrap();
 
     let gone = t.path().join("gone");
-    assert_eq!(pin_refusal(&gone).unwrap_err().0, PinRefusal::DirGone);
+    assert_eq!(pin_refusal(&gone).unwrap_err().0, Some(PinRefusal::DirGone));
+    let file = t.path().join("file");
+    std::fs::write(&file, "").unwrap();
+    assert_eq!(
+        pin_refusal(&file.join("below")).unwrap_err().0,
+        Some(PinRefusal::DirGone),
+        "a component that is not a directory"
+    );
 
     let plain = t.path().join("plain");
     std::fs::create_dir_all(&plain).unwrap();
@@ -406,34 +452,84 @@ fn a_pin_refusal_names_its_reason() {
 
     let empty = t.path().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
-    fixture_git(&empty, &["init", "-q", "-b", "main"]);
+    git_ok(&empty, &["init", "-q", "-b", "main"]);
     let (reason, e) = pin_refusal(&empty).unwrap_err();
-    assert_eq!(reason, PinRefusal::Unpinnable, "{e:#}");
+    assert_eq!(reason, Some(PinRefusal::Unpinnable), "{e:#}");
+
+    let nested = t.path().join("nested");
+    committed_repo(&nested);
+    committed_repo(&nested.join("inner"));
+    let (reason, e) = pin_refusal(&nested).unwrap_err();
+    assert_eq!(reason, Some(PinRefusal::Unpinnable), "{e:#}");
 
     let repo = t.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    fixture_git(&repo, &["init", "-q", "-b", "main"]);
-    std::fs::write(repo.join("a.txt"), "a").unwrap();
-    fixture_git(&repo, &["add", "-A"]);
-    fixture_git(
-        &repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "a",
-        ],
-    );
+    committed_repo(&repo);
     let (_, tree) = pin_refusal(&repo).expect("a clean repository pins");
     assert!(tree.is_some());
 
-    fixture_git(&repo, &["config", "filter.x.clean", "touch /tmp/x"]);
+    git_ok(&repo, &["config", "filter.x.clean", "touch /tmp/x"]);
     let (reason, e) = pin_refusal(&repo).unwrap_err();
-    assert_eq!(reason, PinRefusal::AuditRefused, "{e:#}");
+    assert_eq!(reason, Some(PinRefusal::AuditRefused), "{e:#}");
     assert!(format!("{e:#}").contains("filter.x.clean"), "{e:#}");
+}
+
+/// A fault on the host is no refusal: a request must not be consumed as "tree changed" or "gone"
+/// because the host could not read a file or a directory. Each stays unclassified, and the runner
+/// reports it and refuses nothing.
+#[test]
+fn a_fault_on_the_host_is_not_classified() {
+    use super::pin_refusal;
+    use std::os::unix::fs::PermissionsExt as _;
+    let t = tempfile::tempdir().unwrap();
+
+    let locked = t.path().join("locked");
+    std::fs::create_dir_all(locked.join("inside")).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let holds = permissions_hold(&locked);
+    let denied = pin_refusal(&locked.join("inside"));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !holds {
+        return; // Run as root: no permission fault can be made.
+    }
+    let (reason, e) = denied.unwrap_err();
+    assert_eq!(
+        reason, None,
+        "EACCES is not a directory that is gone: {e:#}"
+    );
+
+    let repo = t.path().join("repo");
+    committed_repo(&repo);
+    let secret = repo.join("secret.txt");
+    std::fs::write(&secret, "s").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let (reason, e) = pin_refusal(&repo).unwrap_err();
+    assert_eq!(
+        reason, None,
+        "an unreadable file is a fault, not an unpinnable tree: {e:#}"
+    );
+}
+
+/// The object a runner parses, pinned exactly: renaming a key or a reason would make every refusal
+/// reach Code Factory as an error that refuses nothing.
+#[test]
+fn the_pin_failure_object_has_one_exact_shape() {
+    use super::{pin_failure_json, PinRefusal};
+    let e = anyhow::anyhow!("why");
+    let dir = Path::new("/r");
+    for (r, wire) in [
+        (PinRefusal::DirGone, "dir_gone"),
+        (PinRefusal::AuditRefused, "audit_refused"),
+        (PinRefusal::Unpinnable, "unpinnable"),
+    ] {
+        assert_eq!(
+            pin_failure_json(dir, Some(r), &e),
+            serde_json::json!({ "dir": "/r", "refused": { "reason": wire, "message": "why" } })
+        );
+    }
+    assert_eq!(
+        pin_failure_json(dir, None, &e),
+        serde_json::json!({ "dir": "/r", "error": { "message": "why" } })
+    );
 }
 
 /// Standard base64 with padding, as Code Factory's frame codec writes it (`@jkb/core`'s
@@ -492,13 +588,15 @@ fn frames_published_through_the_ops_reach_the_waiter_byte_for_byte() {
         runner: "code-factory:1@boot".into(),
         outcome: "signalled".into(),
         exit_status: Some(15),
-        tail_b64: b64(text),
+        // Not the frames: a waiter that printed this instead would fail the byte check below.
+        tail_b64: b64(b"TAIL"),
         total_bytes: i64::try_from(text.len()).unwrap(),
         log_path: Some("/logs/exec-1.log".into()),
     })
     .unwrap();
     let (code, out, err) = waited(&db, &view);
     assert_eq!(code, 128 + 15, "{err}");
-    assert_eq!(out.as_bytes(), text);
+    assert_eq!(out.as_bytes(), text, "the frames, not the row's tail");
+    assert!(!err.contains("did not reach this stream"), "{err}");
     assert!(err.contains("/logs/exec-1.log"), "{err}");
 }

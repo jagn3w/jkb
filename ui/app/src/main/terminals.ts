@@ -195,6 +195,16 @@ export interface Command {
 const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
 
 /**
+ * Why `extraEnv` is not an environment main may add to a program, or `undefined`: every name an
+ * `ENV_NAME`, no value holding a NUL. Checked once, where a once-run is issued (`issueOnce`), for
+ * every target, and again by `commandFor` for the `docker exec -e` it builds.
+ */
+export function envRefusal(extraEnv: Readonly<Record<string, string>>): string | undefined {
+  const bad = Object.keys(extraEnv).find((k) => !ENV_NAME.test(k) || typeof extraEnv[k] !== "string" || extraEnv[k]!.includes("\0"));
+  return bad === undefined ? undefined : `not an environment variable main sets: ${JSON.stringify(bad)}`;
+}
+
+/**
  * The command a spec runs. A container spec's `cwd` is the container's and goes to `docker exec
  * -w`; the docker client itself starts in the host's home, which exists. `tag` names the
  * container program's record (`WRAPPER_SCRIPT`), unique per terminal. `extraEnv` — main's own, for a
@@ -207,8 +217,8 @@ export function commandFor(
   tag: string,
   extraEnv: Readonly<Record<string, string>> = {},
 ): TerminalResult<Command> {
-  const bad = Object.keys(extraEnv).find((k) => !ENV_NAME.test(k) || extraEnv[k]?.includes("\0"));
-  if (bad !== undefined) return { ok: false, error: `not an environment variable main sets: ${JSON.stringify(bad)}` };
+  const refused = envRefusal(extraEnv);
+  if (refused !== undefined) return { ok: false, error: refused };
   if (spec.target === "container") {
     const docker = env.docker();
     if (docker === undefined) {
@@ -516,6 +526,12 @@ export class TerminalHost {
    * lasts for one open. Returns the revoke: `true` when it was still unopened and is now gone.
    */
   issueOnce(owner: number, spec: TerminalSpec, run: OnceRun): () => boolean {
+    // Checked here, for every target: a host program gets `run.env` merged into its spawn environment.
+    const refused = envRefusal(run.env);
+    if (refused !== undefined) {
+      run.onFail(refused);
+      return () => false;
+    }
     const issue: OnceIssue = { key: TerminalHost.onceKey(spec), run };
     const list = this.once.get(owner) ?? [];
     list.push(issue);

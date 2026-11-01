@@ -2700,6 +2700,21 @@ fn file_digest(path: &Path) -> Result<Vec<u8>> {
     Ok(hasher.finalize().as_bytes().to_vec())
 }
 
+/// [`pin_tree`]'s refusal of a tree it will not pin — a request directory the `.gitignore` files
+/// cover, a nested repository, a FIFO or socket, a repository with no commit — as opposed to a fault
+/// on the way (an unreadable file, git not running, no temporary directory). A runner refuses a
+/// request only for this; a fault leaves it pending (`jkb exec pin --json`).
+#[derive(Debug)]
+pub struct NotPinnable(pub String);
+
+impl std::fmt::Display for NotPinnable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotPinnable {}
+
 /// The tree pin of the repository containing `dir` (the Executions design), or `None` when `dir` is
 /// in no repository ([`pin_tree`]'s pin).
 ///
@@ -2756,7 +2771,12 @@ pub fn pin_tree(dir: &Path) -> Result<Option<PinnedTree>> {
     };
     let head = git(&top, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])?
         .filter(|h| !h.is_empty())
-        .with_context(|| format!("{} has no commit to label the pin with", top.display()))?;
+        .ok_or_else(|| {
+            NotPinnable(format!(
+                "{} has no commit to label the pin with",
+                top.display()
+            ))
+        })?;
     let judge = IgnoreJudge::new()?;
     let mut walk = PinWalk {
         top: &top,
@@ -2781,11 +2801,12 @@ pub fn pin_tree(dir: &Path) -> Result<Option<PinnedTree>> {
             prefix.clear();
             prefix.extend_from_slice(&rel[..end]);
             if !walk.walked_dirs.contains(&prefix) {
-                anyhow::bail!(
+                return Err(NotPinnable(format!(
                     "not pinnable: {} is ignored by the repository's .gitignore, so nothing in it \
                      would be pinned — run from a directory the repository tracks",
                     dir.display()
-                );
+                ))
+                .into());
             }
             if end == rel.len() {
                 break;
@@ -2861,12 +2882,13 @@ impl PinWalk<'_> {
                         if dir.is_empty() {
                             continue;
                         }
-                        anyhow::bail!(
+                        return Err(NotPinnable(format!(
                             "not pinnable: {} is a nested repository or a populated submodule, \
                              whose own state the pin does not read — move it out of the \
                              repository, or ignore it in the repository's .gitignore",
                             here.display()
-                        );
+                        ))
+                        .into());
                     }
                     let path = Self::join(dir, &name);
                     if name == b".gitignore" && ty.is_file() {
@@ -2916,10 +2938,11 @@ impl PinWalk<'_> {
                     };
                     self.pinned.push((path, kind, file_digest(&abs)?));
                 } else {
-                    anyhow::bail!(
+                    return Err(NotPinnable(format!(
                         "not pinnable: {} is neither a file, a directory nor a link",
                         self.abs(&path).display()
-                    );
+                    ))
+                    .into());
                 }
             }
             level = next;
@@ -3074,6 +3097,7 @@ mod tests {
         ("src/session.rs", "gate_cmd"), // the_gate_spawn_does_not_inherit_a_repository_selection
         ("src/archive.rs", "fixture_git"), // the_archive_fixture_does_not_reach_another_repository
         ("src/git_audit.rs", "fixture_git"), // the_audit_fixture_does_not_reach_another_repository
+        ("src/exec_cli/tests.rs", "fixture_git"), // the_exec_fixture_does_not_reach_another_repository
         // The spawn is in `git_cmd`, which delegates to `isolate_git_env`; the KEY is where
         // the spawn is, since that is what the scan can see.
         ("tests/sessions.rs", "git_cmd"), // the_fixture_isolation_covers_selection_and_config

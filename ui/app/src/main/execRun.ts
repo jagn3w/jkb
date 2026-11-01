@@ -66,12 +66,15 @@ export const KILL_GRACE_MS = 10_000;
 /** How much output waits for an unreachable daemon before the stream goes to the log only. */
 export const STREAM_BUFFER_BYTES = 4 * 1024 * 1024;
 
+/** How long an `exec.begin` whose answer was lost is waited on before the click is answered. */
+export const UNKNOWN_BEGIN_WAIT_MS = 60_000;
+
 /** How long `jkb exec pin` may take: a walk and a blake3 of the work tree. */
 export const PIN_TIMEOUT_MS = 2 * 60_000;
 
 /** What `jkb exec pin --json` answered. */
 export type PinAnswer =
-  | { readonly kind: "pinned"; readonly pin: ExecPin | null }
+  | { readonly kind: "pinned"; readonly pin: ExecPin | null; readonly dir?: string }
   | { readonly kind: "refused"; readonly reason: string; readonly message: string }
   | { readonly kind: "error"; readonly message: string };
 
@@ -88,16 +91,17 @@ export function parsePinOutput(code: number | null, stdout: string, stderr: stri
   } catch {
     parsed = undefined;
   }
-  const o = parsed as { pin?: unknown; refused?: { reason?: unknown; message?: unknown } } | undefined;
+  const o = parsed as { dir?: unknown; pin?: unknown; refused?: { reason?: unknown; message?: unknown } } | undefined;
   if (typeof o === "object" && o !== null) {
     const r = o.refused;
     if (typeof r === "object" && r !== null && typeof r.reason === "string") {
       return { kind: "refused", reason: r.reason, message: typeof r.message === "string" ? r.message : "" };
     }
     const p = o.pin as { head?: unknown; changes?: unknown } | null | undefined;
-    if (code === 0 && p === null) return { kind: "pinned", pin: null };
+    const dir = typeof o.dir === "string" ? { dir: o.dir } : {};
+    if (code === 0 && p === null) return { kind: "pinned", pin: null, ...dir };
     if (code === 0 && typeof p === "object" && p !== null && typeof p.head === "string" && typeof p.changes === "string") {
-      return { kind: "pinned", pin: { head: p.head, changes: p.changes } };
+      return { kind: "pinned", pin: { head: p.head, changes: p.changes }, ...dir };
     }
   }
   const why = stderr.trim().split("\n").slice(-6).join("\n");
@@ -123,6 +127,8 @@ export interface ExecRunnerDeps {
   pin(hostDir: string): Promise<PinAnswer>;
   readonly roots: TerminalRoots;
   isDirectory(path: string): boolean;
+  /** `path` with every link and `..` resolved, or `undefined` when it does not exist. */
+  realpath(path: string): string | undefined;
   /** A bare program name, found by run.sh's search (path-keep, then its fixed PATH); or `undefined`. */
   findHostProgram(name: string): string | undefined;
   /** The docker client, as a container terminal finds it, or `undefined`. */
@@ -142,6 +148,7 @@ export interface ExecRunnerDeps {
     readonly retryMs?: number;
     readonly maxRetryMs?: number;
     readonly bufferBytes?: number;
+    readonly unknownWaitMs?: number;
   };
 }
 
@@ -180,6 +187,7 @@ export class ExecRunner {
       retryMs: t.retryMs ?? 250,
       maxRetryMs: t.maxRetryMs ?? 5_000,
       bufferBytes: t.bufferBytes ?? STREAM_BUFFER_BYTES,
+      unknownWaitMs: t.unknownWaitMs ?? UNKNOWN_BEGIN_WAIT_MS,
     };
   }
 
@@ -196,10 +204,20 @@ export class ExecRunner {
     const request = read.value;
     if (request.state !== "pending") return stop({ error: `${id} is ${request.state}, not pending`, request });
 
+    // The directory is RESOLVED before anything is decided about it. `hostPathOf` maps by path text,
+    // and the container writes under the repos mount: a `..` in the request, or a link it planted
+    // there, would otherwise carry a host run anywhere on the host while the preview showed a path
+    // under the mount. A container-side directory must resolve under the host's real repos root;
+    // the resolved path is what is shown, pinned and spawned.
     const { roots } = this.deps;
-    const hostDir = request.dir_side === "host" ? hostPathOf(request.dir, roots) ?? request.dir : hostPathOf(request.dir, roots);
+    const spelled = request.dir_side === "host" ? hostPathOf(request.dir, roots) ?? request.dir : hostPathOf(request.dir, roots);
+    const hostDir = spelled === undefined ? undefined : this.deps.realpath(spelled);
     if (hostDir === undefined || !this.deps.isDirectory(hostDir)) {
       return stop({ refuse: "dir_gone", error: `${request.dir} is not a directory the host can reach`, request });
+    }
+    const reposReal = this.deps.realpath(roots.hostReposReal) ?? roots.hostReposReal;
+    if (request.dir_side === "container" && hostDir !== reposReal && !hostDir.startsWith(`${reposReal}/`)) {
+      return stop({ refuse: "dir_gone", error: `${request.dir} resolves to ${hostDir}, outside the repos mount the container shares`, request });
     }
     let containerDir: string | undefined;
     if (request.target === "container") {
@@ -236,6 +254,11 @@ export class ExecRunner {
       return stop({ refuse: refuseReasonFor(pin.reason), error: `the pin could not be recomputed (${pin.reason}): ${pin.message}`, request, partial: prepared });
     }
     if (pin.kind === "error") return stop({ error: pin.message, request, partial: prepared });
+    // The pin's own canonical directory must be the one just resolved: a link retargeted in between
+    // would pin one tree and run in another.
+    if (pin.dir !== undefined && pin.dir !== hostDir) {
+      return stop({ refuse: "tree_changed", error: `the directory moved while it was pinned (${hostDir}, then ${pin.dir})`, request, partial: prepared });
+    }
     return { ok: true, value: prepared };
   }
 
@@ -267,7 +290,7 @@ export class ExecRunner {
         argvShown: request.argv.map(escapeArg),
         ...(facts.hostDir === undefined ? {} : { hostDir: facts.hostDir }),
         ...(facts.containerDir === undefined ? {} : { containerDir: facts.containerDir }),
-        ...(program === undefined ? {} : { program }),
+        ...(program === undefined ? {} : { program, programShown: escapeArg(program) }),
         timeoutMs: request.timeout_ms,
         pin,
         ...(problem === undefined ? {} : { problem }),
@@ -299,7 +322,10 @@ export class ExecRunner {
       const { request, spec } = p.value;
       const pin = p.value.pin.kind === "pinned" ? p.value.pin.pin : null;
       const started = await this.begin(id, pin);
-      if (!started.ok) return started;
+      if (!started.ok) {
+        if (started.held === true) begun = true;
+        return { ok: false, error: started.error };
+      }
       begun = true;
       this.issue(owner, request, spec);
       return { ok: true, value: { id, spec, timeoutMs: request.timeout_ms } };
@@ -308,8 +334,14 @@ export class ExecRunner {
     }
   }
 
-  /** `exec.begin`, and on a lost answer whether it took under this runner. */
-  private async begin(id: string, pin: ExecPin | null): Promise<TerminalResult<null>> {
+  /**
+   * `exec.begin`, and on a lost answer whether it took under this runner. An answer lost to an
+   * unreachable daemon leaves the outcome unknown: the record is read until it says, for up to
+   * `unknownWaitMs`. Still unknown then, the click is answered with that, the gate stays held
+   * (`held`), and the record is read on in the background: if the begin did take, the request is
+   * finished `interrupted` under this runner rather than left `running` with nothing running it.
+   */
+  private async begin(id: string, pin: ExecPin | null): Promise<TerminalResult<null> & { readonly held?: boolean }> {
     const r = await this.deps.op({ op: "exec.begin", id, runner: this.runner, ...(pin === null ? {} : { recomputed_pin: pin }) });
     if (r.ok) {
       const b = decodeExecBegun(r.value);
@@ -318,10 +350,45 @@ export class ExecRunner {
       const why = b.value.begun === "refused" ? `refused (${b.value.request.refuse_reason ?? "tree_changed"}): the tree changed since the request` : b.value.begun;
       return { ok: false, error: `${id} was ${why}` };
     }
-    // The answer may have been lost after the begin took: the record says whose it is.
-    const now = await this.status(id);
-    if (now.ok && now.value.state === "running" && now.value.runner === this.runner) return { ok: true, value: null };
-    return { ok: false, error: `could not begin ${id}: ${r.error.message}` };
+    const t = this.timing;
+    const until = Date.now() + t.unknownWaitMs;
+    let pause = t.retryMs;
+    for (;;) {
+      const now = await this.status(id);
+      if (now.ok) {
+        if (now.value.state === "running" && now.value.runner === this.runner) return { ok: true, value: null };
+        return { ok: false, error: `could not begin ${id}: ${r.error.message}` };
+      }
+      if (Date.now() >= until) break;
+      await sleep(pause);
+      pause = Math.min(pause * 2, t.maxRetryMs);
+    }
+    void this.settleUnknown(id);
+    return {
+      ok: false,
+      held: true,
+      error: `could not tell whether ${id} began (${r.error.message}); if it did, it is ended as interrupted once jkb serve answers`,
+    };
+  }
+
+  /** Read `id` until the record answers; a begin that took under this runner is ended `interrupted`. */
+  private async settleUnknown(id: string): Promise<void> {
+    const t = this.timing;
+    let pause = t.retryMs;
+    for (;;) {
+      const now = await this.status(id);
+      if (now.ok) {
+        if (now.value.state === "running" && now.value.runner === this.runner) {
+          this.deps.log(`${id}: its begin took after all, with no terminal; ending it as interrupted`);
+          await new ExecStream(id, this.runner, this.deps, t, false).finish("interrupted", undefined);
+        } else {
+          this.taken.delete(id);
+        }
+        return;
+      }
+      await sleep(pause);
+      pause = Math.min(pause * 2, t.maxRetryMs);
+    }
   }
 
   /** Issue `spec` to `owner` for one open, and own what follows: the deadline, the timeout, the stream. */

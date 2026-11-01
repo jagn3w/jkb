@@ -62,6 +62,8 @@ function daemon() {
     calls: [],
     down: false,
     downFor: new Set(),
+    /** `exec.begin` commits, then its answer is lost; `exec.status` is unreachable for this long after. */
+    loseBegin: undefined,
     outputs: (id) => (rows.get(id)?.chunks ?? []).map((c) => Buffer.from(c, "base64")).join(""),
     add(over = {}) {
       const n = rows.size + 1;
@@ -97,6 +99,11 @@ function daemon() {
             return { ok: true, value: { result: "exec_begun", begun: "refused", request: view(row) } };
           }
           Object.assign(row, { state: "running", runner: req.runner });
+          if (d.loseBegin !== undefined) {
+            d.downFor.add("exec.status");
+            setTimeout(() => d.downFor.delete("exec.status"), d.loseBegin);
+            return fail("unavailable", "jkb serve restarted mid-call");
+          }
           return { ok: true, value: { result: "exec_begun", begun: "running", request: view(row) } };
         }
         case "exec.refuse":
@@ -149,9 +156,9 @@ function environment(roots, over = {}) {
 }
 
 /** A runner over a stand-in daemon, the stand-in jkb in `h`, and a real terminal host. */
-function rig({ d = daemon(), h = home(), timing = {}, pid = process.pid } = {}) {
+function rig({ d = daemon(), h = home(), timing = {}, pid = process.pid, env: appEnv = process.env } = {}) {
   const roots = { container: "jkb-dev", containerRepos: "/home/vscode/repos", hostRepos: path.join(h.h, "repos"), hostReposReal: path.join(h.h, "repos"), hostHome: h.h };
-  const env = environment(roots);
+  const env = environment(roots, { env: appEnv });
   const events = [];
   const host = new terminals.TerminalHost(pty.spawn, env, (owner, event) => events.push({ owner, ...event }));
   const issued = [];
@@ -161,6 +168,13 @@ function rig({ d = daemon(), h = home(), timing = {}, pid = process.pid } = {}) 
     pin: exec.machinePin(h.h, update.machineRunner(h.h, process.env)),
     roots,
     isDirectory: env.isDirectory,
+    realpath: (p) => {
+      try {
+        return fs.realpathSync(p);
+      } catch {
+        return undefined;
+      }
+    },
     findHostProgram: (name) => (name === "sh" ? "/bin/sh" : undefined),
     docker: () => undefined,
     issueOnce: (owner, spec, run) => {
@@ -186,8 +200,9 @@ async function until(pred, what, ms = 15_000) {
 }
 
 test("a run issues exactly the stored argv, in its directory, with JKB_EXEC_REQUEST, and streams to the topic and the log", async () => {
-  const { d, h, host, runner, issued } = rig();
-  const row = d.add({ dir: h.repo, argv: ["/bin/sh", "-c", 'printf "hi from %s in %s" "$JKB_EXEC_REQUEST" "$(pwd)"; exit 3'] });
+  // The app was started from a shell that exported a repository selection: the run must not inherit it.
+  const { d, h, host, runner, issued } = rig({ env: { ...process.env, GIT_DIR: "/other/.git", GIT_WORK_TREE: "/other" } });
+  const row = d.add({ dir: h.repo, argv: ["/bin/sh", "-c", 'printf "hi from %s in %s [%s]" "$JKB_EXEC_REQUEST" "$(pwd)" "${GIT_DIR-unset}${GIT_WORK_TREE-}"; exit 3'] });
   const started = await runner.run(1, row.id);
   assert.equal(started.ok, true, started.error);
   assert.deepEqual(started.value.spec.argv, row.argv, "exactly the stored argv");
@@ -203,8 +218,8 @@ test("a run issues exactly the stored argv, in its directory, with JKB_EXEC_REQU
   await until(() => row.state === "finished", "the finish");
   assert.equal(row.outcome, "exited");
   assert.equal(row.exit_status, 3);
-  assert.equal(d.outputs(row.id), `hi from ${row.id} in ${h.repo}`);
-  assert.equal(Buffer.from(row.tail, "base64").toString(), `hi from ${row.id} in ${h.repo}`);
+  assert.equal(d.outputs(row.id), `hi from ${row.id} in ${h.repo} [unset]`, "GIT_DIR and GIT_WORK_TREE are dropped");
+  assert.equal(Buffer.from(row.tail, "base64").toString(), `hi from ${row.id} in ${h.repo} [unset]`);
   assert.equal(row.total, Buffer.byteLength(d.outputs(row.id)));
   assert.equal(row.log_path, path.join(h.h, ".jkb", "logs", "exec", `${row.id}.log`));
   assert.equal(fs.readFileSync(row.log_path, "utf8"), d.outputs(row.id));
@@ -309,6 +324,91 @@ test("a directory the host cannot reach is refused dir_gone before any pin", asy
   const m = await runner.run(1, mapped.id);
   assert.equal(m.ok, true, m.error);
   assert.equal(m.value.spec.cwd, h.repo);
+});
+
+test("a container directory that resolves outside the repos mount is refused dir_gone, by `..` or by a link", async () => {
+  const { d, h, runner, issued } = rig();
+  const outside = path.join(h.h, "outside");
+  fs.mkdirSync(outside);
+  fs.symlinkSync(outside, path.join(h.repo, "scratch"));
+  for (const dir of ["/home/vscode/repos/r/scratch", "/home/vscode/repos/../outside", "/home/vscode/repos/r/../../outside"]) {
+    for (const target of ["host", "container"]) {
+      const row = d.add({ dir, dir_side: "container", target, pin: null, argv: ["/bin/true"] });
+      const preview = await runner.preview(row.id);
+      assert.match(preview.value.problem, /outside the repos mount/, `${dir} ${target}`);
+      const r = await runner.run(1, row.id);
+      assert.equal(r.ok, false, `${dir} ${target}`);
+      assert.equal(row.refuse_reason, "dir_gone", `${dir} ${target}`);
+    }
+  }
+  assert.deepEqual(issued, []);
+  assert.deepEqual(h.pinCalls(), [], "nothing outside the mount is even pinned");
+});
+
+test("a directory reached through a link inside the mount is shown, pinned and spawned resolved", async () => {
+  const { d, h, runner } = rig();
+  fs.mkdirSync(path.join(h.repo, "real"));
+  fs.symlinkSync(path.join(h.repo, "real"), path.join(h.repo, "alias"));
+  fs.writeFileSync(path.join(h.repo, "real", "go.sh"), "#!/bin/sh\n", { mode: 0o755 });
+  const row = d.add({ dir: "/home/vscode/repos/r/alias", dir_side: "container", argv: ["./go.sh"] });
+  const preview = await runner.preview(row.id);
+  assert.equal(preview.value.hostDir, path.join(h.repo, "real"));
+  assert.equal(preview.value.program, path.join(h.repo, "real", "go.sh"), "the resolved absolute program is shown");
+  assert.equal(preview.value.programShown, path.join(h.repo, "real", "go.sh"));
+  const r = await runner.run(1, row.id);
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.value.spec.cwd, path.join(h.repo, "real"));
+  assert.deepEqual(r.value.spec.argv, [path.join(h.repo, "real", "go.sh")]);
+  assert.ok(h.pinCalls().every((c) => c === `--json exec pin --dir ${path.join(h.repo, "real")}`), h.pinCalls().join("; "));
+});
+
+test("a pin of another directory than the one resolved refuses the request tree_changed", async () => {
+  const h = home({ answer: { dir: "/somewhere/else", pin: PIN } });
+  const { d, runner, issued } = rig({ h });
+  const row = d.add({ dir: h.repo, argv: ["/bin/true"] });
+  const r = await runner.run(1, row.id);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /moved while it was pinned/);
+  assert.equal(row.refuse_reason, "tree_changed");
+  assert.deepEqual(issued, []);
+});
+
+test("a begin whose answer was lost is followed to its outcome: taken, the run goes on", async () => {
+  const { d, h, runner, issued } = rig();
+  const row = d.add({ dir: h.repo, argv: ["/bin/true"] });
+  d.loseBegin = 150;
+  const r = await runner.run(1, row.id);
+  assert.equal(r.ok, true, r.error);
+  assert.equal(issued.length, 1);
+});
+
+test("a begin whose outcome stays unknown holds the gate, and is ended interrupted once the record answers", async () => {
+  const { d, h, runner, issued } = rig({ timing: { unknownWaitMs: 50 } });
+  const row = d.add({ dir: h.repo, argv: ["/bin/true"] });
+  d.loseBegin = 400;
+  const r = await runner.run(1, row.id);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /could not tell whether/);
+  assert.deepEqual(issued, []);
+  assert.match((await runner.run(1, row.id)).error, /already been run/, "the gate stays held");
+  await until(() => row.state === "finished", "the interrupted finish", 5_000);
+  assert.equal(row.outcome, "interrupted");
+  assert.equal(row.runner, runner.runner);
+});
+
+test("a once-run with an environment main may not set is refused at issue, for a host run too", () => {
+  const h = home();
+  const roots = { container: "jkb-dev", containerRepos: "/c", hostRepos: h.h, hostReposReal: h.h, hostHome: h.h };
+  const host = new terminals.TerminalHost(pty.spawn, environment(roots), () => {});
+  const spec = { target: "host", cwd: h.repo, argv: ["/bin/true"], title: "exec-1: true", sessionUuid: "2f8fad5b-d9cb-469f-a165-70867728950e" };
+  for (const env of [{ "A=B": "x" }, { LD_X: "a\0b" }, { "-e": "x" }]) {
+    const failed = [];
+    const revoke = host.issueOnce(1, spec, { env, onOpen: () => failed.push("opened"), onData: () => {}, onExit: () => {}, onFail: (e) => failed.push(e) });
+    assert.equal(failed.length, 1, JSON.stringify(env));
+    assert.match(failed[0], /not an environment variable main sets/);
+    assert.equal(revoke(), false);
+    assert.equal(host.open(1, spec, 80, 24).ok, false, "and nothing can open it");
+  }
 });
 
 test("the renderer's generic op goes through the gate that refuses the runner's ops", () => {
@@ -475,8 +575,9 @@ test("at startup, a run another Code Factory left running is finished interrupte
 });
 
 test("jkb exec pin's output is read as pinned, refused, or an error", () => {
-  assert.deepEqual(exec.parsePinOutput(0, `${JSON.stringify({ dir: "/r", pin: PIN, gitignores: [] })}\n`, ""), { kind: "pinned", pin: PIN });
-  assert.deepEqual(exec.parsePinOutput(0, JSON.stringify({ dir: "/r", pin: null }), ""), { kind: "pinned", pin: null });
+  assert.deepEqual(exec.parsePinOutput(0, `${JSON.stringify({ dir: "/r", pin: PIN, gitignores: [] })}\n`, ""), { kind: "pinned", pin: PIN, dir: "/r" });
+  assert.deepEqual(exec.parsePinOutput(0, JSON.stringify({ dir: "/r", pin: null }), ""), { kind: "pinned", pin: null, dir: "/r" });
+  assert.equal(exec.parsePinOutput(1, JSON.stringify({ dir: "/r", error: { message: "EACCES" } }), "").kind, "error", "a fault refuses nothing");
   assert.deepEqual(exec.parsePinOutput(1, JSON.stringify({ refused: { reason: "audit_refused", message: "m" } }), "Error: m"), { kind: "refused", reason: "audit_refused", message: "m" });
   assert.equal(exec.parsePinOutput(1, JSON.stringify({ pin: PIN }), "boom").kind, "error", "a failed exit is never a pin");
   assert.equal(exec.parsePinOutput(0, "", "").kind, "error");

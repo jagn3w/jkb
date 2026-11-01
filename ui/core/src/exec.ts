@@ -277,16 +277,18 @@ export class OutputText {
 // ---- showing an argument ---------------------------------------------------------------------
 
 /**
- * Characters that draw nothing, that pass for an ordinary space, or that reorder or hide what is
- * drawn around them: zero-width characters, every space but U+0020, line and paragraph separators,
- * bidirectional controls, the soft hyphen, word joiners, variation selectors, the byte-order mark,
- * the interlinear annotation and tag characters. An argument holding one is not what it looks like.
+ * The characters an argument may not show as themselves, by Unicode property rather than by a list,
+ * because a list is always short (a review round found U+1D173, U+034F, U+180B, U+FFA0 and U+0600
+ * past the first one): controls (Cc), format characters (Cf), private use (Co), unassigned code
+ * points (Cn), lone surrogates (Cs), line and paragraph separators (Zl, Zp), every
+ * default-ignorable code point, and every space separator but U+0020 (Zs). An argument holding one is
+ * not what it looks like. Rust's `{:?}`, which `jkb exec status` prints with, escapes these too.
  */
-const INVISIBLE = /[\u00a0\u00ad\u061c\u115f\u1160\u1680\u17b4\u17b5\u180e\u2000-\u200f\u2028-\u202f\u205f-\u206f\u3000\u3164\ufe00-\ufe0f\ufeff\ufff9-\ufffb\u{e0000}-\u{e007f}]/u;
+const HIDDEN = /[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Cs}\p{Zl}\p{Zp}\p{Default_Ignorable_Code_Point}]|(?!\x20)\p{Zs}/u;
 
 /**
- * One argument as the operator is shown it: every control character (C0, DEL, C1), every invisible
- * or reordering one, a lone surrogate and the backslash itself escaped, so what is read is what runs.
+ * One argument as the operator is shown it: every character [`HIDDEN`] names and the backslash itself
+ * escaped, so what is read is what runs.
  * Printable text, any script, is kept as it is; a newline, tab and carriage return show as `\n`,
  * `\t` and `\r`, anything else as `\u{<hex>}`.
  */
@@ -298,7 +300,7 @@ export function escapeArg(arg: string): string {
     else if (ch === "\n") out += "\\n";
     else if (ch === "\t") out += "\\t";
     else if (ch === "\r") out += "\\r";
-    else if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) || (cp >= 0xd800 && cp <= 0xdfff) || INVISIBLE.test(ch)) {
+    else if (HIDDEN.test(ch)) {
       out += `\\u{${cp.toString(16).padStart(4, "0")}}`;
     } else out += ch;
   }

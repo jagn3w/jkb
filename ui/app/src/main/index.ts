@@ -12,6 +12,7 @@
 // else — a checkout's `out/`, or a package left in a checkout's `dist/` — it refuses unless
 // `JKB_APP_FROM_CHECKOUT=1` says that is deliberate.
 
+import { realpathSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -139,6 +140,13 @@ const execRunner = new ExecRunner({
   pin: machinePin(accountHome(), machineRunner(accountHome(), process.env)),
   roots: terminalRoots,
   isDirectory: (p) => terminalEnvironment.isDirectory(p),
+  realpath: (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return undefined;
+    }
+  },
   findHostProgram: machineFindProgram(accountHome()),
   docker: () => terminalEnvironment.docker(),
   issueOnce: (owner, spec, run) => terminals.issueOnce(owner, spec, run),

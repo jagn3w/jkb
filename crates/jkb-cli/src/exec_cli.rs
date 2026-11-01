@@ -307,18 +307,21 @@ pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
     }
 }
 
-/// Why `jkb exec pin` could not pin a directory, classified for a runner that must answer the
-/// request ([`pin_refusal`]). Each maps onto how Code Factory's runner treats the request: the first
-/// two are `exec.refuse` reasons of the same names, and an unpinnable tree is a pin the host cannot
-/// reproduce, which refuses the request too (`tree_changed`).
+/// Why `jkb exec pin` could not pin a directory, when the cause is identified, for a runner that
+/// must answer the request ([`pin_refusal`]). The first two are `exec.refuse` reasons of the same
+/// names; an unpinnable tree is a pin the host cannot reproduce, which refuses the request too
+/// (`tree_changed`). A fault that is none of these — a permission error, git not running, a full
+/// temporary directory — is **not** classified: the runner reports it and refuses nothing, because a
+/// refusal consumes the request under a reason that would be false.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinRefusal {
-    /// The directory cannot be resolved: it is gone.
+    /// The directory does not exist (`ENOENT`), or a component of it is not a directory (`ENOTDIR`).
     DirGone,
-    /// The hooks-off git audit refused the repository's own config.
+    /// The hooks-off git audit's own finding: a key or a layout it refuses, or a config git cannot
+    /// read at all ([`crate::gitrepo::ConfigUnreadable`]).
     AuditRefused,
-    /// The repository's tree cannot be pinned (`gitrepo::pin_tree`'s "not pinnable", a repository
-    /// with no commit, an unreadable path, git failing).
+    /// [`crate::gitrepo::NotPinnable`]: a tree the pin refuses to cover, or a repository with no
+    /// commit.
     Unpinnable,
 }
 
@@ -334,27 +337,69 @@ impl PinRefusal {
     }
 }
 
-/// `dir` resolved, audited, and pinned — or which [`PinRefusal`] stopped it and why. The audit is
-/// asked on its own first, though every git call [`crate::gitrepo::pin_tree`] makes asks it again,
-/// so that its refusal is told apart from a tree that cannot be pinned: a runner refuses the request
-/// for each with its own reason.
+/// Whether an error of type `T` is anywhere in `e`'s chain.
+fn in_chain<T: std::error::Error + 'static>(e: &anyhow::Error) -> bool {
+    e.chain().any(<dyn std::error::Error>::is::<T>)
+}
+
+/// Whether the audit's error `e` is its own finding rather than a fault on the way. The rule
+/// `git_audit`'s `kind_of` reads the same chain by: an `io::Error` in it is git not running or a
+/// path not readable, which judged nothing — except [`crate::gitrepo::ConfigUnreadable`], a config
+/// git could not parse, which is no more trustworthy than a planted one. The findings themselves are
+/// built with no `io::Error` beneath them.
+fn is_audit_finding(e: &anyhow::Error) -> bool {
+    in_chain::<crate::gitrepo::ConfigUnreadable>(e) || !in_chain::<std::io::Error>(e)
+}
+
+/// `dir` resolved, audited, and pinned — or why not: the [`PinRefusal`] when its cause is
+/// identified, `None` for a fault. The audit is asked on its own first, though every git call
+/// [`crate::gitrepo::pin_tree`] makes asks it again, so that its refusal is told apart from a tree
+/// that cannot be pinned.
 fn pin_refusal(
     dir: &Path,
-) -> Result<(PathBuf, Option<crate::gitrepo::PinnedTree>), (PinRefusal, anyhow::Error)> {
-    let dir = std::fs::canonicalize(dir)
-        .with_context(|| format!("resolving {}", dir.display()))
-        .map_err(|e| (PinRefusal::DirGone, e))?;
-    crate::gitrepo::audit_repo_config(&dir).map_err(|e| (PinRefusal::AuditRefused, e))?;
-    let tree = crate::gitrepo::pin_tree(&dir).map_err(|e| (PinRefusal::Unpinnable, e))?;
+) -> Result<(PathBuf, Option<crate::gitrepo::PinnedTree>), (Option<PinRefusal>, anyhow::Error)> {
+    let dir = std::fs::canonicalize(dir).map_err(|e| {
+        let gone = matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        );
+        (
+            gone.then_some(PinRefusal::DirGone),
+            anyhow::Error::new(e).context(format!("resolving {}", dir.display())),
+        )
+    })?;
+    crate::gitrepo::audit_repo_config(&dir)
+        .map_err(|e| (is_audit_finding(&e).then_some(PinRefusal::AuditRefused), e))?;
+    let tree = crate::gitrepo::pin_tree(&dir).map_err(|e| {
+        let unpinnable = in_chain::<crate::gitrepo::NotPinnable>(&e);
+        (unpinnable.then_some(PinRefusal::Unpinnable), e)
+    })?;
     Ok((dir, tree))
+}
+
+/// The one object `jkb exec pin --json` prints when it could not pin `dir`: `{"dir", "refused":
+/// {"reason", "message"}}` for an identified cause, `{"dir", "error": {"message"}}` for a fault. The
+/// runner refuses a request only on `refused` (Code Factory's `parsePinOutput`).
+fn pin_failure_json(
+    dir: &Path,
+    reason: Option<PinRefusal>,
+    e: &anyhow::Error,
+) -> serde_json::Value {
+    let message = format!("{e:#}");
+    match reason {
+        Some(r) => serde_json::json!({
+            "dir": dir,
+            "refused": { "reason": r.as_str(), "message": message },
+        }),
+        None => serde_json::json!({ "dir": dir, "error": { "message": message } }),
+    }
 }
 
 /// `jkb exec pin`: run before any database or daemon is reached.
 ///
-/// With `--json`, a directory that cannot be pinned still prints one object on stdout —
-/// `{"dir": …, "refused": {"reason": "dir_gone"|"audit_refused"|"unpinnable", "message": …}}` —
-/// before the command fails, so a runner reads why from the output rather than from the wording of
-/// an error ([`PinRefusal`]).
+/// With `--json`, a directory that cannot be pinned still prints one object on stdout
+/// ([`pin_failure_json`]) before the command fails, so a runner reads why from the output rather
+/// than from the wording of an error ([`PinRefusal`]).
 ///
 /// # Errors
 /// An unreadable directory, or a pin that cannot be computed.
@@ -363,13 +408,7 @@ pub fn pin(dir: &Path, against: Option<&Path>, json: bool) -> Result<()> {
         Ok(v) => v,
         Err((reason, e)) => {
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "dir": dir,
-                        "refused": { "reason": reason.as_str(), "message": format!("{e:#}") },
-                    })
-                );
+                println!("{}", pin_failure_json(dir, reason, &e));
             }
             return Err(e);
         }

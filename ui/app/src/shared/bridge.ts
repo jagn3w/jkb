@@ -162,10 +162,15 @@ export interface ExecPreview {
   readonly request: ExecView;
   /** Each argument escaped (control and invisible characters shown), one per line. */
   readonly argvShown: readonly string[];
+  /** The directory resolved on the host (links and `..` followed), and in the container. */
   readonly hostDir?: string;
   readonly containerDir?: string;
-  /** The host program the run starts, as an absolute path (a host run only). */
+  /**
+   * The host program the run starts, resolved to an absolute path (a host run only): relative to
+   * the resolved directory, or a bare name found where run.sh looks. Show `programShown`, escaped.
+   */
   readonly program?: string;
+  readonly programShown?: string;
   /** The run's timeout. */
   readonly timeoutMs: number;
   /** The tree pin recomputed now, against the request's. */

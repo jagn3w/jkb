@@ -175,3 +175,26 @@ test("the generic op gate never sends a runner's op, and sends everything else",
   assert.equal((await rendererOp({ op: "exec.status", id: "exec-1" }, send)).ok, true);
   assert.deepEqual(sent, ["exec.status"]);
 });
+
+test("an argument escapes one code point of every hidden category, by Unicode property", () => {
+  for (const [ch, shown, category] of [
+    ["\u{001b}", "\\u{001b}", "Cc"],
+    ["\u{0085}", "\\u{0085}", "Cc (C1)"],
+    ["\u{0600}", "\\u{0600}", "Cf"],
+    ["\u{1d173}", "\\u{1d173}", "Cf, default-ignorable"],
+    ["\u{200b}", "\\u{200b}", "Cf"],
+    ["\u{e000}", "\\u{e000}", "Co"],
+    ["\u{0378}", "\\u{0378}", "Cn"],
+    ["\u{2028}", "\\u{2028}", "Zl"],
+    ["\u{2029}", "\\u{2029}", "Zp"],
+    ["\u{034f}", "\\u{034f}", "default-ignorable (Mn)"],
+    ["\u{180b}", "\\u{180b}", "default-ignorable (Mn)"],
+    ["\u{ffa0}", "\\u{ffa0}", "default-ignorable (Lo)"],
+    ["\u{00a0}", "\\u{00a0}", "Zs"],
+    ["\u{3000}", "\\u{3000}", "Zs"],
+    ["\u{1bca0}", "\\u{1bca0}", "Cf"],
+  ]) {
+    assert.equal(escapeArg(`a${ch}b`), `a${shown}b`, category);
+  }
+  assert.equal(escapeArg("./scripts/check.sh a b"), "./scripts/check.sh a b", "U+0020 is a space like any other");
+});
