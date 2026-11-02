@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
-  decodeDesignSpan,
   decodeNewPrompt,
   decodeThread,
   decodeThreads,
@@ -14,11 +13,17 @@ import {
 } from "@jkb/core";
 
 import { useTerminals } from "../terminal/TerminalProvider";
+import { approveSelection, settle, versionOf, type Doing } from "./approve";
 import { launchSpec } from "./launch";
 import type { DesignSession } from "./session";
 import type { Draft } from "./ThreadMargin";
 
 const op = (request: Parameters<typeof window.jkb.op>[0]) => window.jkb.op(request);
+
+const STARTING: Doing = { during: "the comment was being started", verb: "start the comment" };
+const REPLYING: Doing = { during: "the reply was being sent", verb: "reply" };
+const RESOLVING: Doing = { during: "the thread was being resolved", verb: "resolve the thread" };
+const ASKING: Doing = { during: "Claude was being asked", verb: "ask Claude" };
 
 /** A selection, and the text it is offsets into: a comment or approval acts only on that text. */
 interface Selected extends Draft {
@@ -89,49 +94,11 @@ export function useThreads(
     [design.topic, load],
   );
 
-  /**
-   * The version whose text is `shown`, or `undefined` with a notice saying why not — each way a
-   * session can fail to settle said as *Discuss* says it, never all as "the text changed".
-   */
-  const versionOf = useCallback(
-    async (shown: string, doing: string): Promise<string | undefined> => {
-      if (session === undefined) return undefined;
-      const settled = await session.settledVersion();
-      if (!settled.ok) {
-        const why = settled.why;
-        switch (why.kind) {
-          case "closed":
-            onNotice(`The design was left before its edits were saved, while ${doing} — select the text again.`);
-            return undefined;
-          case "failed":
-            onNotice(`${why.message} — reopen the design.`);
-            return undefined;
-          case "unread":
-            onNotice(`Cannot read the design: ${why.message}`);
-            return undefined;
-          case "moved":
-            break;
-        }
-      }
-      if (!settled.ok || settled.doc.text !== shown) {
-        onNotice(`The text changed while ${doing} — select it again.`);
-        return undefined;
-      }
-      return settled.doc.version;
-    },
-    [session, onNotice],
-  );
-
   const run = useCallback(
-    async <T>(request: Promise<Outcome<T>>): Promise<T | undefined> => {
+    async <T>(request: () => Promise<Outcome<T>>, doing: Doing): Promise<T | undefined> => {
       setBusy(true);
       try {
-        const answer = await request;
-        if (!answer.ok) {
-          onNotice(answer.error.message);
-          return undefined;
-        }
-        return answer.value;
+        return await settle(request, doing, onNotice);
       } finally {
         setBusy(false);
       }
@@ -143,20 +110,20 @@ export function useThreads(
     async (text: string): Promise<boolean> => {
       const d = draft;
       if (d === undefined) return false;
-      const base = await versionOf(d.shown, "the comment was being started");
+      const base = await versionOf({ session, shown: d.shown, doing: STARTING, onNotice });
       if (base === undefined) return false;
-      const made = await run(op(threadOps.start(design.uid, base, d.from, d.to, text)).then(decodeThread));
+      const made = await run(() => op(threadOps.start(design.uid, base, d.from, d.to, text)).then(decodeThread), STARTING);
       if (made === undefined) return false;
       setDraft(undefined);
       void load();
       return true;
     },
-    [draft, versionOf, run, design.uid, load],
+    [draft, session, onNotice, run, design.uid, load],
   );
 
   const reply = useCallback(
     async (thread: Thread, text: string): Promise<boolean> => {
-      const done = await run(op(threadOps.reply(thread.uid, text)).then(decodeThread));
+      const done = await run(() => op(threadOps.reply(thread.uid, text)).then(decodeThread), REPLYING);
       void load();
       return done !== undefined;
     },
@@ -165,20 +132,16 @@ export function useThreads(
 
   const resolve = useCallback(
     (thread: Thread) => {
-      void run(op(threadOps.resolve(thread.uid)).then(decodeThread)).then(() => load());
+      void run(() => op(threadOps.resolve(thread.uid)).then(decodeThread), RESOLVING).then(() => load());
     },
     [run, load],
   );
 
   const approve = useCallback(
     (from: number, to: number, shown: string) => {
-      void (async () => {
-        const base = await versionOf(shown, "the approval was being sent");
-        if (base === undefined) return;
-        await run(op(threadOps.approveSelection(design.uid, base, from, to)).then(decodeDesignSpan));
-      })();
+      void approveSelection({ design: design.uid, session, from, to, shown, op, onNotice, onBusy: setBusy });
     },
-    [versionOf, run, design.uid],
+    [session, onNotice, design.uid],
   );
 
   const askClaude = useCallback(
@@ -195,7 +158,7 @@ export function useThreads(
         `\`jkb design thread reply ${thread.uid} --text -\` (the reply on stdin). Do not resolve it: ` +
         `that is the operator's.`;
       void (async () => {
-        const answer = await run(op(promptOps.newPrompt(design.uid, ask)).then(decodeNewPrompt));
+        const answer = await run(() => op(promptOps.newPrompt(design.uid, ask)).then(decodeNewPrompt), ASKING);
         if (answer === undefined) return;
         const spec = launchSpec(
           {
