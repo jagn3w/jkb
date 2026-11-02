@@ -101,6 +101,34 @@ export function decodeThread(o: Outcome<OpResponse>): Outcome<Thread> {
   return { ok: true, value: thread };
 }
 
+/** Who Code Factory is connected as: `role.whoami`, which every principal may ask. */
+export const callerOps = {
+  whoami: () => ({ op: "role.whoami" }),
+};
+
+/** `jkb_api::rbac::WhoAmI`: the caller's label, its roles, and the task it is held to, if any. */
+export interface Caller {
+  readonly label: string;
+  readonly roles: readonly string[];
+  readonly task: string | null;
+}
+
+/** `role.whoami`'s answer (`who_am_i`). A refusal passes through unchanged. */
+export function decodeWhoAmI(o: Outcome<OpResponse>): Outcome<Caller> {
+  if (!o.ok) return o;
+  const w = o.value.result === "who_am_i" ? o.value["whoami"] : undefined;
+  if (
+    !isObject(w) ||
+    !isString(w["label"]) ||
+    !Array.isArray(w["roles"]) ||
+    !w["roles"].every(isString) ||
+    !(w["task"] === null || w["task"] === undefined || isString(w["task"]))
+  ) {
+    return failed("internal", "jkb serve did not answer with a well-formed `who_am_i`");
+  }
+  return { ok: true, value: { label: w["label"], roles: w["roles"], task: w["task"] ?? null } };
+}
+
 /** A `thread` message on a design's topic: one of its threads was started, replied to or resolved. */
 export interface ThreadAnnouncement {
   readonly design: string;

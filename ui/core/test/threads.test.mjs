@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { decodeThread, decodeThreads, parseThreadAnnouncement, stackCards, threadOps } from "../dist/index.js";
+import { callerOps, decodeThread, decodeThreads, decodeWhoAmI, parseThreadAnnouncement, stackCards, threadOps } from "../dist/index.js";
 
 const thread = (over = {}) => ({
   uid: "thread:a",
@@ -59,4 +59,20 @@ test("cards keep their place unless the card above would overlap", () => {
     ]),
     [0, 58, 200],
   );
+});
+
+test("who Code Factory is connected as decodes from role.whoami, and a malformed answer is refused", () => {
+  assert.deepEqual(callerOps.whoami(), { op: "role.whoami" });
+  const whoami = (w, result = "who_am_i") => ({ ok: true, value: { result, whoami: w } });
+  const grant = { label: "grant:3", roles: ["designer"], task: null };
+  assert.deepEqual(decodeWhoAmI(whoami(grant)), { ok: true, value: grant });
+  const scoped = decodeWhoAmI(whoami({ label: "ticket:9", roles: ["implementer"], task: "task:x" }));
+  assert.equal(scoped.ok && scoped.value.task, "task:x");
+  assert.equal(decodeWhoAmI(whoami(grant, "grants")).ok, false, "a wrong result tag");
+  assert.equal(decodeWhoAmI(whoami({ ...grant, roles: "designer" })).ok, false, "roles not an array");
+  assert.equal(decodeWhoAmI(whoami({ ...grant, roles: ["designer", 3] })).ok, false, "a role not a string");
+  assert.equal(decodeWhoAmI(whoami({ ...grant, label: 3 })).ok, false, "a label not a string");
+  assert.equal(decodeWhoAmI(whoami({ ...grant, task: 3 })).ok, false, "a task neither a uid nor null");
+  const refused = { ok: false, error: { code: "unauthorized", message: "no such token" } };
+  assert.equal(decodeWhoAmI(refused), refused, "a refusal passes through unchanged");
 });

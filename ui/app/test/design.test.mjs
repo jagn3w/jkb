@@ -50,7 +50,7 @@ const { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading } = await 
 const { LAUNCH_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
 const { createAndOpen, createDesign, createTargets, defaultTarget } = await load(path.join(src, "renderer", "src", "design", "create.ts"));
 const { SIDEBAR_WIDTH, clampSidebarWidth, parseSidebarWidth } = await load(path.join(src, "renderer", "src", "design", "sidebarWidth.ts"));
-const { approveSelection, settle, IDLE_TIMEOUT_MS } = await load(path.join(src, "renderer", "src", "design", "approve.ts"));
+const { APPROVE_BUSY, approveBlocked, approveSelection, settle, IDLE_TIMEOUT_MS } = await load(path.join(src, "renderer", "src", "design", "approve.ts"));
 const Y = require("yjs");
 
 const TOPIC = "design/design.factory-1";
@@ -1004,24 +1004,27 @@ async function approveWith(over = {}) {
 }
 
 test("an approval with no session yet says the design is still opening", async () => {
-  const { out, notices } = await approveWith({ session: undefined, op: async () => assert.fail("no op without a version") });
+  const { out, notices, busy } = await approveWith({ session: undefined, op: async () => assert.fail("no op without a version") });
   assert.equal(out, undefined);
   assert.deepEqual(notices, ["The design is still opening — select the text again."]);
+  assert.deepEqual(busy, [true, false]);
 });
 
 test("an approval whose settle rejects says so, instead of an unhandled rejection", async () => {
   const session = { settledVersion: async () => { throw new Error("Error invoking remote method 'jkb:op': boom"); } };
-  const { out, notices } = await approveWith({ session, op: async () => assert.fail("no op without a version") });
+  const { out, notices, busy } = await approveWith({ session, op: async () => assert.fail("no op without a version") });
   assert.equal(out, undefined);
   assert.deepEqual(notices, ["Cannot approve: Error invoking remote method 'jkb:op': boom"]);
+  assert.deepEqual(busy, [true, false]);
 });
 
 test("an approval waiting on edits that are never saved stops waiting and says so", async () => {
   assert.equal(IDLE_TIMEOUT_MS, 10_000);
   const session = { settledVersion: () => new Promise(() => undefined) };
-  const { out, notices } = await approveWith({ session, idleTimeoutMs: 5, op: async () => assert.fail("no op without a version") });
+  const { out, notices, busy } = await approveWith({ session, idleTimeoutMs: 5, op: async () => assert.fail("no op without a version") });
   assert.equal(out, undefined);
   assert.deepEqual(notices, ["Edits are still being saved — try again in a moment."]);
+  assert.deepEqual(busy, [true, false]);
   // A settle that rejects after the wait was abandoned is swallowed, not left unhandled.
   let reject;
   const late = { settledVersion: () => new Promise((_, r) => { reject = r; }) };
@@ -1048,17 +1051,68 @@ test("an approval whose op rejects says so, and is no longer busy", async () => 
 });
 
 test("an approval jkb refuses says jkb's reason", async () => {
-  const { out, notices } = await approveWith({ op: async () => err("forbidden", "only the operator may approve") });
+  const { out, notices, busy } = await approveWith({ op: async () => err("forbidden", "only the operator may approve") });
   assert.equal(out, undefined);
   assert.deepEqual(notices, ["only the operator may approve"]);
+  assert.deepEqual(busy, [true, false]);
 });
 
 test("an approval over text that moved says to select it again", async () => {
-  const { out, notices } = await approveWith({ session: settledOn("hello there"), op: async () => assert.fail("no op on moved text") });
+  const { out, notices, busy } = await approveWith({ session: settledOn("hello there"), op: async () => assert.fail("no op on moved text") });
   assert.equal(out, undefined);
   assert.deepEqual(notices, ["The text changed while the approval was being sent — select it again."]);
-  const moved = { settledVersion: async () => ({ ok: false, why: { kind: "moved" } }) };
-  assert.deepEqual((await approveWith({ session: moved })).notices, ["The text changed while the approval was being sent — select it again."]);
+  assert.deepEqual(busy, [true, false]);
+  const moved = await approveWith({ session: { settledVersion: async () => ({ ok: false, why: { kind: "moved" } }) } });
+  assert.deepEqual(moved.notices, ["The text changed while the approval was being sent — select it again."]);
+  assert.deepEqual(moved.busy, [true, false]);
+});
+
+test("an approval is busy from the click: through the wait for the session to settle, until it ends", async () => {
+  let settleNow;
+  const session = { settledVersion: () => new Promise((resolve) => { settleNow = () => resolve({ ok: true, doc: { text: "hello world", version: "7.1" } }); }) };
+  const busy = [];
+  const notices = [];
+  const out = approveSelection({
+    design: "design:d",
+    session,
+    from: 4,
+    to: 9,
+    shown: "hello world",
+    op: async () => ok({ result: "design_span", span: approvedSpan }),
+    onNotice: (m) => notices.push(m),
+    onBusy: (b) => busy.push(b),
+  });
+  await tick();
+  assert.ok(settleNow, "the session is being waited on");
+  assert.deepEqual(busy, [true], "busy before the session has settled");
+  assert.deepEqual(notices, []);
+  settleNow();
+  assert.equal((await out).uid, "span:new");
+  assert.deepEqual(busy, [true, false]);
+  assert.deepEqual(notices, ["Approved 5 characters (span:new)."]);
+});
+
+test("Approve is blocked while busy, and for a caller known not to be the operator, saying why", () => {
+  const operator = { label: "operator", roles: ["operator"], task: null };
+  const designer = { label: "grant:3", roles: ["designer", "reviewer"], task: null };
+  const roleless = { label: "grant:4", roles: [], task: null };
+  assert.equal(approveBlocked(operator, false), undefined);
+  // The role decides, not the label: a grant holding the operator role may approve.
+  assert.equal(approveBlocked({ label: "grant:7", roles: ["reviewer", "operator"], task: null }, false), undefined);
+  assert.equal(
+    approveBlocked(designer, false),
+    "Only the operator approves a selection. Code Factory is connected as grant:3 (designer, reviewer).",
+  );
+  assert.equal(
+    approveBlocked(roleless, false),
+    "Only the operator approves a selection. Code Factory is connected as grant:4 (no role).",
+  );
+  // An unknown caller (whoami pending, refused or failed) is offered Approve: the server decides.
+  assert.equal(approveBlocked(undefined, false), undefined);
+  for (const caller of [operator, designer, roleless, undefined]) {
+    assert.equal(approveBlocked(caller, true), APPROVE_BUSY, "busy wins over every caller");
+  }
+  assert.equal(APPROVE_BUSY, "Wait: an action on this design is still being sent.");
 });
 
 test("a successful approval says what it approved, sent against the settled version", async () => {

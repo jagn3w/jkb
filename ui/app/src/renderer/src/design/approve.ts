@@ -3,7 +3,7 @@
 // React. Every path that ends without the action done says why: an Approve that showed nothing was
 // indistinguishable from one that was never clicked.
 
-import { decodeDesignSpan, threadOps, type OpRequest, type OpResponse, type Outcome, type Span } from "@jkb/core";
+import { decodeDesignSpan, threadOps, type Caller, type OpRequest, type OpResponse, type Outcome, type Span } from "@jkb/core";
 
 import type { DesignSession } from "./session";
 
@@ -117,6 +117,26 @@ export async function versionOf({ session, shown, doing, onNotice, idleTimeoutMs
 
 export const APPROVING: Doing = { during: "the approval was being sent", verb: "approve" };
 
+/** [`approveBlocked`]'s reason while busy: the icon also reads `aria-busy` then. */
+export const APPROVE_BUSY = "Wait: an action on this design is still being sent.";
+
+/**
+ * Why Approve cannot be pressed now, or `undefined` when it can: the reason is the disabled icon's
+ * title. Busy wins: an action on this design is still being sent. Otherwise only a caller known not
+ * to be the operator is blocked — approving a selection is the operator's (`OpPermission::Admin`),
+ * the one fact copied from RBAC here; the server still enforces it. An unknown caller (`role.whoami`
+ * not answered yet, refused or failed) is offered Approve and the server decides, so a failed
+ * whoami never hides the operator's own button.
+ */
+export function approveBlocked(caller: Caller | undefined, busy: boolean): string | undefined {
+  if (busy) return APPROVE_BUSY;
+  if (caller !== undefined && !caller.roles.includes("operator")) {
+    const roles = caller.roles.join(", ") || "no role";
+    return `Only the operator approves a selection. Code Factory is connected as ${caller.label} (${roles}).`;
+  }
+  return undefined;
+}
+
 export interface ApproveSelection {
   readonly design: string;
   readonly session: Settling | undefined;
@@ -125,7 +145,10 @@ export interface ApproveSelection {
   readonly shown: string;
   readonly op: Op;
   readonly onNotice: Notice;
-  /** Told when the request is in flight, and when it is over. */
+  /**
+   * Told `true` from the click — before the wait for the session to settle, which can take up to
+   * [`IDLE_TIMEOUT_MS`] — and `false` once the approval has ended, whichever way.
+   */
   readonly onBusy?: (busy: boolean) => void;
   readonly idleTimeoutMs?: number;
 }
@@ -137,16 +160,16 @@ export interface ApproveSelection {
  */
 export async function approveSelection(args: ApproveSelection): Promise<Span | undefined> {
   const { design, session, from, to, shown, op, onNotice, onBusy, idleTimeoutMs } = args;
-  const base = await versionOf({ session, shown, doing: APPROVING, onNotice, idleTimeoutMs });
-  if (base === undefined) return undefined;
+  // Busy from the click: the wait for the session to settle shows as busy too, not as nothing.
   onBusy?.(true);
-  let span: Span | undefined;
   try {
-    span = await settle(async () => decodeDesignSpan(await op(threadOps.approveSelection(design, base, from, to))), APPROVING, onNotice);
+    const base = await versionOf({ session, shown, doing: APPROVING, onNotice, idleTimeoutMs });
+    if (base === undefined) return undefined;
+    const span = await settle(async () => decodeDesignSpan(await op(threadOps.approveSelection(design, base, from, to))), APPROVING, onNotice);
+    if (span === undefined) return undefined;
+    onNotice(`Approved ${span.text.length} characters (${span.uid}).`);
+    return span;
   } finally {
     onBusy?.(false);
   }
-  if (span === undefined) return undefined;
-  onNotice(`Approved ${span.text.length} characters (${span.uid}).`);
-  return span;
 }

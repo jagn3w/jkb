@@ -1,19 +1,22 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  callerOps,
   decodeNewPrompt,
   decodeThread,
   decodeThreads,
+  decodeWhoAmI,
   newPromptTitle,
   promptOps,
   threadOps,
+  type Caller,
   type Design,
   type Outcome,
   type Thread,
 } from "@jkb/core";
 
 import { useTerminals } from "../terminal/TerminalProvider";
-import { approveSelection, settle, versionOf, type Doing } from "./approve";
+import { approveBlocked, approveSelection, settle, versionOf, type Doing } from "./approve";
 import { launchSpec } from "./launch";
 import type { DesignSession } from "./session";
 import type { Draft } from "./ThreadMargin";
@@ -47,7 +50,10 @@ export interface Threads {
   /** Resolves true once the reply is in. */
   readonly reply: (thread: Thread, text: string) => Promise<boolean>;
   readonly resolve: (thread: Thread) => void;
+  /** Does nothing while an action on this design is being sent: a stale icon cannot start a second. */
   readonly approve: (from: number, to: number, shown: string) => void;
+  /** Why Approve cannot be pressed now (`approveBlocked`), or `undefined` when it can. */
+  readonly approveBlocked: string | undefined;
   readonly askClaude: (thread: Thread) => void;
 }
 
@@ -71,7 +77,30 @@ export function useThreads(
   // The version on screen: a thread's offsets are good only against the text they were read for.
   const shownVersion = session?.onScreen()?.version;
   const [draft, setDraft] = useState<Selected | undefined>(undefined);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusyState] = useState(false);
+  // Mirrors `busy` for the callbacks, which a click can reach before React has re-rendered.
+  const busyRef = useRef(false);
+  const setBusy = useCallback((b: boolean) => {
+    busyRef.current = b;
+    setBusyState(b);
+  }, []);
+  // Who Code Factory is connected as, asked once: `undefined` until answered, and after a failure —
+  // which says nothing, since the server's refusal on a click still says why.
+  const [caller, setCaller] = useState<Caller | undefined>(undefined);
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const answer = decodeWhoAmI(await op(callerOps.whoami()));
+        if (live && answer.ok) setCaller(answer.value);
+      } catch {
+        // Left unknown: Approve stays offered and the server decides.
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     // The answer names the version its offsets are into: fresh only while that is the screen's.
@@ -103,7 +132,7 @@ export function useThreads(
         setBusy(false);
       }
     },
-    [onNotice],
+    [onNotice, setBusy],
   );
 
   const start = useCallback(
@@ -139,9 +168,10 @@ export function useThreads(
 
   const approve = useCallback(
     (from: number, to: number, shown: string) => {
+      if (busyRef.current) return;
       void approveSelection({ design: design.uid, session, from, to, shown, op, onNotice, onBusy: setBusy });
     },
-    [session, onNotice, design.uid],
+    [session, onNotice, design.uid, setBusy],
   );
 
   const askClaude = useCallback(
@@ -189,6 +219,7 @@ export function useThreads(
     reply,
     resolve,
     approve,
+    approveBlocked: approveBlocked(caller, busy),
     askClaude,
   };
 }
