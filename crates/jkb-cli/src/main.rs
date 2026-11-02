@@ -1463,6 +1463,11 @@ enum TaskCmd {
         /// asks this before it grafts, so an unapproved head never reaches the base.
         #[arg(long)]
         check: bool,
+        /// The commit of `branch` that was grafted (or, with `--check`, would be), instead of the
+        /// branch's tip read now — so a commit made after the queue read the branch is not
+        /// recorded as the head that landed. A full commit id.
+        #[arg(long)]
+        head: Option<String>,
     },
     /// Release a task's claim held by an owner (defaults to this process).
     Release {
@@ -2795,6 +2800,7 @@ pub(crate) fn cmd_task_landed(
     branch: &str,
     onto: &str,
     check: bool,
+    pinned: Option<&str>,
     json: bool,
 ) -> Result<()> {
     gitrepo::valid_ref(branch)?;
@@ -2802,9 +2808,18 @@ pub(crate) fn cmd_task_landed(
     let ctx = repo::repo_ctx()?;
     // The branch's own tip, read **before** anything else could move it: what a person reading
     // the history needs to recognize which work this was.
-    let head = gitrepo::branch_ref(&ctx.root, branch, gitrepo::Prefer::Local)?
-        .and_then(|r| gitrepo::rev_commit(&ctx.root, &r).transpose())
-        .transpose()?;
+    let head = match pinned {
+        Some(sha) => {
+            anyhow::ensure!(
+                sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+                "--head takes a full commit id, not `{sha}`"
+            );
+            Some(sha.to_owned())
+        }
+        None => gitrepo::branch_ref(&ctx.root, branch, gitrepo::Prefer::Local)?
+            .and_then(|r| gitrepo::rev_commit(&ctx.root, &r).transpose())
+            .transpose()?,
+    };
 
     // Every task recorded on this branch. The queue lands a whole group at once, so this is
     // many-to-one by nature — and it needs no per-branch record to find them, because a task's
@@ -2897,11 +2912,12 @@ pub(crate) fn cmd_task_landed(
     Ok(())
 }
 
-/// `jkb task landed --check`: whether every open task on `branch` may be recorded as landed at
-/// `head` — the review rule ([`jkb_api::review_gate::landing_with`]) for every caller, the operator
-/// included, since the merge queue grafts before it records and a landing it then could not record
-/// is work on the base that no reviewer approved; and `task.land_check`, so a caller the strategy or
-/// a parked workflow refuses is refused before the graft too. A task already landed exactly here is
+/// `jkb task landed --check`: whether a reviewer approved `branch` at `head` — the rule `jkb serve`
+/// asks of a landing a non-operator records ([`jkb_api::review_gate::landing_with`] over the
+/// branch's [`jkb_api::review_gate::branch_state`]), asked here of every caller, the operator
+/// included, since the merge queue grafts before it records. Who may *record* the landing is not
+/// asked: under a strategy where only the operator lands, the queue still grafts and the operator
+/// records it afterwards. A branch whose every task is finished or already landed exactly here is
 /// the queue's re-run, and passes.
 fn check_landing(
     kb: &session_cli::Kb<'_>,
@@ -2911,54 +2927,37 @@ fn check_landing(
     head: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    let landed = jkb_api::sessions::Landed {
-        branch: branch.to_owned(),
-        onto: onto.to_owned(),
-        head: head.map(str::to_owned),
-    };
     let here = jkb_api::sessions::LiveLanding::Grafted {
         branch: branch.to_owned(),
         onto: onto.to_owned(),
     };
-    let mut refusals = Vec::new();
+    let mut states = Vec::new();
+    let mut pending = false;
     for uid in uids {
         let facts = kb.facts(uid)?;
-        if facts.terminal {
-            continue;
-        }
-        if facts.landed.as_deref() == Some(&here) {
-            continue;
-        }
-        let found = review::findings_via(kb, &facts.review.namespaces)?;
-        if let Some(why) = jkb_api::review_gate::landing_with(&found, &facts.review, head).short() {
-            refusals.push((uid.clone(), why));
-            continue;
-        }
-        if let Err(e) = kb.land_check(uid, &landed) {
-            refusals.push((uid.clone(), format!("{e:#}")));
-        }
+        pending |= !facts.terminal && facts.landed.as_deref() != Some(&here);
+        states.push(facts.review);
     }
+    let review = jkb_api::review_gate::branch_state(&states, head);
+    let refusal = if pending {
+        let found = review::findings_via(kb, &review.namespaces)?;
+        jkb_api::review_gate::landing_with(&found, &review, head).short()
+    } else {
+        None
+    };
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "branch": branch, "onto": onto, "head": head,
-                "may_land": refusals.is_empty(),
-                "refused": refusals.iter().map(|(uid, why)| serde_json::json!({
-                    "uid": uid, "reason": why,
-                })).collect::<Vec<_>>(),
+                "may_land": refusal.is_none(), "reason": refusal,
             })
         );
-    } else {
-        for (uid, why) in &refusals {
-            eprintln!("  {uid} — {why}");
-        }
     }
-    anyhow::ensure!(
-        refusals.is_empty(),
-        "{branch} may not land on {onto}: no reviewer approved its head for every task on it (the reasons are above)"
-    );
-    Ok(())
+    match refusal {
+        None => Ok(()),
+        Some(why) => anyhow::bail!("{branch} may not land on {onto}: {why}"),
+    }
 }
 
 /// The host-only session verbs: configure the gate that guards a landing (design D36.5), and break a

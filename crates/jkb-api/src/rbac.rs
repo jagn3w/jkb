@@ -1140,9 +1140,6 @@ pub fn authorize(
     if permission == OpPermission::Land {
         admit_landing(conn, principal, request, target, reference)?;
     }
-    if let Some(why) = closes_past_landing(conn, target, request)? {
-        return Err(forbidden(format!("`{op}` refused: {why}")));
-    }
     match (principal.scope, principal.attested_agent()) {
         (Some(scope), _) => {
             if !roles::in_scope(conn, scope, target)? {
@@ -1208,7 +1205,8 @@ fn admit_landing(
     // as gated by their caller, which holds for the operator and was only a prompt line for a
     // coordinator running the merge queue. A repeat of a recorded landing records nothing.
     if let (false, Some(landed)) = (repeat, landed_of(request)) {
-        let verdict = crate::review_gate::landing(conn, target, landed.head.as_deref())?;
+        let verdict =
+            crate::review_gate::landing(conn, target, &landed.branch, landed.head.as_deref())?;
         if let Some(why) = verdict.short() {
             return Err(forbidden(format!(
                 "`{op}` refused: no reviewer approved the head being landed. {why} Only the \
@@ -1256,37 +1254,6 @@ fn landed_of(request: &Request) -> Option<&crate::sessions::Landed> {
         | Request::TaskLanded { landed, .. } => Some(landed),
         _ => None,
     }
-}
-
-/// Why a non-operator may not set `task`'s status to `done` directly, if it may not. Only a landing
-/// closes a task's work — a coordinator that "marked the group done" once closed the next, unstarted
-/// task instead, and its dependents started on work that did not exist (2026-10-08) — so the one
-/// task a non-operator closes by hand is a review finding a recorded round holds, which whoever
-/// verified the fix closes. Read from the rounds' snapshots, never a tag: a tag is content the
-/// caller could write.
-fn closes_past_landing(
-    conn: &Connection,
-    task: ItemId,
-    request: &Request,
-) -> Result<Option<String>, ApiError> {
-    let Request::TaskSet {
-        status: Some(status),
-        uid,
-        ..
-    } = request
-    else {
-        return Ok(None);
-    };
-    if jkb_types::TaskStatus::from_manual_str(status) != Some(jkb_types::TaskStatus::Done)
-        || jkb_core::reviews::is_recorded_finding(conn, task)?
-    {
-        return Ok(None);
-    }
-    Ok(Some(format!(
-        "only a landing closes {uid} — `jkb task land`, or the merge queue's `jkb task landed` once \
-         a reviewer approved its head. The one task closed by hand is a review finding a recorded \
-         round holds. Only the operator overrides a task to `done`."
-    )))
 }
 
 // -------------------------------------------------------------------------------------------

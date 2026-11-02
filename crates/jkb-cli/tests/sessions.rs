@@ -7170,10 +7170,35 @@ fn landed_check_asks_for_a_clean_review_of_the_head_and_records_nothing() {
     check().success();
     assert_ne!(f.status_of(&uid), "done", "a check records nothing");
 
+    let reviewed = git(&f.repo, &["rev-parse", "swarm-task/group"]);
     git(&f.repo, &["checkout", "-q", "swarm-task/group"]);
     commit_in(&f.repo, "more.txt", "more\n", "after the review");
     git(&f.repo, &["checkout", "-q", "main"]);
     check().failure().stderr(predicate::str::contains(
         "no reviewer saw the commits since",
     ));
+    // The queue pins the commit it read: the reviewed one still passes, whatever the tip is now.
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            "swarm-task/group",
+            "--onto",
+            "integration",
+        ])
+        .args(["--head", reviewed.trim(), "--check"])
+        .assert()
+        .success();
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            "swarm-task/group",
+            "--onto",
+            "integration",
+        ])
+        .args(["--head", "abc", "--check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("full commit id"));
 }

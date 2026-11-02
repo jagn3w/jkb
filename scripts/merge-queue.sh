@@ -18,11 +18,12 @@
 #               common ancestor with <base> at all. Nothing changed.
 #   5  stall   — <branch> is already an ancestor of <base>, and the graph cannot say whether an
 #               earlier entry landed its work or it was never committed to. A person decides.
-#   6  stall   — no reviewer approved <branch>'s head: `jkb task landed --check` found a task on
-#               it with no clean recorded review round of exactly that commit (and no operator
-#               waiver of it), or a caller jkb would not let record the landing. Asked BEFORE
-#               anything moves, because the landing is recorded only after the graft, and a
-#               refusal then would leave unapproved work on <base> with its tasks open. Not an
+#   6  stall   — no reviewer approved <branch>'s head: `jkb task landed --check` found no clean
+#               review round recorded against exactly that commit on the branch's tasks (and no
+#               operator waiver of it). Asked BEFORE anything moves, because the landing is
+#               recorded only after the graft, and a refusal then would leave unapproved work on
+#               <base> with its tasks open. Who may RECORD the landing is not asked: where only the
+#               operator lands, the queue grafts and the operator records it afterwards. Not an
 #               eject: the implementer has nothing to fix, and the reviewer's verdict is what is
 #               missing — a person (or the coordinator's next review pass) supplies it.
 #   4  stall   — this worktree needs a human. Three arms reach it, and they do NOT all mean the
@@ -202,12 +203,17 @@ fi' EXIT
 
 cd "$WT" 2>/dev/null || { echo "error: cannot cd to worktree $WT"; finish 3; }
 git switch "$BASE" >/dev/null 2>&1 || { echo "error: cannot switch to base $BASE"; finish 3; }
-git rev-parse --verify --quiet "$BRANCH_REF^{commit}" >/dev/null 2>&1 || { echo "error: no such branch $BRANCH"; finish 3; }
+HEAD_SHA="$(git rev-parse --verify --quiet "$BRANCH_REF^{commit}" 2>/dev/null)" || HEAD_SHA=""
+[ -n "$HEAD_SHA" ] || { echo "error: no such branch $BRANCH"; finish 3; }
+# THE BRANCH IS READ ONCE. Every step below — the approval question, the entry checks, the graft and
+# the landing record — uses this commit, never the branch name again: an implementer committing
+# while the queue ran would otherwise have its unreviewed commit grafted, and then refused as the
+# recorded head after the base had already moved.
 # A REVIEWER'S VERDICT, RECORDED IN jkb, NOT THE CALLER'S WORD FOR IT. This header called its input
 # "ONE reviewer-approved branch" while nothing here asked: the swarm coordinator's prompt was the only
 # thing between an unreviewed head and the base, and `jkb task landed` below records what it is told.
 # jkb answers now, from the rounds the reviewer recorded against the branch's head.
-if ! "$JKB" task landed "$BRANCH" --onto "$BASE" --check >/tmp/merge-queue-approval.log 2>&1; then
+if ! "$JKB" task landed "$BRANCH" --onto "$BASE" --head "$HEAD_SHA" --check >/tmp/merge-queue-approval.log 2>&1; then
   echo "stall: no reviewer approved $BRANCH's head, so nothing was grafted — run a review round of this head (or the operator waives it). jkb said: $(tr '\n' ' ' </tmp/merge-queue-approval.log)"
   finish 6
 fi
@@ -240,7 +246,7 @@ fi
 # a worktree the queue cannot use needs a person, while an implementer who reported ready without
 # committing needs to go back and implement. Since the consumer now stalls deterministically on 3,
 # leaving it there would have stopped the retryable case from ever retrying.
-_merge_base="$(git merge-base "$BASE_REF" "$BRANCH_REF" 2>/dev/null)" || _merge_base=""
+_merge_base="$(git merge-base "$BASE_REF" "$HEAD_SHA" 2>/dev/null)" || _merge_base=""
 if [ -z "$_merge_base" ]; then
   echo "error: $BRANCH and $BASE have no common ancestor"
   finish 3
@@ -259,7 +265,7 @@ fi
 # "Implement it, commit, and resubmit" — which sends an implementer whose work IS in the base
 # round a retry loop with nothing to fix, until the group resets to `open` with its tasks never
 # closed. Stalling says the true thing: somebody has to look.
-if git merge-base --is-ancestor "$BRANCH_REF" "$BASE_REF" 2>/dev/null; then
+if git merge-base --is-ancestor "$HEAD_SHA" "$BASE_REF" 2>/dev/null; then
   echo "stall: $BRANCH is already an ancestor of $BASE — either an earlier entry landed its work and it was rebased since, or it was never committed to. The graph cannot tell those apart; close it with \`jkb task landed\` if the work is in, or send it back if it is not."
   finish 5
 fi
@@ -274,7 +280,7 @@ fi
 # implement, and exit 3 now stalls for a human. The `rev-list --count` check that used to sit
 # here is gone rather than kept as a belt — it was unreachable, because a branch with no commits
 # ahead is an ancestor and is answered above.
-if git diff --quiet "$_merge_base" "$BRANCH_REF"; then
+if git diff --quiet "$_merge_base" "$HEAD_SHA"; then
   echo "eject: $BRANCH diverged from $BASE but changes nothing against it — no work to land, however many commits it carries. Implement it, commit, and resubmit."
   finish 1
 fi
@@ -292,7 +298,7 @@ PRE=$(git rev-parse HEAD)   # the base tip before this graft: what the gated res
 # claim the branch ref, so it is allowed even when the branch is live elsewhere; we rebase
 # that detached HEAD, then fast-forward the base to the grafted result (linear, no merge
 # commit). Empty commits drop exactly as a normal rebase would.
-if ! git checkout --detach "$BRANCH_REF" >/tmp/merge-queue.log 2>&1; then
+if ! git checkout --detach "$HEAD_SHA" >/tmp/merge-queue.log 2>&1; then
   git switch "$BASE" >/dev/null 2>&1
   echo "eject: cannot detach at $BRANCH (see /tmp/merge-queue.log)"
   finish 1
@@ -389,7 +395,7 @@ fi
 # earlier entry landed the same content, and the commits that were empty to begin with. Neither
 # advances $BASE, and both are reported in the words below rather than as a graft.
 if git diff --quiet "$PRE" "$GRAFT"; then
-  "$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
+  "$JKB" task landed "$BRANCH" --onto "$BASE" --head "$HEAD_SHA" >/dev/null \
     || echo "note: could not record the landing of $BRANCH"
   echo "landed: $BRANCH → $BASE (no new content; $BASE already has everything this branch adds)"
   finish 0
@@ -410,7 +416,7 @@ fi
 # that never moved — closes a whole group and unblocks its dependents, and a guard that is merely
 # redundant costs one comparison.
 if [ "$(git rev-parse HEAD)" = "$PRE" ]; then
-  "$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
+  "$JKB" task landed "$BRANCH" --onto "$BASE" --head "$HEAD_SHA" >/dev/null \
     || echo "note: could not record the landing of $BRANCH"
   echo "landed: $BRANCH → $BASE (no new commits; its content was already in $BASE)"
   finish 0
@@ -424,7 +430,7 @@ fi
 # the repair is one command. stdout is noise; stderr is not: the verb names any task it could not
 # close (open subtasks, most often), and swallowing that would leave the caller believing a whole
 # group was done.
-"$JKB" task landed "$BRANCH" --onto "$BASE" >/dev/null \
+"$JKB" task landed "$BRANCH" --onto "$BASE" --head "$HEAD_SHA" >/dev/null \
   || echo "note: could not record the landing of $BRANCH (the graft itself is done)"
 echo "landed: $BRANCH → $BASE in $(( $(date +%s) - start ))s"
 finish 0

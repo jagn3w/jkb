@@ -177,17 +177,77 @@ pub fn merge(parts: impl IntoIterator<Item = ReviewFindings>) -> ReviewFindings 
     out
 }
 
-/// [`landing_with`], read from the database: what a landing of `head` for `task` by anyone but the
-/// operator must pass.
+/// The review record of a whole branch, from the records of the tasks on it: what a landing of `head`
+/// is judged by. **The branch is the unit of review.** A round is recorded by branch
+/// (`task.review_record --branch`), and a swarm reviewer, scoped to its group's lead, records it
+/// against the lead alone: judged task by task, every other task of the group would read as never
+/// reviewed and no group of two could land.
+///
+/// So every task's rounds count (a newer round on one task does not retire another task's open
+/// must-fix, and the newest round across the branch must be clean), any task's review of exactly
+/// `head` is a review of the branch's head, and so is an operator's waiver of it.
+#[must_use]
+pub fn branch_state<'a>(
+    states: impl IntoIterator<Item = &'a ReviewState>,
+    head: Option<&str>,
+) -> ReviewState {
+    let mut out = ReviewState::default();
+    for s in states {
+        for ns in &s.namespaces {
+            if !out.namespaces.contains(ns) {
+                out.namespaces.push(ns.clone());
+            }
+        }
+        match (&s.reviewed, head) {
+            (Some(r), Some(h)) if r == h => out.reviewed = Some(r.clone()),
+            (Some(r), _) if out.reviewed.is_none() => out.reviewed = Some(r.clone()),
+            _ => {}
+        }
+        if head.is_some() && s.waived.as_deref() == head {
+            out.waived.clone_from(&s.waived);
+        }
+    }
+    out
+}
+
+/// [`landing_with`] over [`branch_state`], read from the database: what a landing of `head` from
+/// `branch`, asked for `task` by anyone but the operator, must pass. When `task` carries
+/// `branch=<branch>`, the branch's tasks are those carrying it in `task`'s repository (its `repo=`);
+/// otherwise `task` is judged on its own record.
 ///
 /// # Errors
 /// A database error, or the findings cannot be read.
 pub fn landing(
     conn: &Connection,
     task: jkb_types::ItemId,
+    branch: &str,
     head: Option<&str>,
 ) -> Result<GateVerdict, ApiError> {
-    let review = jkb_core::reviews::state(conn, task)?;
+    use jkb_core::location::{tasks_in_repo, FACET_BRANCH, FACET_REPO};
+    use jkb_core::query::{CmpOp, TagPred};
+    let mut tasks = vec![task];
+    let tags = jkb_core::tag::applications(conn, task)?;
+    // Only a task on the branch shares its review: naming an approved branch for a task that is not
+    // on it borrows nothing.
+    let on_it = tags.iter().any(|(f, v)| f == FACET_BRANCH && v == branch);
+    for (facet, repo) in tags.iter().filter(|_| on_it) {
+        if facet != FACET_REPO {
+            continue;
+        }
+        let mut on_branch = tasks_in_repo(repo);
+        on_branch.tags.push(TagPred {
+            facet: FACET_BRANCH.to_owned(),
+            op: CmpOp::Eq,
+            value: branch.to_owned(),
+        });
+        for id in on_branch.evaluate(conn)? {
+            if !tasks.contains(&id) {
+                tasks.push(id);
+            }
+        }
+    }
+    let states = jkb_core::reviews::state_for(conn, &tasks)?;
+    let review = branch_state(states.values(), head);
     let parts = review
         .namespaces
         .chunks(MAX_REVIEW_NAMESPACES)
@@ -275,5 +335,42 @@ mod tests {
             landing_with(&none, &waived, None),
             GateVerdict::NeverReviewed
         );
+    }
+
+    #[test]
+    fn a_branch_is_reviewed_when_any_task_on_it_was_reviewed_at_its_head() {
+        let lead = ReviewState {
+            reviewed: Some("aaa".to_owned()),
+            namespaces: vec!["r/2".to_owned()],
+            ..ReviewState::default()
+        };
+        let older = ReviewState {
+            reviewed: Some("old".to_owned()),
+            namespaces: vec!["r/1".to_owned(), "r/2".to_owned()],
+            ..ReviewState::default()
+        };
+        let sibling = ReviewState::default();
+        let b = branch_state([&older, &sibling, &lead], Some("aaa"));
+        assert_eq!(b.reviewed.as_deref(), Some("aaa"));
+        assert_eq!(b.namespaces, ["r/1", "r/2"]);
+        assert_eq!(
+            branch_state([&older], Some("aaa")).reviewed.as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            branch_state([&sibling], Some("aaa")),
+            ReviewState::default()
+        );
+        let waived = ReviewState {
+            waived: Some("aaa".to_owned()),
+            ..ReviewState::default()
+        };
+        assert_eq!(
+            branch_state([&sibling, &waived], Some("aaa"))
+                .waived
+                .as_deref(),
+            Some("aaa")
+        );
+        assert_eq!(branch_state([&waived], Some("bbb")).waived, None);
     }
 }

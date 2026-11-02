@@ -90,11 +90,13 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
             branch,
             onto,
             check,
+            head,
         } => crate::cmd_task_landed(
             &crate::session_cli::Kb::from_ops(ops),
             &branch,
             &onto,
             check,
+            head.as_deref(),
             ops.json,
         ),
         TaskCmd::Review { cmd } => {

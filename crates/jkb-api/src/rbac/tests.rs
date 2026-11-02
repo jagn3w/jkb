@@ -1095,12 +1095,7 @@ fn a_cancelled_workflow_is_not_landed_by_ticking_it_done() {
         json!({ "op": "task.set", "uid": a, "status": "cancelled" }),
     );
     ok(&kb.op, json!({ "op": "workflow.observe", "uid": a }));
-    // The coordinator may not tick it at all; the operator may, and that still lands nothing.
-    refused(&c, json!({ "op": "task.set", "uid": a, "status": "done" }));
-    ok(
-        &kb.op,
-        json!({ "op": "task.set", "uid": a, "status": "done" }),
-    );
+    ok(&c, json!({ "op": "task.set", "uid": a, "status": "done" }));
     let e = refused(
         &c,
         json!({ "op": "task.landed", "uid": a,
@@ -1327,7 +1322,7 @@ fn a_coordinator_lands_only_a_head_a_reviewer_approved() {
     );
     let e = refused(&c, landing("task.landed", Some("abcd")));
     assert!(e.message.contains("must-fix"), "{e:?}");
-    // The finding is the one task the coordinator closes by hand; its own group's task it may not.
+    // The coordinator closes the finding, as CLOSING FINDINGS has it.
     let finding = match ok(
         &kb.op,
         json!({ "op": "task.review_findings", "namespaces": ["repos/r/codereviews/m1"] }),
@@ -1335,8 +1330,6 @@ fn a_coordinator_lands_only_a_head_a_reviewer_approved() {
         Response::ReviewFindings { findings } => findings.open_must_fix[0].uid.clone(),
         other => panic!("{other:?}"),
     };
-    let e = refused(&c, json!({ "op": "task.set", "uid": a, "status": "done" }));
-    assert!(e.message.contains("only a landing closes"), "{e:?}");
     ok(
         &c,
         json!({ "op": "task.set", "uid": finding, "status": "done" }),
@@ -1368,10 +1361,54 @@ fn a_coordinator_lands_only_a_head_a_reviewer_approved() {
     }
 }
 
-/// The operator is not held to a reviewer: the waiver is theirs, and so is a direct override to
-/// `done`.
+/// The branch is the unit of review: a swarm reviewer records its round against the group's lead
+/// alone, and the group's other tasks land on it — but not a task on another branch, nor one in
+/// another repository on a branch of the same name.
 #[test]
-fn the_operator_is_held_to_neither_rule() {
+fn a_round_on_the_lead_approves_every_task_on_its_branch() {
+    let kb = Kb::new();
+    let (_, token) = grant(&kb.op, "coordinator", None, "coord");
+    let c = kb.as_token(&token);
+    let lead = add(&kb.op, "lead");
+    approve(&kb.op, &lead, "abcd");
+    let task = |text: &str, repo: &str, branch: &str| {
+        let uid = add(&kb.op, text);
+        for (tag, mode) in [("repo=", repo), ("branch=", branch)] {
+            ok(
+                &kb.op,
+                json!({ "op": "task.tag", "uid": uid, "facet_value": format!("{tag}{mode}"),
+                        "mode": "set" }),
+            );
+        }
+        for json in [
+            json!({ "op": "workflow.set", "uid": uid, "strategy": "autonomous" }),
+            json!({ "op": "task.set", "uid": uid, "status": "in_progress" }),
+        ] {
+            ok(&kb.op, json);
+        }
+        uid
+    };
+    // Tagged after the round was recorded, so no round names it: what a scoped reviewer leaves.
+    let sibling = task("sibling", "r", "b");
+    let elsewhere = task("another branch", "r", "other");
+    let other_repo = task("same name, other repo", "q", "b");
+    let landing = |uid: &str| {
+        json!({ "op": "task.landed", "uid": uid,
+                "landed": { "branch": "b", "onto": "o", "head": "abcd" } })
+    };
+    match ok(&c, landing(&sibling)) {
+        Response::Landing { landing } => assert!(landing.moved, "{landing:?}"),
+        other => panic!("{other:?}"),
+    }
+    let e = refused(&c, landing(&elsewhere));
+    assert!(e.message.contains("No review has been recorded"), "{e:?}");
+    let e = refused(&c, landing(&other_repo));
+    assert!(e.message.contains("No review has been recorded"), "{e:?}");
+}
+
+/// The operator is not held to a reviewer: the waiver is theirs.
+#[test]
+fn the_operator_is_not_held_to_a_reviewer() {
     let kb = Kb::new();
     let a = add(&kb.op, "task a");
     ok(
@@ -1386,9 +1423,4 @@ fn the_operator_is_held_to_neither_rule() {
         Response::Landing { landing } => assert!(landing.moved, "{landing:?}"),
         other => panic!("{other:?}"),
     }
-    let b = add(&kb.op, "task b");
-    ok(
-        &kb.op,
-        json!({ "op": "task.set", "uid": b, "status": "done" }),
-    );
 }

@@ -106,9 +106,28 @@ case_unapproved() {
     git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
     git -C "$r" checkout -q trunk
     check "a head no reviewer approved stalls, and the base never moves" "$r" 6 still 0 APPROVE_RC=1
-    grep -qx 'task landed feat --onto trunk --check' "$r/.jkb-calls" \
-        && ok "the queue asks jkb about exactly the branch and base it would graft" \
-        || fail "queue: approval question" "jkb was not asked \`task landed feat --onto trunk --check\`: $(cat "$r/.jkb-calls")"
+    local tip; tip="$(git -C "$r" rev-parse refs/heads/feat)"
+    grep -qx "task landed feat --onto trunk --head $tip --check" "$r/.jkb-calls" \
+        && ok "the queue asks jkb about exactly the branch, base and commit it would graft" \
+        || fail "queue: approval question" "jkb was not asked \`task landed feat --onto trunk --head $tip --check\`: $(cat "$r/.jkb-calls")"
+}
+
+# THE HEAD IS READ ONCE. A commit the implementer makes after the approval question is not grafted:
+# the stub's approval answer commits to the branch, as an implementer racing the queue would.
+case_moved_after_approval() {
+    local r tip; r="$(mkrepo moved)"
+    git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
+    git -C "$r" checkout -q trunk
+    tip="$(git -C "$r" rev-parse refs/heads/feat)"
+    check "a commit made after the approval question is not what lands" "$r" 0 moved 1 \
+        RACE_REPO="$r"
+    if git -C "$r" cat-file -e refs/heads/trunk:late 2>/dev/null; then
+        fail "queue: head read once" "the commit made after the approval question was grafted"
+    elif grep -q "^task landed feat --onto trunk --head $tip\$" "$r/.jkb-calls"; then
+        ok "the landing is recorded at the commit that was asked about and grafted"
+    else
+        fail "queue: head read once" "the landing was not recorded at $tip: $(cat "$r/.jkb-calls")"
+    fi
 }
 
 case_red_gate() {   # THE HEADLINE: a red gate must not have moved the base
@@ -291,7 +310,20 @@ echo "==> scripts/merge-queue.sh: what it exits, and whether the base moved"
 # made that call — so the call is now evidence the cases check.
 mkdir -p "$work/bin"
 # `task landed --check` answers APPROVE_RC: whether jkb finds a reviewer's approval of the head.
-printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "$JKB_CALLS"\ncase "$*" in *--check*) exit "${APPROVE_RC:-0}" ;; esac\nexit 0\n' >"$work/bin/jkb"
+# With RACE_REPO set, answering the question also commits to the branch, as a racing implementer.
+cat >"$work/bin/jkb" <<'STUB'
+#!/bin/sh
+printf "%s\n" "$*" >> "$JKB_CALLS"
+case "$*" in *--check*)
+    if [ -n "${RACE_REPO:-}" ]; then
+        git -C "$RACE_REPO" worktree add -q "$RACE_REPO.race" feat >/dev/null 2>&1
+        echo late >"$RACE_REPO.race/late"; git -C "$RACE_REPO.race" add late
+        git -C "$RACE_REPO.race" commit -qm late >/dev/null 2>&1
+    fi
+    exit "${APPROVE_RC:-0}" ;;
+esac
+exit 0
+STUB
 chmod +x "$work/bin/jkb"
 case_signalled() {   # killed mid-gate by any signal: never `landed`, and the base never moves
     local r pid out sig pre bad="" want; r="$(mkrepo signalled)"
@@ -333,7 +365,7 @@ case_signalled() {   # killed mid-gate by any signal: never `landed`, and the ba
     [ -n "$bad" ] || ok "a queue killed mid-gate by TERM, HUP, USR1 or USR2 reports a stall and leaves the base (TERM/HUP after the gate)"
 }
 
-run_cases case_signalled case_land case_unapproved case_red_gate case_red_suite case_nothing_ahead case_empty_work \
+run_cases case_signalled case_land case_unapproved case_moved_after_approval case_red_gate case_red_suite case_nothing_ahead case_empty_work \
           case_conflict case_already_landed case_wedged case_already_merged \
           case_tag_like_branch case_tag_like_ancestor_branch case_tag_like_base \
           case_tag_like_base_suite_floor case_tag_like_base_orphan
