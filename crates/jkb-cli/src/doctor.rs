@@ -332,7 +332,7 @@ fn unplanned_report(health: &jkb_api::health::Health) -> Vec<String> {
     lines.extend(listed.iter().map(|t| format!("  {}  {}", t.uid, t.title)));
     if count > listed.len() {
         lines.push(format!(
-            "  … and {} more (`jkb query \"kind:task is:unplanned\"` lists them all)",
+            "  … and {} more (`jkb --global query \"kind:task is:unplanned\"` lists them all)",
             count - listed.len()
         ));
     }
@@ -432,6 +432,9 @@ mod tests {
         h.unplanned_count = Some(3);
         let lines = unplanned_report(&h);
         assert!(lines[2].starts_with("  … and 2 more"), "{lines:?}");
+        // The hint is unscoped, as `kb.health`'s count is: an ambient-scoped query run from a
+        // mounted repo would list fewer than the count it is offered beside.
+        assert!(lines[2].contains("jkb --global query"), "{lines:?}");
 
         h.unplanned = None;
         h.unplanned_count = None;

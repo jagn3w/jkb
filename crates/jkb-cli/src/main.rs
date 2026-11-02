@@ -115,8 +115,8 @@ enum Command {
         /// task's workflow phase (`design`, `design_review`, `implement`, `review`,
         /// `systemic_review`, `landable`, `landed`, `cancelled`; no workflow yet is `design`), and
         /// `-phase:…` excludes those phases. `is:unplanned` is every open task no execution plan's
-        /// step reaches, and `-is:unplanned` its complement. Quote a query with a `-` term as one
-        /// argument (`jkb query "kind:task -is:unplanned"`), or the term reads as a flag.
+        /// step reaches, and `-is:unplanned` its complement. A term that starts with `-` reads as a
+        /// flag, so put the terms after `--`: `jkb query -- kind:task -is:unplanned`.
         #[arg(required = true, num_args = 1..)]
         terms: Vec<String>,
         /// Maximum number of results.
