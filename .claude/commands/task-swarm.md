@@ -115,13 +115,13 @@ not in it. Ask whether to continue.
 ## 3. Scout and preview
 
 In scope mode, the coordinator's reads, as counts and lists (every read leaves out review
-findings). Its re-design read is empty before the run starts: it holds only tasks the run itself
+findings, and work an earlier run grafted whose landing was never recorded: `swarm-landing=unrecorded`). Its re-design read is empty before the run starts: it holds only tasks the run itself
 designed, so the scout skips it.
 
 ```sh
-jkb task next --global --json '<SCOPE> -tag:finding=review phase:implement,review,landable,systemic_review' --limit 100   # A, build
-jkb task next --global --json '<SCOPE> -tag:finding=review phase:design tag:design=approved' --limit 100                  # B, legacy
-jkb query --global --count 'kind:task is:ready <SCOPE> -tag:finding=review phase:design -tag:design=approved'             # C, design
+jkb task next --global --json '<SCOPE> -tag:finding=review -tag:swarm-landing=unrecorded phase:implement,review,landable,systemic_review' --limit 100   # A, build
+jkb task next --global --json '<SCOPE> -tag:finding=review -tag:swarm-landing=unrecorded phase:design tag:design=approved' --limit 100                  # B, legacy
+jkb query --global --count 'kind:task is:ready <SCOPE> -tag:finding=review -tag:swarm-landing=unrecorded phase:design -tag:design=approved'             # C, design
 jkb query --global --json 'kind:task <SCOPE> phase:design_review' --limit 1000                                            # awaiting you
 ```
 
