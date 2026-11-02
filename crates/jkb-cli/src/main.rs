@@ -1457,6 +1457,12 @@ enum TaskCmd {
         /// The branch it was grafted onto.
         #[arg(long)]
         onto: String,
+        /// Record nothing: exit non-zero unless every open task on the branch could be recorded as
+        /// landed — a reviewer approved the branch's head (a clean recorded round of exactly that
+        /// commit, or the operator's waiver of it) and this caller may land it. The merge queue
+        /// asks this before it grafts, so an unapproved head never reaches the base.
+        #[arg(long)]
+        check: bool,
     },
     /// Release a task's claim held by an owner (defaults to this process).
     Release {
@@ -2788,6 +2794,7 @@ pub(crate) fn cmd_task_landed(
     kb: &session_cli::Kb<'_>,
     branch: &str,
     onto: &str,
+    check: bool,
     json: bool,
 ) -> Result<()> {
     gitrepo::valid_ref(branch)?;
@@ -2814,6 +2821,10 @@ pub(crate) fn cmd_task_landed(
         "no task in {} records branch={branch}, so there is nothing to record a landing for",
         ctx.key
     );
+
+    if check {
+        return check_landing(kb, &uids, branch, onto, head.as_deref(), json);
+    }
 
     let mut recorded = Vec::new();
     let mut not_closed = Vec::new();
@@ -2882,6 +2893,70 @@ pub(crate) fn cmd_task_landed(
     anyhow::ensure!(
         refused < uids.len(),
         "nothing on {branch} was recorded as landed on {onto}: every one of its tasks was refused (the reasons are above)"
+    );
+    Ok(())
+}
+
+/// `jkb task landed --check`: whether every open task on `branch` may be recorded as landed at
+/// `head` — the review rule ([`jkb_api::review_gate::landing_with`]) for every caller, the operator
+/// included, since the merge queue grafts before it records and a landing it then could not record
+/// is work on the base that no reviewer approved; and `task.land_check`, so a caller the strategy or
+/// a parked workflow refuses is refused before the graft too. A task already landed exactly here is
+/// the queue's re-run, and passes.
+fn check_landing(
+    kb: &session_cli::Kb<'_>,
+    uids: &[String],
+    branch: &str,
+    onto: &str,
+    head: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let landed = jkb_api::sessions::Landed {
+        branch: branch.to_owned(),
+        onto: onto.to_owned(),
+        head: head.map(str::to_owned),
+    };
+    let here = jkb_api::sessions::LiveLanding::Grafted {
+        branch: branch.to_owned(),
+        onto: onto.to_owned(),
+    };
+    let mut refusals = Vec::new();
+    for uid in uids {
+        let facts = kb.facts(uid)?;
+        if facts.terminal {
+            continue;
+        }
+        if facts.landed.as_deref() == Some(&here) {
+            continue;
+        }
+        let found = review::findings_via(kb, &facts.review.namespaces)?;
+        if let Some(why) = jkb_api::review_gate::landing_with(&found, &facts.review, head).short() {
+            refusals.push((uid.clone(), why));
+            continue;
+        }
+        if let Err(e) = kb.land_check(uid, &landed) {
+            refusals.push((uid.clone(), format!("{e:#}")));
+        }
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "branch": branch, "onto": onto, "head": head,
+                "may_land": refusals.is_empty(),
+                "refused": refusals.iter().map(|(uid, why)| serde_json::json!({
+                    "uid": uid, "reason": why,
+                })).collect::<Vec<_>>(),
+            })
+        );
+    } else {
+        for (uid, why) in &refusals {
+            eprintln!("  {uid} — {why}");
+        }
+    }
+    anyhow::ensure!(
+        refusals.is_empty(),
+        "{branch} may not land on {onto}: no reviewer approved its head for every task on it (the reasons are above)"
     );
     Ok(())
 }

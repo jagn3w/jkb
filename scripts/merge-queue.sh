@@ -18,6 +18,13 @@
 #               common ancestor with <base> at all. Nothing changed.
 #   5  stall   — <branch> is already an ancestor of <base>, and the graph cannot say whether an
 #               earlier entry landed its work or it was never committed to. A person decides.
+#   6  stall   — no reviewer approved <branch>'s head: `jkb task landed --check` found a task on
+#               it with no clean recorded review round of exactly that commit (and no operator
+#               waiver of it), or a caller jkb would not let record the landing. Asked BEFORE
+#               anything moves, because the landing is recorded only after the graft, and a
+#               refusal then would leave unapproved work on <base> with its tasks open. Not an
+#               eject: the implementer has nothing to fix, and the reviewer's verdict is what is
+#               missing — a person (or the coordinator's next review pass) supplies it.
 #   4  stall   — this worktree needs a human. Three arms reach it, and they do NOT all mean the
 #               graft passed, so every message says which: (a) the gate passed but <base> could
 #               not be checked out again, (b) the gate passed but the fast-forward was refused,
@@ -153,7 +160,7 @@ queue_outcome() {
   case "$1" in
     0) echo landed ;;
     1 | 2) echo eject ;;
-    3 | 4 | 5) echo stall ;;
+    3 | 4 | 5 | 6) echo stall ;;
     *) echo "stall: unknown exit $1" ;;
   esac
 }
@@ -196,6 +203,14 @@ fi' EXIT
 cd "$WT" 2>/dev/null || { echo "error: cannot cd to worktree $WT"; finish 3; }
 git switch "$BASE" >/dev/null 2>&1 || { echo "error: cannot switch to base $BASE"; finish 3; }
 git rev-parse --verify --quiet "$BRANCH_REF^{commit}" >/dev/null 2>&1 || { echo "error: no such branch $BRANCH"; finish 3; }
+# A REVIEWER'S VERDICT, RECORDED IN jkb, NOT THE CALLER'S WORD FOR IT. This header called its input
+# "ONE reviewer-approved branch" while nothing here asked: the swarm coordinator's prompt was the only
+# thing between an unreviewed head and the base, and `jkb task landed` below records what it is told.
+# jkb answers now, from the rounds the reviewer recorded against the branch's head.
+if ! "$JKB" task landed "$BRANCH" --onto "$BASE" --check >/tmp/merge-queue-approval.log 2>&1; then
+  echo "stall: no reviewer approved $BRANCH's head, so nothing was grafted — run a review round of this head (or the operator waives it). jkb said: $(tr '\n' ' ' </tmp/merge-queue-approval.log)"
+  finish 6
+fi
 # AND IT MUST HAVE SOMETHING TO GRAFT. A branch sitting at the base tip rebases to a no-op, and
 # `merge --ff-only` then answers "Already up to date." with exit 0 — so the queue printed `landed:`
 # and called `jkb task landed`, which drives every task recording that branch to done with

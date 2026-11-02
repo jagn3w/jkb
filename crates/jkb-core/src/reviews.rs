@@ -435,6 +435,18 @@ pub fn is_finding_of(conn: &Connection, task: ItemId, target: ItemId) -> Result<
         .query_row(params![task.get(), target.get()], |r| r.get(0))?)
 }
 
+/// Whether `target` is a finding of any recorded round — what a coordinator may close by hand once a
+/// clean round confirms its fix. Read from the snapshot, like [`is_finding_of`], which only a
+/// recording writes.
+///
+/// # Errors
+/// A database error.
+pub fn is_recorded_finding(conn: &Connection, target: ItemId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM review_round_findings WHERE item_id = ?1)")?
+        .query_row(params![target.get()], |r| r.get(0))?)
+}
+
 /// `task`'s review state.
 ///
 /// # Errors
