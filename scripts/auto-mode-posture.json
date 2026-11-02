@@ -1,5 +1,8 @@
 {
   "require": {
+    "env": {
+      "CLAUDE_CODE_AUTO_MODE_SERVER": "0"
+    },
     "permissions": {
       "defaultMode": "auto",
       "disableBypassPermissionsMode": "disable",

@@ -18,6 +18,17 @@
 # `autoAllowBashIfSandboxed` means a sandboxed command is never shown to the classifier — the OS
 # boundary *is* the check.
 #
+# `env.CLAUDE_CODE_AUTO_MODE_SERVER: "0"` keeps that true (2026-11-02). Auto mode now also sends
+# sandboxed commands to "server-side classifier review", the one exception the sandboxing docs
+# list to auto-allow in auto mode, and neither allow rules nor `autoMode` prose override it.
+# Measured on 2.1.293 across three sessions in one day: plain `ls`/`grep`, commits in a task
+# worktree, `jkb` reads and lands blocked, the same land blocked three times and allowed twice on
+# identical input. The variable is the documented switch back to Claude Code's own classifier,
+# which reads `autoMode`. Rejected: `acceptEdits`, tried the same day, which prompts on every
+# commit (`.git` is a protected path), on Bash writes outside the working directory, and on every
+# `jkb` line the attest hook defers (anything but `jkb`/`cd`/`echo` on it, a stdin redirect, or
+# `jkb exec request`). If the switch is ever removed, those prompts are the cost of leaving auto.
+#
 # WHY NOT `--dangerously-skip-permissions`. The sandbox confines Bash and everything it spawns.
 # It does NOT confine Claude Code's in-process tools; the settings schema says so about
 # `strictAllowlist` in as many words ("in-process tools such as WebFetch are not gated by this

@@ -398,6 +398,8 @@ test("an agent's panel opens its role in the Roles view, which lists every role 
   await rolePanel.waitFor();
   assert.equal(await agentPanel.isVisible(), false, "the agent's panel is hidden, not shown beside it");
   const table = pane.locator(".roles-table");
+  // The panel can open before the role list has loaded; read the rows only once the last is there.
+  await table.locator("tbody tr").nth(rolesByPreset[DEFAULT].roles.length - 1).waitFor();
   assert.deepEqual(
     await table.locator("tbody tr").evaluateAll((rows) => rows.map((r) => r.getAttribute("data-role"))),
     rolesByPreset[DEFAULT].roles.map((r) => r.name),
