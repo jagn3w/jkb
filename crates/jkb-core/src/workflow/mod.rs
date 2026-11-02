@@ -25,6 +25,25 @@ use jkb_fsm::{
 };
 use jkb_types::TaskStatus;
 
+/// The longest description accepted, in characters: an agent template's, a strategy definition's or
+/// an agent set's.
+pub const MAX_DESCRIBE_CHARS: usize = 500;
+
+/// The one rule a description meets, wherever it is written: non-empty once trimmed, and at most
+/// [`MAX_DESCRIBE_CHARS`] characters. Agent templates, strategy definitions and agent sets all call
+/// it, so the three cannot drift apart.
+///
+/// # Errors
+/// [`crate::Error::Types`] for an empty or over-long description.
+pub fn validate_describe(describe: &str) -> crate::Result<()> {
+    if describe.trim().is_empty() || describe.chars().count() > MAX_DESCRIBE_CHARS {
+        return Err(crate::Error::Types(jkb_types::Error::Validation(format!(
+            "a description of 1 to {MAX_DESCRIBE_CHARS} characters"
+        ))));
+    }
+    Ok(())
+}
+
 /// Where a task's work stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Phase {
@@ -367,6 +386,69 @@ fn stated(f: &WorkflowFacts) -> Option<Phase> {
     f.stated
 }
 
+impl WorkflowEvent {
+    /// What this event's guard checks, in plain words, for a person reading the graph (the app's
+    /// Lifecycle pane): `None` for an event no row guards. `area` is the strategy's
+    /// `repeated_area` attribute, which the review guards read.
+    ///
+    /// Keyed by event because every guarded row of one event carries the same guard here, which
+    /// `one_guard_per_event` pins; a row of the event that is unguarded (`implement --reopen-->
+    /// implement`) checks nothing, so a caller shows this only for a guarded row.
+    #[must_use]
+    pub fn describe_guard(self, area: &strategy::RepeatedArea) -> Option<String> {
+        let live = "the work has not landed and the task is not cancelled";
+        let fresh = "a review round was filed since the work was submitted";
+        let unit = area.scope.unit();
+        let repeated = format!(
+            "the newest {} rounds all flagged must-fixes in the same {unit}",
+            area.rounds
+        );
+        Some(match self {
+            Self::ReviewPassed => format!("{fresh} and found no must-fix; {live}"),
+            Self::ReviewFailed => {
+                format!("{fresh} and found must-fixes, but not {repeated}; {live}")
+            }
+            Self::ReviewRepeated => format!("{fresh} and found must-fixes, and {repeated}; {live}"),
+            Self::ObservedLanded => {
+                "a landing is recorded for the work (a `done` checkbox is not a landing)".to_owned()
+            }
+            Self::ObservedCancelled => {
+                "the task is cancelled and its work has not landed".to_owned()
+            }
+            Self::Reopen => "the task itself is back to work: no landing speaks for it and its \
+                             status is neither done nor cancelled (`jkb task set <uid> --status \
+                             open` first)"
+                .to_owned(),
+            Self::SubmitDesign
+            | Self::ApproveDesign
+            | Self::RejectDesign
+            | Self::SubmitWork
+            | Self::SubmitSystemic
+            | Self::SystemicRedesign
+            | Self::Rework
+            | Self::Cancel
+            | Self::Override => return None,
+        })
+    }
+
+    /// The command that fires this event (`<uid>` stands for the task): `jkb workflow fire` for an
+    /// act, with the reason or destination it needs; `jkb workflow observe` for an observation,
+    /// which takes the one step the facts call for.
+    #[must_use]
+    pub fn command(self) -> String {
+        match (jkb_fsm::Event::kind(self), self) {
+            (EventKind::Reconciled, _) => "jkb workflow observe <uid>".to_owned(),
+            (_, Self::Override) => {
+                "jkb workflow fire <uid> override --to <phase> --reason <why>".to_owned()
+            }
+            (_, e) if e.needs_reason() => {
+                format!("jkb workflow fire <uid> {} --reason <why>", e.as_str())
+            }
+            (_, e) => format!("jkb workflow fire <uid> {}", e.as_str()),
+        }
+    }
+}
+
 // -------------------------------------------------------------------------------------------
 // Graphs
 // -------------------------------------------------------------------------------------------
@@ -569,9 +651,9 @@ macro_rules! graph {
     };
 }
 
-/// `reviewed-design`: a written design waits in `design_review` for whoever the strategy's
+/// `design-gate`: a written design waits in `design_review` for whoever the strategy's
 /// `approves_design` toggle names.
-static REVIEWED_DESIGN: &[Row] = graph!(row(
+static DESIGN_GATE: &[Row] = graph!(row(
     Phase::Design,
     WorkflowEvent::SubmitDesign,
     Phase::DesignReview
@@ -586,39 +668,68 @@ static DIRECT: &[Row] = graph!(row(
 ));
 
 /// Which execution graph a strategy runs.
+///
+/// A graph is always named with the word "graph" (`design-gate graph`), so it cannot be read as the
+/// preset strategy of a similar name. `design-gate` was called `reviewed-design` until it was renamed
+/// for being a near-anagram of the `design-reviewed` preset: stored pins and definitions still hold
+/// the old name and are never rewritten, so it is read forever — by the serde alias here and by
+/// [`GraphId::parse`] through [`GraphId::LEGACY_ALIASES`] — while every new write stores the new one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GraphId {
     /// A design is reviewed before implementation starts.
-    ReviewedDesign,
+    #[serde(rename = "design-gate", alias = "reviewed-design")]
+    DesignGate,
     /// A design goes straight to implementation.
     Direct,
 }
 
 impl GraphId {
     /// Every graph, for the checks and for listing.
-    pub const ALL: &'static [Self] = &[Self::ReviewedDesign, Self::Direct];
+    pub const ALL: &'static [Self] = &[Self::DesignGate, Self::Direct];
+
+    /// Former names still accepted on read, each with the graph it now means. Never written.
+    pub const LEGACY_ALIASES: &'static [(&'static str, Self)] =
+        &[("reviewed-design", Self::DesignGate)];
 
     /// The stored and typed name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::ReviewedDesign => "reviewed-design",
+            Self::DesignGate => "design-gate",
             Self::Direct => "direct",
         }
     }
 
-    /// Parse a name.
+    /// Parse a name: the current one, or a former one in [`Self::LEGACY_ALIASES`].
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|g| g.as_str() == name)
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|g| g.as_str() == name)
+            .or_else(|| {
+                Self::LEGACY_ALIASES
+                    .iter()
+                    .find(|(old, _)| *old == name)
+                    .map(|&(_, g)| g)
+            })
     }
 
-    /// One line on what it is.
+    /// One sentence on what it is for: why a strategy would run it.
     #[must_use]
     pub const fn describe(self) -> &'static str {
         match self {
-            Self::ReviewedDesign => {
+            Self::DesignGate => "A written design waits for approval before implementation starts.",
+            Self::Direct => "A written design goes straight to implementation.",
+        }
+    }
+
+    /// The phases it passes through, as one arrow line.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::DesignGate => {
                 "design → design review → implement ⇄ review (⇄ systemic review) → landable"
             }
             Self::Direct => "design → implement ⇄ review (⇄ systemic review) → landable",
@@ -630,7 +741,7 @@ impl GraphId {
     pub fn machine(self) -> WorkflowMachine {
         Machine {
             transitions: match self {
-                Self::ReviewedDesign => REVIEWED_DESIGN,
+                Self::DesignGate => DESIGN_GATE,
                 Self::Direct => DIRECT,
             },
             initial: Phase::Design,

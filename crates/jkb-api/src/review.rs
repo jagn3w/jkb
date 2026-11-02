@@ -257,7 +257,8 @@ fn check_bytes(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
 }
 
 /// `task.review_file`: file a review's findings as `managed:` tasks under `ask.ns`, one section per
-/// severity (`must-fix`, `concern`, `nit`), each mirrored into `tasks/` like any task homed outside it.
+/// severity (`must-fix`, `concern`, `nit`), each mirrored into `tasks/` like any task homed outside it
+/// and tagged [`jkb_core::reviews::FINDING_TAG`], so a frontier query can leave findings out.
 ///
 /// Refused when the review did not run fully ([`ReviewRun::refusal`]), when the namespace already
 /// holds anything — a second filing into one review would mix two runs, and the gate reads them as
@@ -350,6 +351,8 @@ pub fn file(
         spec.priority = Some(priority);
         spec.home = home;
         let id = task::create(conn, meta, &spec)?;
+        let (facet, value) = jkb_core::reviews::FINDING_TAG;
+        tag::apply(conn, meta, id, facet, value)?;
         if let Some(file) = files.get(i).and_then(Option::as_deref) {
             tag::apply(conn, meta, id, FACET_AREA, file)?;
         }

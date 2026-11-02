@@ -381,3 +381,31 @@ fn a_grant_its_minter_may_no_longer_grant_does_not_resolve() {
     assert!(!listed.iter().any(|g| g.id == stale.id), "{listed:?}");
     assert!(listed.iter().any(|g| g.id == fine.id), "{listed:?}");
 }
+
+/// `Role::describe` is the enum's own doc lines, joined: the sentence the Roles view prints cannot
+/// drift from what the code says the role is.
+#[test]
+fn a_roles_sentence_is_its_doc_comment() {
+    let source = include_str!("../roles.rs");
+    let body = source
+        .split("pub enum Role {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("pub enum Role in roles.rs");
+    let mut docs: Vec<String> = Vec::new();
+    let mut seen = Vec::new();
+    for line in body.lines().map(str::trim) {
+        if let Some(doc) = line.strip_prefix("///") {
+            docs.push(doc.trim().to_owned());
+        } else if let Some(variant) = line.strip_suffix(',') {
+            seen.push((variant.to_owned(), docs.join(" ")));
+            docs.clear();
+        }
+    }
+    let all = <Role as jkb_rbac::Role>::ALL;
+    assert_eq!(seen.len(), all.len(), "{seen:?}");
+    for (role, (variant, doc)) in all.iter().zip(&seen) {
+        assert_eq!(format!("{role:?}"), *variant);
+        assert_eq!(role.describe(), doc, "{variant}");
+    }
+}

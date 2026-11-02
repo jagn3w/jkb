@@ -27,7 +27,7 @@ undoable. Run `jkb guide` for this cheat-sheet inline, or `jkb <cmd> --help` for
 | `jkb recent [path]` | The most-recently-updated items — what changed lately. |
 | `jkb find [path] --kind K --tag f=v --status S` | Structured (typed) item search; compiles to the query DSL. |
 | `jkb grep <pattern> [path] [-i -l -c]` | Literal-substring content search; `uid:line:text`; exit 1 on no match. |
-| `jkb query "<DSL>"` | Full query DSL: `kind: tag: status: resolution: ns: is:ready is:frontier is:tombstone priority<= due<= …` (negate with `-tag:f=v` / `-kind:k`). `--count` for a total. |
+| `jkb query "<DSL>"` | Full query DSL: `kind: tag: status: resolution: phase: ns: is:ready is:frontier is:tombstone priority<= due<= …` (negate with `-tag:f=v` / `-kind:k` / `-phase:p`; `phase:` is the workflow phase, a comma list matches any). `--count` for a total. |
 | `jkb search "<terms>" --route hybrid` | Ranked vector/FTS retrieval (needs a running embedder). |
 
 **grep vs find vs search:** use `find`/`query` when you know the *kind/tag/status* (structured,

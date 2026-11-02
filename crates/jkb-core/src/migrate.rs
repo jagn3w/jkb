@@ -1122,4 +1122,64 @@ mod edges_namespaces_autoincrement_tests {
             .unwrap();
         assert_eq!(hits, 0, "FTS still indexes the note's old text");
     }
+
+    /// V033 tags every review finding filed before `task.review_file` tagged them: what a filing
+    /// recorded, and a task placed under a repository's `codereviews/` (a mounted round), and nothing
+    /// else — not a task under `tasks/`, nor one under a `codereviews` that is not a repository's.
+    #[test]
+    fn v033_tags_the_findings_filed_before_filings_were_tagged() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(32))
+            .run(&mut conn)
+            .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO items (id, uid, kind, content) VALUES
+                 (1, 'task:filed', 'task', 'a filed finding'),
+                 (2, 'task:mounted', 'task', 'a mounted round''s finding'),
+                 (3, 'task:work', 'task', 'ordinary work'),
+                 (4, 'task:elsewhere', 'task', 'under a codereviews that is no repository''s'),
+                 (5, 'n:note', 'note', 'a note in a round'),
+                 (6, 'task:tagged', 'task', 'already tagged');
+             INSERT INTO namespaces (id, path, kind) VALUES
+                 (101, 'repos/jkb/codereviews/r1/must-fix', 'logical'),
+                 (102, 'repos/jkb/codereviews/r0/tasks.md/concern', 'logical'),
+                 (103, 'tasks/repos/jkb/inbox', 'logical'),
+                 (104, 'notes/codereviews/x', 'logical'),
+                 (105, 'repos/codereviews/x', 'logical');
+             INSERT INTO placements (item_id, namespace_id, role) VALUES
+                 (1, 101, 'home'), (2, 102, 'home'), (3, 103, 'home'), (4, 104, 'home'),
+                 (4, 105, 'ref'), (5, 102, 'home'), (6, 101, 'home');
+             INSERT INTO review_filings (ns, item_id, filed_by) VALUES
+                 ('repos/jkb/codereviews/r1', 1, 'operator'),
+                 ('repos/jkb/codereviews/r1', 6, 'operator'),
+                 ('repos/jkb/codereviews/r1', 99, 'operator');
+             INSERT INTO tag_applications (item_id, facet, value) VALUES (6, 'finding', 'review');",
+        )
+        .unwrap();
+
+        super::run(&mut conn).expect("V033 applied");
+
+        let tagged: Vec<i64> = conn
+            .prepare(
+                "SELECT item_id FROM tag_applications WHERE facet = 'finding' AND value = 'review'
+                 ORDER BY item_id",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(tagged, [1, 2, 6]);
+        let kind: String = conn
+            .query_row(
+                "SELECT value_kind FROM tag_defs WHERE facet = 'finding'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the facet is declared");
+        assert_eq!(kind, "string");
+    }
 }

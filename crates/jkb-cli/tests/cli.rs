@@ -5441,7 +5441,7 @@ fn a_workflow_walks_from_the_cli_and_the_stop_hook_asks_only_when_the_session_dr
     assert!(block.contains("reviewer"), "{block}");
 
     jkb(&db)
-        .args(["workflow", "dot", "reviewed-design"])
+        .args(["workflow", "dot", "direct"])
         .assert()
         .success()
         .stdout(predicate::str::contains("digraph"));
@@ -6097,6 +6097,20 @@ fn a_session_is_recorded_from_where_it_starts_and_listed_with_its_resume() {
 /// `jkb workflow agent` (D53.7): a script reads a packaged template filled in; the operator copies
 /// and edits it, which the same read then answers; `export` writes it into a packaged-templates file
 /// as its next version.
+/// The version `crates/jkb-core/src/workflow/agents.json` packages `name` at — read, so a template's
+/// next version bump does not break the export tests that count from it.
+fn packaged_agent_version(name: &str) -> i64 {
+    let file: serde_json::Value =
+        serde_json::from_str(include_str!("../../jkb-core/src/workflow/agents.json")).unwrap();
+    file["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == name)
+        .and_then(|a| a["version"].as_i64())
+        .unwrap()
+}
+
 #[test]
 fn workflow_agent_copy_set_show_and_export() {
     let dir = TempDir::new().unwrap();
@@ -6174,7 +6188,10 @@ fn workflow_agent_copy_set_show_and_export() {
         .arg(&file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("swarm-coordinator packaged as v2"));
+        .stdout(predicate::str::contains(format!(
+            "swarm-coordinator packaged as v{}",
+            packaged_agent_version("swarm-coordinator") + 1
+        )));
     let text: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
     let entry = text["agents"]
@@ -6242,12 +6259,13 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
     let file = dir.path().join("agents.json");
     let mut upstream: serde_json::Value =
         serde_json::from_str(include_str!("../../jkb-core/src/workflow/agents.json")).unwrap();
-    // Upstream moves on: the file packages a v2 of its own, and the copy is still built on v1.
-    // Exporting it would overwrite v2 with text that never saw it, so it is refused, naming both —
-    // unless overridden.
+    // Upstream moves on: the file packages the next version of its own, and the copy is still built
+    // on this jkb's. Exporting it would overwrite the next version with text that never saw it, so it
+    // is refused, naming both — unless overridden.
+    let pv = packaged_agent_version("swarm-coordinator");
     for a in upstream["agents"].as_array_mut().unwrap() {
         if a["name"] == "swarm-coordinator" {
-            a["version"] = serde_json::json!(2);
+            a["version"] = serde_json::json!(pv + 1);
             a["template"] = serde_json::json!(["Set {{status}} upstream."]);
         }
     }
@@ -6258,8 +6276,11 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("built on packaged v1")
-                .and(predicate::str::contains("the file packages v2"))
+            predicate::str::contains(format!("built on packaged v{pv}"))
+                .and(predicate::str::contains(format!(
+                    "the file packages v{}",
+                    pv + 1
+                )))
                 .and(predicate::str::contains("update jkb")),
         );
     jkb(&db)
@@ -6274,7 +6295,104 @@ fn workflow_agent_export_refuses_a_copy_built_on_another_version() {
         .arg(&file)
         .assert()
         .success()
-        .stdout(predicate::str::contains("swarm-coordinator packaged as v3"));
+        .stdout(predicate::str::contains(format!(
+            "swarm-coordinator packaged as v{}",
+            pv + 2
+        )));
+}
+
+/// The graph `design-gate` was `reviewed-design`: both names draw it, and a definition naming
+/// either is accepted and stored under the new name.
+#[test]
+fn the_design_gate_graph_answers_to_its_former_name() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let dot_new = jkb(&db)
+        .args(["workflow", "dot", "design-gate"])
+        .output()
+        .unwrap();
+    assert!(dot_new.status.success());
+    let dot_new = String::from_utf8(dot_new.stdout).unwrap();
+    assert!(dot_new.contains("digraph"), "{dot_new}");
+    jkb(&db)
+        .args(["workflow", "dot", "reviewed-design"])
+        .assert()
+        .success()
+        .stdout(predicate::eq(dot_new.as_str()));
+    for (name, graph) in [("gate-new", "design-gate"), ("gate-old", "reviewed-design")] {
+        jkb(&db)
+            .args([
+                "workflow",
+                "define",
+                name,
+                "--graph",
+                graph,
+                "--describe",
+                "A gate.",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!("defined {name}@1")));
+    }
+    let listed = jkb(&db)
+        .args(["--json", "workflow", "strategies"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    for name in ["gate-new@1", "gate-old@1"] {
+        let s = listed["strategies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("{name} in {listed}"));
+        assert_eq!(s["spec"]["graph"], "design-gate", "{name}");
+    }
+}
+
+/// `--describe` is required on `jkb workflow define`, also with `--from` (an altered copy is not
+/// described by its base's sentence): clap refuses the call before anything reaches the daemon. An
+/// empty one reaches it and is refused there. The sentence is what `workflow strategies` lists.
+#[test]
+fn workflow_define_requires_a_description() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    for args in [
+        vec!["workflow", "define", "mine"],
+        vec!["workflow", "define", "mine", "--from", "autonomous"],
+    ] {
+        jkb(&db).args(&args).assert().code(2).stderr(
+            predicate::str::contains("the following required arguments were not provided")
+                .and(predicate::str::contains("--describe")),
+        );
+    }
+    jkb(&db)
+        .args(["workflow", "define", "mine", "--describe", ""])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "a description of 1 to 500 characters",
+        ));
+    jkb(&db)
+        .args([
+            "workflow",
+            "define",
+            "mine",
+            "--from",
+            "autonomous",
+            "--describe",
+            "The coordinator lands without a design review.",
+        ])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["workflow", "strategies"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "mine@1               The coordinator lands without a design review.",
+        ));
 }
 
 /// `jkb workflow show --graph` prints the machines from the compiled tables, for a named strategy or
@@ -6315,7 +6433,10 @@ fn workflow_show_graph_prints_the_machines() {
         .unwrap();
     assert!(text.status.success());
     let text = String::from_utf8(text.stdout).unwrap();
-    assert!(text.contains("strategy:  design-reviewed"), "{text}");
+    assert!(
+        text.contains("strategy:  design-reviewed (design-gate graph)"),
+        "{text}"
+    );
     let lifecycle = text.split("\nlifecycle:\n").nth(1).unwrap();
     for row in lifecycle.lines().filter(|l| !l.trim().is_empty()) {
         let event = row.split_whitespace().nth(1).unwrap();
@@ -6332,6 +6453,56 @@ fn workflow_show_graph_prints_the_machines() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("--graph"));
+}
+
+/// `jkb workflow roles --json` is `workflow.roles`' answer as it stands, for a named strategy or the
+/// default; the text form names every role, those no agent acts as too.
+#[test]
+fn workflow_roles_prints_every_role_under_the_strategy() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let out = jkb(&db)
+        .args(["--json", "workflow", "roles", "--strategy", "autonomous"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: jkb_api::workflows::RolesView = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v.strategy, "autonomous");
+    let coordinator = v.roles.iter().find(|r| r.name == "coordinator").unwrap();
+    assert!(coordinator.lands);
+    let wire: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(wire, serde_json::to_value(&v).unwrap(), "nothing dropped");
+    let text = jkb(&db).args(["workflow", "roles"]).output().unwrap();
+    assert!(text.status.success());
+    let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.starts_with("strategy:  design-reviewed\n"), "{text}");
+    for role in [
+        "operator",
+        "coordinator",
+        "designer",
+        "implementer",
+        "reviewer",
+        "systemic_reviewer",
+    ] {
+        assert!(text.contains(&format!("\n{role} — ")), "{role}: {text}");
+    }
+    assert!(
+        text.contains("toggles:     approves_design off, lands off"),
+        "{text}"
+    );
+    // Each op class with its sentence.
+    assert!(
+        text.contains("\n    exec_request   Ask the operator to run one command.\n"),
+        "{text}"
+    );
+    jkb(&db)
+        .args(["workflow", "roles", "--strategy", "no-such-strategy"])
+        .assert()
+        .failure();
 }
 
 /// `jkb task edit` and `jkb item edit` take the base a replace was made against (`--expected`, or
@@ -6481,7 +6652,12 @@ fn the_attest_hook_installs_the_subagent_types() {
         "the install wrote to the hook's stdout: {}",
         String::from_utf8_lossy(&out.stdout)
     );
-    for name in ["jkb-implementer", "jkb-reviewer"] {
+    for name in [
+        "jkb-designer",
+        "jkb-implementer",
+        "jkb-reviewer",
+        "jkb-systemic-reviewer",
+    ] {
         let def = std::fs::read_to_string(claude.join("agents").join(format!("{name}.md")))
             .unwrap_or_else(|e| panic!("{name} was not installed: {e}"));
         assert!(def.starts_with(&format!("---\nname: {name}\n")), "{def}");

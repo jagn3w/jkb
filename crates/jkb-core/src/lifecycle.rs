@@ -399,6 +399,41 @@ fn stated(f: &TaskFacts) -> Option<TaskStatus> {
     f.stated
 }
 
+impl TaskEvent {
+    /// What this event's guard checks, in plain words, for a person reading the graph (the app's
+    /// Lifecycle pane): `None` for an event no row guards.
+    ///
+    /// Keyed by event because every guarded row of one event carries the same guard, which
+    /// `one_guard_per_event` pins; an unguarded row of a guarded event (`done --land--> done`)
+    /// checks nothing, so a caller shows this only for a guarded row.
+    #[must_use]
+    pub const fn describe_guard(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Start => {
+                "the task is unclaimed, held by whoever starts it, or held by an owner proven gone"
+            }
+            Self::Land => {
+                "there is work to land: a session or commits; the session has no uncommitted \
+                 changes; it has commits the target lacks; no subtask is open; the checkout the \
+                 graft happens in is clean; and a review of the current head has no open must-fix \
+                 (unless landed with `--no-review`)"
+            }
+            Self::Abandon => "the session has no uncommitted changes",
+            Self::ObservedLanded => {
+                "a merged pull request, or jkb's own merge queue, proves the work reached its \
+                 target, and no subtask is open"
+            }
+            Self::ObservedOwnerGone => "something holds the claim, and its owner is proven gone",
+            Self::SetFromFile => "the task is backed by a synced file that states a status for it",
+            Self::SubmitForReview
+            | Self::RequestChanges
+            | Self::Cancel
+            | Self::Reopen
+            | Self::Override => return None,
+        })
+    }
+}
+
 // -------------------------------------------------------------------------------------------
 // Effects
 // -------------------------------------------------------------------------------------------

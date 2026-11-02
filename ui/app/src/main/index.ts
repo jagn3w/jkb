@@ -12,17 +12,20 @@
 // else — a checkout's `out/`, or a package left in a checkout's `dist/` — it refuses unless
 // `JKB_APP_FROM_CHECKOUT=1` says that is deliberate.
 
+import { realpathSync, statSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   BUILD_EXIT,
+  APP_SRC_IN_HOME,
   REMOTE_VAR,
   TOKEN_FILE_VAR,
   daemonUrl,
   failed,
   portOf,
+  rendererOp,
   tokenPath,
   updateSummary,
   type OpRequest,
@@ -48,6 +51,8 @@ import type { TerminalResult, TerminalRoots } from "../shared/terminal";
 import { ContainerKit, machineKit } from "./container";
 import { DaemonClient } from "./daemon";
 import { DesignFeeds } from "./designFeeds";
+import { ExecFeed } from "./execFeed";
+import { ExecRunner, bootId, machineBase, machineDiff, machineFindProgram, machinePin, readProgramFile } from "./execRun";
 import { rendererSource } from "./devRenderer";
 import { gitPlace } from "./gitPlace";
 import { NotifyFeed } from "./notifyFeed";
@@ -102,9 +107,11 @@ const spawnPty: SpawnPty = (file, args, options) => {
   return ptyModule.spawn(file, args, options);
 };
 
+const terminalEnvironment = machineEnvironment(terminalRoots, process.env, loginShell());
+
 const terminals = new TerminalHost(
   spawnPty,
-  machineEnvironment(terminalRoots, process.env, loginShell()),
+  terminalEnvironment,
   (owner, event) => {
     const contents = webContents.fromId(owner);
     if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.terminalEvent, event);
@@ -123,6 +130,46 @@ const updater = new AppUpdater(accountHome(), machineRunner(accountHome(), proce
   exe: app.getPath("exe"),
   platform: process.platform,
   commit: builtCommit(join(__dirname, "..")),
+});
+
+/**
+ * Run requests (the Executions design): main reads the request, recomputes its pin with the host's
+ * own jkb (`~/.cargo/bin/jkb` under the ACCOUNT's home, run with git's repository selection scrubbed),
+ * begins it, and issues the terminal to the window for one open. The renderer only names an id.
+ */
+const execRunner = new ExecRunner({
+  op: (request) => daemon.op(request),
+  pin: machinePin(accountHome(), machineRunner(accountHome(), process.env)),
+  // The base is verified on the host: `git ls-remote` on the audited remote URL, else Code Factory's
+  // own clean clone — never the request repository's `origin/main`, which the container can write.
+  base: machineBase(accountHome(), machineRunner(accountHome(), process.env), join(accountHome(), APP_SRC_IN_HOME)),
+  diff: machineDiff(accountHome(), machineRunner(accountHome(), process.env), join(accountHome(), APP_SRC_IN_HOME)),
+  readProgram: readProgramFile,
+  roots: terminalRoots,
+  isDirectory: (p) => terminalEnvironment.isDirectory(p),
+  realpath: (p) => {
+    try {
+      return realpathSync.native(p);
+    } catch {
+      return undefined;
+    }
+  },
+  identity: (p) => {
+    try {
+      const st = statSync(p, { bigint: true });
+      return { dev: st.dev.toString(), ino: st.ino.toString() };
+    } catch {
+      return undefined;
+    }
+  },
+  findHostProgram: machineFindProgram(accountHome()),
+  docker: () => terminalEnvironment.docker(),
+  issueOnce: (owner, spec, run) => terminals.issueOnce(owner, spec, run),
+  processAlive: (pid) => terminalEnvironment.processAlive(pid),
+  pid: process.pid,
+  boot: bootId(),
+  home: accountHome(),
+  log: (message) => process.stderr.write(`code-factory: ${message}\n`),
 });
 
 /** Set by an update that staged a build: install it as this process quits, relaunching or not. */
@@ -147,10 +194,21 @@ const notifyFeed = new NotifyFeed(
   { log: (message) => process.stderr.write(`code-factory: ${message}\n`) },
 );
 
+/** The run-request feed: the app's own (operator) group on `exec/requests`, one for every window. */
+const execFeed = new ExecFeed(
+  (request, options) => daemon.op(request, options),
+  (owner, event) => {
+    const contents = webContents.fromId(owner);
+    if (contents !== undefined && !contents.isDestroyed()) contents.send(BRIDGE_CHANNELS.execEvent, event);
+  },
+  { log: (message) => process.stderr.write(`code-factory: ${message}\n`) },
+);
+
 /** Every feed a window can hold, ended together when it closes or reloads. */
 function closeFeeds(owner?: number): void {
   designFeeds.closeAll(owner);
   notifyFeed.closeAll(owner);
+  execFeed.closeAll(owner);
 }
 
 /** The windows this process created: the only senders the bridge answers. */
@@ -197,7 +255,9 @@ function registerBridge(): void {
   ipcMain.handle(BRIDGE_CHANNELS.op, (event, request: unknown) => {
     assertTrusted(event);
     if (!isOpRequest(request)) return failed("bad_request", "an op is an object with a string `op`");
-    return daemon.op(request);
+    // A run starts only through `execRun`, which reads the request and recomputes its pin itself:
+    // the runner's own ops are refused here (`EXEC_RUNNER_OPS`).
+    return rendererOp(request, (r) => daemon.op(r));
   });
   ipcMain.handle(BRIDGE_CHANNELS.info, (event): AppInfo => {
     assertTrusted(event);
@@ -273,6 +333,24 @@ function registerBridge(): void {
   ipcMain.handle(BRIDGE_CHANNELS.sessionsPlace, (event, cwd: unknown) => {
     assertTrusted(event);
     return gitPlace(cwd, terminalRoots);
+  });
+
+  // Run requests: the renderer names an id; main does the rest (`execRun.ts`) and issues the terminal
+  // spec to this window for ONE open.
+  ipcMain.handle(BRIDGE_CHANNELS.execPreview, (event, id: unknown) => {
+    assertTrusted(event);
+    return execRunner.preview(id);
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.execRun, (event, id: unknown, shown: unknown) => {
+    assertTrusted(event);
+    return execRunner.run(event.sender.id, id, shown);
+  });
+  ipcMain.handle(BRIDGE_CHANNELS.execSubscribe, (event) => {
+    assertTrusted(event);
+    return execFeed.join(event.sender.id);
+  });
+  ipcMain.on(BRIDGE_CHANNELS.execUnsubscribe, (event) => {
+    if (isTrusted(event)) execFeed.leave(event.sender.id);
   });
 }
 
@@ -456,6 +534,8 @@ if (refusal !== undefined) {
     registerBridge();
     createWindow();
     void notePendingInstall();
+    // Runs a quit or a crash left `running`: their PTYs died with that app.
+    void execRunner.reconcile();
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
@@ -495,7 +575,7 @@ app.on("will-quit", (event) => {
   if (leftNotify) return;
   leftNotify = true;
   event.preventDefault();
-  void notifyFeed.leaveAll(LEAVE_WAIT_MS).finally(() => app.exit(0));
+  void Promise.allSettled([notifyFeed.leaveAll(LEAVE_WAIT_MS), execFeed.leaveAll(LEAVE_WAIT_MS)]).finally(() => app.exit(0));
 });
 
 app.on("window-all-closed", () => {

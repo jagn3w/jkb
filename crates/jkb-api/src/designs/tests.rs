@@ -854,7 +854,7 @@ fn a_plan_play_names_the_open_tasks_not_on_the_chosen_strategy() {
     let define = || {
         ok(
             &kb.op,
-            json!({ "op": "workflow.define", "name": "mine",
+            json!({ "op": "workflow.define", "name": "mine", "describe": "Mine.",
                     "spec": { "graph": "direct", "toggles": { "lands": ["operator", "coordinator"] } } }),
         )
     };

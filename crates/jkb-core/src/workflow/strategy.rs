@@ -69,6 +69,9 @@ pub enum Controls {
 pub struct ToggleDef {
     /// The spec field and CLI flag.
     pub name: &'static str,
+    /// What it grants, in a few plain words (`approves designs`): how
+    /// [`StrategySpec::changes_from`] names it.
+    pub label: &'static str,
     /// What it grants.
     pub controls: Controls,
     /// The roles it may name.
@@ -82,12 +85,14 @@ pub struct ToggleDef {
 pub const TOGGLES: &[ToggleDef] = &[
     ToggleDef {
         name: "approves_design",
+        label: "approves designs",
         controls: Controls::Events(&[WorkflowEvent::ApproveDesign, WorkflowEvent::RejectDesign]),
         domain: &[Role::Operator, Role::Coordinator],
         acts_in: Some(Phase::DesignReview),
     },
     ToggleDef {
         name: "lands",
+        label: "lands",
         controls: Controls::Land,
         domain: &[Role::Operator, Role::Coordinator],
         acts_in: None,
@@ -136,6 +141,17 @@ pub enum AreaScope {
     File,
     /// The same directory.
     Directory,
+}
+
+impl AreaScope {
+    /// The area in a sentence: `file` or `directory`.
+    #[must_use]
+    pub const fn unit(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+        }
+    }
 }
 
 /// When must-fixes count as repeating (operator decision 3: the same file in two consecutive
@@ -190,7 +206,8 @@ pub const DEFAULT_PRESET: &str = "design-reviewed";
 pub struct Preset {
     /// Its name.
     pub name: &'static str,
-    /// One line.
+    /// One sentence on why to choose it. It does not say which is the default: pickers mark that,
+    /// and an operator's `default` definition replaces [`DEFAULT_PRESET`].
     pub describe: &'static str,
     /// Its spec.
     pub spec: fn() -> StrategySpec,
@@ -200,18 +217,18 @@ pub struct Preset {
 pub const PRESETS: &[Preset] = &[
     Preset {
         name: "design-reviewed",
-        describe: "the operator approves each design and lands (the default)",
+        describe: "The operator approves each design and lands each task.",
         spec: || StrategySpec {
-            graph: GraphId::ReviewedDesign,
+            graph: GraphId::DesignGate,
             toggles: Toggles::default(),
             attributes: Attributes::default(),
         },
     },
     Preset {
         name: "coordinated",
-        describe: "the coordinator may approve designs; the operator lands",
+        describe: "The coordinator may approve designs; the operator lands each task.",
         spec: || StrategySpec {
-            graph: GraphId::ReviewedDesign,
+            graph: GraphId::DesignGate,
             toggles: Toggles {
                 approves_design: vec![Role::Operator, Role::Coordinator],
                 lands: vec![Role::Operator],
@@ -221,7 +238,7 @@ pub const PRESETS: &[Preset] = &[
     },
     Preset {
         name: "autonomous",
-        describe: "no design review; the coordinator may land",
+        describe: "No design review; the coordinator may land.",
         spec: || StrategySpec {
             graph: GraphId::Direct,
             toggles: Toggles {
@@ -248,11 +265,11 @@ pub static BASE: RoleTable<Role, WorkflowEvent> = RoleTable {
         },
         Grant {
             role: Role::Coordinator,
+            // Not `submit_design`, `submit_systemic` or `systemic_redesign`: a coordinator schedules
+            // and never writes, so a design is a designer's to submit and a systemic finding a
+            // systemic reviewer's. Held here rather than left to the coordinator's prompt.
             permits: &[
-                WorkflowEvent::SubmitDesign,
                 WorkflowEvent::SubmitWork,
-                WorkflowEvent::SubmitSystemic,
-                WorkflowEvent::SystemicRedesign,
                 WorkflowEvent::Rework,
                 WorkflowEvent::Cancel,
             ],
@@ -283,7 +300,58 @@ fn invalid(msg: impl Into<String>) -> Error {
     Error::Types(jkb_types::Error::Validation(msg.into()))
 }
 
+/// The roles a toggle's list grants, as a sentence names them: the operator, who always holds it,
+/// then the listed roles in [`jkb_rbac::Role::ALL`]'s order, so an empty list, `[operator]` and a
+/// reordering all read the same.
+fn holders(roles: &[Role]) -> String {
+    <Role as jkb_rbac::Role>::ALL
+        .iter()
+        .filter(|r| **r == Role::Operator || roles.contains(r))
+        .map(|r| r.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl StrategySpec {
+    /// One line per way this strategy differs from `base` (the default strategy, which each line
+    /// names as `default`): its graph, then every [`TOGGLES`] row by its label, then each attribute.
+    /// Empty when the two grant and check the same. What `workflow.graph` answers as
+    /// `changes_from_default` and `jkb workflow show --graph` prints.
+    #[must_use]
+    pub fn changes_from(&self, base: &Self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.graph != base.graph {
+            lines.push(format!(
+                "graph: {} (default: {})",
+                self.graph.as_str(),
+                base.graph.as_str()
+            ));
+        }
+        for t in TOGGLES {
+            let (mine, theirs) = (
+                holders(self.toggles.get(t.name)),
+                holders(base.toggles.get(t.name)),
+            );
+            if mine != theirs {
+                lines.push(format!("{}: {mine} (default: {theirs})", t.label));
+            }
+        }
+        // Destructured, so an attribute added to `Attributes` does not compile until it is
+        // compared here.
+        let Attributes { repeated_area } = &self.attributes;
+        let base_area = &base.attributes.repeated_area;
+        if repeated_area != base_area {
+            lines.push(format!(
+                "must-fixes repeat after {} rounds in one {} (default: {} in one {})",
+                repeated_area.rounds,
+                repeated_area.scope.unit(),
+                base_area.rounds,
+                base_area.scope.unit()
+            ));
+        }
+        lines
+    }
+
     /// Refuse a spec that could not mean what it says (D52.5): a toggle naming a role outside its
     /// domain, a toggle whose graph never reaches the phase it acts in, an attribute out of range,
     /// or a resulting permission table with a defect.

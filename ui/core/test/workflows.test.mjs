@@ -2,23 +2,36 @@
 //! a save sends, and the two layouts. Runs against `dist/`.
 
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import test from "node:test";
 
 import {
   agentGraph,
+  agentSetsOf,
   canContribute,
   decodeAgent,
+  agentSetSentence,
   decodeAgents,
+  decodeRoles,
   decodeWorkflowGraph,
   draftOf,
   editBetween,
+  eventsFiredBy,
   isAgentName,
   layered,
-  machineLayout,
+  machineDrawing,
+  markerSources,
   placeholdersOf,
+  rowKey,
+  sameSelection,
   saveRequest,
+  selectionIn,
+  stateRows,
+  takenByRow,
+  templatesActingAs,
+  toggleMarks,
   workflowOps,
-  workflowsOf,
 } from "../dist/index.js";
 
 const ok = (value) => ({ ok: true, value });
@@ -82,6 +95,21 @@ test("agents decode, and a malformed answer is a named failure", () => {
   assert.equal(listed.value.agents[0].matches_packaged, false);
   // The roles are the server's, whatever they are: a role added there is offered here.
   assert.deepEqual(listed.value.roles, ["operator", "auditor"]);
+  // An older daemon sends no agent sets: none, so the tab shows no sentence.
+  assert.deepEqual(listed.value.agent_sets, []);
+  assert.equal(agentSetSentence(listed.value.agent_sets, "task-swarm"), undefined);
+  const sets = [
+    { name: "task-swarm", describe: "A swarm." },
+    { name: "code-review", describe: "A review." },
+  ];
+  const described = decodeAgents(ok({ result: "workflow_agents", agents: [agent()], roles: [], agent_sets: sets }));
+  assert.deepEqual(described.value.agent_sets, sets);
+  assert.equal(agentSetSentence(described.value.agent_sets, "code-review"), "A review.");
+  assert.equal(agentSetSentence(described.value.agent_sets, "subagents"), undefined, "a set the daemon did not describe");
+  assert.equal(agentSetSentence(described.value.agent_sets, undefined), undefined);
+  for (const bad of [{ name: "x" }, [{ name: 1, describe: "d" }], [{ name: "x" }]]) {
+    assert.equal(decodeAgents(ok({ result: "workflow_agents", agents: [agent()], roles: [], agent_sets: bad })).ok, false, JSON.stringify(bad));
+  }
   assert.equal(decodeAgents(ok({ result: "workflow_agents", agents: [agent()] })).ok, false, "no roles");
   assert.equal(decodeAgents(ok({ result: "workflow_agents", agents: [{ name: "x" }], roles: [] })).ok, false);
   assert.equal(decodeAgents(ok({ result: "strategies" })).ok, false);
@@ -132,7 +160,7 @@ test("names and placeholders follow jkb's rules", () => {
   assert.deepEqual(placeholdersOf("{{b}} {{a}} {{b}} {{Not}}"), ["a", "b"]);
 });
 
-test("the agent graph is a workflow's agents and their hand-offs, fragments left out", () => {
+test("the agent graph is an agent set's agents and their hand-offs, fragments left out", () => {
   const agents = [
     agent({ name: "a", hands_off_to: ["b", "c"] }),
     agent({ name: "b", hands_off_to: ["c", "gone"] }),
@@ -140,7 +168,7 @@ test("the agent graph is a workflow's agents and their hand-offs, fragments left
     agent({ name: "frag", fragment: true }),
     agent({ name: "other", workflow: "code-review" }),
   ];
-  assert.deepEqual(workflowsOf(agents), ["task-swarm", "code-review"]);
+  assert.deepEqual(agentSetsOf(agents), ["task-swarm", "code-review"]);
   const g = agentGraph(agents, "task-swarm");
   assert.deepEqual(
     g.nodes.map((n) => [n.id, n.layer, n.row]),
@@ -187,20 +215,116 @@ const machine = {
   ],
 };
 
-test("a machine is laid out from its table, self-loops and overrides left to be listed", () => {
-  const l = machineLayout(machine);
+test("a machine's drawing keeps its states and edges, self-loops and overrides left to be listed", () => {
+  const d = machineDrawing(machine);
   assert.deepEqual(
-    l.nodes.map((n) => [n.id, n.layer]),
-    [
-      ["design", 0],
-      ["implement", 1],
-      ["landed", 2],
-    ],
+    d.states.map((s) => s.name),
+    ["design", "implement", "landed"],
   );
   assert.deepEqual(
-    l.links.map((x) => x.label),
+    d.edges.map((x) => x.event),
     ["submit_design", "observed_landed"],
   );
+  assert.deepEqual(
+    d.listed.map((t) => t.event),
+    ["reopen", "override"],
+  );
+});
+
+const st = (name, over = {}) => ({ name, initial: false, settled: false, awaits_input: false, next_role: "implementer", next_step: "s", ...over });
+const tr = (from, event, to, over = {}) => ({ from, event, to, reconciled: false, guarded: false, planned: false, roles: ["operator"], fired_by: "operator", ...over });
+const obs = (from, event, to, over = {}) => tr(from, event, to, { reconciled: true, guarded: true, roles: [], fired_by: "observed", ...over });
+
+// Shaped like `design-reviewed`: six live phases, each with an observed landing and cancelling.
+const PHASES = ["design", "design_review", "implement", "review", "landable", "changes_requested"];
+const sixPhase = {
+  states: [
+    ...PHASES.map((p, i) => st(p, { initial: i === 0 })),
+    st("landed", { settled: true, next_role: null, next_step: null }),
+    st("cancelled", { settled: true, next_role: null, next_step: null }),
+  ],
+  transitions: [
+    tr("design", "submit_design", "design_review"),
+    tr("design_review", "approve_design", "implement"),
+    tr("implement", "submit_work", "review"),
+    obs("review", "review_passed", "landable"),
+    tr("review", "request_changes", "changes_requested"),
+    tr("changes_requested", "submit_work", "review"),
+    ...PHASES.map((p) => obs(p, "observed_landed", "landed", { guarded: p !== "landable" })),
+    ...PHASES.map((p) => obs(p, "observed_cancelled", "cancelled")),
+    ...PHASES.map((p) => tr(p, "override", null)),
+    tr("implement", "note", "implement", { roles: [], fired_by: "applied" }),
+  ],
+};
+
+test("observations from two or more phases collapse into one marker per target", () => {
+  const d = machineDrawing(sixPhase);
+  assert.deepEqual(
+    d.markers.map((m) => [m.to, m.groups.map((g) => [g.event, g.rows.map((r) => r.from)])]),
+    [
+      ["landed", [["observed_landed", PHASES]]],
+      ["cancelled", [["observed_cancelled", PHASES]]],
+    ],
+  );
+  assert.equal(markerSources(d.markers[0]).length, 6, "every live phase is still counted, not hidden as 'from any'");
+  assert.deepEqual(
+    d.markers[0].groups[0].rows.map((r) => r.guarded),
+    PHASES.map((p) => p !== "landable"),
+    "a guarded and an unguarded row of one (to, event) share a group, each keeping its own flag",
+  );
+  assert.ok(d.edges.every((e) => e.event !== "observed_landed" && e.event !== "observed_cancelled"));
+  assert.deepEqual(
+    d.edges.map((x) => x.event),
+    ["submit_design", "approve_design", "submit_work", "review_passed", "request_changes", "submit_work"],
+    "the graph draws only the real phase-to-phase edges",
+  );
+  assert.ok(d.states.some((s) => s.name === "landed") && d.states.some((s) => s.name === "cancelled"), "a state only markers reach is still drawn");
+
+  // Two collapsed events reaching one target: one marker, two groups.
+  const two = {
+    ...sixPhase,
+    transitions: [...sixPhase.transitions, obs("design", "observed_merged", "landed"), obs("review", "observed_merged", "landed")],
+  };
+  const m = machineDrawing(two).markers.filter((x) => x.to === "landed");
+  assert.equal(m.length, 1);
+  assert.deepEqual(
+    m[0].groups.map((g) => g.event),
+    ["observed_landed", "observed_merged"],
+  );
+  assert.equal(markerSources(m[0]).length, 6, "N counts distinct source states, not rows");
+});
+
+test("a single-source observation stays an edge", () => {
+  const d = machineDrawing(sixPhase);
+  assert.ok(d.edges.some((e) => e.from === "review" && e.event === "review_passed" && e.to === "landable"));
+  assert.ok(!d.markers.some((m) => m.to === "landable"));
+  // One live phase collapses nothing.
+  const one = {
+    states: [st("implement", { initial: true }), st("landed", { settled: true })],
+    transitions: [obs("implement", "observed_landed", "landed"), tr("implement", "override", null)],
+  };
+  const o = machineDrawing(one);
+  assert.deepEqual(o.markers, []);
+  assert.deepEqual(
+    o.edges.map((e) => e.event),
+    ["observed_landed"],
+  );
+  // The same event from two states, but not observed: arrows, never a marker.
+  const fired = { ...one, states: [...one.states, st("review")], transitions: [tr("implement", "land", "landed"), tr("review", "land", "landed")] };
+  assert.deepEqual(machineDrawing(fired).markers, []);
+});
+
+test("every row is drawn, collapsed or listed, exactly once", () => {
+  for (const m of [machine, sixPhase]) {
+    const d = machineDrawing(m);
+    const seen = [...d.edges, ...d.markers.flatMap((x) => x.groups.flatMap((g) => g.rows)), ...d.listed];
+    assert.equal(seen.length, m.transitions.length);
+    assert.deepEqual(new Set(seen), new Set(m.transitions), "each row is the table's own object, none invented or lost");
+    assert.equal(new Set(d.markers.map((x) => x.to)).size, d.markers.length, "one marker per target");
+    assert.ok(d.listed.every((t) => t.to === null || t.to === t.from));
+    assert.ok(d.edges.every((t) => t.to !== null && t.to !== t.from));
+    assert.equal(d.states, m.states);
+  }
 });
 
 test("the graph answer decodes, with absent optionals as null", () => {
@@ -212,7 +336,17 @@ test("the graph answer decodes, with absent optionals as null", () => {
   );
   assert.equal(g.ok, true);
   assert.equal(g.value.task, null);
+  assert.equal(g.value.path, null, "an older daemon sends no path");
   assert.equal(g.value.workflow.transitions[3].to, null);
+  const pathed = decodeWorkflowGraph(
+    ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "A sentence.", path: "a → b", workflow: machine, lifecycle: machine } }),
+  );
+  assert.equal(pathed.value.describe, "A sentence.");
+  assert.equal(pathed.value.path, "a → b");
+  assert.equal(
+    decodeWorkflowGraph(ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "d", path: 3, workflow: machine, lifecycle: machine } })).ok,
+    false,
+  );
   assert.equal(g.value.lifecycle.transitions[2].fired_by, "applied", "who fires a row is jkb's word, not redecided here");
   const unlabelled = { ...machine, transitions: machine.transitions.map(({ fired_by: _, ...t }) => t) };
   assert.equal(
@@ -220,4 +354,160 @@ test("the graph answer decodes, with absent optionals as null", () => {
     false,
   );
   assert.equal(decodeWorkflowGraph(ok({ result: "workflow_graph", graph: { strategy: "x" } })).ok, false);
+});
+
+test("a state's rows are what leaves it, what arrives, and what is not drawn", () => {
+  const d = machineDrawing(sixPhase);
+  const ev = (rows) => rows.map((t) => `${t.from}|${t.event}|${t.to}`);
+  const implement = stateRows(d, "implement");
+  assert.deepEqual(ev(implement.leaves), ["implement|submit_work|review"]);
+  assert.deepEqual(ev(implement.arrives), ["design_review|approve_design|implement"]);
+  assert.deepEqual(ev(implement.listed), ["implement|override|null", "implement|note|implement"], "its override and its self-loop, in table order");
+  // A marker's rows arrive at its target, after the drawn edges into it.
+  const landed = stateRows(d, "landed");
+  assert.deepEqual(landed.leaves, []);
+  assert.deepEqual(ev(landed.arrives), PHASES.map((p) => `${p}|observed_landed|landed`));
+  assert.deepEqual(landed.listed, []);
+  // Each row is the table's own object.
+  assert.ok(implement.leaves.every((t) => sixPhase.transitions.includes(t)));
+});
+
+test("every row of every machine is reachable from some state's panel", () => {
+  const fixture = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "..", "app", "test", "fixtures", "workflow-graphs.json"), "utf8"));
+  const machines = Object.values(fixture).flatMap((g) => [g.workflow, g.lifecycle]);
+  assert.equal(machines.length, 6);
+  for (const m of [...machines, machine, sixPhase]) {
+    const d = machineDrawing(m);
+    const reached = new Set(
+      m.states.flatMap((s) => {
+        const r = stateRows(d, s.name);
+        return [...r.leaves, ...r.arrives, ...r.listed];
+      }),
+    );
+    for (const t of m.transitions) assert.ok(reached.has(t), `${t.from} --${t.event}--> ${t.to} is in no state's panel`);
+  }
+});
+
+test("a selection survives a strategy switch only if it still names something drawn", () => {
+  const d = machineDrawing(sixPhase);
+  assert.equal(selectionIn(d, { kind: "state", machine: "workflow", name: "review" }), true);
+  assert.equal(selectionIn(d, { kind: "state", machine: "workflow", name: "systemic_review" }), false);
+  assert.equal(selectionIn(d, { kind: "edge", machine: "workflow", from: "review", event: "review_passed" }), true);
+  // A row that is listed or collapsed is not an edge of the picture.
+  assert.equal(selectionIn(d, { kind: "edge", machine: "workflow", from: "implement", event: "override" }), false);
+  assert.equal(selectionIn(d, { kind: "edge", machine: "workflow", from: "implement", event: "observed_landed" }), false);
+  assert.equal(selectionIn(d, { kind: "marker", machine: "workflow", to: "landed" }), true);
+  assert.equal(selectionIn(d, { kind: "marker", machine: "workflow", to: "landable" }), false);
+});
+
+test("two selections are the same only for the same part of the same machine", () => {
+  const s = { kind: "state", machine: "workflow", name: "review" };
+  assert.equal(sameSelection(s, { name: "review", machine: "workflow", kind: "state" }), true, "key order does not matter");
+  assert.equal(sameSelection(s, { ...s, machine: "lifecycle" }), false);
+  assert.equal(sameSelection(s, { kind: "marker", machine: "workflow", to: "review" }), false);
+  assert.equal(sameSelection({ kind: "edge", machine: "workflow", from: "a", event: "x" }, { kind: "edge", machine: "workflow", from: "a", event: "y" }), false);
+  assert.equal(sameSelection(undefined, undefined), true);
+  assert.equal(sameSelection(s, undefined), false);
+});
+
+test("a role's events are those the strategy lets it fire, once each", () => {
+  assert.deepEqual(eventsFiredBy(sixPhase, "operator"), ["submit_design", "approve_design", "submit_work", "request_changes", "override"]);
+  assert.deepEqual(eventsFiredBy(sixPhase, "designer"), []);
+});
+
+test("a task's moves count per row, an override's destinations summed", () => {
+  const taken = takenByRow([
+    { from: "review", event: "override", to: "design", count: 1 },
+    { from: "review", event: "override", to: "implement", count: 2 },
+    { from: "implement", event: "submit_work", to: "review", count: 2 },
+  ]);
+  assert.equal(taken.get(rowKey("review", "override")), 3);
+  assert.equal(taken.get(rowKey("implement", "submit_work")), 2);
+  assert.equal(taken.size, 2);
+});
+
+test("a row's guard and command are jkb's words, absent ones null; every role's op classes come with the graph", () => {
+  const worded = {
+    ...machine,
+    transitions: machine.transitions.map((t, i) => (i === 1 ? { ...t, guard: "a landing is recorded", command: "jkb workflow observe <uid>" } : t)),
+  };
+  const g = decodeWorkflowGraph(
+    ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "d", workflow: worded, lifecycle: machine, role_ops: { operator: ["read"] } } }),
+  );
+  assert.equal(g.ok, true);
+  assert.equal(g.value.workflow.transitions[1].guard, "a landing is recorded");
+  assert.equal(g.value.workflow.transitions[1].command, "jkb workflow observe <uid>");
+  assert.equal(g.value.workflow.transitions[0].guard, null, "an older jkb's row has no guard words");
+  assert.equal(g.value.workflow.transitions[0].command, null);
+  assert.deepEqual(g.value.role_ops, { operator: ["read"] });
+  const older = decodeWorkflowGraph(ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "d", workflow: machine, lifecycle: machine } }));
+  assert.deepEqual(older.value.role_ops, {});
+  const bad = (graph) => decodeWorkflowGraph(ok({ result: "workflow_graph", graph: { strategy: "x", graph: "g", describe: "d", workflow: machine, lifecycle: machine, ...graph } })).ok;
+  assert.equal(bad({ role_ops: { operator: "read" } }), false);
+  assert.equal(bad({ workflow: { ...machine, transitions: [{ ...machine.transitions[0], guard: 3 }] } }), false);
+});
+
+// `workflow.roles`, read from what jkb answers for every preset (fixtures/workflow-roles.json, which
+// `roles_fixture_matches_presets` in crates/jkb-api holds to the op).
+const rolesFixture = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, "..", "..", "app", "test", "fixtures", "workflow-roles.json"), "utf8"));
+
+test("workflow.roles asks for a strategy's roles, or the default's", () => {
+  assert.deepEqual(workflowOps.roles(), { op: "workflow.roles" });
+  assert.deepEqual(workflowOps.roles("autonomous"), { op: "workflow.roles", strategy: "autonomous" });
+});
+
+test("every preset's workflow.roles answer decodes whole, every role once", () => {
+  assert.deepEqual(Object.keys(rolesFixture).sort(), ["autonomous", "coordinated", "design-reviewed"]);
+  for (const [name, roles] of Object.entries(rolesFixture)) {
+    const d = decodeRoles(ok({ result: "workflow_roles", roles }));
+    assert.equal(d.ok, true, name);
+    assert.deepEqual(d.value, roles, `${name}: nothing dropped or renamed`);
+    assert.deepEqual(
+      d.value.roles.map((r) => r.name),
+      ["operator", "coordinator", "designer", "implementer", "reviewer", "systemic_reviewer"],
+    );
+    assert.ok(d.value.roles.every((r) => r.ops.every((o) => o.describe.length > 0)), `${name}: every op class has its sentence`);
+  }
+  const autonomous = decodeRoles(ok({ result: "workflow_roles", roles: rolesFixture.autonomous })).value;
+  const coordinator = autonomous.roles.find((r) => r.name === "coordinator");
+  assert.equal(coordinator.lands, true);
+  assert.ok(coordinator.ops.some((o) => o.name === "land"), "the strategy's lands toggle shows as the land op class");
+});
+
+test("a malformed or foreign answer is refused, and a missing acts_in is null", () => {
+  const roles = rolesFixture["design-reviewed"];
+  assert.equal(decodeRoles(ok({ result: "workflow_graph", roles })).ok, false);
+  assert.equal(decodeRoles(ok({ result: "workflow_roles", roles: { ...roles, roles: [{ name: "x" }] } })).ok, false);
+  assert.equal(decodeRoles(ok({ result: "workflow_roles", roles: { ...roles, toggles: [{ name: "lands" }] } })).ok, false);
+  const bad = { ...roles.roles[0], toggled_by: [{ toggle: "lands", on: "yes" }] };
+  assert.equal(decodeRoles(ok({ result: "workflow_roles", roles: { ...roles, roles: [bad] } })).ok, false);
+  const { acts_in: _, ...lands } = roles.toggles.find((t) => t.name === "lands");
+  const d = decodeRoles(ok({ result: "workflow_roles", roles: { ...roles, toggles: [lands] } }));
+  assert.equal(d.ok, true);
+  assert.equal(d.value.toggles[0].acts_in, null);
+  const failure = { ok: false, error: { code: "bad_request", message: "unknown variant" } };
+  assert.equal(decodeRoles(failure), failure, "a refusal passes through");
+});
+
+test("a role's toggle marks say which toggle grants what, on or off in this strategy", () => {
+  const view = rolesFixture["design-reviewed"];
+  const coordinator = view.roles.find((r) => r.name === "coordinator");
+  assert.deepEqual(toggleMarks(view, coordinator), [
+    { toggle: "approves_design", label: "approves designs", on: false, controls: ["approve_design", "reject_design"] },
+    { toggle: "lands", label: "lands", on: false, controls: ["land"] },
+  ]);
+  const coordinated = rolesFixture.coordinated;
+  assert.equal(toggleMarks(coordinated, coordinated.roles.find((r) => r.name === "coordinator"))[0].on, true);
+  assert.deepEqual(toggleMarks(view, view.roles.find((r) => r.name === "designer")), [], "no toggle can name a designer");
+});
+
+test("a role's agents are the templates acting as it in any agent set, never a fragment", () => {
+  const agents = [
+    agent({ name: "a", workflow: "task-swarm", role: "reviewer" }),
+    agent({ name: "b", workflow: "code-review", role: "reviewer" }),
+    agent({ name: "c", workflow: "code-review", role: "reviewer", fragment: true }),
+    agent({ name: "d", role: "implementer" }),
+  ];
+  assert.deepEqual(templatesActingAs(agents, "reviewer").map((a) => a.name), ["a", "b"]);
+  assert.deepEqual(templatesActingAs(agents, "systemic_reviewer"), []);
 });

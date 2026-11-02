@@ -408,12 +408,16 @@ fn samples() -> Vec<Request> {
         },
         Request::WorkflowDefine {
             name: "mine".into(),
+            describe: "Mine.".into(),
             spec: json!({ "graph": "direct" }),
         },
         Request::WorkflowStrategies {},
         Request::WorkflowGraph {
             uid: None,
             strategy: Some("autonomous".into()),
+        },
+        Request::WorkflowRoles {
+            strategy: Some("coordinated".into()),
         },
         Request::WorkflowAgents {},
         Request::WorkflowAgent {
@@ -577,6 +581,18 @@ fn samples() -> Vec<Request> {
         Request::DesignPromptOf {
             session: "s".into(),
         },
+        Request::TimelineSessions {},
+        Request::TimelineSession {
+            session: "s".into(),
+            after: None,
+        },
+        Request::TimelineTask {
+            uid: "task:x".into(),
+            after: None,
+        },
+        Request::TimelinePlan {
+            uid: "plan:x".into(),
+        },
         Request::DesignCompact {
             uid: "design:x".into(),
         },
@@ -662,6 +678,55 @@ fn samples() -> Vec<Request> {
             },
             pr: None,
             dry_run: true,
+        },
+        Request::ExecRequest(super::exec::ExecAsk {
+            target: "host".into(),
+            dir: "/w".into(),
+            dir_side: "host".into(),
+            argv: vec!["ls".into()],
+            reason: String::new(),
+            pin: None,
+            timeout_ms: None,
+        }),
+        Request::ExecStatus {
+            id: "exec-1".into(),
+        },
+        Request::ExecList {
+            state: None,
+            after: None,
+            newest_first: false,
+        },
+        Request::ExecFollow {
+            id: "exec-1".into(),
+            after: None,
+            max: 10,
+        },
+        Request::ExecBegin {
+            id: "exec-1".into(),
+            recomputed_pin: None,
+            runner: "r".into(),
+        },
+        Request::ExecDecline {
+            id: "exec-1".into(),
+            note: "n".into(),
+        },
+        Request::ExecRefuse {
+            id: "exec-1".into(),
+            reason: "dir_gone".into(),
+        },
+        Request::ExecFinish {
+            id: "exec-1".into(),
+            runner: "r".into(),
+            outcome: "exited".into(),
+            exit_status: Some(0),
+            tail_b64: String::new(),
+            total_bytes: 0,
+            log_path: None,
+        },
+        Request::ExecOutput {
+            id: "exec-1".into(),
+            runner: "r".into(),
+            chunk_b64: "eA==".into(),
         },
     ]
 }
@@ -1953,6 +2018,7 @@ const READS: &[&str] = &[
     "workflow.show",
     "workflow.strategies",
     "workflow.graph",
+    "workflow.roles",
     "workflow.agents",
     "workflow.agent",
     "design.list",
@@ -1966,6 +2032,11 @@ const READS: &[&str] = &[
     "design.prompt",
     "design.prompts",
     "design.prompt_of",
+    "timeline.sessions",
+    "timeline.session",
+    "timeline.task",
+    "timeline.plan",
+    "exec.follow",
 ];
 
 #[test]
@@ -3727,4 +3798,266 @@ fn mutates_names_the_writes_and_not_the_reads() {
     ] {
         assert!(op(write.clone()).mutates(), "{write}");
     }
+}
+
+#[test]
+fn the_timeline_ops_are_reads_anyone_may_ask_and_answer_through_the_wire() {
+    use crate::rbac::{OpPermission, Target};
+    let timeline = [
+        json!({"op": "timeline.sessions"}),
+        json!({"op": "timeline.session", "session": "s-1"}),
+        json!({"op": "timeline.task", "uid": "task:t", "after": "1.status.2"}),
+        json!({"op": "timeline.plan", "uid": "plan:p"}),
+    ];
+    for r in &timeline {
+        let request: Request = serde_json::from_value(r.clone()).unwrap();
+        assert_eq!(request.permission(), OpPermission::Read, "{}", request.op());
+        assert!(
+            request.is_agent_read(),
+            "{} is served on the reader",
+            request.op()
+        );
+        assert!(!request.mutates(), "{}", request.op());
+        assert!(matches!(request.target(), Target::Free), "{}", request.op());
+    }
+
+    let b = backend();
+    b.db.write_txn("t", |c, m| {
+        let mut t = jkb_core::task::NewTask::new("task:t", "the task");
+        t.home = "tasks/f".into();
+        jkb_core::task::create(c, m, &t)
+    })
+    .unwrap();
+    let Response::TimelineTask { task } =
+        call(&b, json!({"op": "timeline.task", "uid": "task:t"})).unwrap()
+    else {
+        panic!("not a timeline_task");
+    };
+    assert_eq!(task.timeline.uid, "task:t");
+    assert_eq!(task.timeline.title, "the task");
+    assert_eq!(
+        task.graph.task.as_deref(),
+        Some("task:t"),
+        "the graph is the task's own strategy"
+    );
+    let wire = serde_json::to_value(Response::TimelineTask { task }).unwrap();
+    assert_eq!(wire["result"], "timeline_task");
+    assert_eq!(wire["task"]["timeline"]["landing"]["state"], "none");
+
+    let Response::TimelineSessions { overview } =
+        call(&b, json!({"op": "timeline.sessions"})).unwrap()
+    else {
+        panic!("not timeline_sessions");
+    };
+    assert!(overview.sessions.is_empty() && overview.unattributed.is_empty());
+    assert_eq!(
+        call(
+            &b,
+            json!({"op": "timeline.session", "session": "not a session"})
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Invalid
+    );
+    assert_eq!(
+        call(&b, json!({"op": "timeline.task", "uid": "task:missing"}))
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        call(
+            &b,
+            json!({"op": "timeline.task", "uid": "task:t", "after": "garbage"})
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Invalid
+    );
+    assert!(
+        serde_json::from_value::<Request>(
+            json!({"op": "timeline.session", "session": "s", "extra": 1})
+        )
+        .is_err(),
+        "an unknown field is refused"
+    );
+}
+
+/// What each op's class sentence must say for that op: the family of ops it belongs to, in the words
+/// `OpPermission::describe` uses. One entry per op, so a new op must be worded before this passes.
+const OP_WORDS: &[(&str, &str)] = &[
+    ("mq.topic_create", "queue"),
+    ("mq.send", "queue"),
+    ("mq.group_create", "queue"),
+    ("mq.poll", "queue"),
+    ("mq.ack", "queue"),
+    ("mq.group_delete", "queue"),
+    ("mq.compact", "compact the queue"),
+    ("mq.inspect", "queue"),
+    ("mq.tail", "queue"),
+    ("notify.event", "notifications"),
+    ("notify.open_sessions", "notifications"),
+    ("notify.gone", "notifications"),
+    ("session.started", "session registry"),
+    ("session.ended", "session registry"),
+    ("session.gone", "session registry"),
+    ("session.list", "session registry"),
+    ("session.state", "session registry"),
+    ("kb.ambient", "knowledge base"),
+    ("kb.query", "items"),
+    ("kb.ls", "items"),
+    ("kb.tree", "items"),
+    ("kb.cat", "items"),
+    ("kb.grep", "items"),
+    ("kb.search", "items"),
+    ("kb.related", "items"),
+    ("kb.blobs", "items"),
+    ("kb.blob", "items"),
+    ("kb.context", "items"),
+    ("kb.health", "knowledge base"),
+    ("kb.history", "history"),
+    ("item.show", "items"),
+    ("inv.read", "knowledge base"),
+    ("ns.list", "namespaces"),
+    ("view.list", "views"),
+    ("view.run", "views"),
+    ("task.ready", "tasks"),
+    ("task.show", "tasks"),
+    ("task.subtasks", "tasks"),
+    ("task.why", "tasks"),
+    ("task.facts", "tasks"),
+    ("task.by_branch", "tasks"),
+    ("task.review_findings", "tasks"),
+    ("task.claims", "tasks"),
+    ("task.staging", "tasks"),
+    ("task.pr_facts", "tasks"),
+    ("task.open_in_repo", "tasks"),
+    ("repo.gate", "tasks"),
+    ("removal.list", "removals"),
+    ("lease.get", "leases"),
+    ("role.list", "roles"),
+    ("role.whoami", "roles"),
+    ("role.bind", "bind an attested agent"),
+    ("workflow.show", "workflows"),
+    ("workflow.strategies", "workflows"),
+    ("workflow.graph", "workflows"),
+    ("workflow.roles", "workflows"),
+    ("workflow.agents", "workflows"),
+    ("workflow.agent", "workflows"),
+    ("design.list", "designs"),
+    ("design.cat", "designs"),
+    ("design.export", "designs"),
+    ("design.state", "designs"),
+    ("design.spans", "designs"),
+    ("design.threads", "designs"),
+    ("design.plan", "designs"),
+    ("design.plans", "designs"),
+    ("design.prompt", "designs"),
+    ("design.prompts", "designs"),
+    ("design.prompt_of", "designs"),
+    ("timeline.sessions", "timelines"),
+    ("timeline.session", "timelines"),
+    ("timeline.task", "timelines"),
+    ("timeline.plan", "timelines"),
+    ("exec.status", "run requests"),
+    ("exec.list", "run requests"),
+    ("exec.follow", "run requests"),
+    ("task.add", "add tasks"),
+    ("task.set", "fields"),
+    ("task.edit", "text"),
+    ("task.tag", "tags"),
+    ("task.depend", "dependencies"),
+    ("task.undepend", "dependencies"),
+    ("task.place", "placement"),
+    ("task.move", "placement"),
+    ("task.unplace", "placement"),
+    ("task.bind", "bindings"),
+    ("ingest.text", "ingest text"),
+    ("inv.write", "investigations"),
+    ("task.locate", "worktree location"),
+    ("task.pr_record", "pull request"),
+    ("task.pr_absent", "pull request"),
+    ("task.claim", "claim"),
+    ("task.release", "release work"),
+    ("task.start", "start"),
+    ("task.take", "take"),
+    ("task.abandon", "abandon"),
+    ("lease.take", "land lease"),
+    ("lease.release", "land lease"),
+    ("removal.add", "queue"),
+    ("removal.archived", "archive"),
+    ("removal.cancel", "cancel"),
+    ("removal.drop", "drop worktree removals"),
+    ("task.review_file", "file"),
+    ("task.review_record", "record a review"),
+    ("task.land", "land a task"),
+    ("task.land_check", "check whether it may land"),
+    ("task.landed", "record a landing"),
+    ("task.close_merged", "merged elsewhere"),
+    ("workflow.fire", "fire"),
+    ("workflow.observe", "observe"),
+    ("design.create", "create"),
+    ("design.move", "move"),
+    ("design.split", "split"),
+    ("design.thread_reply", "reply to threads"),
+    ("design.apply", "apply changes"),
+    ("design.edit", "edit"),
+    ("design.span", "parts"),
+    ("design.stage", "stage"),
+    ("design.plan_create", "plans"),
+    ("design.plan_step", "plans"),
+    ("design.prompt_record", "prompts"),
+    ("design.target", "targets"),
+    ("design.sources", "sources"),
+    ("design.approve", "approve a part of a design"),
+    ("role.grant", "hand out"),
+    ("role.revoke", "revoke"),
+    ("attest.mint", "vouch"),
+    ("attest.release", "vouch"),
+    ("exec.request", "ask the operator"),
+    ("design.thread_start", "start and resolve design threads"),
+    ("design.thread_resolve", "start and resolve design threads"),
+    ("design.approve_selection", "approve selections"),
+    ("task.review_waive", "waive reviews"),
+    ("task.ran_on_host", "ran on the host"),
+    ("task.reclaim", "reclaim work"),
+    ("lease.break", "break leases"),
+    ("item.rm", "remove items"),
+    ("ns.mv", "move namespaces"),
+    ("role.map", "map agent types"),
+    ("role.rotate_container", "rotate the container credential"),
+    ("workflow.set", "choose"),
+    ("workflow.define", "define strategies"),
+    ("workflow.agent_copy", "edit agent templates"),
+    ("workflow.agent_set", "edit agent templates"),
+    ("design.compact", "compact the queue and designs"),
+    ("design.retire", "retire"),
+    ("design.restore", "restore designs"),
+    ("exec.begin", "approve"),
+    ("exec.decline", "decline"),
+    ("exec.refuse", "refuse"),
+    ("exec.finish", "finish run requests"),
+    ("exec.output", "run"),
+];
+
+/// Every op's class sentence names the family the op belongs to, so the Roles view's plain words
+/// cover every op a role may run, not just the first ones thought of.
+#[test]
+fn every_op_class_sentence_names_each_op_it_admits() {
+    for r in samples() {
+        let op = r.op();
+        let word = OP_WORDS
+            .iter()
+            .find(|(o, _)| *o == op)
+            .unwrap_or_else(|| panic!("{op}: add it to OP_WORDS, and word its class's sentence"))
+            .1;
+        let class = r.permission();
+        let sentence = class.describe().to_lowercase();
+        assert!(
+            sentence.contains(word),
+            "{op} is a {} op, but its sentence does not say \"{word}\": {sentence}",
+            jkb_rbac::Permission::name(class)
+        );
+    }
+    assert_eq!(OP_WORDS.len(), Request::OPS.len(), "one entry per op");
 }

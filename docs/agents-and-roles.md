@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 159.ngGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 cca35d2a71086a5b5ea30e8c4ae3eda6027f969f7af1630c507da2432af1dfde) -->
+<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 cfbe327a05707878e7d1093403df8c79305840cb4254028e64494ccd01689752) -->
 # Agents and roles
 
 jkb is driven by agents as much as by people: a task swarm that schedules, implements, reviews
@@ -60,10 +60,9 @@ already in the KB, and a restarted coordinator resumes from them.
 
 ### Workers are typed subagents, rendered from the templates and installed by jkb
 
-The workers' types are templates of the `subagents` workflow in `agents.json`: `jkb-implementer` and
-`jkb-reviewer`. `jkb_core::workflow::agents::subagent_definitions` renders each as a Claude Code agent
-definition (the template is its system prompt). A reviewer gets `Read, Grep, Glob, Bash`; an
-implementer gets the editing tools. **Neither gets `Agent`**: a subagent can start subagents
+The workers' types are templates of the `subagents` workflow in `agents.json`: `jkb-designer`, `jkb-implementer`, `jkb-reviewer` and `jkb-systemic-reviewer`. `jkb_core::workflow::agents::subagent_definitions`
+renders each as a Claude Code agent definition (the template is its system prompt). A designer and both reviewers get `Read, Grep, Glob, Bash`; an
+implementer gets the editing tools. **None of them gets `Agent`**: a subagent can start subagents
 (measured 2026-10-10 on Claude Code 2.1.293 in the dev container: a subagent's nested start returned), and each
 child attests as its own type, so a reviewer holding `Agent` could start a `jkb-implementer` and edit
 code, and an implementer could start a reviewer of its own branch. Workers never start workers; a
@@ -74,8 +73,7 @@ beside the `/jkb-*` commands, so they reach every repository without a commit un
 the dev container remote mode never runs that auto-install and the sandbox denies the agent's writes
 there, so the attestation hook runs it: the one jkb the container runs outside the sandbox, from the
 operator's kit, on every tool call. The `jkb-` prefix is the installer's: the type a coordinator
-names, the file and the role map's key are one spelling. `setup.sh` maps both types to their roles,
-and clears the bare `implementer` and `reviewer` they replace and the `workflow-subagent` stopgap, so a
+names, the file and the role map's key are one spelling. `setup.sh` maps each type to its role, and clears the bare `designer`, `implementer`, `reviewer` and `systemic-reviewer` they replace and the `workflow-subagent` stopgap, so a
 user's own agent of those names holds no role; a test holds its lines to the templates' roles. It
 does not stop a repository from defining a `jkb-reviewer` of its own, which attestation would map by
 name; that trust in names is follow-up work. A copy of a subagent template is refused: it would be
@@ -88,9 +86,17 @@ refuses a missing or a stray one.
 
 ### The swarm is a coordinator loop; the merge queue stays a script and names its outcome
 
-The swarm coordinator (`swarm-coordinator`, started by `/jkb-task-swarm`) reads the ready frontier,
+The swarm coordinator (`swarm-coordinator`, started by `/jkb-task-swarm`) reads the ready frontier by workflow phase (see "The design gate"),
 groups overlapping tasks, and per group starts a `jkb-implementer` (in a worktree) and then a fresh
-`jkb-reviewer`, sending request-changes and ejects back to the same implementer with SendMessage.
+`jkb-reviewer`, sending request-changes and ejects back to the same implementer with SendMessage. When review flags
+the same area twice, the task moves to `systemic_review` and the coordinator starts a
+`jkb-systemic-reviewer`, which records the cause in the task and takes one exit with a reason:
+`submit_systemic` sends the cause back to the same implementer, and `systemic_redesign` pauses the
+group (its claims, branch and implementer kept) while a designer revises the design for the
+operator's approval, after which the same implementer resumes. A task an earlier run left at
+`systemic_review` is taken up by the next run as a group of one, whose exits start a new implementer
+on the task's branch; and a designer that cannot finish tags its task `design-failed=<run owner>`
+before it reports, so a coordinator rebuilding after a compaction does not wait on it.
 Claiming, status moves, branch records and the post-landing check are its own `jkb` calls, not
 agents. What the script kept in memory is now in jkb, so a compaction loses none of it: a settled
 group's tasks (landed, given up or stalled) are tagged `swarm-settled=<run owner>` and every frontier
@@ -129,8 +135,7 @@ between the coordinator's commands and a reviewer handed an empty contract would
 Pre-existing findings are reported, not filed as review findings; the coordinator, which holds
 task-write, files them with `jkb task add --backlog`, and `task review file` refuses one (the rule is
 in the callee, not only in the coordinator's prompt). A finding's `scope` is a closed set
-(`introduced`, `aggravated`, `pre-existing`; absent reads as introduced), so an unknown spelling is
-refused rather than filed as the change's own; merged duplicates keep the scope that holds the change
+(`introduced`, `aggravated`, `pre-existing`; absent reads as introduced), so an unknown spelling is refused rather than filed as the change's own; every finding is tagged `finding=review` as it is filed, so a frontier read leaves findings out with `-tag:finding=review`; merged duplicates keep the scope that holds the change
 responsible. A reviewer files with `jkb task review
 file --from -` and records with `jkb task review record`; an attested reviewer files only once bound
 to the task it reviews, so the coordinator finds the task working the branch and the reviewer runs
@@ -540,17 +545,21 @@ The ordering is the decision, not a step: the CLI surface first, the hook last. 
 denies raw SQL before the CLI can serve a need hard-blocks agents, so the hook was the final
 task of the fleet work, gated on the read and mutate surface being complete.
 
-## The design gate
+### The swarm reads its frontier by workflow phase
 
-Swarm implementers run headless, as Workflow sub-agents, and cannot ask the user about a design
-that has not been decided. So design is separated from implementation by a tag gate: people
-decide designs, the swarm implements decided ones.
-
-### A task is swarm-eligible only when tagged `design=approved`
-
-`/task-swarm` ANDs `tag:design=approved` into its `task next`/`query` selection, in its scout and
-in every SCHEDULER pass, whenever it runs in scope mode, so un-triaged tasks are invisible to the
-swarm. Two bypasses exist: `--no-design-gate` (`cfg.designGate: false`) and explicit-uid mode,
+Every frontier read of the `/task-swarm` coordinator is `is:ready is:unclaimed` plus the run's scope,
+leaving out the run's settled tasks and review findings (tagged `finding=review` as they are filed;
+`V033` backfilled the older ones). It reads four times, in order: A,
+`phase:implement,review,landable,systemic_review`, the work to build, read first so an approved task
+is never hidden behind the tasks still at `design`; R, `phase:design tag:swarm-designed=<run owner>`,
+designs this run wrote and the operator rejected, re-designed whatever the budget has left; B,
+`phase:design tag:design=approved`, the legacy tag path while the switch to `approve_design` is under
+way; and C, `phase:design -tag:design=approved`, the tasks for designers, limited to what remains of
+the `--designers` budget (counted by task). B and C leave out R's tasks, so no task is in two reads. A
+task at `design_review` is in no read, so it waits for the operator with no tag and no re-check, and
+moves into read A, or back to R or C, once approved or rejected. Two bypasses send read C's tasks down the legacy path instead of
+to a designer, and neither applies to a design turned down by `reject_design` or `systemic_redesign`,
+which always goes back to a designer: `--no-design-gate` and explicit-uid mode,
 where the operator names the tasks.
 
 ### `/design-pass` settles a design with the user
@@ -571,9 +580,7 @@ the approved design first and follows it rather than re-deciding.
 
 ### The gate is spelled in the query DSL
 
-Use `tag:design=approved`. The `#facet=value` form is quick-add only, and `task next` silently
-drops terms that are not `tag:` or `ns:`, so `#design=approved` in a `task next` scope is parsed
-as free text and dropped, and the gate silently admits everything.
+Use `phase:<phase>` and `tag:design=approved`; a phase name is checked, and an unknown one is refused. The `#facet=value` form is quick-add only: `#design=approved` in a query is free text matched against the body, not a filter, and the gate silently admits everything.
 
 ## The code reviewer
 
@@ -870,9 +877,9 @@ There is one phase set: design, `design_review`, implement, review, `systemic_re
 landed, cancelled. Two graphs over it are `jkb-fsm` tables that pass `check()` and an `audit()`
 over every combination of facts. A strategy is a composition (the operator's clarification): a
 graph, permission **toggles** (`approves_design`, `lands`), each bounded by a domain so no toggle
-can hand an operator power to a worker, and **attributes** (`repeated_area`). The presets are
-`design-reviewed` (the default), `coordinated` and `autonomous`; operator definitions are
-versioned. Phases were not folded into `TaskStatus`: the status is the claim and land axis every
+can hand an operator power to a worker, and **attributes** (`repeated_area`). The presets are `design-reviewed` (the default), `coordinated` and `autonomous`; operator
+definitions are versioned, and each version carries the one-sentence description
+`jkb workflow define --describe` requires. Phases were not folded into `TaskStatus`: the status is the claim and land axis every
 frontier and synced checkbox reads, and the workflow is a second axis over it.
 
 ### A task pins its workflow at its first move
@@ -1296,7 +1303,7 @@ reporting a moved submodule commit). `checkout` and `switch` run `--quiet` too, 
 report of local changes enters every populated submodule, and a branch can bring a submodule only
 the target tree's `.gitmodules` names (measured: the planted filter ran on `checkout --detach` and
 `switch`, not with `--quiet`). And jkb's git runs only the subcommands measured not to enter a
-submodule (`SAFE_SUBCOMMANDS`; `add -A`, `stash`, `cherry-pick` and `diff-index` did), refused at
+submodule (`SAFE_SUBCOMMANDS`; `add -A`, `stash`, `cherry-pick` and `diff-index` did; `ls-remote`, `pack-objects`, `index-pack` and `fast-import` were measured in for the Executions diff, `ls-remote` under `GIT_ALLOW_PROTOCOL=https:ssh` with a hostile repository config running nothing), refused at
 runtime otherwise, so a new subcommand arrives with its own measurement. The cost: a submodule's
 uncommitted edits no longer make a checkout read dirty, and a graft carries only the submodule's
 commit anyway.
@@ -1565,3 +1572,174 @@ the reap scan.
 The reap scan first judged the template directory as a whole, which a single hook symlinked into
 `~/repos` stepped around, and the standing finding it then raised against every repository hid any
 real one behind an unchanged summary. Replaced by judging each template hook where it really is.
+
+## Executions: the operator's view of sessions at work, and the commands they ask for
+
+Code Factory's Executions tab has two jobs. It shows the lifecycle being applied: which sessions
+hold which tasks, how each task has moved through its strategy's phases, and how a plan progresses
+over time. And it is where a session that is blocked by its own permissions asks the operator to
+run one command for it, somewhere the session cannot reach: on the host, or in the container
+outside the agent's sandbox. The operator reads exactly what would run, runs it with a click or
+declines it, and the output goes straight back to the session that asked.
+
+The second job opens a hole in a boundary on purpose. The hooks-off git design holds that the host
+never runs code the container wrote; a run request is the one sanctioned exception, and the
+operator's click is the only thing standing in for that rule. So everything below serves one
+property: **what the operator approves is exactly what runs, and anything that would make them
+differ refuses the run.**
+
+### The timeline is read from facts jkb already records
+
+The tab invents no new record for the first job. It reads the transition log (every phase change,
+with its actor and time), claims (which session holds which task, and since when), review rounds,
+landings and the session registry. It shows them per session (the tasks it holds and the events it
+fired), per task (its path through the strategy's graph, drawn over the same graph the Workflows
+tab draws), and per plan (open, in progress and done over time). A session that has stopped firing
+events while holding claims is shown as stalled, with how long ago its last event was.
+
+### A run request is a typed record, never a shell string
+
+A session asks with `jkb exec request --target host|container --dir <path> -- <argv>…`. An MCP
+tool of the same shape waits until `jkb mcp` can name the session that calls it: today it
+authenticates with a role token, so a request made through it would have no requester to record. The request records:
+
+- the **argv**, as a list, run without a shell. A request that needs a pipeline names `sh -c` and
+  its script as argv explicitly, so the operator sees that a shell is involved;
+- the **directory**, resolved to its real path when the request is made;
+- the **target**: `host`, or `container`, which runs in the dev container through `docker exec`,
+  outside the agent's sandbox but inside the container;
+- the **requester**: the session, its role (from its attested credential) and the task it holds;
+- a **reason**, one sentence the session writes for the operator;
+- the **tree pin** (next section).
+
+Requests are KB-local rows in their own table, written through the writer-actor, so they have a
+changelog and appear in the audit history. They never appear in git. Asking needs a new op class,
+`exec_request`, granted to every role but the operator in the static op table (`OP_GRANTS`),
+not per strategy. Approving, declining and running
+are operator-only: the container holds only a coordinator credential, so no session can approve
+its own request.
+
+### The tree pin: the operator reviews the code that would run, and the run refuses if it changes
+
+Running `./scripts/check.sh` runs everything that script sources, builds and executes, and none of
+that can be enumerated from the argv. So the request pins the directory's whole repository rather
+than single files: a blake3 over every path of its working tree that its committed ignore rules do
+not ignore, each as its path, its kind (file, executable, link target) and its bytes, read from the
+files and never from `.git`. Everything under `.git` is container-written (only `config` and
+`hooks` are bound read-only), so nothing in it is trusted: not the index, refs, objects, excludes or
+attributes. The ignore rules are the tree's own `.gitignore` files, matched by git's own matcher in
+a throwaway repository on both sides. The `HEAD` commit is recorded as a label for the operator and
+trusted for nothing. The tab
+shows the operator:
+
+- the argv, one argument per line, with control characters and invisible characters escaped;
+- the directory and target;
+- the program file, when `argv[0]` is a path inside the repository: a link is shown as a link, never followed, and a file the pin does not cover is marked "outside the pin: can change before Run" rather than shown as reviewed code;
+- the diff to the pinned bytes from a base verified on the host: the default branch's tip by
+  `git ls-remote` on the repository's origin, but only when that origin is the clean clone's remote
+  or a line of `~/.jkb/trusted-remotes` (a file the container cannot write; it starts empty, and the
+  operator adds remotes by hand), with the clean clone as the fallback. The base's objects may come
+  from the request repository, but only after `index-pack --fsck-objects` re-names them by hash in a
+  throwaway repository, so a forged object leaves the base missing, never different. Any other remote
+  is never contacted: the diff is against the request's `HEAD` label under **base unverified (remote
+  chosen by the repository)**, and stays runnable. The patch is diffed with `--text`, so a NUL byte
+  cannot hide a file, and `jkb exec diff` prints it escaped. Every `.gitignore` the pin applied is
+  part of the diffed tree, so a change to the ignore rules shows as a change. A tracked file the rules
+  exclude is listed `I`, and left out of the patch, only when the pin's walk judged that exact path (or
+  an ignored parent) ignored and it is a file or link reached through real directories. The file list
+  (up to 10,000 paths) is complete or says it was cut; a patch over 2 MiB is cut with a banner and Run
+  stays enabled; and a request in a repository whose diff cannot be produced cannot be Run. This is the code the operator is about to run
+  that nobody has reviewed yet. It is rendered on the host from the same walk that computed the
+  pin, over raw bytes with no attribute, filter or diff driver applied, so a `.gitattributes` in
+  the tree cannot hide a file's content from the operator.
+
+When Run is clicked, main recomputes the pin. Any difference refuses the run and the request is
+marked `refused: tree changed`. The session may ask again, and the new request is reviewed fresh.
+The preview pins, diffs and pins again; if any pin differs from the request's, it says **Tree changed
+since the request: Run will refuse** and disables Run. Previews run two at a time, so a session that
+files many requests cannot flood the host.
+A host run also runs the hooks-off git audit on the repository first, and a refused audit refuses
+the run. A directory outside any repository gets no tree pin, and the tab says so in place of a
+diff.
+
+The pin does not cover everything a run reads, and this is accepted for now. Files git ignores
+(`target/`, `node_modules/`, build output) are outside it, and `check.sh` runs them. And the
+container can change a file between the pin check and the moment the run reads it. Closing both
+means running from a private host copy of the pinned tree, which costs a cold build per run and
+keeps the run's effects out of the session's directory; revisit that if a request ever needs it. The
+directory itself is resolved before anything else (links and `..` followed): one the container named
+must resolve under the host's real repos root, or the request is refused as directory gone, and the
+resolved path is what the operator sees, what the pin covers and where the run starts; a pin of any
+other directory refuses the request; the pin's directory is compared by identity (device and inode),
+not spelling. Run names what the preview showed, the resolved directory and host program, and a
+request that now resolves to anything else is refused (tree changed). A host run starts through a
+fixed launcher main builds: it enters the directory with `cd -P` and runs the program only if the
+directory's inode, read with `/bin/ls`, is the one recorded when it was resolved and pinned, and main
+checks device and inode again just before the spawn. A relative program runs as `./<path>` from the
+verified directory, so it is never read as an option. A directory swapped for a link, or for another
+directory, after the pin runs nothing: the launcher prints a refusal carrying a per-run nonce and
+exits 125, and the request ends interrupted; only that line with that exit counts as a refusal, so a
+program's own output cannot pass for one. The operator is shown the program, never the launcher. The
+pin is recomputed by the host's own `~/.cargo/bin/jkb`, the
+binary `setup.sh` installs. A request is refused only for an identified cause (the directory does not
+exist, the audit's own finding, or a tree the pin will not cover, including a repository with no
+commit); a fault on the host refuses nothing, and the request stays pending with the error shown. State under `.git` other than the read-only `config` and `hooks` (index, refs, objects, `info/`) is
+not pinned either: a run whose scripts consult git in that repository acts on container-written
+state, which no run today executes. A link's target outside the tree is pinned and shown; the file
+it names is not.
+
+### A run is the Container tab's button, generalized
+
+The run reuses the integrated terminal's existing rules rather than adding a second way to start a
+host program. The renderer names a request id. Main reads the request from jkb, recomputes the pin,
+and builds the terminal spec itself (`issueHost`), so a window cannot turn an approval into a
+different argv. The terminal runs once (no Restart), and one run per request is taken
+synchronously from the click, as `ActionGate` does for the Container tab. The environment is
+`hostEnv`'s fixed environment, not the app's, without git's repository selection, plus
+`JKB_EXEC_REQUEST=<id>`. A host program is named by its resolved absolute path (relative to the
+resolved directory, or a bare name found where `run.sh` looks), and the preview shows that path and
+every argument with each control, format, private-use, unassigned, separator and default-ignorable
+character escaped. The renderer's generic op channel refuses the runner's own ops (`exec.begin`,
+`exec.output`, `exec.finish`, `exec.refuse`); a run whose terminal does not open within 30 seconds
+ends as interrupted; and an `exec.begin` whose outcome stays unknown keeps the click's gate held until
+the daemon answers, then ends the run as interrupted if it took. Each run has a timeout, shown before
+Run is clicked: at the timeout main sends SIGTERM to the process group and SIGKILL ten seconds later.
+Runs an earlier app instance left `running` are ended as interrupted at the next start.
+
+### Output goes straight to the session
+
+`jkb exec request` waits by default. It subscribes to the request's `mq` topic and prints what
+arrives: the decision, the output streamed as it is produced, and the exit status, which becomes
+its own exit status. Main publishes the run's output to that topic as the terminal shows it, so
+the operator and the session see the same bytes. The row keeps the last 256 KiB and the exit
+status; the full output goes to `~/.jkb/logs/exec/exec-<n>.log`. The Executions tab's history shows the
+newest 50 ended requests with their outcome, exit status, note, log path and escaped tail (`exec.list`
+with `newest_first`). A new request posts a sticky notification (`exec-<n>`: the requester and the
+reason, never the argv) in the same transaction, and any decision withdraws it; a full notification
+topic drops it rather than refusing the request. Every request and every move is announced on the
+reserved `exec/requests` topic, which only the operator may read and only jkb may send on, and the
+tab re-reads on each announcement. While the daemon is unreachable main buffers up to 4 MiB of output; past that the rest goes to the log only, and the stream says how much it missed and where the log is. `--no-wait` returns the request id at
+once, and `jkb exec status <id>` reads the outcome later.
+
+### A request's states
+
+`pending`, then `running` and `finished` (exit status), or `declined` (the operator's note goes to
+the session), `refused` (tree changed, audit refused, or directory gone), or `expired` (the
+requester's session ended, or it went unanswered for two hours). A run times out after 15 minutes unless the request asks
+for longer, up to two hours. A session holding claims with no event for 30 minutes is stalled. A request runs at most once. An
+identical pending request from the same session (same argv, directory, target and pin) folds into
+the existing one instead of queueing twice. Editing a request before running it is not offered:
+the operator declines with a note saying what to ask for instead, so that what ran is always
+exactly what a session asked for.
+
+### Rejected
+
+- **Auto-approval by pattern.** An allowlist of argv shapes that run unattended would bring back,
+  inside jkb, the permission-prompt fatigue this boundary exists to avoid. It would also make the
+  tree pin decorative, because nobody would read the diff. Revisit only with a measurement of how
+  many requests are truly identical.
+- **Pinning only the files the argv names.** Scripts source, build and exec other files, and no
+  static reading of an argv finds them all. Pinning the repository is the only pin that covers
+  what actually runs.
+- **Running in the requesting session's own sandbox with wider permissions.** That widens every
+  later call the session makes, not this one command.

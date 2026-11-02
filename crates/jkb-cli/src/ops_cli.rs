@@ -47,6 +47,7 @@ pub const fn handles(command: &Command) -> bool {
         | Command::History { .. }
         | Command::Inv { .. }
         | Command::Design { .. }
+        | Command::Timeline { .. }
         | Command::Ns {
             cmd: NsCmd::Ls { .. } | NsCmd::Mv { .. },
         }
@@ -218,6 +219,7 @@ impl<'a> Ops<'a> {
             Command::History { path } => crate::item_cli::history(self, &path),
             Command::Inv { cmd } => crate::inv_cli::run(self, cmd, self.global),
             Command::Design { cmd } => crate::design_cli::run(self, cmd, self.global),
+            Command::Timeline { cmd } => crate::timeline_cli::run(self, cmd),
             Command::Ns {
                 cmd: NsCmd::Ls { scope },
             } => self.ns_ls(scope),

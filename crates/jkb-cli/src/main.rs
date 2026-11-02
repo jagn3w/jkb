@@ -14,6 +14,7 @@ mod commands;
 mod design_cli;
 mod design_export;
 mod doctor;
+mod exec_cli;
 mod git_audit;
 mod gitrepo;
 mod inv_cli;
@@ -36,6 +37,7 @@ mod session_cli;
 mod staging;
 mod stop;
 mod task_cli;
+mod timeline_cli;
 mod transcripts;
 
 use std::collections::BTreeMap;
@@ -109,7 +111,10 @@ enum Command {
     },
     /// Run a structured query and list the matching items.
     Query {
-        /// Query DSL terms, e.g. `kind:task is:ready ns:tasks/**`.
+        /// Query DSL terms, e.g. `kind:task is:ready ns:tasks/**`. `phase:<p>[,<p>…]` matches a
+        /// task's workflow phase (`design`, `design_review`, `implement`, `review`,
+        /// `systemic_review`, `landable`, `landed`, `cancelled`; no workflow yet is `design`), and
+        /// `-phase:…` excludes those phases.
         #[arg(required = true, num_args = 1..)]
         terms: Vec<String>,
         /// Maximum number of results.
@@ -247,6 +252,13 @@ enum Command {
     Attest {
         #[command(subcommand)]
         cmd: rbac_cli::AttestCmd,
+    },
+    /// Run requests: ask the operator to run one command where this session's sandbox cannot
+    /// reach — on the host, or in the dev container outside the agent's sandbox — and wait for its
+    /// output and exit status (the Executions design).
+    Exec {
+        #[command(subcommand)]
+        cmd: exec_cli::ExecCmd,
     },
     /// The message queue: topics, sends, NDJSON subscriptions (design r3.2 Q6).
     Mq {
@@ -390,6 +402,13 @@ enum Command {
         #[command(subcommand)]
         cmd: DesignCmd,
     },
+    /// The lifecycle timeline, read from the transition logs, claims, review rounds, landings and the
+    /// session registry: which sessions hold which tasks (and which have stalled), one task's path
+    /// through its strategy, one plan's progress over time. What Code Factory's Executions tab draws.
+    Timeline {
+        #[command(subcommand)]
+        cmd: TimelineCmd,
+    },
     /// The content-addressed blob archive. File sync stores the bytes of every version it
     /// settles and blobs are never deleted, so this is a complete history of every synced
     /// file — the recovery path when a sync has written a wrong version over your work.
@@ -423,6 +442,36 @@ enum BlobCmd {
     Cat {
         /// The blake3 hash (a unique prefix is enough).
         hash: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TimelineCmd {
+    /// Every live session and every session holding a claim: its claims, newest event, and whether
+    /// it has stalled (claims held, not ended, no event for 30 minutes); then the claims no session
+    /// is attributed (a process's `host:pid`, say).
+    Sessions,
+    /// One session's tasks and the events it fired, oldest first (500 a page).
+    Session {
+        /// The Claude Code session id.
+        session: String,
+        /// Continue after a page: the `next` it printed.
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// One task's workflow and status moves, claim and review rounds merged in time order (500 a
+    /// page), the phase edges it visited, and where its work landed.
+    Task {
+        /// The task.
+        uid: String,
+        /// Continue after a page: the `next` it printed.
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// A plan's open, in-progress, done and cancelled counts at each moment they changed.
+    Plan {
+        /// The plan.
+        uid: String,
     },
 }
 
@@ -1689,6 +1738,14 @@ fn run(cli: Cli) -> Result<()> {
         return design_export::check_files(repo.as_deref(), cli.json);
     }
 
+    // `jkb exec pin`, `base` and `diff` are git and a hash: no database, no daemon, in any mode
+    // (Code Factory runs `base` and `diff` on the host).
+    if let Command::Exec { cmd } = &cli.command {
+        if let Some(done) = exec_cli::no_database(cmd, cli.json) {
+            return done;
+        }
+    }
+
     // (2) With JKB_REMOTE set this process must never open a database — on the dev container's
     // kernel that is the host's `jkb.db`, which a process on each side of the bind corrupts — so
     // every other command either goes to the daemon or is refused here, at dispatch, before it has
@@ -1837,7 +1894,8 @@ fn run(cli: Cli) -> Result<()> {
         | Command::Blob { .. }
         | Command::History { .. }
         | Command::Inv { .. }
-        | Command::Design { .. } => {
+        | Command::Design { .. }
+        | Command::Timeline { .. } => {
             anyhow::bail!("internal: a command served as an op missed ops_cli's dispatch")
         }
         Command::Commands { cmd } => match cmd {
@@ -1874,6 +1932,9 @@ fn run(cli: Cli) -> Result<()> {
         }),
         Command::Mq { cmd } => {
             mq_cli::run(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
+        }
+        Command::Exec { cmd } => {
+            exec_cli::run(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
         }
         Command::Role { cmd } => {
             rbac_cli::role(&jkb_api::LocalBackend::new(db).with_actor("cli"), cmd, json)
@@ -1974,7 +2035,7 @@ ORIENT (read-only)
   jkb recent [path]           most-recently-updated items — what changed lately.
   jkb find [path] --kind K --tag f=v --status S   structured search (typed; → query DSL).
   jkb grep <pat> [path] [-i -l -c]   literal-substring content search; exit 1 on no match.
-  jkb query "<DSL>"           full query DSL (kind: tag: status: ns: is:ready due<= …).
+  jkb query "<DSL>"           full query DSL (kind: tag: status: phase: ns: is:ready due<= …).
   jkb search "<terms>" --route hybrid   ranked vector/FTS retrieval (needs the embedder).
       Pick by what you already know: `find`/`query` when you know the KIND/TAG/STATUS,
       `grep` for a LITERAL string in content, `search` for fuzzy/semantic ranking.

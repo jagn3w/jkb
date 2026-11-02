@@ -31,6 +31,7 @@ use serde_json::Value;
 
 pub mod claims;
 pub mod designs;
+pub mod exec;
 pub mod health;
 pub mod ingest;
 pub mod inv;
@@ -44,6 +45,7 @@ pub mod review;
 pub mod sessions;
 pub mod staging;
 pub mod tasks;
+pub mod timeline;
 pub mod workflows;
 
 /// One operation. Serialized with an `"op"` tag, e.g. `{"op":"mq.send","topic":"t",…}`.
@@ -527,6 +529,105 @@ pub enum Request {
         /// The session id.
         session: String,
     },
+    /// Ask the operator to run one command, as an attested session ([`exec`]).
+    #[serde(rename = "exec.request")]
+    ExecRequest(exec::ExecAsk),
+    /// A run request and its output ([`exec::status`]).
+    #[serde(rename = "exec.status")]
+    ExecStatus {
+        /// `exec-<n>`.
+        id: String,
+    },
+    /// Run requests, a page at a time ([`exec::list`]).
+    #[serde(rename = "exec.list")]
+    ExecList {
+        /// Only requests in this state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+        /// Continue from this: the `next` of the previous page.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<i64>,
+        /// Newest first: pages run down from the newest request, and `after` is the id to continue
+        /// below.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        newest_first: bool,
+    },
+    /// A run request's messages after seq `after` — how its requester follows it. The topic is
+    /// reserved: no `mq.*` op reads it ([`exec::follow`]).
+    #[serde(rename = "exec.follow")]
+    ExecFollow {
+        /// `exec-<n>`.
+        id: String,
+        /// Continue after this seq: the last one already read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<i64>,
+        /// At most this many (at most 256).
+        max: usize,
+    },
+    /// Start running a pending request — the operator's runner (`jkb_core::exec::begin`).
+    ///
+    /// `recomputed_pin` is **not an echo of the request's pin**: the runner computes it itself, on
+    /// the host, at the moment of Run, with `jkb-cli`'s `gitrepo::tree_pin` over the request's
+    /// directory. `begin` refuses the request (`tree_changed`) when it differs from the stored one —
+    /// which is the only thing standing between what was reviewed and what runs, so sending back
+    /// the pin `exec.status` reported would wave every change through.
+    #[serde(rename = "exec.begin")]
+    ExecBegin {
+        /// `exec-<n>`.
+        id: String,
+        /// The pin the runner computed at Run; absent for a directory outside any repository.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recomputed_pin: Option<exec::Pin>,
+        /// Who runs it.
+        runner: String,
+    },
+    /// Decline a pending request with a note for the session.
+    #[serde(rename = "exec.decline")]
+    ExecDecline {
+        /// `exec-<n>`.
+        id: String,
+        /// What to ask for instead.
+        note: String,
+    },
+    /// Refuse a pending request: it cannot run as approved.
+    #[serde(rename = "exec.refuse")]
+    ExecRefuse {
+        /// `exec-<n>`.
+        id: String,
+        /// `tree_changed`, `audit_refused` or `dir_gone`.
+        reason: String,
+    },
+    /// Record that a running request ended — its runner's.
+    #[serde(rename = "exec.finish")]
+    ExecFinish {
+        /// `exec-<n>`.
+        id: String,
+        /// Who ran it.
+        runner: String,
+        /// `exited`, `signalled`, `timed_out` or `interrupted`.
+        outcome: String,
+        /// The exit status, or the signal number.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_status: Option<i64>,
+        /// The last bytes of output (at most 256 KiB), base64.
+        #[serde(default)]
+        tail_b64: String,
+        /// Every byte the run produced.
+        total_bytes: i64,
+        /// Where the full output is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        log_path: Option<String>,
+    },
+    /// Publish one chunk of a running request's output on its topic — its runner's.
+    #[serde(rename = "exec.output")]
+    ExecOutput {
+        /// `exec-<n>`.
+        id: String,
+        /// Who runs it.
+        runner: String,
+        /// The bytes (at most 47 KiB), base64.
+        chunk_b64: String,
+    },
     /// Record a worktree disposal for the reap service ([`removals::add`]).
     #[serde(rename = "removal.add")]
     RemovalAdd {
@@ -747,6 +848,9 @@ pub enum Request {
     WorkflowDefine {
         /// Its name.
         name: String,
+        /// One sentence on why to choose it: required, and refused when empty
+        /// ([`jkb_core::workflow::validate_describe`]).
+        describe: String,
         /// Its spec, as JSON.
         spec: Value,
     },
@@ -761,6 +865,14 @@ pub enum Request {
         #[serde(default)]
         uid: Option<String>,
         /// The strategy to draw.
+        #[serde(default)]
+        strategy: Option<String>,
+    },
+    /// Every role under a named strategy or the default: its op classes, grants, acts, phases,
+    /// toggles and mapped agent types ([`workflows::roles`]).
+    #[serde(rename = "workflow.roles")]
+    WorkflowRoles {
+        /// The strategy to read the roles under.
         #[serde(default)]
         strategy: Option<String>,
     },
@@ -1108,6 +1220,36 @@ pub enum Request {
     DesignPromptOf {
         /// The session id.
         session: String,
+    },
+    /// The sessions at work: every live session and every session holding a claim, each with its
+    /// claim count, newest event and stalled flag, and the claims no session is attributed
+    /// ([`timeline::sessions`]).
+    #[serde(rename = "timeline.sessions")]
+    TimelineSessions {},
+    /// One session's tasks and the events it fired, one page ([`timeline::session`]).
+    #[serde(rename = "timeline.session")]
+    TimelineSession {
+        /// The Claude Code session id.
+        session: String,
+        /// The previous page's `next`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    /// One task's path through its strategy, its claim, review rounds and landing, one page, with
+    /// the strategy's graph ([`timeline::task`]).
+    #[serde(rename = "timeline.task")]
+    TimelineTask {
+        /// The task.
+        uid: String,
+        /// The previous page's `next`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
+    /// A plan's open, in-progress, done and cancelled counts over time ([`timeline::plan`]).
+    #[serde(rename = "timeline.plan")]
+    TimelinePlan {
+        /// The plan.
+        uid: String,
     },
     /// Fold a design's updates into its snapshot (operator; [`jkb_core::design::compact`]).
     #[serde(rename = "design.compact")]
@@ -1674,6 +1816,15 @@ impl Request {
         "task.abandon",
         "repo.gate",
         "session.state",
+        "exec.request",
+        "exec.status",
+        "exec.list",
+        "exec.follow",
+        "exec.begin",
+        "exec.decline",
+        "exec.refuse",
+        "exec.finish",
+        "exec.output",
         "removal.add",
         "removal.list",
         "removal.archived",
@@ -1705,6 +1856,7 @@ impl Request {
         "workflow.define",
         "workflow.strategies",
         "workflow.graph",
+        "workflow.roles",
         "workflow.agents",
         "workflow.agent",
         "workflow.agent_copy",
@@ -1739,6 +1891,10 @@ impl Request {
         "design.prompt_record",
         "design.prompts",
         "design.prompt_of",
+        "timeline.sessions",
+        "timeline.session",
+        "timeline.task",
+        "timeline.plan",
         "design.compact",
         "attest.mint",
         "attest.release",
@@ -1852,6 +2008,7 @@ impl Request {
             Self::WorkflowDefine { .. } => "workflow.define",
             Self::WorkflowStrategies {} => "workflow.strategies",
             Self::WorkflowGraph { .. } => "workflow.graph",
+            Self::WorkflowRoles { .. } => "workflow.roles",
             Self::WorkflowAgents {} => "workflow.agents",
             Self::WorkflowAgent { .. } => "workflow.agent",
             Self::WorkflowAgentCopy { .. } => "workflow.agent_copy",
@@ -1884,6 +2041,10 @@ impl Request {
             Self::DesignPromptRecord { .. } => "design.prompt_record",
             Self::DesignPrompts { .. } => "design.prompts",
             Self::DesignPromptOf { .. } => "design.prompt_of",
+            Self::TimelineSessions {} => "timeline.sessions",
+            Self::TimelineSession { .. } => "timeline.session",
+            Self::TimelineTask { .. } => "timeline.task",
+            Self::TimelinePlan { .. } => "timeline.plan",
             Self::DesignCompact { .. } => "design.compact",
             Self::DesignRetire { .. } => "design.retire",
             Self::DesignRestore { .. } => "design.restore",
@@ -1911,6 +2072,15 @@ impl Request {
             Self::TaskPrRecord { .. } => "task.pr_record",
             Self::TaskPrAbsent { .. } => "task.pr_absent",
             Self::TaskCloseMerged { .. } => "task.close_merged",
+            Self::ExecRequest(_) => "exec.request",
+            Self::ExecStatus { .. } => "exec.status",
+            Self::ExecList { .. } => "exec.list",
+            Self::ExecFollow { .. } => "exec.follow",
+            Self::ExecBegin { .. } => "exec.begin",
+            Self::ExecDecline { .. } => "exec.decline",
+            Self::ExecRefuse { .. } => "exec.refuse",
+            Self::ExecFinish { .. } => "exec.finish",
+            Self::ExecOutput { .. } => "exec.output",
         }
     }
 
@@ -1964,6 +2134,7 @@ impl Request {
             | Self::WorkflowShow { .. }
             | Self::WorkflowStrategies {}
             | Self::WorkflowGraph { .. }
+            | Self::WorkflowRoles { .. }
             | Self::WorkflowAgents {}
             | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }
@@ -1976,7 +2147,13 @@ impl Request {
             | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. }
             | Self::DesignPrompts { .. }
-            | Self::DesignPromptOf { .. } => true,
+            | Self::DesignPromptOf { .. }
+            | Self::TimelineSessions {}
+            | Self::TimelineSession { .. }
+            | Self::TimelineTask { .. }
+            | Self::TimelinePlan { .. }
+            // A plain read of the request's own topic, with no group to touch.
+            | Self::ExecFollow { .. } => true,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -2072,7 +2249,17 @@ impl Request {
             | Self::DesignSources { .. }
             | Self::DesignCompact { .. }
             | Self::DesignRetire { .. }
-            | Self::DesignRestore { .. } => false,
+            | Self::DesignRestore { .. }
+            // Every exec op settles expiries in its own transaction, the reads too, so all are
+            // served on the writer.
+            | Self::ExecRequest(_)
+            | Self::ExecStatus { .. }
+            | Self::ExecList { .. }
+            | Self::ExecBegin { .. }
+            | Self::ExecDecline { .. }
+            | Self::ExecRefuse { .. }
+            | Self::ExecFinish { .. }
+            | Self::ExecOutput { .. } => false,
         }
     }
 
@@ -2102,6 +2289,9 @@ impl Request {
                     | Self::LeaseGet { .. }
                     // An FTS5 integrity check: an `INSERT` that changes nothing.
                     | Self::KbHealth {}
+                    // Reads that expire what came due: twice is the same as once.
+                    | Self::ExecStatus { .. }
+                    | Self::ExecList { .. }
             )
     }
 }
@@ -2348,6 +2538,42 @@ pub enum Response {
         /// The state — a closed set, so a state a newer daemon adds fails to decode rather than reading
         /// as some other one.
         state: SessionStateIs,
+    },
+    /// An `exec.request`.
+    ExecRequested {
+        /// The request — the existing one when folded.
+        request: exec::ExecView,
+        /// An identical pending request from the same session already existed, and this is it.
+        folded: bool,
+    },
+    /// An `exec.status`, `exec.decline`, `exec.refuse` or `exec.finish`: the request now.
+    ExecRequest {
+        /// The request.
+        request: exec::ExecView,
+    },
+    /// An `exec.begin`.
+    ExecBegun {
+        /// `running`, or `refused` (the pin differed) or `expired` (it came due): what the begin did.
+        begun: String,
+        /// The request now.
+        request: exec::ExecView,
+    },
+    /// An `exec.list` page.
+    ExecRequests {
+        /// The requests, oldest first.
+        requests: Vec<exec::ExecView>,
+        /// Continue after this.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<i64>,
+    },
+    /// An `exec.output`.
+    ExecOutputSent {
+        /// The chunk's seq on the request's topic; absent when the topic was full and the chunk was
+        /// dropped (the row's tail and the log are the record, and a follower sees the gap).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<i64>,
+        /// Its 0-based number.
+        n: i64,
     },
     /// A `removal.add`.
     RemovalAdded {
@@ -2599,6 +2825,11 @@ pub enum Response {
         /// The machines.
         graph: Box<workflows::GraphView>,
     },
+    /// A `workflow.roles`.
+    WorkflowRoles {
+        /// Every role, under the strategy.
+        roles: Box<workflows::RolesView>,
+    },
     /// A `workflow.agents`.
     WorkflowAgents {
         /// Every template, as the one in effect.
@@ -2606,6 +2837,10 @@ pub enum Response {
         /// Every role a template may act as, as stored ([`workflows::role_names`]).
         #[serde(default)]
         roles: Vec<String>,
+        /// Every agent set, with its sentence ([`workflows::agent_sets`]); empty from a daemon that
+        /// predates the field.
+        #[serde(default)]
+        agent_sets: Vec<workflows::AgentSetView>,
     },
     /// A `workflow.agent`, `workflow.agent_copy` or `workflow.agent_set`.
     WorkflowAgent {
@@ -2737,6 +2972,26 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<Box<designs::prompts::DesignPrompt>>,
     },
+    /// A `timeline.sessions`.
+    TimelineSessions {
+        /// The sessions and the unattributed claims.
+        overview: Box<jkb_core::timeline::Overview>,
+    },
+    /// A `timeline.session`.
+    TimelineSession {
+        /// The session's timeline page.
+        timeline: Box<jkb_core::timeline::SessionTimeline>,
+    },
+    /// A `timeline.task`.
+    TimelineTask {
+        /// The task's timeline page and its strategy's graph.
+        task: Box<timeline::TaskView>,
+    },
+    /// A `timeline.plan`.
+    TimelinePlan {
+        /// The plan's change points.
+        plan: Box<jkb_core::timeline::PlanTimeline>,
+    },
     /// A `design.plan`, `design.plan_create` or `design.plan_step`.
     DesignPlan {
         /// The plan after it.
@@ -2839,6 +3094,7 @@ impl Response {
             | Self::Strategies { .. }
             | Self::Defined { .. }
             | Self::WorkflowGraph { .. }
+            | Self::WorkflowRoles { .. }
             | Self::WorkflowAgents { .. }
             | Self::WorkflowAgent { .. }
             | Self::Ticket { .. }
@@ -2861,11 +3117,21 @@ impl Response {
             | Self::DesignPromptRecorded { .. }
             | Self::DesignPrompts { .. }
             | Self::DesignPromptOf { .. }
+            | Self::TimelineSessions { .. }
+            | Self::TimelineSession { .. }
+            | Self::TimelineTask { .. }
+            | Self::TimelinePlan { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignCompacted { .. }
             | Self::GroupDeleted { .. }
-            | Self::NeedsGlobalBacklogAssent {} => false,
+            | Self::NeedsGlobalBacklogAssent {}
+            // A page with a `next` is a page, not a cut answer.
+            | Self::ExecRequested { .. }
+            | Self::ExecRequest { .. }
+            | Self::ExecBegun { .. }
+            | Self::ExecRequests { .. }
+            | Self::ExecOutputSent { .. } => false,
         }
     }
 
@@ -2885,7 +3151,14 @@ impl Response {
             Self::Sent { .. }
             | Self::DesignSpan { .. }
             | Self::DesignSplit { .. }
-            | Self::DesignThread { .. } => true,
+            | Self::DesignThread { .. }
+            // A run request's moves are announced on `exec/<n>`; every exec op may also expire
+            // requests that came due, each announced on its own topic.
+            | Self::ExecRequested { .. }
+            | Self::ExecRequest { .. }
+            | Self::ExecBegun { .. }
+            | Self::ExecRequests { .. }
+            | Self::ExecOutputSent { .. } => true,
             Self::Notified { sent, .. } => *sent > 0,
             // Every stored design update is announced on `design/<uid>` (D53.4).
             Self::DesignWritten { written } => written.seq.is_some(),
@@ -2966,6 +3239,7 @@ impl Response {
             | Self::Strategies { .. }
             | Self::Defined { .. }
             | Self::WorkflowGraph { .. }
+            | Self::WorkflowRoles { .. }
             | Self::WorkflowAgents { .. }
             | Self::WorkflowAgent { .. }
             | Self::Ticket { .. }
@@ -2982,6 +3256,10 @@ impl Response {
             | Self::DesignNewPrompt { .. }
             | Self::DesignPrompts { .. }
             | Self::DesignPromptOf { .. }
+            | Self::TimelineSessions { .. }
+            | Self::TimelineSession { .. }
+            | Self::TimelineTask { .. }
+            | Self::TimelinePlan { .. }
             | Self::DesignPlan { .. }
             | Self::DesignPlans { .. }
             | Self::DesignCompacted { .. }
@@ -3447,6 +3725,13 @@ impl LocalBackend {
                 } else {
                     Start::FromNow
                 };
+                // The run-request index is reserved; its groups are the operator's alone
+                // (`exec::index_group_create`). Anyone else is refused by `mq`, as for any `exec/`.
+                if exec_index(principal, &topic) {
+                    return Ok(created(db.write_txn(actor, move |c, m| {
+                        jkb_core::exec::index_group_create(c, m, &group, start, now)
+                    })?));
+                }
                 created(db.write_txn(actor, move |c, m| {
                     mq::group_create(c, m, &topic, &group, start, now)
                 })?)
@@ -3460,7 +3745,15 @@ impl LocalBackend {
                 // Asked with a read first: an idle subscriber polls several times a second, and a
                 // poll that hands nothing over and has no touch due must not take the write lock.
                 let (t, g) = (topic.clone(), group.clone());
-                if !db.read(move |c| mq::poll_needed(c, &t, &g, max, after, now))? {
+                let index = exec_index(principal, &topic);
+                let needed = db.read(move |c| {
+                    if index {
+                        jkb_core::exec::index_poll_needed(c, &g, max, after, now)
+                    } else {
+                        mq::poll_needed(c, &t, &g, max, after, now)
+                    }
+                })?;
+                if !needed {
                     return Ok(Response::Messages {
                         messages: Vec::new(),
                     });
@@ -3468,20 +3761,41 @@ impl LocalBackend {
                 Response::Messages {
                     messages: db
                         .write_txn(actor, move |c, m| {
-                            mq::poll(c, m, &topic, &group, max, after, now)
+                            if index {
+                                jkb_core::exec::index_poll(c, m, &group, max, after, now)
+                            } else {
+                                mq::poll(c, m, &topic, &group, max, after, now)
+                            }
                         })?
                         .into_iter()
                         .map(Message::from)
                         .collect(),
                 }
             }
-            Request::MqGroupDelete { topic, group } => Response::GroupDeleted {
-                deleted: db.write_txn(actor, move |c, m| mq::group_delete(c, m, &topic, &group))?,
-            },
-            Request::MqAck { topic, group, seq } => Response::Position {
-                position: db
-                    .write_txn(actor, move |c, m| mq::ack(c, m, &topic, &group, seq, now))?,
-            },
+            Request::MqGroupDelete { topic, group } => {
+                let index = exec_index(principal, &topic);
+                Response::GroupDeleted {
+                    deleted: db.write_txn(actor, move |c, m| {
+                        if index {
+                            jkb_core::exec::index_group_delete(c, m, &group)
+                        } else {
+                            mq::group_delete(c, m, &topic, &group)
+                        }
+                    })?,
+                }
+            }
+            Request::MqAck { topic, group, seq } => {
+                let index = exec_index(principal, &topic);
+                Response::Position {
+                    position: db.write_txn(actor, move |c, m| {
+                        if index {
+                            jkb_core::exec::index_ack(c, m, &group, seq, now)
+                        } else {
+                            mq::ack(c, m, &topic, &group, seq, now)
+                        }
+                    })?,
+                }
+            }
             Request::MqCompact { force } => {
                 let r = db.write_txn(actor, move |c, m| mq::compact(c, m, now, force))?;
                 Response::Compacted {
@@ -3584,32 +3898,45 @@ impl LocalBackend {
                 pid,
                 instance,
             } => Response::SessionEnd {
-                outcome: db
-                    .write_txn(actor, move |c, m| {
+                outcome: {
+                    let vouched = exec::vouches_for_end(principal, &session);
+                    db.write_txn(actor, move |c, m| {
                         let process = claude_session::Process {
                             session: &session,
                             pid: &pid,
                             instance: &instance,
                         };
-                        claude_session::ended(c, m, &process, &reason, now)
+                        let ended = claude_session::ended(c, m, &process, &reason, now)?;
+                        if vouched {
+                            jkb_core::exec::expire_if_ended(c, m, &session, now)?;
+                        }
+                        Ok(ended)
                     })?
-                    .as_str()
-                    .to_owned(),
+                }
+                .as_str()
+                .to_owned(),
             },
             Request::SessionGone {
                 session,
                 pid,
                 instance,
-            } => Response::SessionGone {
-                ended: db.write_txn(actor, move |c, m| {
-                    let process = claude_session::Process {
-                        session: &session,
-                        pid: &pid,
-                        instance: &instance,
-                    };
-                    claude_session::gone(c, m, &process, now)
-                })?,
-            },
+            } => {
+                let vouched = exec::vouches_for_end(principal, &session);
+                Response::SessionGone {
+                    ended: db.write_txn(actor, move |c, m| {
+                        let process = claude_session::Process {
+                            session: &session,
+                            pid: &pid,
+                            instance: &instance,
+                        };
+                        let ended = claude_session::gone(c, m, &process, now)?;
+                        if ended && vouched {
+                            jkb_core::exec::expire_if_ended(c, m, &session, now)?;
+                        }
+                        Ok(ended)
+                    })?,
+                }
+            }
             Request::SessionList { all, after } => {
                 let after = after.as_deref().map(SessionCursor::decode).transpose()?;
                 let page = db.read(move |c| claude_session::list(c, all, after.as_ref()))?;
@@ -3938,6 +4265,120 @@ impl LocalBackend {
                     state: db.read(move |c| claude_session::state(c, &session))?.into(),
                 }
             }
+            Request::ExecRequest(ask) => {
+                let requester = exec::requester(principal)?;
+                let ask = ask.into_ask()?;
+                db.write_txn_with(actor, move |c, m| {
+                    let r = jkb_core::exec::request(c, m, &requester, &ask, now)?;
+                    Ok::<_, ApiError>(Response::ExecRequested {
+                        request: exec::view(c, r.row)?,
+                        folded: r.folded,
+                    })
+                })?
+            }
+            Request::ExecStatus { id } => Response::ExecRequest {
+                request: exec::status(db, actor, principal, &id, now)?,
+            },
+            Request::ExecList {
+                state,
+                after,
+                newest_first,
+            } => {
+                let (requests, next) = exec::list(
+                    db,
+                    actor,
+                    principal,
+                    state.as_deref(),
+                    after,
+                    newest_first,
+                    now,
+                )?;
+                Response::ExecRequests { requests, next }
+            }
+            Request::ExecFollow { id, after, max } => Response::Messages {
+                messages: exec::follow(db, principal, &id, after.unwrap_or(0), max, now)?
+                    .into_iter()
+                    .map(Message::from)
+                    .collect(),
+            },
+            Request::ExecBegin {
+                id,
+                recomputed_pin,
+                runner,
+            } => {
+                let n = exec::id(&id)?;
+                let pin = recomputed_pin.map(jkb_core::exec::TreePin::from);
+                db.write_txn_with(actor, move |c, m| {
+                    let (begun, row) =
+                        match jkb_core::exec::begin(c, m, n, pin.as_ref(), &runner, now)? {
+                            jkb_core::exec::Begun::Running(r) => ("running", r),
+                            jkb_core::exec::Begun::Refused(r) => ("refused", r),
+                            jkb_core::exec::Begun::Expired(r) => ("expired", r),
+                        };
+                    Ok::<_, ApiError>(Response::ExecBegun {
+                        begun: begun.to_owned(),
+                        request: exec::view(c, row)?,
+                    })
+                })?
+            }
+            Request::ExecDecline { id, note } => {
+                let n = exec::id(&id)?;
+                db.write_txn_with(actor, move |c, m| {
+                    let row = jkb_core::exec::decline(c, m, n, &note, now)?;
+                    Ok::<_, ApiError>(Response::ExecRequest {
+                        request: exec::view(c, row)?,
+                    })
+                })?
+            }
+            Request::ExecRefuse { id, reason } => {
+                let n = exec::id(&id)?;
+                let reason = exec::refuse_reason(&reason)?;
+                db.write_txn_with(actor, move |c, m| {
+                    let row = jkb_core::exec::refuse(c, m, n, reason, now)?;
+                    Ok::<_, ApiError>(Response::ExecRequest {
+                        request: exec::view(c, row)?,
+                    })
+                })?
+            }
+            Request::ExecFinish {
+                id,
+                runner,
+                outcome,
+                exit_status,
+                tail_b64,
+                total_bytes,
+                log_path,
+            } => {
+                let n = exec::id(&id)?;
+                let outcome = exec::outcome(&outcome)?;
+                let tail = exec::bytes("tail_b64", &tail_b64)?;
+                db.write_txn_with(actor, move |c, m| {
+                    let done = jkb_core::exec::Finished {
+                        runner: &runner,
+                        outcome,
+                        exit_status,
+                        tail: &tail,
+                        total_bytes,
+                        log_path: log_path.as_deref(),
+                    };
+                    let row = jkb_core::exec::finish(c, m, n, &done, now)?;
+                    Ok::<_, ApiError>(Response::ExecRequest {
+                        request: exec::view(c, row)?,
+                    })
+                })?
+            }
+            Request::ExecOutput {
+                id,
+                runner,
+                chunk_b64,
+            } => {
+                let n = exec::id(&id)?;
+                let chunk = exec::bytes("chunk_b64", &chunk_b64)?;
+                let (seq, n) = db.write_txn(actor, move |c, m| {
+                    jkb_core::exec::output(c, m, n, &runner, &chunk, now)
+                })?;
+                Response::ExecOutputSent { seq, n }
+            }
             Request::RemovalAdd { removal } => {
                 let roots = self.file_roots.clone();
                 Response::RemovalAdded {
@@ -4132,8 +4573,14 @@ impl LocalBackend {
                 })?;
                 Response::Applied {}
             }
-            Request::WorkflowDefine { name, spec } => Response::Defined {
-                version: db.write_txn_with(actor, move |c, m| rbac::define(c, m, &name, &spec))?,
+            Request::WorkflowDefine {
+                name,
+                describe,
+                spec,
+            } => Response::Defined {
+                version: db.write_txn_with(actor, move |c, m| {
+                    rbac::define(c, m, &name, &describe, &spec)
+                })?,
             },
             Request::WorkflowStrategies {} => {
                 let (strategies, default) = db.read_with(rbac::strategies)?;
@@ -4147,9 +4594,13 @@ impl LocalBackend {
                     workflows::graph(c, uid.as_deref(), strategy.as_deref())
                 })?),
             },
+            Request::WorkflowRoles { strategy } => Response::WorkflowRoles {
+                roles: Box::new(db.read_with(move |c| workflows::roles(c, strategy.as_deref()))?),
+            },
             Request::WorkflowAgents {} => Response::WorkflowAgents {
                 agents: db.read_with(workflows::list)?,
                 roles: workflows::role_names(),
+                agent_sets: workflows::agent_sets()?,
             },
             Request::WorkflowAgent {
                 name,
@@ -4418,6 +4869,20 @@ impl LocalBackend {
                     prompt: prompt.map(Box::new),
                 }
             }
+            Request::TimelineSessions {} => Response::TimelineSessions {
+                overview: Box::new(db.read_with(move |c| timeline::sessions(c, now))?),
+            },
+            Request::TimelineSession { session, after } => Response::TimelineSession {
+                timeline: Box::new(
+                    db.read_with(move |c| timeline::session(c, &session, after.as_deref(), now))?,
+                ),
+            },
+            Request::TimelineTask { uid, after } => Response::TimelineTask {
+                task: Box::new(db.read_with(move |c| timeline::task(c, &uid, after.as_deref()))?),
+            },
+            Request::TimelinePlan { uid } => Response::TimelinePlan {
+                plan: Box::new(db.read_with(move |c| timeline::plan(c, &uid))?),
+            },
             Request::DesignCompact { uid } => {
                 let done = db.write_txn_with(actor, move |c, m| {
                     jkb_core::design::compact(c, m, &uid).map_err(ApiError::from)
@@ -4696,6 +5161,13 @@ impl LocalBackend {
             }
         })
     }
+}
+
+/// Whether an `mq` group, poll or ack on `topic` is the operator's on the run-request index
+/// ([`jkb_core::exec::INDEX_TOPIC`]): the one reserved topic a consumer group may be kept on, and
+/// only by the operator. Anyone else's falls through to `mq`, which refuses every `exec/` topic.
+fn exec_index(principal: &rbac::Principal, topic: &str) -> bool {
+    topic == jkb_core::exec::INDEX_TOPIC && principal.is_operator()
 }
 
 #[cfg(test)]

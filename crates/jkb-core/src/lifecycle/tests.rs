@@ -610,3 +610,50 @@ fn absorbed_abandon_still_releases_the_claim() {
         "abandon was absorbed and dropped its plan: {out:?}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The guards in plain words
+// ---------------------------------------------------------------------------------------------
+
+fn verdict(v: Verdict<TaskEvent>) -> Option<String> {
+    match v {
+        Verdict::Allow => None,
+        Verdict::Deny(d) => Some(d.reason),
+    }
+}
+
+#[test]
+fn one_guard_per_event() {
+    // `describe_guard` is keyed by event: that is only sound while every guarded row of an event
+    // answers every observation the same way.
+    let m = machine();
+    let contexts = every_context();
+    for &e in TaskEvent::ALL {
+        let guards: Vec<_> = m
+            .transitions
+            .iter()
+            .filter(|t| t.event == e)
+            .filter_map(|t| t.guard)
+            .collect();
+        for f in &contexts {
+            let answers: Vec<_> = guards.iter().map(|guard| verdict(guard(f))).collect();
+            assert!(
+                answers.windows(2).all(|w| w[0] == w[1]),
+                "{} rows disagree at {f:?}",
+                e.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn every_guarded_row_says_what_its_guard_checks() {
+    let m = machine();
+    for &e in TaskEvent::ALL {
+        let guarded = m
+            .transitions
+            .iter()
+            .any(|t| t.event == e && t.guard.is_some());
+        assert_eq!(e.describe_guard().is_some(), guarded, "{}", e.name());
+    }
+}

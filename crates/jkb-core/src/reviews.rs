@@ -32,6 +32,13 @@ use crate::{item, tag, Error, Result};
 /// The facet a finding's area (the file it is in) is recorded under.
 pub const FACET_AREA: &str = "area";
 
+/// The tag every item `task.review_file` files carries, as `facet=value`, so a query can leave
+/// review findings out (`-tag:finding=review`) wherever their namespaces are placed or mirrored.
+/// A finding is an ordinary open task, mirrored into `tasks/`, and nothing else on it says what it
+/// is: a work frontier that offered it would build a must-fix another implementer is fixing, or
+/// start a designer on a concern. Content, like [`FACET_AREA`], not a fact anything is gated on.
+pub const FINDING_TAG: (&str, &str) = ("finding", "review");
+
 /// What the land gate reads about a task's reviews.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewState {

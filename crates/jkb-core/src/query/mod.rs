@@ -119,6 +119,13 @@ pub struct Query {
     /// excluded. Lets a strategy's frontier drop, say, stale observations without
     /// resorting to raw SQL.
     pub exclude_tags: Vec<TagPred>,
+    /// `phase:<p>[,<p>…]` — the item's current workflow phase is any of these (the phase
+    /// `jkb workflow show` prints: an item with no workflow row is at `design`). Empty means "no
+    /// phase filter". Each name must be a [`crate::workflow::Phase`]; [`Query::evaluate`] refuses
+    /// any other, so a typo is an error rather than a query that silently matches nothing.
+    pub phases: Vec<String>,
+    /// `-phase:<p>[,<p>…]` — the item's current workflow phase is none of these.
+    pub exclude_phases: Vec<String>,
     /// Namespace scope (default [`Scope::All`]).
     pub scope: Scope,
     /// `is:ready` — non-terminal status with no unfinished `depends_on`.
@@ -169,6 +176,25 @@ const SUBTASK_CLAUSE: &str = concat!(
 const I_NOT_TERMINAL: &str = jkb_types::sql_not_terminal!("i.status");
 const D_NOT_TERMINAL: &str = jkb_types::sql_not_terminal!("d.status");
 
+/// The item's current workflow phase (see [`crate::workflow::store`]).
+const PHASE: &str = crate::workflow::store::CURRENT_PHASE_SQL;
+
+/// Why `name` is not a workflow phase, if it is not: `phase:desing` must be refused, never read as
+/// "nothing is there".
+pub(crate) fn phase_problem(name: &str) -> Option<String> {
+    if crate::workflow::Phase::parse(name).is_some() {
+        return None;
+    }
+    let known: Vec<&str> = <crate::workflow::Phase as jkb_fsm::State>::ALL
+        .iter()
+        .map(|p| p.as_str())
+        .collect();
+    Some(format!(
+        "`{name}` is not a workflow phase: a phase is one of {}",
+        known.join(", ")
+    ))
+}
+
 /// The most `tag:`/`-tag:` terms one query evaluates ([`Query::evaluate`]).
 pub const MAX_TAG_TERMS: usize = 64;
 
@@ -178,7 +204,8 @@ impl Query {
     /// module docs).
     ///
     /// # Errors
-    /// Returns an error if a scope path is malformed or a statement fails.
+    /// Returns an error if a scope path is malformed, a phase is not a workflow phase, or a
+    /// statement fails.
     pub fn evaluate(&self, conn: &Connection) -> Result<Vec<ItemId>> {
         // Each tag term is its own subquery, and SQLite refuses an expression deeper than 1000 — a
         // query a client wrote with ~1000 `tag:` terms (8 KiB) came back an internal error. A tag term
@@ -188,6 +215,14 @@ impl Query {
             return Err(crate::Error::Types(jkb_types::Error::Validation(format!(
                 "a query of at most {MAX_TAG_TERMS} tag terms ({tag_terms} given)"
             ))));
+        }
+        if let Some(why) = self
+            .phases
+            .iter()
+            .chain(&self.exclude_phases)
+            .find_map(|p| phase_problem(p))
+        {
+            return Err(crate::Error::Types(jkb_types::Error::Validation(why)));
         }
         let mut clauses: Vec<String> = Vec::new();
         let mut params: Vec<Value> = Vec::new();
@@ -222,7 +257,8 @@ impl Query {
         Ok(rows)
     }
 
-    /// Predicates over `items`' own columns: kind, status, resolution, priority, due.
+    /// Predicates over `items`' own columns (kind, status, resolution, priority, due) and the
+    /// workflow phase derived from its log.
     fn push_column_clauses(&self, clauses: &mut Vec<String>, params: &mut Vec<Value>) {
         if let Some(kind) = &self.kind {
             clauses.push("i.kind = ?".to_owned());
@@ -261,6 +297,16 @@ impl Query {
         if let Some((op, n)) = self.priority {
             clauses.push(format!("i.priority {} ?", op.as_sql()));
             params.push(Value::Integer(n));
+        }
+        // The phase is the one definition `workflow::store::current` reads, never a copy of it. Bound
+        // as one list each, like the kinds.
+        if !self.phases.is_empty() {
+            clauses.push(format!("{PHASE} IN (SELECT value FROM json_each(?))"));
+            params.push(Value::Text(crate::sql::json_strings(&self.phases)));
+        }
+        if !self.exclude_phases.is_empty() {
+            clauses.push(format!("{PHASE} NOT IN (SELECT value FROM json_each(?))"));
+            params.push(Value::Text(crate::sql::json_strings(&self.exclude_phases)));
         }
         if let Some((op, due)) = &self.due {
             match due {

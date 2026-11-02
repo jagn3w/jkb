@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:code-factory-18dcdf2fb12449281bfddd, edit there (version 216.1QGBvNO6msyoB_rFCIGwstrHwusCAYPk-8DR24cLAYTMr_Tq1_MLAYXq3P7A984LAYiK45y_poUMAYjYpJeL5P4EAYqq0IzWw7kOAYzWtJT0jKoKAY2kkZP5g8oKAYyqsdfz5NAMAY-az8Hcte8GAY-wosv2818BkIC16MGKswMBkoKMuY6DrwQBkvD9lOWmzwcBlMKR7O3w1wEBlIL7sf7LngwBlpCGpdez7QoBl7CU1pPXywoBlura69iFvwUBmOTQrpOipA0BmrLImt2xrQkBm-6Y5rKg_w4Bm_qHj-HcoAkBncjY0p2XjwIBnZCc_peF7A8Bnqzlm7r31wgBoJb0rpKdqQkBn5qZw9iJ4gUBouSgvJLX_ggBo7LWrP71UAGk3s_Mj6_aCAGl1uPKsNK3CwGm5q_AqJiLCQGPpq73wcTTCwGo6v7iroX-BQGp-PTz74oqAai2idLR8doJAaSQnd_drpAPAZ2Uq8DYxc0BAa3khoi2s9ANAa3mopOTioIKAayexM-KrYMHAbDKn_vr9ZINAbCUkd3H-7cGAZbAr4fo8a4F9x2zhriKgZTHCwG00tbkyKfhBQGd0PC7moDXCdkBnt7zobz2ywEBsbC4t_GC_gGVAbmwyeSB3JMJAbmou6TgjY4DAbuW_qOSx_MHAb3Ggr_2q98HAb3G0uLv9NkEAb3m9YyN8-ADAcC0zNfA8ucPAb3yxba3uq8MAcKK99nyxcIBAcCC6NmboDUBvpS8g6LqxAQ6xdSQ-biKmAYByMjAzajB-AYBybDetNK6zAgByoKnjvig7wUBy9yM84-d0QYByqCsgPG1_wf-Bs2Yvrns2bcOAdKK-7GqwaMNAdPypIOgj8ACAdSk_v-Q5KsLAdXMgYT6h4sBAdXUjPH8tKMMAdbKkInukQ8B2Mi9lOzL2QoB2PKYisyruwQB2Ia1iq7d8wsB0s6H1MzwxQvFAdbYooubv8MO6gHXwPbBwYGeC0Te6Mvbo_zfAgHftNWvoefICgHfgqvCrurPAgHe_P-nuY7RCwHf-MWP7ugWAd6G9tHKrrMNAeD6kviFjZsOAePAir77vv8LAeb-mYGw06sHAee0mNWn35IOAeea6MSR2bMNAem27rC6qAEB6Z6g1L3p7wsB6di_-52O6QgB7OjvwNvjzwMB58zVxNPLvQfEAfCMkurR7IcLAfHO7-vu75sFAfCkh9L-76MIAfP265LcprwFAfTKm5T8npIMAfLc0ISpwfEEAfHQ04uniMEHwAP55rusypC2AQH73oXYvPeVDAH7xIrqmfr1DAH9xvbsoOyLCAH-sLH_roupCFL_8KO0wef1CAGA4Y3DypGfCQH9uMn_0vfhCLYBgtGvlOOB_QIBgp_EwpHX_gYB_NTx2r6wngQBhunfxdmz1wEBhoGHrt61kwUBiPf3qNGIpgQBiP2n5ef0_QcBhtPG-N7lVQGL1c7NncmIDgGMo-W_mvSVBwGMpbO_zJCZDwGHmZzP07aUDwGIwZOr5PHvCwGNndHH--bRBgGJjZumgOiUAwGI_bS189_aBQGTwarpwIaoDgGUpfSTw7_LBgGTv9_S46SODQGWp5yB-4BfAZez7obB5-YOAZibzOeQxNwCAZjdgpPFqPgGAY-7kOjTooMFAZmnyJSsl9kOqgScu7vygfWSCwGgx_fhhIX7CAGho8euuPeeDgGio_SXjbvcAgGixdr-v6f0DQGk0dbl4daeAwGlifPBieeuCgGmwcPMy4OZBgGn4dCak4naAQGo66HNmaDjCAGh05vr2YuTCZEQqq3nje-EvQgBq_-wn87ppwUBrfWz2IWCsATNAa7hg_DosIcBAbH1ypD-7pYBAbLzvsO6wJcDAbPN5NOOkYgKAbSHj4LqzuQDAbWVrceF2skOAbbh7OH5rcALAbudv_3B-bYGAb23wrGmkq4EAb6Ju7WF8vgKAb_n9ur-uTQBwPuO4vL-qQEBwM34l6qZxAMBwon7_JfvqgUBw72C6JbttQIBveX7jobuiwkBxenE7qPDyAkBxLvs5ZrSCgHCp5KyxIKlDwHIr87xpbmiAgHJk5La_OcCAcr3wLehsMsNAcmFkc0BAsz508WVndkNAcCJ7IXIqYwC_QLPnamclMe4DgHPt_31qpafDQHSjaj4prbBAgHY0_SmoaLkCQHZ_767vPuKDwHak4CR35iuCgHc4Y7N2oDtCwHd8-SKmajmBQHet9PW9-cNAd_Tl4OO78oEAd7n0pir44wPAeOX1r6DpIkHAebZ2PewwMMEAee5memskYgJAenNwI64_dgOAev1gPis3ucNAez19vL7k4QJAe3NpOLo2OQKAezP7LWwyf0FAe-V0q_826QIAfDzwqn1iN0JAfHtyMy-z4EGAez5o_DHoLUEAfOr8MSEyMwOAfTrk6eOhMQEAfW5yaC9mGIB9JPYqqXO_wYB8_nTgf7Q0QUB-LnphdP34Q0B-dmYotbyzQwB-amGxOLlnwIB-uuQsviU5goB_IXe97mI_AUB-bHH_cTx0QwB_dP3mu2MDQH328C_6tCWDAE, blake3 acbc989e1c43afb50fa721de7b5116ecd0cc36303308d18ae2a25f51af8ab4c5) -->
+<!-- generated from jkb design design:code-factory-18dcdf2fb12449281bfddd, edit there (version 216.1QGBvNO6msyoB_rFCIGwstrHwusCAYPk-8DR24cLAYTMr_Tq1_MLAYXq3P7A984LAYiK45y_poUMAYjYpJeL5P4EAYqq0IzWw7kOAYzWtJT0jKoKAY2kkZP5g8oKAYyqsdfz5NAMAY-az8Hcte8GAY-wosv2818BkIC16MGKswMBkoKMuY6DrwQBkvD9lOWmzwcBlMKR7O3w1wEBlIL7sf7LngwBlpCGpdez7QoBl7CU1pPXywoBlura69iFvwUBmOTQrpOipA0BmrLImt2xrQkBm-6Y5rKg_w4Bm_qHj-HcoAkBncjY0p2XjwIBnZCc_peF7A8Bnqzlm7r31wgBoJb0rpKdqQkBn5qZw9iJ4gUBouSgvJLX_ggBo7LWrP71UAGk3s_Mj6_aCAGl1uPKsNK3CwGm5q_AqJiLCQGPpq73wcTTCwGo6v7iroX-BQGp-PTz74oqAai2idLR8doJAaSQnd_drpAPAZ2Uq8DYxc0BAa3khoi2s9ANAa3mopOTioIKAayexM-KrYMHAbDKn_vr9ZINAbCUkd3H-7cGAZbAr4fo8a4F9x2zhriKgZTHCwG00tbkyKfhBQGd0PC7moDXCdkBnt7zobz2ywEBsbC4t_GC_gGVAbmwyeSB3JMJAbmou6TgjY4DAbuW_qOSx_MHAb3Ggr_2q98HAb3G0uLv9NkEAb3m9YyN8-ADAcC0zNfA8ucPAb3yxba3uq8MAcKK99nyxcIBAcCC6NmboDUBvpS8g6LqxAQ6xdSQ-biKmAYByMjAzajB-AYBybDetNK6zAgByoKnjvig7wUBy9yM84-d0QYByqCsgPG1_wf-Bs2Yvrns2bcOAdKK-7GqwaMNAdPypIOgj8ACAdSk_v-Q5KsLAdXMgYT6h4sBAdXUjPH8tKMMAdbKkInukQ8B2Mi9lOzL2QoB2PKYisyruwQB2Ia1iq7d8wsB0s6H1MzwxQvFAdbYooubv8MO6gHXwPbBwYGeC0Te6Mvbo_zfAgHftNWvoefICgHfgqvCrurPAgHe_P-nuY7RCwHf-MWP7ugWAd6G9tHKrrMNAeD6kviFjZsOAePAir77vv8LAeb-mYGw06sHAee0mNWn35IOAeea6MSR2bMNAem27rC6qAEB6Z6g1L3p7wsB6di_-52O6QgB7OjvwNvjzwMB58zVxNPLvQfEAfCMkurR7IcLAfHO7-vu75sFAfCkh9L-76MIAfP265LcprwFAfTKm5T8npIMAfLc0ISpwfEEAfHQ04uniMEHwAP55rusypC2AQH73oXYvPeVDAH7xIrqmfr1DAH9xvbsoOyLCAH-sLH_roupCFL_8KO0wef1CAGA4Y3DypGfCQH9uMn_0vfhCLYBgtGvlOOB_QIBgp_EwpHX_gYB_NTx2r6wngQBhunfxdmz1wEBhoGHrt61kwUBiPf3qNGIpgQBiP2n5ef0_QcBhtPG-N7lVQGL1c7NncmIDgGMo-W_mvSVBwGMpbO_zJCZDwGHmZzP07aUDwGIwZOr5PHvCwGNndHH--bRBgGJjZumgOiUAwGI_bS189_aBQGTwarpwIaoDgGUpfSTw7_LBgGTv9_S46SODQGWp5yB-4BfAZez7obB5-YOAZibzOeQxNwCAZjdgpPFqPgGAY-7kOjTooMFAZmnyJSsl9kOqgScu7vygfWSCwGgx_fhhIX7CAGho8euuPeeDgGio_SXjbvcAgGixdr-v6f0DQGk0dbl4daeAwGlifPBieeuCgGmwcPMy4OZBgGn4dCak4naAQGo66HNmaDjCAGh05vr2YuTCZEQqq3nje-EvQgBq_-wn87ppwUBrfWz2IWCsATNAa7hg_DosIcBAbH1ypD-7pYBAbLzvsO6wJcDAbPN5NOOkYgKAbSHj4LqzuQDAbWVrceF2skOAbbh7OH5rcALAbudv_3B-bYGAb23wrGmkq4EAb6Ju7WF8vgKAb_n9ur-uTQBwPuO4vL-qQEBwM34l6qZxAMBwon7_JfvqgUBw72C6JbttQIBveX7jobuiwkBxenE7qPDyAkBxLvs5ZrSCgHCp5KyxIKlDwHIr87xpbmiAgHJk5La_OcCAcr3wLehsMsNAcmFkc0BAsz508WVndkNAcCJ7IXIqYwC_QLPnamclMe4DgHPt_31qpafDQHSjaj4prbBAgHY0_SmoaLkCQHZ_767vPuKDwHak4CR35iuCgHc4Y7N2oDtCwHd8-SKmajmBQHet9PW9-cNAd_Tl4OO78oEAd7n0pir44wPAeOX1r6DpIkHAebZ2PewwMMEAee5memskYgJAenNwI64_dgOAev1gPis3ucNAez19vL7k4QJAe3NpOLo2OQKAezP7LWwyf0FAe-V0q_826QIAfDzwqn1iN0JAfHtyMy-z4EGAez5o_DHoLUEAfOr8MSEyMwOAfTrk6eOhMQEAfW5yaC9mGIB9JPYqqXO_wYB8_nTgf7Q0QUB-LnphdP34Q0B-dmYotbyzQwB-amGxOLlnwIB-uuQsviU5goB_IXe97mI_AUB-bHH_cTx0QwB_dP3mu2MDQH328C_6tCWDAE, blake3 6d6bf4b261d4c573e4e8f213281cbd614a91b642e475391ae8a2d0f87c07c732) -->
 # Code Factory
 
 Code Factory is the first standalone app on jkb: one place to **design, plan and implement** with
@@ -189,7 +189,7 @@ passed with the sandbox off. `getLastWebPreferences` is undocumented; if Electro
 fails rather than passes. The unreachable-daemon smoke writes a token for its closed port, so the
 status it checks comes from a refused connection, not from a missing token.
 
-Every tab is a fixed frame whose regions scroll
+### Every tab is a fixed frame whose regions scroll
 
 Operator feedback (2026-10-14): scrolling a long design carried the Design / Plans / Tasks / Prompts
 tabs off screen with it, and the Sessions tab filled only part of the window. Both are one defect in
@@ -1190,7 +1190,12 @@ that have drifted apart fail loudly rather than run a prompt with a hole in it.
 
 ### Permissions are two halves, both shown
 
-The role's jkb op classes (`OP_GRANTS`, enforced by `jkb serve`) come with every template. The
+The role's jkb op classes (`rbac::role_decision` under the strategy, enforced by `jkb serve`) are the
+role's, never the agent's: the agent panel links to its role in the Roles view (`workflow.roles`, and
+`jkb workflow roles`), which lists every role under the selected strategy, including roles no agent
+acts as ("no agent: done by hand"), with each op class in plain words (`OpPermission::describe`), the
+acts it may fire, whether it lands, the toggles that change it, the phases where it acts and the
+agents that run as it. The
 template's own `permissions` (where it runs, `none` / `worktree`; its model, none meaning the session's;
 the most it may change, `nothing`/`kb`/`git`/`code`) are what the script enforces, read from the
 `agent()` options the scripts pass today. They are stored with `deny_unknown_fields`: a permission a
@@ -1211,11 +1216,18 @@ list the app keeps.
 state with who acts next, `next_actor`; each transition with the roles the strategy's permission table
 lets fire it) and the task lifecycle machine, both from `Machine::table()`. Each transition carries
 `fired_by`, the one answer both `jkb workflow show --graph` and the pane print: `observed`, the roles,
-`applied` (a lifecycle move jkb makes inside the op that moves it, whose own grant decides), or `no one`.
+`applied` (a lifecycle move jkb makes inside the op that moves it, whose own grant decides), or `no one`. It also answers `default`, the strategy an unpinned task runs (`wf::default_strategy`), and
+`changes_from_default`, one line per difference from it (`StrategySpec::changes_from`, which walks the
+graph, every `TOGGLES` row by its label, and the attributes); when the stored default cannot be read and
+the answer did not need it, both come back empty and the difference is shown as unknown. `jkb workflow
+show --graph` prints them as a `changes from default (<default>):` block, and the tab's legend lists
+them under one line each defining role, agent, agent set, graph and strategy.
 Two lifecycle acts do have roles: `land` is the strategy's landers (its `lands` toggle, what `task.land`
 is checked against), and `override` is whoever holds `task.set --status` (`OP_GRANTS`'s `task_status`),
-both read from those tables, not restated. Self-loops and overrides are listed under the picture rather
-than drawn (every live state has an override), and the list under it is every row.
+both read from those tables, not restated. Self-loops and overrides are not drawn (every live state
+has an override). Clicking a state, edge or marker shows its rows in the side panel, with each edge's
+guard in plain words and the command that fires it, both carried in `workflow.graph`; every row is in
+some state's panel.
 
 ### *Contribute* runs in a fresh worktree off `origin/main`, in the container
 
@@ -1694,7 +1706,17 @@ What IS measured is the mechanism, against a stand-in `docker` that runs the pro
 (`setsid`), the way the real client is a separate process from what it runs: with the end, an
 interactive `bash` and its background job are gone and the record removed; without it (an end that
 fails), the program outlives its client and the UI says "may still be running". Until it is measured
-live, the UI claims an ending only on the end command's success.
+live, the UI claims an ending only on the end command's success. The macOS
+`spawn-helper` path of node-pty was first run on a Mac on 2026-10-11, and failed: every terminal said
+`posix_spawnp failed`, because node-pty 1.1.0's prebuilds ship `spawn-helper` at mode 0644 and on macOS
+node-pty starts every process through it (Linux uses none, so CI never saw it).
+`ui/scripts/pty-helper-exec.mjs` sets the bit on every helper node-pty can load, run as the UI
+workspace's postinstall and again first in `@jkb/app`'s `package` script, since an install with
+`--ignore-scripts` leaves it unset and a later up-to-date install did not restore it (measured).
+`ui/app/test/pty-helper.test.mjs` holds it on any platform: the darwin prebuilds are in the tarball on
+Linux too. Rejected: a chmod at launch in the main process (it writes into the installed bundle, and
+dev and tests would still differ) and a pnpm patch of node-pty (carried across upgrades for one mode
+bit).
 
 ## `docs/` is generated from jkb designs
 

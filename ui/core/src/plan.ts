@@ -70,7 +70,12 @@ export interface WorkPrompt {
 export interface Strategy {
   readonly name: string;
   readonly preset: boolean;
+  /** One sentence on why to choose it (for a definition written before descriptions, a fallback naming its graph). */
   readonly describe: string;
+  /** One sentence on its graph; absent from an older daemon. */
+  readonly graph?: string | null;
+  /** When a definition's listed version was defined; absent for a preset, and from an older daemon. */
+  readonly defined_at?: string | null;
 }
 
 export interface Strategies {
@@ -124,13 +129,71 @@ export const planOps = {
     expected === undefined ? { op: "task.edit", uid, text, append } : { op: "task.edit", uid, text, append, expected },
 } as const;
 
+/** A strategy identity, taken apart: the one parser of `name@version` and `default:<name>`. */
+export interface StrategyParts {
+  /** The name `workflow.set` and *Play* resolve. */
+  readonly name: string;
+  /** A definition's version; `null` for a preset. */
+  readonly version: number | null;
+  /** A task's `default:<name>`: it pinned nothing and runs whatever the default is. */
+  readonly followsDefault: boolean;
+}
+
+const FOLLOWS_DEFAULT = "default:";
+
+/**
+ * Take a strategy identity apart: a listing's or a pin's `name@version` (a definition), a bare name
+ * (a preset), either behind a task's `default:`. A definition name is letters, digits, `-` and `_`
+ * (`store::define`), so neither `@` nor `:` occurs inside one.
+ */
+export function strategyParts(identity: string): StrategyParts {
+  const followsDefault = identity.startsWith(FOLLOWS_DEFAULT);
+  const rest = followsDefault ? identity.slice(FOLLOWS_DEFAULT.length) : identity;
+  const at = rest.lastIndexOf("@");
+  const version = at > 0 ? rest.slice(at + 1) : "";
+  if (/^\d+$/.test(version)) {
+    return { name: rest.slice(0, at), version: Number(version), followsDefault };
+  }
+  return { name: rest, version: null, followsDefault };
+}
+
 /**
  * The name `workflow.set` and *Play* resolve: a definition is listed as `name@version` and
  * resolved by `name` (its newest version); a preset is its name.
  */
 export function strategyName(listed: string): string {
-  const at = listed.lastIndexOf("@");
-  return at > 0 ? listed.slice(0, at) : listed;
+  return strategyParts(listed).name;
+}
+
+/**
+ * A strategy identity as the app shows it: `factory · v1` for a definition (the agent panel's
+ * `packaged · v1`), a preset by its name, and `(following default)` after a task's `default:`.
+ * Display only — every comparison and request keeps the identity itself.
+ */
+export function strategyLabel(identity: string): string {
+  const { name, version, followsDefault } = strategyParts(identity);
+  return `${name}${version === null ? "" : ` · v${version}`}${followsDefault ? " (following default)" : ""}`;
+}
+
+/** Whether two identities name the same strategy (a listing's `name@version`, the default's). */
+export function sameStrategy(a: string, b: string): boolean {
+  return strategyName(a) === strategyName(b);
+}
+
+/** A definition time in the operator's own locale; the raw text when it is not a time. */
+export function localTime(at: string): string {
+  const t = new Date(at);
+  return Number.isNaN(t.getTime()) ? at : t.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
+/**
+ * What a picker's option shows for one listed strategy: its label, then — for an operator
+ * definition — the marker that sets it apart from the presets and when its version was defined,
+ * then `(default)` when it is what an unpinned task runs. `time` formats the definition time.
+ */
+export function strategyOption(s: Strategy, defaultIdentity: string, time: (at: string) => string = localTime): string {
+  const own = s.preset ? "" : ` — operator-defined${s.defined_at == null ? "" : ` ${time(s.defined_at)}`}`;
+  return `${strategyLabel(s.name)}${own}${sameStrategy(s.name, defaultIdentity) ? " (default)" : ""}`;
 }
 
 // ---- decisions --------------------------------------------------------------------------------
@@ -370,7 +433,13 @@ export function decodeStrategies(o: Outcome<OpResponse>): Outcome<Strategies> {
       isString(v["default"]) &&
       Array.isArray(v["strategies"]) &&
       v["strategies"].every(
-        (s) => isObject(s) && isString(s["name"]) && typeof s["preset"] === "boolean" && isString(s["describe"]),
+        (s) =>
+          isObject(s) &&
+          isString(s["name"]) &&
+          typeof s["preset"] === "boolean" &&
+          isString(s["describe"]) &&
+          isOptString(s["graph"]) &&
+          isOptString(s["defined_at"]),
       ),
   );
 }

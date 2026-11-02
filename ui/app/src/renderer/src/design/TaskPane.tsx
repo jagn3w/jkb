@@ -13,6 +13,8 @@ import {
   type TaskDetail,
 } from "@jkb/core";
 
+import { useNavigation } from "../navigation";
+
 type Detail =
   | { readonly kind: "loading" }
   | { readonly kind: "loaded"; readonly detail: TaskDetail }
@@ -47,6 +49,7 @@ export function TaskPane({
   readonly onChanged: () => void;
   readonly onNotice: (message: string) => void;
 }): React.JSX.Element {
+  const nav = useNavigation();
   const [detail, setDetail] = useState<Detail>({ kind: "loading" });
   const [draft, setDraft] = useState<Draft | undefined>(undefined);
   /** The Save was refused as stale: the task's text changed under the draft. */
@@ -129,6 +132,14 @@ export function TaskPane({
       <header className="pane-bar">
         <h2 title={task.uid}>{task.title}</h2>
         <span className="spacer" />
+        <button
+          type="button"
+          className="bar-button"
+          onClick={() => nav.openTimeline("task", task.uid)}
+          title="Its path through its strategy, in the Executions tab"
+        >
+          Timeline
+        </button>
         <button
           type="button"
           className="bar-button play-button"

@@ -115,7 +115,7 @@ export function AgentGraphView({
       </svg>
       {graph.dangling.length > 0 && (
         <p className="muted plan-hint">
-          Hand-offs to agents not in this workflow:{" "}
+          Hand-offs to agents not in this agent set:{" "}
           {graph.dangling.map((d) => `${d.from} → ${d.to}`).join(", ")}
         </p>
       )}

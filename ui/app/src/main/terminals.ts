@@ -8,8 +8,9 @@
 // wrapper recording the program's process group inside the container so that closing it can end it
 // there (`END_SCRIPT`), not only end the docker client. A host terminal is the login shell, which
 // runs nothing until it is typed into, or a spec main itself built and issued (`issueHost`, the
-// Container tab's `run.sh` actions); a host argv the renderer made up is refused. That refusal
-// stops ACCIDENTAL host routing only: a host login shell takes `write`, so the renderer is trusted
+// Container tab's `run.sh` actions; `issueOnce`, a run request's program, for one open only); a host
+// argv the renderer made up is refused. That refusal stops ACCIDENTAL host routing only: a host
+// login shell takes `write`, so the renderer is trusted
 // for host execution, and the defence is that the renderer is the app's own code (contextIsolation,
 // sandbox, the bridge's top-frame check, a `script-src 'self'` CSP; D53.1, D53.10). A terminal's
 // target is fixed when it opens. Every terminal belongs to the window that opened it: only that
@@ -35,6 +36,7 @@ import {
   type TerminalRoots,
   type TerminalSpec,
 } from "../shared/terminal";
+import { GIT_SELECTION } from "../shared/gitEnv";
 
 /** The part of a `node-pty` `IPty` this module uses. */
 export interface Pty {
@@ -78,6 +80,8 @@ export interface TerminalEnvironment {
   readonly containerRunDir: string;
   /** Whether process `pid` (a PTY's child) still exists. */
   processAlive(pid: number): boolean;
+  /** Send `signal` to every process in group `pgid` (a host PTY's child leads its own). */
+  signalGroup(pgid: number, signal: NodeJS.Signals): void;
 }
 
 /**
@@ -187,12 +191,34 @@ export interface Command {
   readonly end?: { readonly file: string; readonly args: readonly string[] };
 }
 
+/** A variable name main adds to a program's environment: never an option, never `=`. */
+const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
+
+/**
+ * Why `extraEnv` is not an environment main may add to a program, or `undefined`: every name an
+ * `ENV_NAME`, no value holding a NUL. Checked once, where a once-run is issued (`issueOnce`), for
+ * every target, and again by `commandFor` for the `docker exec -e` it builds.
+ */
+export function envRefusal(extraEnv: Readonly<Record<string, string>>): string | undefined {
+  const bad = Object.keys(extraEnv).find((k) => !ENV_NAME.test(k) || typeof extraEnv[k] !== "string" || extraEnv[k]!.includes("\0"));
+  return bad === undefined ? undefined : `not an environment variable main sets: ${JSON.stringify(bad)}`;
+}
+
 /**
  * The command a spec runs. A container spec's `cwd` is the container's and goes to `docker exec
  * -w`; the docker client itself starts in the host's home, which exists. `tag` names the
- * container program's record (`WRAPPER_SCRIPT`), unique per terminal.
+ * container program's record (`WRAPPER_SCRIPT`), unique per terminal. `extraEnv` — main's own, for a
+ * run it issued (`issueOnce`) — reaches a container program as `docker exec -e`; a host program gets
+ * it in its spawn environment instead (`TerminalHost.open`).
  */
-export function commandFor(spec: TerminalSpec, env: TerminalEnvironment, tag: string): TerminalResult<Command> {
+export function commandFor(
+  spec: TerminalSpec,
+  env: TerminalEnvironment,
+  tag: string,
+  extraEnv: Readonly<Record<string, string>> = {},
+): TerminalResult<Command> {
+  const refused = envRefusal(extraEnv);
+  if (refused !== undefined) return { ok: false, error: refused };
   if (spec.target === "container") {
     const docker = env.docker();
     if (docker === undefined) {
@@ -209,7 +235,9 @@ export function commandFor(spec: TerminalSpec, env: TerminalEnvironment, tag: st
         file: docker,
         // Everything after the container name is the command, never docker's flags.
         args: [
-          "exec", "-i", "-t", "-e", `TERM=${TERM}`, "-e", "COLORTERM=truecolor", "-w", spec.cwd, container,
+          "exec", "-i", "-t", "-e", `TERM=${TERM}`, "-e", "COLORTERM=truecolor",
+          ...Object.entries(extraEnv).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
+          "-w", spec.cwd, container,
           "/bin/sh", "-c", WRAPPER_SCRIPT, "jkb-terminal", record, ...program,
         ],
         cwd: env.roots.hostHome,
@@ -357,6 +385,13 @@ export function machineEnvironment(
         return (e as { code?: unknown }).code === "EPERM";
       }
     },
+    signalGroup: (pgid, signal) => {
+      try {
+        process.kill(-pgid, signal);
+      } catch {
+        // Gone already.
+      }
+    },
   };
 }
 
@@ -371,6 +406,48 @@ export function runToEnd(env: Readonly<Record<string, string | undefined>>): Ter
         resolve({ code: typeof code === "number" ? code : null, output: output || error.message });
       });
     });
+}
+
+/**
+ * A run main issued to one window for one open (`TerminalHost.issueOnce`): what it adds to the
+ * program's environment, and the hooks that hear it. The hooks hear the terminal whatever becomes of
+ * its window — output and exit are reported after a close or a reload, when the window no longer is.
+ */
+export interface OnceRun {
+  /**
+   * Added to the program's environment: a host program's spawn environment (which also drops git's
+   * repository selection, `GIT_SELECTION`), or `docker exec -e` for a container program.
+   */
+  readonly env: Readonly<Record<string, string>>;
+  /**
+   * Asked just before the spawn: why it must not start now (its directory is no longer the one that
+   * was pinned, say), or `undefined`. A refusal is `onFail`, and nothing is spawned.
+   */
+  verify?(): string | undefined;
+  /** The terminal started. */
+  onOpen(handle: OnceHandle): void;
+  /** Output, as it is sent to the window: gathered for `FLUSH_MS`, in order. */
+  onData(data: string): void;
+  /** The program exited; every byte of its output was handed to `onData` first. */
+  onExit(end: { readonly exitCode: number; readonly signal?: number }): void;
+  /** The open was taken but nothing started (no docker, a spawn that failed), or the window went first. */
+  onFail(error: string): void;
+}
+
+/** A started once-run, for the runner's timeout. */
+export interface OnceHandle {
+  readonly id: number;
+  /**
+   * Stop the program for its timeout. A host program's process group gets SIGTERM, then SIGKILL after
+   * `graceMs` if it has not exited. A container program is ended inside the container by the wrapper's
+   * recorded PID (`END_SCRIPT`), as an explicit close is. Resolves once that has been done.
+   */
+  stop(graceMs: number): Promise<void>;
+}
+
+interface OnceIssue {
+  readonly key: string;
+  readonly run: OnceRun;
 }
 
 interface Running {
@@ -395,6 +472,8 @@ interface Running {
    * sent — a reloaded page under the same id would hold its output and exit as a terminal opening.
    */
   disowned: boolean;
+  /** The run main issued it for (`issueOnce`), which hears its output and exit. */
+  readonly once: OnceRun | undefined;
 }
 
 /**
@@ -413,6 +492,9 @@ export class TerminalHost {
 
   /** Per window: the host programs (cwd and argv) main itself built and handed that window. */
   private readonly issued = new Map<number, Set<string>>();
+
+  /** Per window: the runs main issued for ONE open each (`issueOnce`), keyed by their whole spec. */
+  private readonly once = new Map<number, OnceIssue[]>();
 
   constructor(
     private readonly spawn: SpawnPty,
@@ -437,19 +519,81 @@ export class TerminalHost {
     this.issued.set(owner, set);
   }
 
+  /** A spec's whole identity, every field in a fixed order: what a once-run is matched by. */
+  private static onceKey(spec: TerminalSpec): string {
+    return JSON.stringify([spec.target, spec.cwd, spec.argv, spec.title, spec.sessionUuid ?? null]);
+  }
+
+  /**
+   * Let `owner` open `spec` ONCE, as one run main built (a run request's, `execRun.ts`): the first
+   * open of exactly this spec — every field, its fresh `sessionUuid` included — takes it, whatever its
+   * target, and gets `run`'s environment and hooks; it cannot be opened again. Unlike `issueHost` it
+   * lasts for one open. Returns the revoke: `true` when it was still unopened and is now gone.
+   */
+  issueOnce(owner: number, spec: TerminalSpec, run: OnceRun): () => boolean {
+    // Checked here, for every target: a host program gets `run.env` merged into its spawn environment.
+    const refused = envRefusal(run.env);
+    if (refused !== undefined) {
+      run.onFail(refused);
+      return () => false;
+    }
+    const issue: OnceIssue = { key: TerminalHost.onceKey(spec), run };
+    const list = this.once.get(owner) ?? [];
+    list.push(issue);
+    this.once.set(owner, list);
+    return () => this.takeOnce(owner, issue);
+  }
+
+  /** Remove `issue` from `owner`'s; whether it was there. */
+  private takeOnce(owner: number, issue: OnceIssue): boolean {
+    const list = this.once.get(owner);
+    if (list === undefined) return false;
+    const at = list.indexOf(issue);
+    if (at < 0) return false;
+    list.splice(at, 1);
+    if (list.length === 0) this.once.delete(owner);
+    return true;
+  }
+
+  /** The once-run `spec` opens for `owner`, taken so nothing opens it again; or `undefined`. */
+  private claimOnce(owner: number, spec: TerminalSpec): OnceRun | undefined {
+    const key = TerminalHost.onceKey(spec);
+    const issue = this.once.get(owner)?.find((i) => i.key === key);
+    if (issue === undefined) return undefined;
+    this.takeOnce(owner, issue);
+    return issue.run;
+  }
+
   /** Start a terminal for `owner` from an unvalidated spec, at an initial size. */
   open(owner: number, rawSpec: unknown, cols: unknown, rows: unknown): TerminalResult<TerminalInfo> {
     const parsed = parseSpec(rawSpec);
     if (!parsed.ok) return parsed;
     if (!isValidSize(cols, rows)) return { ok: false, error: "not a terminal size" };
     const spec = parsed.value;
+    const once = this.claimOnce(owner, spec);
     // The host runs the login shell, or a program main built; never argv the renderer chose.
-    if (spec.target === "host" && spec.argv.length > 0 && !(this.issued.get(owner)?.has(TerminalHost.hostKey(spec)) ?? false)) {
+    if (
+      once === undefined &&
+      spec.target === "host" &&
+      spec.argv.length > 0 &&
+      !(this.issued.get(owner)?.has(TerminalHost.hostKey(spec)) ?? false)
+    ) {
       return { ok: false, error: "the host runs only its login shell or what the app itself built; programs run in the container" };
     }
-    const command = commandFor(spec, this.environment, this.newTag());
-    if (!command.ok) return command;
+    const failed = (error: string): TerminalResult<TerminalInfo> => {
+      once?.onFail(error);
+      return { ok: false, error };
+    };
+    const unverified = once?.verify?.();
+    if (unverified !== undefined) return failed(unverified);
+    const command = commandFor(spec, this.environment, this.newTag(), spec.target === "container" ? once?.env : undefined);
+    if (!command.ok) return failed(command.error);
 
+    let env = terminalEnv(this.environment.env);
+    if (once !== undefined && spec.target === "host") {
+      for (const k of GIT_SELECTION) delete env[k];
+      env = { ...env, ...once.env };
+    }
     let pty: Pty;
     try {
       pty = this.spawn(command.value.file, [...command.value.args], {
@@ -457,10 +601,10 @@ export class TerminalHost {
         cols: cols as number,
         rows: rows as number,
         cwd: command.value.cwd,
-        env: terminalEnv(this.environment.env),
+        env,
       });
     } catch (e) {
-      return { ok: false, error: `could not start ${command.value.file}: ${e instanceof Error ? e.message : String(e)}` };
+      return failed(`could not start ${command.value.file}: ${e instanceof Error ? e.message : String(e)}`);
     }
     const id = this.nextId++;
     let markExited = (): void => undefined;
@@ -478,6 +622,7 @@ export class TerminalHost {
       exitCheck: undefined,
       draining: false,
       disowned: false,
+      once,
     };
     this.running.set(id, entry);
     pty.onData((data) => {
@@ -493,8 +638,26 @@ export class TerminalHost {
       this.running.delete(id);
       markExited();
       if (!entry.disowned) this.emit(owner, { id, kind: "exit", exitCode, ...(signal ? { signal } : {}) });
+      entry.once?.onExit({ exitCode, ...(signal ? { signal } : {}) });
     });
+    once?.onOpen({ id, stop: (graceMs) => this.stopOnce(entry, graceMs) });
     return { ok: true, value: entry.info };
+  }
+
+  /** `OnceHandle.stop`: a host group's SIGTERM then SIGKILL, or the in-container end. */
+  private async stopOnce(entry: Running, graceMs: number): Promise<void> {
+    entry.draining = true;
+    this.unpause(entry);
+    if (entry.end !== undefined) {
+      await this.end(entry);
+      return;
+    }
+    let gone = false;
+    void entry.exited.then(() => (gone = true));
+    // node-pty's child calls setsid: its pid leads the group everything it started is in.
+    this.environment.signalGroup(entry.pty.pid, "SIGTERM");
+    await Promise.race([entry.exited, new Promise<void>((resolve) => setTimeout(resolve, graceMs).unref?.())]);
+    if (!gone) this.environment.signalGroup(entry.pty.pid, "SIGKILL");
   }
 
   private flush(entry: Running): void {
@@ -522,6 +685,7 @@ export class TerminalHost {
       }, PAUSED_EXIT_CHECK_MS);
       entry.exitCheck.unref?.();
     }
+    entry.once?.onData(data);
     if (!entry.disowned) this.emit(entry.owner, { id: entry.info.id, kind: "data", data });
   }
 
@@ -656,6 +820,12 @@ export class TerminalHost {
     }
     if (owner === undefined) this.issued.clear();
     else this.issued.delete(owner);
+    // A run issued to a window that is gone can never be opened: say so now, not at its deadline.
+    for (const [o, list] of [...this.once]) {
+      if (owner !== undefined && o !== owner) continue;
+      this.once.delete(o);
+      for (const issue of list) issue.run.onFail("its window closed before it opened");
+    }
   }
 
   /** The terminals `owner` runs. */

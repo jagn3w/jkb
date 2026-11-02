@@ -96,6 +96,54 @@ fn findings_are_filed_by_severity_where_the_gate_reads_them() {
     }
 }
 
+/// Every item a filing makes says it is a review finding (`finding=review`), so a frontier query
+/// leaves findings out by `-tag:` wherever they are placed or mirrored, and keeps every other task.
+#[test]
+fn every_filed_finding_is_tagged_so_a_frontier_query_leaves_it_out() {
+    let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    let work = match call(&b, json!({ "op": "task.add", "text": "ordinary work" })).unwrap() {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    let filed = file(
+        &b,
+        "repos/proj/codereviews/r1",
+        &json!([
+            { "severity": "must-fix", "summary": "breaks", "file": "src/a.rs" },
+            { "severity": "concern", "summary": "odd" },
+            { "severity": "nit", "summary": "typo" },
+        ]),
+    )
+    .unwrap();
+    let clean = file(&b, "repos/proj/codereviews/r2", &json!([])).unwrap();
+    let (facet, value) = jkb_core::reviews::FINDING_TAG;
+    for uid in filed.uids.iter().chain(&clean.uids) {
+        let tags = &show(&b, uid)["item"]["tags"];
+        assert!(
+            tags.as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["facet"] == facet && t["value"] == value),
+            "{uid}: {tags}"
+        );
+    }
+    let ready = |dsl: &str| {
+        serde_json::to_string(
+            &call(&b, json!({ "op": "task.ready", "dsl": dsl, "limit": 100 })).unwrap(),
+        )
+        .unwrap()
+    };
+    // The mirror under `tasks/` offers them, as a swarm's scope does, until the query leaves them out.
+    let all = ready("ns:tasks/**");
+    assert!(filed.uids.iter().all(|u| all.contains(u)), "{all}");
+    let frontier = ready(&format!("ns:tasks/** -tag:{facet}={value}"));
+    assert!(frontier.contains(&work), "{frontier}");
+    assert!(
+        !filed.uids.iter().any(|u| frontier.contains(u)),
+        "{frontier}"
+    );
+}
+
 /// Only a review every reviewer came back from is filed.
 #[test]
 fn only_a_review_that_ran_fully_is_filed() {

@@ -2,7 +2,7 @@ use jkb_fsm::{Event as _, Fact, Outcome, Reconciliation, State as _};
 use jkb_rbac::{Decision, Grants as _};
 use jkb_types::TaskStatus;
 
-use super::strategy::{preset, StrategySpec, Toggles, BASE, PRESETS};
+use super::strategy::{preset, AreaScope, StrategySpec, Toggles, BASE, PRESETS, TOGGLES};
 use super::{GraphId, Phase, WorkflowEvent, WorkflowFacts};
 use crate::roles::Role;
 
@@ -57,9 +57,9 @@ fn the_two_graphs_differ_in_exactly_where_a_design_goes() {
         Outcome::Moved { to, .. } => to,
         other => panic!("{other:?}"),
     };
-    assert_eq!(to(GraphId::ReviewedDesign), Phase::DesignReview);
+    assert_eq!(to(GraphId::DesignGate), Phase::DesignReview);
     assert_eq!(to(GraphId::Direct), Phase::Implement);
-    assert!(GraphId::ReviewedDesign.reaches_unforced(Phase::DesignReview));
+    assert!(GraphId::DesignGate.reaches_unforced(Phase::DesignReview));
     assert!(
         !GraphId::Direct.reaches_unforced(Phase::DesignReview),
         "only an override reaches it"
@@ -78,7 +78,7 @@ fn review(new_round: Fact, must_fix: Fact, repeated: Fact) -> WorkflowFacts {
 }
 
 fn reconciled(f: &WorkflowFacts) -> Option<(WorkflowEvent, Phase)> {
-    match GraphId::ReviewedDesign.machine().reconcile(f) {
+    match GraphId::DesignGate.machine().reconcile(f) {
         Reconciliation::Fired(Outcome::Moved { event, to, .. }) => Some((event, to)),
         Reconciliation::Settled => None,
         other => panic!("{other:?}"),
@@ -134,7 +134,7 @@ fn a_done_checkbox_is_not_a_landing() {
 #[test]
 fn systemic_review_goes_back_to_design_or_to_implementation_by_what_it_found() {
     let f = WorkflowFacts::at(Phase::SystemicReview);
-    let m = GraphId::ReviewedDesign.machine();
+    let m = GraphId::DesignGate.machine();
     assert!(matches!(
         m.apply(&f, WorkflowEvent::SubmitSystemic),
         Outcome::Moved {
@@ -163,9 +163,82 @@ fn every_preset_validates_and_design_reviewed_is_the_default() {
     }
     assert_eq!(super::strategy::DEFAULT_PRESET, "design-reviewed");
     let d = preset("design-reviewed").unwrap();
-    assert_eq!(d.graph, GraphId::ReviewedDesign);
+    assert_eq!(d.graph, GraphId::DesignGate);
     assert_eq!(d.toggles, Toggles::default());
     assert_eq!(BASE.check(), vec![], "the shared base table is sound");
+}
+
+#[test]
+fn each_preset_says_what_it_changes_from_design_reviewed() {
+    let base = preset("design-reviewed").unwrap();
+    assert_eq!(base.changes_from(&base), Vec::<String>::new());
+    assert_eq!(
+        preset("coordinated").unwrap().changes_from(&base),
+        vec!["approves designs: operator, coordinator (default: operator)"]
+    );
+    assert_eq!(
+        preset("autonomous").unwrap().changes_from(&base),
+        vec![
+            "graph: direct (default: design-gate)",
+            "lands: operator, coordinator (default: operator)",
+        ]
+    );
+    // Against another base, the lines name that base's values as the default.
+    assert_eq!(
+        base.changes_from(&preset("autonomous").unwrap()),
+        vec![
+            "graph: design-gate (default: direct)",
+            "lands: operator (default: operator, coordinator)",
+        ]
+    );
+}
+
+#[test]
+fn a_toggle_change_is_the_roles_it_grants_not_how_the_list_is_written() {
+    let base = preset("design-reviewed").unwrap();
+    let mut same = base.clone();
+    // The operator always holds every toggle, so an empty list grants what `[operator]` does.
+    same.toggles.lands = vec![];
+    assert_eq!(same.changes_from(&base), Vec::<String>::new());
+    let coordinated = preset("coordinated").unwrap();
+    let mut reordered = coordinated.clone();
+    reordered.toggles.approves_design = vec![Role::Coordinator, Role::Operator];
+    assert_eq!(reordered.changes_from(&coordinated), Vec::<String>::new());
+}
+
+#[test]
+fn a_repeated_area_change_says_its_rounds_and_scope() {
+    let base = preset("design-reviewed").unwrap();
+    let mut spec = base.clone();
+    spec.attributes.repeated_area.rounds = 3;
+    spec.attributes.repeated_area.scope = AreaScope::Directory;
+    assert_eq!(
+        spec.changes_from(&base),
+        vec!["must-fixes repeat after 3 rounds in one directory (default: 2 in one file)"]
+    );
+}
+
+/// `changes_from` walks `TOGGLES`, so every toggle is named without anyone adding it there.
+#[test]
+fn every_toggle_has_a_label_and_flipping_it_alone_is_one_change() {
+    let base = preset("design-reviewed").unwrap();
+    for t in TOGGLES {
+        assert!(!t.label.trim().is_empty(), "{} has no label", t.name);
+        let mut spec = base.clone();
+        let flipped: Vec<Role> = if base.toggles.get(t.name).iter().eq(t.domain.iter()) {
+            vec![Role::Operator]
+        } else {
+            t.domain.to_vec()
+        };
+        spec.toggles.set(t.name, flipped).unwrap();
+        let lines = spec.changes_from(&base);
+        assert_eq!(lines.len(), 1, "{}: {lines:?}", t.name);
+        assert!(
+            lines[0].starts_with(&format!("{}: ", t.label)),
+            "{}: {lines:?}",
+            t.name
+        );
+    }
 }
 
 fn allowed(spec: &StrategySpec, role: Role, event: WorkflowEvent) -> bool {
@@ -275,6 +348,34 @@ fn a_spec_round_trips_and_an_unknown_field_is_refused_not_ignored() {
     assert!(StrategySpec::from_json(r#"{"graph":"sideways"}"#).is_err());
 }
 
+/// `design-gate` was `reviewed-design`; the old name is read, never written.
+#[test]
+fn the_graph_s_former_name_is_read_and_its_new_name_written() {
+    assert_eq!(GraphId::parse("design-gate"), Some(GraphId::DesignGate));
+    assert_eq!(GraphId::parse("reviewed-design"), Some(GraphId::DesignGate));
+    assert_eq!(GraphId::parse("direct"), Some(GraphId::Direct));
+    assert_eq!(
+        GraphId::parse("design-reviewed"),
+        None,
+        "a preset is not a graph"
+    );
+    let old = StrategySpec::from_json(r#"{"graph":"reviewed-design"}"#).unwrap();
+    assert_eq!(old.graph, GraphId::DesignGate);
+    assert!(old.to_json().unwrap().contains(r#""graph":"design-gate""#));
+    for &(name, g) in GraphId::LEGACY_ALIASES {
+        assert!(
+            GraphId::ALL.iter().all(|c| c.as_str() != name),
+            "an alias never shadows a current name"
+        );
+        let json = format!(r#"{{"graph":"{name}"}}"#);
+        assert_eq!(
+            StrategySpec::from_json(&json).unwrap().graph,
+            g,
+            "serde agrees with parse"
+        );
+    }
+}
+
 #[test]
 fn the_effective_table_is_the_base_plus_the_toggles() {
     let coordinated = preset("coordinated").unwrap().permissions();
@@ -300,16 +401,199 @@ fn next_actor_names_a_role_for_every_live_phase() {
 #[test]
 fn the_coordinator_s_base_permits_are_exactly_these() {
     // Pinned whole, so a widening is a visible edit here rather than an unnoticed row: `reopen`
-    // (picking up what the operator landed or cancelled) and `override` stay the operator's.
+    // (picking up what the operator landed or cancelled) and `override` stay the operator's, and
+    // the design and systemic events are their workers' (and the operator's), never the
+    // scheduler's.
     assert_eq!(
         BASE.permissions_of(Role::Coordinator),
         vec![
-            WorkflowEvent::SubmitDesign,
             WorkflowEvent::SubmitWork,
-            WorkflowEvent::SubmitSystemic,
-            WorkflowEvent::SystemicRedesign,
             WorkflowEvent::Rework,
             WorkflowEvent::Cancel,
         ]
     );
+    for e in [
+        WorkflowEvent::SubmitDesign,
+        WorkflowEvent::SubmitSystemic,
+        WorkflowEvent::SystemicRedesign,
+    ] {
+        assert!(BASE.permits(Role::Operator, e), "the operator keeps {e:?}");
+        for p in PRESETS {
+            let spec = (p.spec)();
+            assert!(
+                !spec.permissions().permits(Role::Coordinator, e),
+                "{}: no toggle gives the coordinator {e:?}",
+                p.name
+            );
+        }
+    }
+}
+
+/// A verdict as something comparable: `None` to allow, the denial's sentence to refuse.
+fn verdict(v: jkb_fsm::Verdict<WorkflowEvent>) -> Option<String> {
+    match v {
+        jkb_fsm::Verdict::Allow => None,
+        jkb_fsm::Verdict::Deny(d) => Some(d.reason),
+    }
+}
+
+#[test]
+fn one_guard_per_event() {
+    // `describe_guard` is keyed by event: that is only sound while every guarded row of an event
+    // answers every observation the same way.
+    for &g in GraphId::ALL {
+        let m = g.machine();
+        for &e in <WorkflowEvent as jkb_fsm::Event>::ALL {
+            let guards: Vec<_> = m
+                .transitions
+                .iter()
+                .filter(|t| t.event == e)
+                .filter_map(|t| t.guard)
+                .collect();
+            for f in contexts() {
+                let answers: Vec<_> = guards.iter().map(|guard| verdict(guard(&f))).collect();
+                assert!(
+                    answers.windows(2).all(|w| w[0] == w[1]),
+                    "{} rows of {} disagree at {f:?}",
+                    e.as_str(),
+                    g.as_str()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_guarded_row_says_what_its_guard_checks() {
+    let area = super::strategy::RepeatedArea::default();
+    let mut guarded_events = Vec::new();
+    for &g in GraphId::ALL {
+        for t in g.machine().transitions {
+            if t.guard.is_some() {
+                assert!(
+                    t.event.describe_guard(&area).is_some(),
+                    "{} --{}--> in {} is guarded but says nothing about it",
+                    t.from.as_str(),
+                    t.event.as_str(),
+                    g.as_str()
+                );
+                guarded_events.push(t.event);
+            }
+        }
+    }
+    // And no description outlives its guard.
+    for &e in <WorkflowEvent as jkb_fsm::Event>::ALL {
+        assert_eq!(
+            e.describe_guard(&area).is_some(),
+            guarded_events.contains(&e),
+            "{}",
+            e.as_str()
+        );
+    }
+}
+
+#[test]
+fn the_repeated_review_guard_reads_the_strategy_s_attribute() {
+    use super::strategy::{AreaScope, RepeatedArea};
+    let two_files = RepeatedArea {
+        scope: AreaScope::File,
+        rounds: 2,
+    };
+    let said = WorkflowEvent::ReviewRepeated
+        .describe_guard(&two_files)
+        .unwrap();
+    assert!(
+        said.contains("the newest 2 rounds all flagged must-fixes in the same file"),
+        "{said}"
+    );
+    let three_dirs = RepeatedArea {
+        scope: AreaScope::Directory,
+        rounds: 3,
+    };
+    let said = WorkflowEvent::ReviewFailed
+        .describe_guard(&three_dirs)
+        .unwrap();
+    assert!(
+        said.contains("but not the newest 3 rounds all flagged must-fixes in the same directory"),
+        "{said}"
+    );
+}
+
+#[test]
+fn each_event_names_the_command_that_fires_it() {
+    assert_eq!(
+        WorkflowEvent::SubmitWork.command(),
+        "jkb workflow fire <uid> submit_work"
+    );
+    assert_eq!(
+        WorkflowEvent::SubmitSystemic.command(),
+        "jkb workflow fire <uid> submit_systemic --reason <why>"
+    );
+    assert_eq!(
+        WorkflowEvent::Override.command(),
+        "jkb workflow fire <uid> override --to <phase> --reason <why>"
+    );
+    for e in [
+        WorkflowEvent::ReviewPassed,
+        WorkflowEvent::ReviewFailed,
+        WorkflowEvent::ReviewRepeated,
+        WorkflowEvent::ObservedLanded,
+        WorkflowEvent::ObservedCancelled,
+    ] {
+        assert_eq!(e.command(), "jkb workflow observe <uid>", "{}", e.as_str());
+    }
+    // Every reason an event needs is in its command.
+    for &e in <WorkflowEvent as jkb_fsm::Event>::ALL {
+        assert_eq!(
+            e.command().contains("--reason"),
+            e.needs_reason(),
+            "{}",
+            e.as_str()
+        );
+    }
+}
+
+/// The compiled-in descriptions — presets, graphs, agent sets and packaged agents — are each one
+/// sentence: a capital first letter, a final full stop, no line break. An operator's own text only
+/// has to pass `validate_describe`.
+#[test]
+fn every_compiled_in_description_is_one_sentence() {
+    let mut all: Vec<(String, &str)> = Vec::new();
+    for p in PRESETS {
+        all.push((format!("preset {}", p.name), p.describe));
+    }
+    for g in GraphId::ALL {
+        all.push((format!("graph {}", g.as_str()), g.describe()));
+    }
+    for s in super::agents::agent_sets().unwrap() {
+        all.push((format!("agent set {}", s.name), &s.describe));
+    }
+    for a in super::agents::packaged().unwrap() {
+        all.push((format!("agent {}", a.name), &a.def.describe));
+    }
+    for (what, d) in all {
+        super::validate_describe(d).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            d.chars().next().is_some_and(char::is_uppercase),
+            "{what} starts lowercase: {d}"
+        );
+        assert!(
+            d.ends_with('.'),
+            "{what} does not end with a full stop: {d}"
+        );
+        assert!(!d.contains('\n'), "{what} spans lines: {d}");
+        assert!(
+            !d.contains("(the default)"),
+            "{what} claims the default: {d}"
+        );
+    }
+}
+
+/// A graph's sentence says why; its path says what. They are different texts.
+#[test]
+fn a_graph_s_sentence_is_not_its_path() {
+    for g in GraphId::ALL {
+        assert!(g.path().contains('→'), "{}", g.as_str());
+        assert!(!g.describe().contains('→'), "{}", g.as_str());
+    }
 }

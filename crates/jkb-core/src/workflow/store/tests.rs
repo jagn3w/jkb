@@ -262,11 +262,11 @@ fn only_the_operator_sets_a_strategy_and_a_task_keeps_the_version_it_pinned() {
     db.write_txn("test", move |c, m| {
         let mut spec = preset("coordinated").unwrap();
         spec.attributes.repeated_area.rounds = 3;
-        define(c, m, "mine", &spec)?;
+        define(c, m, "mine", "A test strategy.", &spec)?;
         set_strategy(c, m, id, "mine", &Actor::operator())?;
         // Redefined after the task pinned it.
         spec.attributes.repeated_area.rounds = 5;
-        define(c, m, "mine", &spec)
+        define(c, m, "mine", "A test strategy.", &spec)
     })
     .unwrap();
     let cur = db.read(move |c| current(c, id)).unwrap();
@@ -283,7 +283,13 @@ fn only_the_operator_sets_a_strategy_and_a_task_keeps_the_version_it_pinned() {
 
     let e = db
         .write_txn("test", |c, m| {
-            define(c, m, "autonomous", &preset("autonomous").unwrap())
+            define(
+                c,
+                m,
+                "autonomous",
+                "A test strategy.",
+                &preset("autonomous").unwrap(),
+            )
         })
         .unwrap_err()
         .to_string();
@@ -295,7 +301,13 @@ fn a_default_definition_replaces_the_default_preset() {
     let db = Db::open_in_memory().unwrap();
     let id = a_task(&db);
     db.write_txn("test", |c, m| {
-        define(c, m, "default", &preset("autonomous").unwrap())
+        define(
+            c,
+            m,
+            "default",
+            "A test strategy.",
+            &preset("autonomous").unwrap(),
+        )
     })
     .unwrap();
     let cur = db.read(move |c| current(c, id)).unwrap();
@@ -481,7 +493,13 @@ fn redefining_default_does_not_move_a_task_that_has_started() {
         Moved::To { .. }
     ));
     db.write_txn("test", |c, m| {
-        define(c, m, "default", &preset("autonomous").unwrap())
+        define(
+            c,
+            m,
+            "default",
+            "A test strategy.",
+            &preset("autonomous").unwrap(),
+        )
     })
     .unwrap();
     let cur = db.read(move |c| current(c, id)).unwrap();
@@ -671,4 +689,342 @@ fn a_round_holds_under_every_name_the_mirror_gives_it() {
         inside("tasks/jkb/codereviews/f/nit")
     );
     assert!(inside("jkb/codereviews/f/nit").is_some());
+}
+
+/// The graph `design-gate` was stored as `reviewed-design` before its rename. Nothing rewrites a
+/// stored row, so a pin and a definition naming the old graph must still resolve — to the renamed
+/// graph — and new writes must store the new name.
+#[test]
+fn a_stored_spec_naming_the_graph_s_former_name_still_resolves() {
+    use crate::workflow::GraphId;
+    let db = Db::open_in_memory().unwrap();
+    let id = a_task(&db);
+    db.write_txn("test", move |c, _| {
+        c.execute(
+            "INSERT INTO workflow_transitions
+                 (txn_id, item_id, at, event, from_phase, to_phase, role, actor, reason, spec)
+             VALUES ('old', ?1, 'then', 'set_strategy', 'design', 'design', 'operator',
+                     'operator', 'old-pin', '{\"graph\":\"reviewed-design\"}')",
+            [id.get()],
+        )?;
+        c.execute(
+            "INSERT INTO workflow_strategies (name, version, spec, defined_at)
+             VALUES ('legacy', 1, '{\"graph\":\"reviewed-design\"}', 'then')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let cur = db.read(move |c| current(c, id)).unwrap();
+    assert_eq!(cur.spec.graph, GraphId::DesignGate);
+    assert_eq!(cur.source, "old-pin");
+    let (name, spec) = db.read(|c| super::resolve_strategy(c, "legacy")).unwrap();
+    assert_eq!(name, "legacy@1");
+    assert_eq!(spec.graph, GraphId::DesignGate);
+    // The stored rows are left as they were.
+    let stored: String = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT spec FROM workflow_strategies WHERE name = 'legacy'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(stored, r#"{"graph":"reviewed-design"}"#);
+    // A redefinition writes the new name.
+    db.write_txn("test", move |c, m| {
+        define(c, m, "legacy", "A test strategy.", &spec)
+    })
+    .unwrap();
+    let json = db
+        .read(super::definitions)
+        .unwrap()
+        .into_iter()
+        .find(|d| d.name == "legacy")
+        .unwrap()
+        .spec;
+    assert!(json.contains(r#""graph":"design-gate""#), "{json}");
+}
+
+/// A definition's description: required non-empty and at most `MAX_DESCRIBE_CHARS`, refused before
+/// anything is stored, kept per version, and absent (`None`) on a row written before V032.
+#[test]
+fn a_definition_carries_its_own_description_per_version() {
+    use crate::workflow::MAX_DESCRIBE_CHARS;
+    let db = Db::open_in_memory().unwrap();
+    let spec = preset("coordinated").unwrap();
+    for bad in [
+        String::new(),
+        "   ".to_owned(),
+        "x".repeat(MAX_DESCRIBE_CHARS + 1),
+    ] {
+        let s = spec.clone();
+        let e = db
+            .write_txn("test", move |c, m| define(c, m, "mine", &bad, &s))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("a description of 1 to 500 characters"), "{e}");
+    }
+    assert!(
+        db.read(super::definitions).unwrap().is_empty(),
+        "nothing stored"
+    );
+    let longest = "x".repeat(MAX_DESCRIBE_CHARS);
+    let s = spec.clone();
+    db.write_txn("test", move |c, m| {
+        define(c, m, "mine", "The first sentence.", &s)?;
+        define(c, m, "mine", &longest, &s)
+    })
+    .unwrap();
+    let stored: Vec<Option<String>> = db
+        .read(|c| {
+            let mut st = c.prepare(
+                "SELECT describe FROM workflow_strategies WHERE name = 'mine' ORDER BY version",
+            )?;
+            let rows = st.query_map([], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+        .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            Some("The first sentence.".to_owned()),
+            Some("x".repeat(MAX_DESCRIBE_CHARS))
+        ]
+    );
+    db.write_txn("test", |c, _| {
+        c.execute(
+            "INSERT INTO workflow_strategies (name, version, spec, defined_at)
+             VALUES ('legacy', 1, '{\"graph\":\"direct\"}', 'then')",
+            [],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let defs = db.read(super::definitions).unwrap();
+    let by = |n: &str| defs.iter().find(|d| d.name == n).unwrap().clone();
+    assert_eq!(by("legacy").describe, None);
+    assert_eq!(by("mine").version, 2);
+    assert_eq!(by("mine").describe, Some("x".repeat(MAX_DESCRIBE_CHARS)));
+}
+
+/// For every phase, `phase:<p>` selects exactly the tasks [`current`] puts at `<p>`, and
+/// `-phase:<p>` exactly the rest, both through the one [`super::CURRENT_PHASE_SQL`].
+fn phase_terms_agree_with_current(db: &Db, ids: &[ItemId]) {
+    let ids = ids.to_vec();
+    db.read(move |c| {
+        for &id in &ids {
+            let at = current(c, id)?.phase;
+            for &p in <Phase as jkb_fsm::State>::ALL {
+                // Through the DSL, as `jkb query` reads it, restricted to this task.
+                let select = |exclude: bool| {
+                    let sign = if exclude { "-" } else { "" };
+                    crate::query::Query {
+                        ids: vec![id],
+                        ..crate::query::parse(&format!("{sign}phase:{}", p.as_str()))?
+                    }
+                    .evaluate(c)
+                };
+                assert_eq!(
+                    select(false)?.contains(&id),
+                    at == p,
+                    "phase:{} for a task at {}",
+                    p.as_str(),
+                    at.as_str()
+                );
+                assert_eq!(
+                    select(true)?.contains(&id),
+                    at != p,
+                    "-phase:{} for a task at {}",
+                    p.as_str(),
+                    at.as_str()
+                );
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// The query DSL's phase terms read the phase `current` reads, at every phase of the graph: a task
+/// with no workflow row (at `design`), one whose first move writes a `pin_strategy` row, and one
+/// whose latest row is a `set_strategy` at the phase it already holds.
+#[test]
+#[allow(clippy::too_many_lines)] // one walk through the graph, checked at every step
+fn the_phase_terms_agree_with_current_through_the_whole_graph() {
+    let db = Db::open_in_memory().unwrap();
+    let make = |uid: &'static str| {
+        db.write_txn("test", move |c, m| create(c, m, &NewTask::new(uid, uid)))
+            .unwrap()
+    };
+    let walked = make("task:walked");
+    let untouched = make("task:untouched");
+    let pinned = make("task:pinned");
+    let all = [walked, untouched, pinned];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut check = |db: &Db| {
+        phase_terms_agree_with_current(db, &all);
+        seen.insert(phase(db, walked).as_str());
+    };
+    check(&db);
+    assert_eq!(phase(&db, untouched), Phase::Design);
+
+    // A first move pins the strategy: a `pin_strategy` row, then the move's own.
+    do_fire(
+        &db,
+        pinned,
+        WorkflowEvent::SubmitDesign,
+        Role::Designer,
+        None,
+    );
+    let hist = db.read(move |c| current(c, pinned)).unwrap().history;
+    assert_eq!(
+        hist.iter().map(|r| r.event.as_str()).collect::<Vec<_>>(),
+        ["pin_strategy", "submit_design"]
+    );
+    check(&db);
+
+    // A `set_strategy` row at `design`, the walked task's only row.
+    db.write_txn("test", move |c, m| {
+        set_strategy(c, m, walked, "design-reviewed", &Actor::operator())
+    })
+    .unwrap();
+    check(&db);
+    do_fire(
+        &db,
+        walked,
+        WorkflowEvent::SubmitDesign,
+        Role::Designer,
+        None,
+    );
+    check(&db);
+    do_fire(
+        &db,
+        walked,
+        WorkflowEvent::RejectDesign,
+        Role::Operator,
+        Some("name the files"),
+    );
+    check(&db);
+    do_fire(
+        &db,
+        walked,
+        WorkflowEvent::SubmitDesign,
+        Role::Designer,
+        None,
+    );
+    do_fire(
+        &db,
+        walked,
+        WorkflowEvent::ApproveDesign,
+        Role::Operator,
+        None,
+    );
+    check(&db);
+    // A `set_strategy` mid-flight: the latest row, at the phase the task already holds.
+    db.write_txn("test", move |c, m| {
+        set_strategy(c, m, walked, "design-reviewed", &Actor::operator())
+    })
+    .unwrap();
+    assert_eq!(
+        db.read(move |c| current(c, walked))
+            .unwrap()
+            .history
+            .last()
+            .unwrap()
+            .event,
+        "set_strategy"
+    );
+    check(&db);
+    do_fire(
+        &db,
+        walked,
+        WorkflowEvent::SubmitWork,
+        Role::Implementer,
+        None,
+    );
+    check(&db);
+    file_round(&db, walked, 1, &[(1, "src/a.rs")]);
+    do_observe(&db, walked);
+    check(&db);
+    do_fire(
+        &db,
+        walked,
+        WorkflowEvent::SubmitWork,
+        Role::Implementer,
+        None,
+    );
+    file_round(&db, walked, 2, &[(1, "src/a.rs")]);
+    do_observe(&db, walked);
+    check(&db);
+    do_fire(
+        &db,
+        walked,
+        WorkflowEvent::SubmitSystemic,
+        Role::SystemicReviewer,
+        Some("one owner"),
+    );
+    do_fire(
+        &db,
+        walked,
+        WorkflowEvent::SubmitWork,
+        Role::Implementer,
+        None,
+    );
+    file_round(&db, walked, 3, &[(3, "src/b.rs")]);
+    do_observe(&db, walked);
+    check(&db);
+    for to in [Phase::Landed, Phase::Cancelled] {
+        db.write_txn("test", move |c, m| {
+            fire(
+                c,
+                m,
+                walked,
+                WorkflowEvent::Override,
+                &Actor::operator(),
+                Some("the test puts it there"),
+                Some(to),
+            )
+        })
+        .unwrap();
+        check(&db);
+    }
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        {
+            let mut all: Vec<&str> = <Phase as jkb_fsm::State>::ALL
+                .iter()
+                .map(|p| p.as_str())
+                .collect();
+            all.sort_unstable();
+            all
+        },
+        "the walk reached every phase"
+    );
+}
+
+/// The shared SQL's fallback is the phase `current` gives a task with no row.
+#[test]
+fn the_phase_sql_falls_back_to_design() {
+    assert!(super::CURRENT_PHASE_SQL.ends_with(&format!("'{}')", Phase::Design.as_str())));
+}
+
+/// A query naming a phase no workflow has is refused, whether parsed or built.
+#[test]
+fn an_unknown_phase_in_a_built_query_is_refused() {
+    let db = Db::open_in_memory().unwrap();
+    for q in [
+        crate::query::Query {
+            phases: vec!["shipped".into()],
+            ..crate::query::Query::default()
+        },
+        crate::query::Query {
+            exclude_phases: vec!["Design".into()],
+            ..crate::query::Query::default()
+        },
+    ] {
+        let e = db.read(move |c| q.evaluate(c)).unwrap_err().to_string();
+        assert!(e.contains("is not a workflow phase"), "{e}");
+    }
 }

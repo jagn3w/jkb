@@ -97,6 +97,28 @@ impl Role {
         })
     }
 
+    /// One sentence on what the role is for: the enum's own doc lines, as the Workflows tab's Roles
+    /// view and `jkb workflow roles` print them.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Operator => {
+                "The human. Holds everything, and is the only role whose credential never enters \
+                 the dev container."
+            }
+            Self::Coordinator => {
+                "The session driving a task: spawns workers, advances the workflow, never approves \
+                 what the operator approves unless the task's strategy toggles say so."
+            }
+            Self::Designer => "Gathers details and writes the design.",
+            Self::Implementer => "Writes the code.",
+            Self::Reviewer => "Reviews it and files findings.",
+            Self::SystemicReviewer => {
+                "Looks for the systemic cause when review keeps finding the same areas."
+            }
+        }
+    }
+
     /// The four roles a coordinator hands to the agents it spawns.
     #[must_use]
     pub const fn is_worker(self) -> bool {

@@ -1,0 +1,339 @@
+/* The Executions tab: the lifecycle timeline. Colour is meaning only: the one alert is a stalled
+ * session; a plan's bands and the swimlanes are ink at three weights, and a task's path over its
+ * strategy's graph is drawn in ink over the hairline table. */
+
+.executions-tab {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* The scrolling region under the bar. Its sections stack: the timeline now, the request queue
+ * beside it later. */
+.executions-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+}
+
+.timeline-pane .pane-body {
+  padding: var(--space-3);
+  font-size: var(--text-md);
+}
+
+.timeline-ask {
+  display: inline-flex;
+  gap: var(--space-1);
+  margin-left: var(--space-2);
+}
+
+.timeline-ask input {
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  width: 28ch;
+  padding: 2px var(--space-1);
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+}
+
+.timeline-summary {
+  margin: 0 0 var(--space-2);
+}
+
+.timeline-back {
+  margin-bottom: var(--space-2);
+}
+
+.timeline-more {
+  margin-top: var(--space-2);
+}
+
+.timeline-stalled {
+  color: var(--alert);
+  font-weight: 600;
+}
+
+.timeline-table {
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+  margin-top: var(--space-2);
+}
+
+.timeline-table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--ink-muted);
+  border-bottom: var(--hairline-width) solid var(--hairline);
+  padding: 2px var(--space-3) 2px 0;
+}
+
+.timeline-table td {
+  padding: 1px var(--space-3) 1px 0;
+  vertical-align: top;
+}
+
+.timeline-events td {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.timeline-unattributed h3 {
+  font-size: var(--text-md);
+  margin: var(--space-4) 0 0;
+}
+
+.timeline-lanes,
+.timeline-chart {
+  display: block;
+  margin: var(--space-2) 0;
+}
+
+.lane-track {
+  stroke: var(--hairline);
+}
+
+.lane-label {
+  font-size: var(--text-sm);
+  fill: var(--ink);
+  cursor: pointer;
+}
+
+[data-holds="true"] .lane-label {
+  font-weight: 600;
+}
+
+.lane-tick {
+  stroke: var(--ink);
+  stroke-width: 2;
+}
+
+.lane-tick[data-source="claim"],
+.lane-tick[data-source="session"] {
+  stroke: var(--ink-faint);
+}
+
+.lane-tick[data-source="review"] {
+  stroke: var(--ink-muted);
+  stroke-dasharray: 2 2;
+}
+
+.lane-axis {
+  font-size: var(--text-xs);
+  fill: var(--ink-muted);
+}
+
+.plan-band[data-band="done"],
+.plan-swatch[data-band="done"] {
+  fill: var(--ink);
+  background: var(--ink);
+}
+
+.plan-band[data-band="in_progress"],
+.plan-swatch[data-band="in_progress"] {
+  fill: var(--ink-muted);
+  background: var(--ink-muted);
+}
+
+.plan-band[data-band="open"],
+.plan-swatch[data-band="open"] {
+  fill: var(--hairline-strong);
+  background: var(--hairline-strong);
+}
+
+.plan-legend {
+  display: flex;
+  gap: var(--space-3);
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+.plan-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  vertical-align: middle;
+}
+
+/* A task's path over its strategy's machines (the Lifecycle pane's `visited`). */
+.machine-edge[data-visited="true"] .graph-edge {
+  stroke: var(--ink);
+  stroke-width: 2.25;
+}
+
+.machine-state[data-visited="true"] rect {
+  stroke: var(--ink);
+}
+
+.machine-marker[data-visited="true"] rect {
+  stroke: var(--ink);
+  stroke-width: 2.25;
+}
+
+.machine-row[data-taken="true"] {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* A picked part's rows, under the task's picture. */
+.timeline-task .machine-panel {
+  border: var(--hairline-width) solid var(--hairline);
+  border-radius: var(--radius);
+  margin: var(--space-2) 0;
+  max-width: 640px;
+}
+
+.visited-off-table {
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  padding-left: var(--space-4);
+}
+
+.timeline-asof {
+  font-size: var(--text-sm);
+  margin-right: var(--space-2);
+}
+
+/* A source this app does not know (a newer jkb serve's): drawn, neutrally. */
+.lane-tick[data-source="other"] {
+  stroke: var(--ink-faint);
+  stroke-dasharray: 1 2;
+}
+
+/* The request queue. The one alert colour is for what stops a run (the tree moved, the base is
+ * unverified); everything a session wrote is monospace, and an escape is drawn inverted so it is
+ * never read as the text around it. */
+.requests-pane .pane-body {
+  padding: var(--space-3);
+  font-size: var(--text-md);
+}
+
+.request-card {
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.request-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.request-facts dt {
+  color: var(--ink-muted);
+}
+
+.request-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.request-argv {
+  margin: 0;
+  padding-left: 3ch;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+.request-argv code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.esc {
+  background: var(--ink);
+  color: var(--bg);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+.exec-pre {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  max-height: 40em;
+  overflow: auto;
+  border: var(--hairline-width) solid var(--hairline);
+  padding: var(--space-1) var(--space-2);
+  white-space: pre;
+}
+
+.exec-diff .diff-add {
+  background: color-mix(in srgb, var(--ink) 6%, transparent);
+}
+
+.exec-diff .diff-del {
+  color: var(--ink-muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--hairline-strong);
+}
+
+.exec-diff .diff-meta,
+.exec-diff .diff-hunk {
+  color: var(--ink-faint);
+}
+
+.request-verdict,
+.request-unverified,
+.request-blocked,
+.request-said {
+  color: var(--alert);
+}
+
+.request-banner {
+  font-weight: 600;
+}
+
+.request-actions {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  margin-top: var(--space-2);
+}
+
+.request-decline {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+
+.request-decline textarea {
+  font: inherit;
+  width: 100%;
+}
+
+.request-files {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  max-height: 16em;
+  overflow: auto;
+}
+
+.history-row {
+  border-top: var(--hairline-width) solid var(--hairline);
+  padding: var(--space-1) 0;
+}
+
+.request-card button.link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.history-argv {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

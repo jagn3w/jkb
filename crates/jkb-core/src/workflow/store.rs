@@ -79,15 +79,18 @@ pub fn repeated(rounds: &[Round], n: u32, scope: AreaScope) -> bool {
 // Strategy definitions
 // -------------------------------------------------------------------------------------------
 
-/// Define (or redefine) the strategy `name` as `spec`, returning its new version. Redefining
-/// appends; a task that pinned an earlier version keeps it.
+/// Define (or redefine) the strategy `name` as `spec`, described by `describe` (one sentence on
+/// why to choose it), returning its new version. Redefining appends; a task that pinned an earlier
+/// version keeps it, and each version keeps its own description.
 ///
 /// # Errors
-/// [`Error::Types`] for a malformed name or an invalid spec, or a database error.
+/// [`Error::Types`] for a malformed name, an empty or over-long description
+/// ([`super::validate_describe`]) or an invalid spec, or a database error.
 pub fn define(
     conn: &Connection,
     _meta: &WriteMeta,
     name: &str,
+    describe: &str,
     spec: &StrategySpec,
 ) -> Result<i64> {
     if name.is_empty()
@@ -106,15 +109,16 @@ pub fn define(
              from it)"
         )));
     }
+    super::validate_describe(describe)?;
     spec.validate()?;
     let version: i64 = conn
         .prepare_cached(
-            "INSERT INTO workflow_strategies (name, version, spec, defined_at)
+            "INSERT INTO workflow_strategies (name, version, spec, defined_at, describe)
              VALUES (?1, (SELECT coalesce(max(version), 0) + 1 FROM workflow_strategies WHERE name = ?1),
-                     ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                     ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3)
              RETURNING version",
         )?
-        .query_row(params![name, spec.to_json()?], |r| r.get(0))?;
+        .query_row(params![name, spec.to_json()?, describe], |r| r.get(0))?;
     Ok(version)
 }
 
@@ -146,17 +150,41 @@ pub fn resolve_strategy(conn: &Connection, name: &str) -> Result<(String, Strate
     )))
 }
 
+/// One operator definition's newest version, as [`definitions`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Definition {
+    /// Its name.
+    pub name: String,
+    /// Its newest version.
+    pub version: i64,
+    /// That version's spec, as stored.
+    pub spec: String,
+    /// When that version was defined (RFC 3339, UTC).
+    pub defined_at: String,
+    /// That version's description; `None` for a version defined before descriptions were recorded
+    /// (V032).
+    pub describe: Option<String>,
+}
+
 /// Every operator definition's newest version, by name.
 ///
 /// # Errors
 /// A database error.
-pub fn definitions(conn: &Connection) -> Result<Vec<(String, i64, String)>> {
+pub fn definitions(conn: &Connection) -> Result<Vec<Definition>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT name, max(version), (SELECT spec FROM workflow_strategies w2
-                                     WHERE w2.name = w.name ORDER BY version DESC LIMIT 1)
-         FROM workflow_strategies w GROUP BY name ORDER BY name",
+        "SELECT name, version, spec, defined_at, describe FROM workflow_strategies w
+         WHERE version = (SELECT max(version) FROM workflow_strategies w2 WHERE w2.name = w.name)
+         ORDER BY name",
     )?;
-    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Definition {
+            name: r.get(0)?,
+            version: r.get(1)?,
+            spec: r.get(2)?,
+            defined_at: r.get(3)?,
+            describe: r.get(4)?,
+        })
+    })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -253,18 +281,37 @@ pub struct Current {
     pub history: Vec<WorkflowRow>,
 }
 
+/// The current phase of the row aliased `i` (an `items` row, or any row with its `id`), as one SQL
+/// expression: the latest workflow row's `to_phase`, or `design` for a task with no workflow row yet.
+///
+/// **The one definition.** [`current`] reads a task's phase through it, and the query DSL's
+/// `phase:`/`-phase:` terms ([`crate::query::Query::phases`]) match it, so the phase a query selects
+/// on is the phase `jkb workflow show` prints. A row at the current phase (`pin_strategy`,
+/// `set_strategy`) carries that phase as its `to_phase`, so the latest row is always right.
+/// `idx_workflow_transitions_item (item_id, id)` serves the subquery.
+pub(crate) const CURRENT_PHASE_SQL: &str =
+    "coalesce((SELECT t.to_phase FROM workflow_transitions t \
+     WHERE t.item_id = i.id ORDER BY t.id DESC LIMIT 1), 'design')";
+
+/// `task`'s phase name through [`CURRENT_PHASE_SQL`]. The id is bound as a one-row `i`, not read
+/// from `items`, so a history whose item was removed (the log has no cascade) still answers.
+fn current_phase_name(conn: &Connection, task: ItemId) -> Result<String> {
+    let sql = format!("SELECT {CURRENT_PHASE_SQL} FROM (SELECT ?1 AS id) i");
+    Ok(conn
+        .prepare_cached(&sql)?
+        .query_row([task.get()], |r| r.get(0))?)
+}
+
 /// Where `task`'s workflow stands.
 ///
 /// # Errors
-/// [`Error::Types`] for a stored spec this binary cannot read (refused, never ignored), or a
-/// database error.
+/// [`Error::Types`] for a stored spec or phase this binary cannot read (refused, never ignored), or
+/// a database error.
 pub fn current(conn: &Connection, task: ItemId) -> Result<Current> {
     let history = history(conn, task)?;
-    let phase = match history.last() {
-        Some(r) => Phase::parse(&r.to_phase)
-            .ok_or_else(|| invalid(format!("an unknown workflow phase `{}`", r.to_phase)))?,
-        None => Phase::Design,
-    };
+    let name = current_phase_name(conn, task)?;
+    let phase = Phase::parse(&name)
+        .ok_or_else(|| invalid(format!("an unknown workflow phase `{name}`")))?;
     let pinned = history.iter().rev().find_map(|r| {
         r.spec
             .as_ref()

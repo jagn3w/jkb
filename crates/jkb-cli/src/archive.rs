@@ -2360,7 +2360,7 @@ pub fn stamp(secs: u64) -> String {
 
 /// Days since 1970-01-01 to a civil date (Howard Hinnant's `civil_from_days`). Written out rather
 /// than taking a date dependency for one cosmetic directory name.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;

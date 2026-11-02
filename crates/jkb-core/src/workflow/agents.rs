@@ -41,8 +41,7 @@ pub const MAX_TEMPLATE_BYTES: usize = 64 * 1024;
 /// The most agents one template may hand off to.
 pub const MAX_HANDOFFS: usize = 64;
 
-/// The longest one-line description accepted, in characters.
-pub const MAX_DESCRIBE_CHARS: usize = 500;
+pub use super::MAX_DESCRIBE_CHARS;
 
 fn invalid(msg: impl Into<String>) -> Error {
     Error::Types(jkb_types::Error::Validation(msg.into()))
@@ -91,7 +90,9 @@ pub struct AgentPermissions {
 /// What one version of a template says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDef {
-    /// The workflow it belongs to (`task-swarm`, `code-review`, or [`SUBAGENTS_WORKFLOW`]).
+    /// The agent set it belongs to (`task-swarm`, `code-review`, or [`SUBAGENTS_WORKFLOW`]): the
+    /// templates one coordinator script runs. Named `workflow` on the wire, in `agents.json` and in
+    /// the `workflow_agents` column, which keep that name to spare a migration and a wire break.
     pub workflow: String,
     /// The role its calls act as.
     pub role: Role,
@@ -307,11 +308,7 @@ impl AgentDef {
                 self.workflow
             )));
         }
-        if self.describe.trim().is_empty() || self.describe.chars().count() > MAX_DESCRIBE_CHARS {
-            return Err(invalid(format!(
-                "a description of 1 to {MAX_DESCRIBE_CHARS} characters"
-            )));
-        }
+        super::validate_describe(&self.describe)?;
         if self.template.trim().is_empty() {
             return Err(invalid("an empty template"));
         }
@@ -378,9 +375,23 @@ struct PackagedEntry {
     template: Vec<String>,
 }
 
+/// An agent set: the templates one coordinator script runs (each template's `workflow` names
+/// one), with one sentence on what the set is for. Packaged only — an operator copy inherits its
+/// source's set and cannot name another — so the sets are exactly [`PACKAGED_FILE`]'s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSet {
+    /// Its name, as templates' `workflow` field spells it.
+    pub name: String,
+    /// One sentence on what it is for.
+    pub describe: String,
+}
+
+/// [`PACKAGED_FILE`], in its stored form. The field order is the file's.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PackagedFile {
+    agent_sets: Vec<AgentSet>,
     agents: Vec<PackagedEntry>,
 }
 
@@ -420,8 +431,37 @@ impl PackagedEntry {
 }
 
 fn parse_file(json: &str) -> Result<PackagedFile> {
-    let file: PackagedFile = serde_json::from_str(json)
+    let value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| invalid(format!("the packaged-templates file does not parse: {e}")))?;
+    // `agent_sets` stays required. A file without it is one written before agent sets existed, most
+    // often the target of an export (`jkb workflow agent export` into a branch this change has not
+    // reached), so the refusal names that skew and its remedy instead of serde's bare missing field.
+    if value.is_object() && value.get("agent_sets").is_none() {
+        return Err(invalid(
+            "the packaged-templates file has no `agent_sets`: it predates agent sets, so it is \
+             older than this jkb. Nothing was written. Export from a jkb built from that file's \
+             commit, or wait until agent sets reach the branch it was read from",
+        ));
+    }
+    let file: PackagedFile = serde_json::from_value(value)
+        .map_err(|e| invalid(format!("the packaged-templates file does not parse: {e}")))?;
+    let mut sets = BTreeSet::new();
+    for set in &file.agent_sets {
+        if !sets.insert(set.name.as_str()) {
+            return Err(invalid(format!(
+                "the packaged-templates file names agent set `{}` twice",
+                set.name
+            )));
+        }
+        super::validate_describe(&set.describe)
+            .map_err(|err| invalid(format!("agent set `{}`: {err}", set.name)))?;
+        if !file.agents.iter().any(|e| e.workflow == set.name) {
+            return Err(invalid(format!(
+                "agent set `{}` has no agents in the packaged-templates file",
+                set.name
+            )));
+        }
+    }
     let mut names = BTreeSet::new();
     for e in &file.agents {
         validate_name(&e.name).map_err(|err| invalid(format!("packaged `{}`: {err}", e.name)))?;
@@ -429,6 +469,12 @@ fn parse_file(json: &str) -> Result<PackagedFile> {
             return Err(invalid(format!(
                 "the packaged-templates file names `{}` twice",
                 e.name
+            )));
+        }
+        if !sets.contains(e.workflow.as_str()) {
+            return Err(invalid(format!(
+                "packaged `{}` belongs to agent set `{}`, which `agent_sets` does not name",
+                e.name, e.workflow
             )));
         }
         if e.version < 1 {
@@ -453,26 +499,43 @@ fn write_file(file: &PackagedFile) -> Result<String> {
     Ok(s)
 }
 
+type Compiled = (Vec<AgentSet>, Vec<Agent>);
+
+/// The compiled-in file, parsed once.
+fn compiled() -> Result<&'static Compiled> {
+    static COMPILED: OnceLock<std::result::Result<Compiled, String>> = OnceLock::new();
+    COMPILED
+        .get_or_init(|| {
+            parse_file(PACKAGED_JSON)
+                .map(|f| {
+                    let agents = f
+                        .agents
+                        .into_iter()
+                        .map(PackagedEntry::into_agent)
+                        .collect();
+                    (f.agent_sets, agents)
+                })
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| invalid(e.clone()))
+}
+
 /// Every packaged template, in the file's order.
 ///
 /// # Errors
 /// [`Error::Types`] if the compiled-in file is malformed — which a test refuses before it can
 /// ship, so in practice never.
 pub fn packaged() -> Result<&'static [Agent]> {
-    static PACKAGED: OnceLock<std::result::Result<Vec<Agent>, String>> = OnceLock::new();
-    PACKAGED
-        .get_or_init(|| {
-            parse_file(PACKAGED_JSON)
-                .map(|f| {
-                    f.agents
-                        .into_iter()
-                        .map(PackagedEntry::into_agent)
-                        .collect()
-                })
-                .map_err(|e| e.to_string())
-        })
-        .as_deref()
-        .map_err(|e| invalid(e.clone()))
+    Ok(&compiled()?.1)
+}
+
+/// Every agent set, in the file's order. Every template's `workflow` names one of them.
+///
+/// # Errors
+/// As [`packaged`].
+pub fn agent_sets() -> Result<&'static [AgentSet]> {
+    Ok(&compiled()?.0)
 }
 
 fn packaged_named(name: &str) -> Result<Option<&'static Agent>> {

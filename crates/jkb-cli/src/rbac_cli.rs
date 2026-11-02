@@ -135,10 +135,14 @@ pub enum WorkflowCmd {
     Define {
         /// Its name; `default` makes it the default for tasks with none pinned.
         name: String,
+        /// One sentence on why to choose it. Required, also with `--from`: an altered copy is not
+        /// described by its base's sentence.
+        #[arg(long)]
+        describe: String,
         /// Start from this preset or definition.
         #[arg(long)]
         from: Option<String>,
-        /// reviewed-design or direct.
+        /// The graph: design-gate or direct (the former name reviewed-design is still accepted).
         #[arg(long)]
         graph: Option<String>,
         /// Who approves designs, comma-separated (operator, coordinator).
@@ -153,9 +157,17 @@ pub enum WorkflowCmd {
     },
     /// List the presets and definitions, and the default.
     Strategies,
+    /// Every role under a strategy (the default's unless `--strategy`): the op classes it may run,
+    /// who grants it, the acts it may fire, whether it lands, the phases where it acts, the toggles
+    /// that change it, and the agent types mapped to it.
+    Roles {
+        /// A preset or a defined name.
+        #[arg(long)]
+        strategy: Option<String>,
+    },
     /// Print a graph as Graphviz dot.
     Dot {
-        /// reviewed-design or direct.
+        /// The graph: design-gate or direct (the former name reviewed-design is still accepted).
         graph: String,
     },
     /// The agent templates the coordinator sessions give themselves and their workers (design D53.7): packaged ones
@@ -455,24 +467,25 @@ pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()>
         }
         WorkflowCmd::Define {
             name,
+            describe,
             from,
             graph,
             approves_design,
             lands,
             repeated_area,
         } => {
-            let mut spec = match &from {
-                Some(base) => {
-                    let (list, _) = strategies(b)?;
-                    list.into_iter()
-                        .find(|s| {
-                            s.name == *base || s.name.split('@').next() == Some(base.as_str())
-                        })
-                        .with_context(|| format!("no strategy `{base}` to start from"))?
-                        .spec
-                }
-                None => json!({ "graph": "reviewed-design" }),
-            };
+            // With no `--from`, start from the default preset as the daemon spells it. The client
+            // never writes a graph name of its own: the daemon may be an older or newer jkb than
+            // this binary, and a graph name one of them does not know is refused.
+            let base = from
+                .as_deref()
+                .unwrap_or(jkb_core::workflow::strategy::DEFAULT_PRESET);
+            let (list, _) = strategies(b)?;
+            let mut spec = list
+                .into_iter()
+                .find(|s| s.name == base || s.name.split('@').next() == Some(base))
+                .with_context(|| format!("no strategy `{base}` to start from"))?
+                .spec;
             if let Some(g) = graph {
                 spec["graph"] = json!(g);
             }
@@ -493,6 +506,7 @@ pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()>
                 b,
                 Request::WorkflowDefine {
                     name: name.clone(),
+                    describe,
                     spec,
                 },
             )? {
@@ -528,10 +542,18 @@ pub fn workflow(b: &dyn Backend, cmd: WorkflowCmd, json_out: bool) -> Result<()>
             );
             Ok(())
         }
+        WorkflowCmd::Roles { strategy } => {
+            let r = call(b, Request::WorkflowRoles { strategy })?;
+            let Response::WorkflowRoles { roles } = r else {
+                return unexpected("workflow.roles", &r);
+            };
+            print(json_out, &json!(roles), || print!("{}", roles_text(&roles)));
+            Ok(())
+        }
         WorkflowCmd::Agent { cmd } => crate::agent_cli::run(b, cmd, json_out),
         WorkflowCmd::Dot { graph } => {
             let g = jkb_core::workflow::GraphId::parse(&graph)
-                .with_context(|| format!("no graph `{graph}` (reviewed-design, direct)"))?;
+                .with_context(|| format!("no graph `{graph}` (design-gate, direct)"))?;
             print!("{}", g.machine().dot(g.as_str()));
             Ok(())
         }
@@ -549,7 +571,7 @@ fn show_graph(
         return unexpected("workflow.graph", &r);
     };
     print(json_out, &json!(graph), || {
-        println!("strategy:  {} ({})", graph.strategy, graph.graph);
+        println!("strategy:  {} ({} graph)", graph.strategy, graph.graph);
         if let Some(task) = &graph.task {
             println!(
                 "task:      {task} — phase {}, status {}",
@@ -557,6 +579,7 @@ fn show_graph(
                 graph.status.as_deref().unwrap_or("-")
             );
         }
+        print!("{}", changes_block(&graph));
         for (title, m) in [
             ("workflow", &graph.workflow),
             ("lifecycle", &graph.lifecycle),
@@ -574,6 +597,71 @@ fn show_graph(
         }
     });
     Ok(())
+}
+
+/// The `changes from default:` block of `jkb workflow show --graph`: a line per change, or that the
+/// strategy is the default's; nothing from a daemon that predates the field.
+fn changes_block(graph: &jkb_api::workflows::GraphView) -> String {
+    use std::fmt::Write as _;
+    if graph.default.is_empty() {
+        return String::new();
+    }
+    if graph.changes_from_default.is_empty() {
+        return format!("changes from default ({}): none\n", graph.default);
+    }
+    let mut out = format!("changes from default ({}):\n", graph.default);
+    for line in &graph.changes_from_default {
+        // Writing to a `String` cannot fail.
+        let _ = writeln!(out, "  {line}");
+    }
+    out
+}
+
+/// `jkb workflow roles` as text: a block per role.
+fn roles_text(v: &jkb_api::workflows::RolesView) -> String {
+    use std::fmt::Write as _;
+    let list = |items: &[String]| {
+        if items.is_empty() {
+            "-".to_owned()
+        } else {
+            items.join(", ")
+        }
+    };
+    let mut out = format!("strategy:  {}\n", v.strategy);
+    for r in &v.roles {
+        let mut ops = String::new();
+        for o in &r.ops {
+            // Writing to a `String` cannot fail.
+            let _ = write!(ops, "\n    {:<15}{}", o.name, o.describe);
+        }
+        if ops.is_empty() {
+            ops.push_str(" -");
+        }
+        let toggles: Vec<String> = r
+            .toggled_by
+            .iter()
+            .map(|t| format!("{} {}", t.toggle, if t.on { "on" } else { "off" }))
+            .collect();
+        // Writing to a `String` cannot fail.
+        let _ = write!(
+            out,
+            "\n{} — {}\n  may run:{}\n  may fire:    {}\n  lands:       {}\n  \
+             acts next:   {}\n  fires in:    {}\n  may grant:   {}\n  granted by:  {}\n  \
+             toggles:     {}\n  agent types: {}\n",
+            r.name,
+            r.describe,
+            ops,
+            list(&r.events),
+            if r.lands { "yes" } else { "no" },
+            list(&r.acts_next_in),
+            list(&r.fires_in),
+            list(&r.may_grant),
+            list(&r.granted_by),
+            list(&toggles),
+            list(&r.agent_types),
+        );
+    }
+    out
 }
 
 fn strategies(b: &dyn Backend) -> Result<(Vec<jkb_api::rbac::StrategyInfo>, String)> {
@@ -1138,10 +1226,97 @@ pub fn attest(cmd: &AttestCmd) {
 #[cfg(test)]
 mod tests {
     use super::{
-        attestation, driven, failure_line, is_blank, pre_tool_use, runs_jkb, shell_commands,
-        Attestation, Drive, BREAKS, FATAL, HARMLESS, SEPARATORS, UNQUOTABLE,
+        attestation, changes_block, driven, failure_line, is_blank, pre_tool_use, runs_jkb,
+        shell_commands, workflow, Attestation, Drive, WorkflowCmd, BREAKS, FATAL, HARMLESS,
+        SEPARATORS, UNQUOTABLE,
     };
-    use serde_json::json;
+    use jkb_api::{rbac::StrategyInfo, ApiError, Backend, Request, Response};
+    use serde_json::{json, Value};
+    use std::cell::RefCell;
+
+    /// A daemon whose default preset runs a graph this binary has never heard of, recording the
+    /// spec each `workflow.define` sends.
+    struct Daemon {
+        defined: RefCell<Vec<Value>>,
+    }
+
+    const DAEMONS_GRAPH: &str = "a-graph-only-the-daemon-knows";
+
+    impl Backend for Daemon {
+        fn call(&self, request: Request) -> Result<Response, ApiError> {
+            match request {
+                Request::WorkflowStrategies {} => Ok(Response::Strategies {
+                    strategies: vec![StrategyInfo {
+                        name: jkb_core::workflow::strategy::DEFAULT_PRESET.to_owned(),
+                        preset: true,
+                        describe: String::new(),
+                        graph: String::new(),
+                        spec: json!({ "graph": DAEMONS_GRAPH }),
+                        defined_at: None,
+                    }],
+                    default: jkb_core::workflow::strategy::DEFAULT_PRESET.to_owned(),
+                }),
+                Request::WorkflowDefine { spec, .. } => {
+                    self.defined.borrow_mut().push(spec);
+                    Ok(Response::Defined { version: 1 })
+                }
+                other => panic!("unexpected request {other:?}"),
+            }
+        }
+    }
+
+    /// With no `--from` and no `--graph`, `workflow define` sends the daemon's own default preset
+    /// spec, so an older or newer daemon is never handed a graph name this client made up.
+    #[test]
+    fn define_without_a_graph_sends_the_daemon_s_own_graph_name() {
+        let b = Daemon {
+            defined: RefCell::new(Vec::new()),
+        };
+        workflow(
+            &b,
+            WorkflowCmd::Define {
+                name: "mine".into(),
+                describe: "Mine.".into(),
+                from: None,
+                graph: None,
+                approves_design: Some("operator,coordinator".into()),
+                lands: None,
+                repeated_area: None,
+            },
+            true,
+        )
+        .unwrap();
+        let sent = b.defined.borrow();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["graph"], DAEMONS_GRAPH, "{}", sent[0]);
+        assert_eq!(
+            sent[0]["toggles"]["approves_design"],
+            json!(["operator", "coordinator"])
+        );
+    }
+
+    /// `jkb workflow show --graph` names what the strategy changes from the default, says when it
+    /// changes nothing, and prints nothing for a daemon that predates the field.
+    #[test]
+    fn show_graph_prints_what_the_strategy_changes_from_the_default() {
+        let db = jkb_core::Db::open_in_memory().unwrap();
+        let graph = |name: &'static str| {
+            db.read_with(move |c| jkb_api::workflows::graph(c, None, Some(name)))
+                .unwrap()
+        };
+        assert_eq!(
+            changes_block(&graph("autonomous")),
+            "changes from default (design-reviewed):\n  graph: direct (default: design-gate)\n  \
+             lands: operator, coordinator (default: operator)\n"
+        );
+        let mut reviewed = graph("design-reviewed");
+        assert_eq!(
+            changes_block(&reviewed),
+            "changes from default (design-reviewed): none\n"
+        );
+        reviewed.default = String::new();
+        assert_eq!(changes_block(&reviewed), "");
+    }
 
     /// A line of `attest-hook.log` can be dated: it opens with the RFC 3339 UTC stamp and pid that
     /// `serve.log` lines carry, then names the failed call and why.

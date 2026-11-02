@@ -1,7 +1,8 @@
 //! The Workflows tab's data as the ops answer it (D53.7), minus the window: agent templates
 //! (`workflow.agents` / `workflow.agent` / `workflow.agent_copy` / `workflow.agent_set`), a
-//! strategy's machines (`workflow.graph`), and the two layouts the tab draws — the agent graph from
-//! the templates' hand-offs, and a machine from its compiled table.
+//! strategy's machines (`workflow.graph`), the agent graph's layout from the templates' hand-offs,
+//! and what of a machine's compiled table the Lifecycle pane draws (`machineDrawing`; the app lays
+//! it out, in `machineGeometry.ts`).
 //
 // The Rust side is the source of truth: `crates/jkb-api/src/workflows.rs` (the shapes) and
 // `crates/jkb-core/src/workflow/agents.rs` (the rules: read-only packaged templates, copies that
@@ -30,6 +31,7 @@ export interface AgentTemplate {
   readonly version: number;
   /** `packaged` is read-only; `operator` is an editable copy. */
   readonly source: "packaged" | "operator";
+  /** The agent set it belongs to (`task-swarm`, …). The wire keeps the name `workflow`. */
   readonly workflow: string;
   readonly role: string;
   /** The jkb op classes the role may run. */
@@ -52,10 +54,21 @@ export interface AgentTemplate {
   readonly matches_packaged: boolean;
 }
 
-/** `workflow.agents`' answer: every template, and every role one may act as (this jkb's, never a copy). */
+/** `jkb_api::workflows::AgentSetView`: an agent set and the one sentence on what it is for. */
+export interface AgentSetInfo {
+  readonly name: string;
+  readonly describe: string;
+}
+
+/**
+ * `workflow.agents`' answer: every template, every role one may act as (this jkb's, never a copy),
+ * and the agent sets with their sentences — empty from a daemon that predates them, and then the tab
+ * shows no sentence.
+ */
 export interface AgentList {
   readonly agents: readonly AgentTemplate[];
   readonly roles: readonly string[];
+  readonly agent_sets: readonly AgentSetInfo[];
 }
 
 /** `jkb_api::workflows::GraphState`. */
@@ -81,6 +94,10 @@ export interface GraphEdge {
   readonly roles: readonly string[];
   /** Who fires it, as jkb words it for every surface: `observed`, `applied`, the roles, or `no one`. */
   readonly fired_by: string;
+  /** What its guard checks, in jkb's plain words; `null` for an unguarded row (or an older jkb). */
+  readonly guard: string | null;
+  /** The command that fires it, `<uid>` standing for the task; `null` where jkb names none. */
+  readonly command: string | null;
 }
 
 /** `jkb_api::workflows::MachineView`. */
@@ -93,12 +110,67 @@ export interface MachineTable {
 export interface WorkflowGraph {
   readonly strategy: string;
   readonly graph: string;
+  /** One sentence on the graph: why a strategy runs it. */
   readonly describe: string;
+  /** The phases it passes through, as one arrow line; `null` from a daemon that predates it. */
+  readonly path: string | null;
   readonly task: string | null;
   readonly phase: string | null;
   readonly status: string | null;
   readonly workflow: MachineTable;
   readonly lifecycle: MachineTable;
+  /** Every role's jkb op classes (`jkb role matrix`); empty from an older jkb. */
+  readonly role_ops: Readonly<Record<string, readonly string[]>>;
+  /** The strategy an unpinned task runs; `null` from a daemon that predates it. */
+  readonly default: string | null;
+  /** What this strategy changes from the default, one line each; `null` (unknown) from an older daemon. */
+  readonly changes_from_default: readonly string[] | null;
+}
+
+/** `jkb_api::workflows::OpClassView`: an op class and what holding it lets a role do. */
+export interface OpClass {
+  readonly name: string;
+  readonly describe: string;
+}
+
+/** `jkb_api::workflows::ToggleView`: a strategy toggle and what the strategy sets it to. */
+export interface ToggleInfo {
+  readonly name: string;
+  /** What it grants, in a few plain words. */
+  readonly label: string;
+  /** The workflow events it grants, or `["land"]`. */
+  readonly controls: readonly string[];
+  /** The roles it may ever name. */
+  readonly domain: readonly string[];
+  readonly acts_in: string | null;
+  /** The roles the strategy names, as stored (the operator always holds it). */
+  readonly value: readonly string[];
+}
+
+/** `jkb_api::workflows::RoleView`: one role under a strategy. */
+export interface RoleInfo {
+  readonly name: string;
+  readonly describe: string;
+  readonly ops: readonly OpClass[];
+  readonly may_grant: readonly string[];
+  readonly granted_by: readonly string[];
+  /** The workflow acts it may fire under the strategy. */
+  readonly events: readonly string[];
+  readonly lands: boolean;
+  readonly acts_next_in: readonly string[];
+  readonly fires_in: readonly string[];
+  /** The toggles that can name it; `on` when the strategy does. */
+  readonly toggled_by: readonly { readonly toggle: string; readonly on: boolean }[];
+  /** The attested agent types mapped to it. */
+  readonly agent_types: readonly string[];
+}
+
+/** `jkb_api::workflows::RolesView`: `workflow.roles`' answer. */
+export interface RolesView {
+  readonly strategy: string;
+  readonly toggles: readonly ToggleInfo[];
+  /** Every role, in jkb's order, including those no agent acts as. */
+  readonly roles: readonly RoleInfo[];
 }
 
 /** What a save changes: `jkb_api::workflows::AgentEdit`. */
@@ -130,6 +202,8 @@ export const workflowOps = {
   set: (name: string, edit: AgentEdit) => ({ op: "workflow.agent_set", name, edit }),
   /** A named strategy's machines, or the default's. */
   graph: (strategy?: string) => (strategy === undefined ? { op: "workflow.graph" } : { op: "workflow.graph", strategy }),
+  /** Every role under a named strategy, or the default's. */
+  roles: (strategy?: string) => (strategy === undefined ? { op: "workflow.roles" } : { op: "workflow.roles", strategy }),
 } as const;
 
 /** `jkb_core::workflow::agents::validate_name`: what a copy may be called. */
@@ -259,10 +333,13 @@ export function decodeAgents(o: Outcome<OpResponse>): Outcome<AgentList> {
   const ours = o.value.result === "workflow_agents";
   const agents = ours ? o.value["agents"] : undefined;
   const roles = ours ? o.value["roles"] : undefined;
-  if (!Array.isArray(agents) || !agents.every(isAgent) || !isStrings(roles)) {
+  const sets = ours ? o.value["agent_sets"] : undefined;
+  const setsOk = sets === undefined || (Array.isArray(sets) && sets.every((s) => isObject(s) && isString(s["name"]) && isString(s["describe"])));
+  if (!Array.isArray(agents) || !agents.every(isAgent) || !isStrings(roles) || !setsOk) {
     return failed("internal", "jkb serve did not answer with well-formed `workflow_agents`");
   }
-  return { ok: true, value: { agents: agents.map(normal), roles } };
+  const agentSets = ((sets ?? []) as AgentSetInfo[]).map(({ name, describe }) => ({ name, describe }));
+  return { ok: true, value: { agents: agents.map(normal), roles, agent_sets: agentSets } };
 }
 
 /** `workflow.agent`'s, `workflow.agent_copy`'s or `workflow.agent_set`'s answer. */
@@ -297,7 +374,9 @@ function isEdge(v: unknown): v is GraphEdge {
     isBool(v["guarded"]) &&
     isBool(v["planned"]) &&
     isStrings(v["roles"]) &&
-    isString(v["fired_by"])
+    isString(v["fired_by"]) &&
+    isOptString(v["guard"]) &&
+    isOptString(v["command"])
   );
 }
 
@@ -314,7 +393,7 @@ function isMachine(v: unknown): v is MachineTable {
 function normalMachine(m: MachineTable): MachineTable {
   return {
     states: m.states.map((s) => ({ ...s, next_role: s.next_role ?? null, next_step: s.next_step ?? null })),
-    transitions: m.transitions.map((t) => ({ ...t, to: t.to ?? null })),
+    transitions: m.transitions.map((t) => ({ ...t, to: t.to ?? null, guard: t.guard ?? null, command: t.command ?? null })),
   };
 }
 
@@ -327,11 +406,15 @@ export function decodeWorkflowGraph(o: Outcome<OpResponse>): Outcome<WorkflowGra
     !isString(g["strategy"]) ||
     !isString(g["graph"]) ||
     !isString(g["describe"]) ||
+    !isOptString(g["path"]) ||
     !isOptString(g["task"]) ||
     !isOptString(g["phase"]) ||
     !isOptString(g["status"]) ||
     !isMachine(g["workflow"]) ||
-    !isMachine(g["lifecycle"])
+    !isMachine(g["lifecycle"]) ||
+    !(g["role_ops"] === undefined || (isObject(g["role_ops"]) && Object.values(g["role_ops"]).every(isStrings))) ||
+    !(g["default"] === undefined || isString(g["default"])) ||
+    !(g["changes_from_default"] === undefined || isStrings(g["changes_from_default"]))
   ) {
     return failed("internal", "jkb serve did not answer with a well-formed `workflow_graph`");
   }
@@ -341,13 +424,100 @@ export function decodeWorkflowGraph(o: Outcome<OpResponse>): Outcome<WorkflowGra
       strategy: g["strategy"],
       graph: g["graph"],
       describe: g["describe"],
+      path: g["path"] ?? null,
       task: g["task"] ?? null,
       phase: g["phase"] ?? null,
       status: g["status"] ?? null,
       workflow: normalMachine(g["workflow"]),
       lifecycle: normalMachine(g["lifecycle"]),
+      role_ops: (g["role_ops"] as Record<string, string[]> | undefined) ?? {},
+      // Both or neither: a daemon that sends one sends the other, and a default without its diff
+      // (or the reverse) is not an answer the legend can word.
+      ...(isString(g["default"]) && g["default"] !== "" && isStrings(g["changes_from_default"])
+        ? { default: g["default"], changes_from_default: g["changes_from_default"] }
+        : { default: null, changes_from_default: null }),
     },
   };
+}
+
+function isRole(v: unknown): v is RoleInfo {
+  return (
+    isObject(v) &&
+    isString(v["name"]) &&
+    isString(v["describe"]) &&
+    Array.isArray(v["ops"]) &&
+    v["ops"].every((o) => isObject(o) && isString(o["name"]) && isString(o["describe"])) &&
+    isStrings(v["may_grant"]) &&
+    isStrings(v["granted_by"]) &&
+    isStrings(v["events"]) &&
+    isBool(v["lands"]) &&
+    isStrings(v["acts_next_in"]) &&
+    isStrings(v["fires_in"]) &&
+    Array.isArray(v["toggled_by"]) &&
+    v["toggled_by"].every((t) => isObject(t) && isString(t["toggle"]) && isBool(t["on"])) &&
+    isStrings(v["agent_types"])
+  );
+}
+
+function isToggle(v: unknown): v is ToggleInfo {
+  return (
+    isObject(v) &&
+    isString(v["name"]) &&
+    isString(v["label"]) &&
+    isStrings(v["controls"]) &&
+    isStrings(v["domain"]) &&
+    isOptString(v["acts_in"]) &&
+    isStrings(v["value"])
+  );
+}
+
+/** `workflow.roles`' answer. */
+export function decodeRoles(o: Outcome<OpResponse>): Outcome<RolesView> {
+  if (!o.ok) return o;
+  const v = o.value.result === "workflow_roles" ? o.value["roles"] : undefined;
+  if (
+    !isObject(v) ||
+    !isString(v["strategy"]) ||
+    !Array.isArray(v["toggles"]) ||
+    !v["toggles"].every(isToggle) ||
+    !Array.isArray(v["roles"]) ||
+    !v["roles"].every(isRole)
+  ) {
+    return failed("internal", "jkb serve did not answer with a well-formed `workflow_roles`");
+  }
+  return {
+    ok: true,
+    value: {
+      strategy: v["strategy"],
+      toggles: (v["toggles"] as ToggleInfo[]).map((t) => ({ ...t, acts_in: t.acts_in ?? null })),
+      roles: v["roles"] as RoleInfo[],
+    },
+  };
+}
+
+/** The agent templates that act as `role`, in any agent set (fragments are not agents). */
+export function templatesActingAs(agents: readonly AgentTemplate[], role: string): AgentTemplate[] {
+  return agents.filter((a) => a.role === role && !a.fragment);
+}
+
+/**
+ * How a role's grant from a toggle reads: for each toggle that can name the role, what it controls
+ * that this role holds (`on`) or would hold (`off in this strategy`). A grant no toggle controls has
+ * no entry.
+ */
+export interface ToggleMark {
+  readonly toggle: string;
+  readonly label: string;
+  readonly on: boolean;
+  /** The events (or `land`) it controls. */
+  readonly controls: readonly string[];
+}
+
+export function toggleMarks(view: RolesView, role: RoleInfo): ToggleMark[] {
+  return role.toggled_by.flatMap(({ toggle, on }) => {
+    const t = view.toggles.find((x) => x.name === toggle);
+    return t === undefined ? [] : [{ toggle, label: t.label, on, controls: t.controls }];
+  });
 }
 
 // ---- layouts ----------------------------------------------------------------------------------
@@ -439,14 +609,19 @@ export function layered(
   };
 }
 
-/** The workflows the templates belong to, in first-seen order. */
-export function workflowsOf(agents: readonly AgentTemplate[]): string[] {
+/** The sentence describing agent set `name`, if the daemon sent one. */
+export function agentSetSentence(sets: readonly AgentSetInfo[], name: string | undefined): string | undefined {
+  return name === undefined ? undefined : sets.find((s) => s.name === name)?.describe;
+}
+
+/** The agent sets the templates belong to (each template's `workflow` field), in first-seen order. */
+export function agentSetsOf(agents: readonly AgentTemplate[]): string[] {
   return [...new Set(agents.map((a) => a.workflow))];
 }
 
-/** A workflow's agent graph: its agents (fragments are not agents) and their hand-offs. */
+/** An agent set's agent graph: its agents (fragments are not agents) and their hand-offs. */
 export interface AgentGraph extends Layout {
-  /** Hand-offs naming an agent that is not in this workflow: drawn nowhere, so said aloud. */
+  /** Hand-offs naming an agent that is not in this agent set: drawn nowhere, so said aloud. */
   readonly dangling: readonly { readonly from: string; readonly to: string }[];
 }
 
@@ -467,16 +642,158 @@ export function agentGraph(agents: readonly AgentTemplate[], workflow: string): 
 /** The pseudo-state an override's edge runs to: a destination the operator names. */
 export const STATED = "(stated)";
 
+/** Rows of one observed event reaching one state, from two or more states: drawn as one marker. */
+export interface ObservedGroup {
+  readonly event: string;
+  /** The per-state rows, in table order; each keeps its own `guarded` flag. */
+  readonly rows: readonly GraphEdge[];
+}
+
+/** One marker on a target state: every collapsed observation that reaches it. */
+export interface ObservedMarker {
+  /** The target state. */
+  readonly to: string;
+  /** One per event that reaches it, in table order. */
+  readonly groups: readonly ObservedGroup[];
+}
+
+/** What the Lifecycle pane draws of a machine, and how. */
+export interface MachineDrawing {
+  readonly states: readonly GraphState[];
+  /** Drawn as arrows. */
+  readonly edges: readonly GraphEdge[];
+  /** Drawn as one marker per target state. */
+  readonly markers: readonly ObservedMarker[];
+  /** Self-loops and overrides (`to: null`): listed, never drawn, or they bury the graph. */
+  readonly listed: readonly GraphEdge[];
+}
+
+/** The distinct source states of a marker's rows: the `N` of `observed ×N`. */
+export function markerSources(m: ObservedMarker): string[] {
+  return [...new Set(m.groups.flatMap((g) => g.rows.map((r) => r.from)))];
+}
+
 /**
- * A machine laid out from its table: states by distance from the initial one. Self-loops and
- * overrides (`to: null`, every live state has one) are left to the caller to list rather than draw,
- * or they bury the graph.
+ * Split a machine's table into what is drawn. An observation (`reconciled`) that reaches one state
+ * by one event from two or more distinct states — `observed_landed` from every live phase — is one
+ * marker on that state rather than one arrow per phase, which would be most of the picture. One
+ * from a single state stays an arrow. Self-loops and overrides are listed. Every transition lands in
+ * exactly one of `edges`, `markers[].groups[].rows` or `listed`, each in table order.
  */
-export function machineLayout(m: MachineTable): Layout {
-  const ids = m.states.map((s) => s.name);
-  const edges = m.transitions
-    .filter((t) => t.to !== null && t.to !== t.from)
-    .map((t) => ({ from: t.from, to: t.to as string, label: t.event }));
-  const roots = m.states.filter((s) => s.initial).map((s) => s.name);
-  return layered(ids, edges, roots);
+export function machineDrawing(m: MachineTable): MachineDrawing {
+  const drawable = (t: GraphEdge): t is GraphEdge & { readonly to: string } => t.to !== null && t.to !== t.from;
+  const key = (to: string, event: string): string => JSON.stringify([to, event]);
+  const sources = new Map<string, Set<string>>();
+  for (const t of m.transitions) {
+    if (t.reconciled && drawable(t)) {
+      const k = key(t.to, t.event);
+      const s = sources.get(k) ?? new Set<string>();
+      s.add(t.from);
+      sources.set(k, s);
+    }
+  }
+  const edges: GraphEdge[] = [];
+  const listed: GraphEdge[] = [];
+  const markers = new Map<string, Map<string, GraphEdge[]>>();
+  for (const t of m.transitions) {
+    if (!drawable(t)) {
+      listed.push(t);
+    } else if (t.reconciled && (sources.get(key(t.to, t.event))?.size ?? 0) >= 2) {
+      const groups = markers.get(t.to) ?? new Map<string, GraphEdge[]>();
+      const rows = groups.get(t.event) ?? [];
+      rows.push(t);
+      groups.set(t.event, rows);
+      markers.set(t.to, groups);
+    } else {
+      edges.push(t);
+    }
+  }
+  return {
+    states: m.states,
+    edges,
+    markers: [...markers].map(([to, groups]) => ({
+      to,
+      groups: [...groups].map(([event, rows]) => ({ event, rows })),
+    })),
+    listed,
+  };
+}
+
+/** The two machines a strategy draws: its workflow (phases) and the task lifecycle (statuses). */
+export type MachineName = "workflow" | "lifecycle";
+
+/** What of a drawn machine the Lifecycle pane's side panel shows: a state, a drawn edge, or a marker. */
+export type MachineSelection =
+  | { readonly kind: "state"; readonly machine: MachineName; readonly name: string }
+  | { readonly kind: "edge"; readonly machine: MachineName; readonly from: string; readonly event: string }
+  | { readonly kind: "marker"; readonly machine: MachineName; readonly to: string };
+
+/** A state's rows, as its panel lists them. */
+export interface StateRows {
+  /** The drawn edges out of it. */
+  readonly leaves: readonly GraphEdge[];
+  /** The drawn edges into it, then the rows its marker collapsed. */
+  readonly arrives: readonly GraphEdge[];
+  /** Its self-loops and its override: rows the picture does not draw. */
+  readonly listed: readonly GraphEdge[];
+}
+
+/**
+ * A state's rows, each in table order: what leaves it and what arrives along the drawn edges and its
+ * marker, and its rows the picture does not draw. With the table gone this is where rows are read,
+ * so every transition is in some state's lists (a collapsed row in its target's `arrives`).
+ */
+export function stateRows(d: MachineDrawing, name: string): StateRows {
+  return {
+    leaves: d.edges.filter((t) => t.from === name),
+    arrives: [
+      ...d.edges.filter((t) => t.to === name),
+      ...d.markers.filter((m) => m.to === name).flatMap((m) => m.groups.flatMap((g) => g.rows)),
+    ],
+    listed: d.listed.filter((t) => t.from === name),
+  };
+}
+
+/** Whether `sel` still names something drawn in `d`: after a strategy switch it may not. */
+export function selectionIn(d: MachineDrawing, sel: MachineSelection): boolean {
+  switch (sel.kind) {
+    case "state":
+      return d.states.some((s) => s.name === sel.name);
+    case "edge":
+      return d.edges.some((t) => t.from === sel.from && t.event === sel.event);
+    case "marker":
+      return d.markers.some((m) => m.to === sel.to);
+  }
+}
+
+/** Whether two selections name the same part of the same machine. */
+export function sameSelection(a: MachineSelection | undefined, b: MachineSelection | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  if (a.machine !== b.machine) return false;
+  switch (a.kind) {
+    case "state":
+      return b.kind === "state" && a.name === b.name;
+    case "edge":
+      return b.kind === "edge" && a.from === b.from && a.event === b.event;
+    case "marker":
+      return b.kind === "marker" && a.to === b.to;
+  }
+}
+
+/** The events `role` may fire under the strategy (each row's `roles`), once each, in table order. */
+export function eventsFiredBy(m: MachineTable, role: string): string[] {
+  return [...new Set(m.transitions.filter((t) => t.roles.includes(role)).map((t) => t.event))];
+}
+
+/** A row's key, as the table keys rows: the state it applies in and the event it answers. */
+export const rowKey = (from: string, event: string): string => `${from}\u0000${event}`;
+
+/**
+ * How often a task took each row, from the moves its history made (`timeline.task`'s `visited`): an
+ * override is one row with several destinations, so its moves are summed.
+ */
+export function takenByRow(moves: readonly { readonly from: string; readonly event: string; readonly count: number }[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const v of moves) counts.set(rowKey(v.from, v.event), (counts.get(rowKey(v.from, v.event)) ?? 0) + v.count);
+  return counts;
 }

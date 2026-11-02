@@ -7,6 +7,10 @@
 // in the preload and in main's handlers together; nothing reaches the renderer any other way.
 
 import type {
+  BaseAnswer,
+  DiffAnswer,
+  ExecPin,
+  ExecView,
   ContainerAction,
   ContainerResult,
   ContainerStatus,
@@ -46,6 +50,12 @@ export const BRIDGE_CHANNELS = {
   /** main → renderer: a session's notification moved, or the feed's standing changed. */
   notifyEvent: "jkb:notify:event",
   sessionsPlace: "jkb:sessions:place",
+  execRun: "jkb:exec:run",
+  execPreview: "jkb:exec:preview",
+  execSubscribe: "jkb:exec:subscribe",
+  execUnsubscribe: "jkb:exec:unsubscribe",
+  /** main → renderer: a run request was made or moved, or the feed's standing changed. */
+  execEvent: "jkb:exec:event",
 } as const;
 
 /** What the renderer may know about where it runs. Nothing secret: no token, no token path. */
@@ -153,6 +163,109 @@ export interface SessionsBridge {
   place(cwd: string): Promise<TerminalResult<GitPlace>>;
 }
 
+/** What Run would do for a request now (main's `ExecRunner.preview`): shown before Run is clicked. */
+export interface ExecPreview {
+  readonly request: ExecView;
+  /** Each argument escaped (control and invisible characters shown), one per line. */
+  readonly argvShown: readonly string[];
+  /** The directory resolved on the host (links and `..` followed), and in the container. */
+  readonly hostDir?: string;
+  readonly containerDir?: string;
+  /**
+   * The host program the run starts, resolved to an absolute path (a host run only): relative to
+   * the resolved directory, or a bare name found where run.sh looks. Show `programShown`, escaped.
+   */
+  readonly program?: string;
+  readonly programShown?: string;
+  /** The run's timeout. */
+  readonly timeoutMs: number;
+  /** The tree pin recomputed now, against the request's. */
+  readonly pin:
+    | { readonly state: "match" }
+    | { readonly state: "differs"; readonly now: ExecPin | null }
+    | { readonly state: "refused"; readonly reason: string; readonly message: string }
+    | { readonly state: "error"; readonly message: string };
+  /**
+   * The base the diff is read against: verified on the host, or unverified (and then the diff is
+   * against the request's own `HEAD` label, which the container could have moved). Absent for a
+   * directory in no repository, or when the request could not be resolved.
+   */
+  readonly base?: BaseAnswer;
+  /** The pinned tree against the base, with the commit it was diffed against. */
+  readonly diff?: DiffAnswer & { readonly against: string };
+  /** The program file, when `argv[0]` is a path in the repository. */
+  readonly programFile?: ProgramFile;
+  /**
+   * Main's verdict on the tree, pin → diff → pin: `changed` (Run will refuse, and is disabled),
+   * `match`, or `no_repo`. Absent when the preview stopped before it (see `problem`).
+   */
+  readonly verdict?: { readonly state: "match" } | { readonly state: "no_repo" } | { readonly state: "changed"; readonly message: string };
+  /** Why Run would not start now, when it would not. Run is disabled while there is one. */
+  readonly problem?: string;
+}
+
+/** A program file as the queue shows it: read without following a link, capped. */
+export type ProgramFile = (
+  | { readonly path: string; readonly kind: "file"; readonly text: string; readonly truncated: boolean }
+  | { readonly path: string; readonly kind: "link"; readonly target: string }
+  | { readonly path: string; readonly kind: "absent" | "other" }
+) & {
+  /**
+   * Whether the pin covers it. One that is not (under an ignored directory) can change between the
+   * preview and Run unnoticed, so it is not reviewed code.
+   */
+  readonly pinned?: boolean;
+};
+
+/**
+ * What main tells a window about the run-request index (`exec/requests`, the operator's own group).
+ * - `changed`: request `id` was made or moved to `state`; re-read the queue.
+ * - `gap`, `error`, `live`: the feed's standing, as for a design topic.
+ */
+export type ExecFeedEvent =
+  | { readonly topic: string; readonly kind: "changed"; readonly id: string; readonly state: string }
+  | { readonly topic: string; readonly kind: "gap"; readonly message: string }
+  | { readonly topic: string; readonly kind: "error"; readonly message: string }
+  | { readonly topic: string; readonly kind: "live" };
+
+/** What Run started: the terminal the window opens ONCE, in its drawer, with no Restart. */
+export interface ExecStarted {
+  readonly id: string;
+  /**
+   * The terminal to open. A host run's argv is main's launcher (`/bin/sh -c <launcher>`), which
+   * enters the pinned directory only if it is still that directory, then execs the program: show
+   * `argv`, not this.
+   */
+  readonly spec: TerminalSpec;
+  /** The program and its arguments as they run: the resolved host program, then the request's arguments. */
+  readonly argv: readonly string[];
+  readonly timeoutMs: number;
+}
+
+/**
+ * `window.jkb.exec`: running a run request (the Executions design). The renderer names a request id
+ * and nothing else: main reads the request, recomputes the pin, begins it and builds the terminal
+ * itself. The generic `op` refuses the runner's own ops (`EXEC_RUNNER_OPS`).
+ */
+export interface ExecBridge {
+  /** What Run would do now. Changes nothing. */
+  preview(id: string): Promise<TerminalResult<ExecPreview>>;
+  /**
+   * Run request `id`: the spec to open once, or why nothing started (refused, expired, already run).
+   * `shown` is what its preview showed (`hostDir`, and `program` for a host run): if the request now
+   * resolves to anything else, it is refused rather than run somewhere the operator was not shown.
+   */
+  run(id: string, shown: { readonly hostDir: string; readonly program?: string }): Promise<TerminalResult<ExecStarted>>;
+  /**
+   * Hear the run-request index. Resolves once main's group is on it: read the queue after that, and
+   * no change falls between the read and the feed.
+   */
+  subscribe(): Promise<Outcome<null>>;
+  unsubscribe(): void;
+  /** Hear every exec event for this window. Returns the unsubscribe. */
+  onEvent(listener: (event: ExecFeedEvent) => void): () => void;
+}
+
 /** `window.jkb`: everything the renderer can ask of the main process. */
 export interface JkbBridge {
   /** `GET /v1/hello`: whether the daemon is reachable, and which schema and ops it serves. */
@@ -171,4 +284,6 @@ export interface JkbBridge {
   readonly notify: NotifyBridge;
   /** Where sessions run. */
   readonly sessions: SessionsBridge;
+  /** Running run requests. */
+  readonly exec: ExecBridge;
 }

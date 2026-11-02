@@ -271,3 +271,208 @@ test("a run that collides with a live one removes nothing of it", async () => {
   assert.notEqual(git(origin, "branch", "--list", "agent-template/*"), "");
   assert.deepEqual(leftovers(checkout), { worktrees: 0, dirs: [], branches: "" });
 });
+
+// The Roles view, rendered to a string (as shell.test.mjs renders the tabs) from what jkb answers
+// for every preset (fixtures/workflow-roles.json, held to `workflow.roles` by
+// `roles_fixture_matches_presets` in crates/jkb-api).
+const rolesFixture = JSON.parse(fs.readFileSync(path.join(here, "fixtures", "workflow-roles.json"), "utf8"));
+
+async function loadTsx(name, contents) {
+  const outfile = path.join(work, `${name}.cjs`);
+  await esbuild.build({
+    stdin: { contents, resolveDir: path.join(src, "renderer", "src"), loader: "tsx" },
+    bundle: true,
+    format: "cjs",
+    platform: "node",
+    jsx: "automatic",
+    outfile,
+    logLevel: "silent",
+  });
+  return require(outfile);
+}
+
+const views = await loadTsx(
+  "roles-entry",
+  `import { renderToString } from "react-dom/server";
+   import { RolesTable, RolePanel, RolePending, NO_AGENT } from "./workflows/RolesView";
+   import { AgentPanel } from "./workflows/AgentPanel";
+   import { TerminalProvider } from "./terminal/TerminalProvider";
+   const none = () => {};
+   export { NO_AGENT };
+   export const table = (view, agents) =>
+     renderToString(<RolesTable view={view} agents={agents} selected={undefined} onSelect={none} onOpenAgent={none} />);
+   export const panel = (view, role, agents) =>
+     renderToString(<RolePanel view={view} role={view.roles.find((r) => r.name === role)} agents={agents} onClose={none} onOpenAgent={none} />);
+   export const pending = (name, message) => renderToString(<RolePending name={name} message={message} onClose={none} />);
+   export const agentPanel = (agent) =>
+     renderToString(<TerminalProvider><AgentPanel agent={agent} roles={[agent.role]} onSaved={none} onNotice={none} onOpenRole={none} /></TerminalProvider>);`,
+);
+
+const strip = (html) => html.replaceAll("<!-- -->", "");
+const loaded = (agents) => ({ kind: "loaded", agents });
+/** The `<tr>` of `role` in a rendered table. */
+const row = (html, role) => {
+  const m = new RegExp(`<tr data-role="${role}"[^>]*>([\\s\\S]*?)</tr>`).exec(html);
+  assert.ok(m, `no row for ${role}`);
+  return m[1];
+};
+
+const IMPLEMENTER = {
+  name: "swarm-implementer",
+  version: 1,
+  source: "packaged",
+  workflow: "task-swarm",
+  role: "implementer",
+  role_ops: ["read"],
+  fragment: false,
+  describe: "Builds one piece of work.",
+  template: "Build {{what}}.",
+  placeholders: ["what"],
+  permissions: { isolation: "worktree", model: null, writes: "code" },
+  hands_off_to: [],
+  based_on: null,
+  defined_at: null,
+  packaged_version: 1,
+  overrides_packaged: false,
+  behind_packaged: false,
+  packaged_base: 1,
+  matches_packaged: false,
+};
+
+test("the Roles view lists every role, one with no agent as done by hand", () => {
+  const view = rolesFixture["design-reviewed"];
+  // A reviewer has no template here, only an attested agent type mapped to it.
+  const mapped = { ...view, roles: view.roles.map((r) => (r.name === "reviewer" ? { ...r, agent_types: ["jkb-reviewer"] } : r)) };
+  const html = strip(views.table(mapped, loaded([IMPLEMENTER, { ...IMPLEMENTER, name: "a-piece", fragment: true, role: "designer" }])));
+  assert.deepEqual(
+    [...html.matchAll(/<tr data-role="([a-z_]+)"/g)].map((m) => m[1]),
+    ["operator", "coordinator", "designer", "implementer", "reviewer", "systemic_reviewer"],
+  );
+  for (const role of ["operator", "coordinator", "designer", "systemic_reviewer"]) {
+    assert.match(row(html, role), /no agent: done by hand/, `${role} has no agent (a fragment is not one)`);
+  }
+  assert.doesNotMatch(row(html, "implementer"), /done by hand/);
+  assert.match(row(html, "implementer"), /<button[^>]*title="task-swarm: Builds one piece of work\."[^>]*>swarm-implementer<\/button>/);
+  assert.match(row(html, "reviewer"), /<code>jkb-reviewer<\/code> <span class="muted">\(agent type\)<\/span>/);
+  assert.doesNotMatch(row(html, "reviewer"), /done by hand/);
+  // A role with no template still shows its op classes, each with its sentence on hover.
+  assert.match(row(html, "systemic_reviewer"), /<li title="Read the knowledge base[^"]*">read<\/li>/);
+  assert.match(row(html, "designer"), /submit_design/);
+  assert.match(row(html, "designer"), /<td>design<\/td>/, "where it acts next");
+});
+
+test("a toggle-controlled grant carries the toggle's name, and an unset one is off in this strategy", () => {
+  const reviewed = strip(views.table(rolesFixture["design-reviewed"], loaded([])));
+  const coordinator = row(reviewed, "coordinator");
+  assert.match(coordinator, /approve_design, reject_design<span class="role-toggle" data-on="false" title="approves designs">approves_design \(off in this strategy\)<\/span>/);
+  assert.match(coordinator, /land<span class="role-toggle" data-on="false" title="lands">lands \(off in this strategy\)<\/span>/);
+  // A role no toggle can name carries no mark.
+  assert.doesNotMatch(row(reviewed, "designer"), /role-toggle/);
+
+  const coordinated = row(strip(views.table(rolesFixture.coordinated, loaded([]))), "coordinator");
+  assert.match(coordinated, /<li>approve_design<span class="role-toggle" data-on="true" title="approves designs">approves_design<\/span><\/li>/);
+  assert.match(coordinated, /lands \(off in this strategy\)/);
+  const autonomous = row(strip(views.table(rolesFixture.autonomous, loaded([]))), "coordinator");
+  assert.match(autonomous, /<li>land<span class="role-toggle" data-on="true" title="lands">lands<\/span><\/li>/);
+  assert.match(autonomous, /approves_design \(off in this strategy\)/);
+});
+
+test("a role's panel says each op class in plain words, its toggles and its agents", () => {
+  const view = rolesFixture["design-reviewed"];
+  const html = strip(views.panel(view, "systemic_reviewer", loaded([IMPLEMENTER])));
+  assert.match(html, /aria-label="Role systemic_reviewer"/);
+  const role = view.roles.find((r) => r.name === "systemic_reviewer");
+  assert.match(html, new RegExp(role.describe.replace(/[.()]/g, "\\$&")));
+  for (const op of role.ops) assert.ok(html.includes(`<li><code>${op.name}</code> ${op.describe.replaceAll("'", "&#x27;")}</li>`), op.name);
+  assert.match(html, /no toggle can change it/);
+  assert.match(html, /no agent: done by hand/);
+  const coordinator = strip(views.panel(rolesFixture.coordinated, "coordinator", loaded([])));
+  assert.match(coordinator, /<li data-on="true"><code>approves_design<\/code> \(approves designs\): on<\/li>/);
+  assert.match(coordinator, /<li data-on="false"><code>lands<\/code> \(lands\): off in this strategy<\/li>/);
+});
+
+test("an agent's panel links to its role rather than listing the role's op classes", () => {
+  const html = strip(views.agentPanel(IMPLEMENTER));
+  assert.match(html, /<button type="button" class="link-button" title="Open this role in the Roles view">implementer<\/button>/);
+  assert.doesNotMatch(html, /In jkb, a implementer may/);
+  assert.doesNotMatch(html, />read</, "the role's op classes are not repeated here");
+});
+
+test("until the agent templates are known, no role is said to have no agent", () => {
+  const view = rolesFixture["design-reviewed"];
+  const mapped = { ...view, roles: view.roles.map((r) => (r.name === "reviewer" ? { ...r, agent_types: ["jkb-reviewer"] } : r)) };
+  const loading = strip(views.table(mapped, { kind: "loading" }));
+  assert.doesNotMatch(loading, /done by hand/);
+  assert.match(row(loading, "designer"), /agents unknown: the templates are loading/);
+  // A mapped agent type is known either way, and still listed.
+  assert.match(row(loading, "reviewer"), /<code>jkb-reviewer<\/code>/);
+  assert.match(row(loading, "reviewer"), /agents unknown/);
+  const failed = strip(views.table(mapped, { kind: "failed", message: "jkb serve is not reachable" }));
+  assert.doesNotMatch(failed, /done by hand/);
+  assert.match(row(failed, "systemic_reviewer"), /agents unknown: jkb serve is not reachable/);
+  assert.match(strip(views.panel(view, "designer", { kind: "loading" })), /agents unknown/);
+});
+
+test("a role that cannot be drawn says why and can be closed", () => {
+  const html = strip(views.pending("designer", "Cannot list the roles: unknown variant"));
+  assert.match(html, /<section class="machine-panel role-panel" aria-label="Role designer" data-pending="true">/);
+  assert.match(html, /Cannot list the roles: unknown variant/);
+  assert.match(html, /<button type="button" class="bar-button" aria-label="Close">×<\/button>/);
+});
+
+const side = await load(path.join(src, "renderer", "src", "workflows", "side.ts"));
+
+test("a selected role always draws something: its panel, or why it cannot", () => {
+  const roles = rolesFixture["design-reviewed"];
+  const pick = { kind: "role", name: "designer" };
+  assert.deepEqual(side.roleSide(side.AGENT, { kind: "failed", message: "x" }), { kind: "none" });
+  assert.deepEqual(side.roleSide({ kind: "state", machine: "workflow", name: "design" }, { kind: "loading" }), { kind: "none" });
+  assert.deepEqual(side.roleSide(pick, { kind: "loading" }), { kind: "pending", name: "designer", message: "Loading the roles…" });
+  assert.deepEqual(side.roleSide(pick, { kind: "failed", message: "unknown variant" }), {
+    kind: "pending",
+    name: "designer",
+    message: "Cannot list the roles: unknown variant",
+  });
+  assert.deepEqual(side.roleSide({ kind: "role", name: "ghost" }, { kind: "loaded", value: roles }), {
+    kind: "pending",
+    name: "ghost",
+    message: "design-reviewed has no role ghost.",
+  });
+  const shown = side.roleSide(pick, { kind: "loaded", value: roles });
+  assert.equal(shown.kind, "shown");
+  assert.equal(shown.role.name, "designer");
+});
+
+test("switching back to Agents gives the side panel back to the agent; nothing else moves", () => {
+  const pick = { kind: "role", name: "designer" };
+  assert.deepEqual(side.sideForView(pick, "agents"), side.AGENT);
+  assert.equal(side.sideForView(pick, "roles"), pick);
+  const part = { kind: "edge", machine: "workflow", from: "design", event: "submit_design" };
+  assert.equal(side.sideForView(part, "agents"), part);
+  assert.equal(side.machinePart(pick), undefined);
+  assert.equal(side.machinePart(part), part);
+});
+
+const { agentGraph } = await load(path.join(here, "..", "..", "core", "src", "workflows.ts"));
+const packagedAgents = JSON.parse(fs.readFileSync(path.join(here, "..", "..", "..", PACKAGED_FILE), "utf8")).agents;
+
+test("the packaged swarm's Agents graph draws the designer and the systemic reviewer its coordinator starts", () => {
+  const g = agentGraph(packagedAgents, "task-swarm");
+  assert.deepEqual(
+    g.nodes.map((n) => n.id).sort(),
+    ["swarm-coordinator", "swarm-designer", "swarm-implementer", "swarm-reviewer", "swarm-systemic-reviewer"],
+  );
+  const at = (id) => g.nodes.find((n) => n.id === id);
+  assert.equal(at("swarm-coordinator").layer, 0, "the coordinator is the graph's root");
+  assert.ok(
+    g.links.some((l) => l.from === "swarm-coordinator" && l.to === "swarm-designer"),
+    "the coordinator hands a held-back task to a designer",
+  );
+  assert.ok(at("swarm-designer").layer > 0);
+  assert.ok(
+    g.links.some((l) => l.from === "swarm-coordinator" && l.to === "swarm-systemic-reviewer"),
+    "the coordinator hands a task whose review repeats an area to a systemic reviewer",
+  );
+  assert.ok(at("swarm-systemic-reviewer").layer > 0);
+  assert.deepEqual(g.dangling, []);
+});

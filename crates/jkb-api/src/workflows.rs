@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use jkb_core::roles::Role;
 use jkb_core::workflow::agents::{self, Agent, AgentPermissions, Edit, Listed, Pick, Source};
 use jkb_core::workflow::store as wf;
-use jkb_core::workflow::strategy::StrategySpec;
+use jkb_core::workflow::strategy::{Controls, StrategySpec, ToggleDef, TOGGLES};
 use jkb_core::workflow::{Phase, WorkflowEvent};
 use jkb_core::{task, WriteMeta};
 use jkb_fsm::Table;
@@ -36,7 +36,8 @@ pub struct AgentView {
     pub version: i64,
     /// `packaged` (read-only) or `operator` (an editable copy).
     pub source: Source,
-    /// The workflow it belongs to.
+    /// The agent set it belongs to (`task-swarm`, `code-review`, `subagents`). The field keeps the
+    /// name `workflow` so the wire does not break between app and daemon.
     pub workflow: String,
     /// The D52 role its calls act as.
     pub role: String,
@@ -154,6 +155,31 @@ fn listed_view(l: &Listed) -> Result<AgentView, ApiError> {
 /// A database error, or a stored row this jkb cannot read.
 pub fn list(conn: &Connection) -> Result<Vec<AgentView>, ApiError> {
     agents::list(conn)?.iter().map(listed_view).collect()
+}
+
+/// An agent set as `workflow.agents` answers it beside the templates: its name (what templates'
+/// `workflow` field names) and one sentence on what it is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSetView {
+    /// Its name.
+    pub name: String,
+    /// One sentence on what it is for.
+    pub describe: String,
+}
+
+/// Every agent set, in the packaged file's order ([`agents::agent_sets`]).
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] if the compiled-in templates file is malformed, which a test refuses
+/// before it can ship.
+pub fn agent_sets() -> Result<Vec<AgentSetView>, ApiError> {
+    Ok(agents::agent_sets()?
+        .iter()
+        .map(|s| AgentSetView {
+            name: s.name.clone(),
+            describe: s.describe.clone(),
+        })
+        .collect())
 }
 
 /// Every role a template may act as, as stored: what `workflow.agents` answers beside the
@@ -309,6 +335,14 @@ pub struct GraphEdge {
     /// decides), the roles (a workflow act, the lifecycle's `land` per the strategy's `lands`
     /// toggle, its `override` per who holds `task.set --status`), or `no one`.
     pub fired_by: String,
+    /// What its guard checks, in plain words; `None` for an unguarded row. The workflow machine's
+    /// review guards read the strategy's `repeated_area`.
+    #[serde(default)]
+    pub guard: Option<String>,
+    /// The command that fires it, `<uid>` standing for the task (`jkb workflow fire <uid> <event>`,
+    /// or `jkb workflow observe <uid>` for an observation); the workflow machine only.
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 /// One machine.
@@ -327,8 +361,12 @@ pub struct GraphView {
     pub strategy: String,
     /// Its execution graph.
     pub graph: String,
-    /// One line on the graph.
+    /// One sentence on the graph: why a strategy would run it ([`jkb_core::workflow::GraphId::describe`]).
     pub describe: String,
+    /// The phases it passes through, as one arrow line ([`jkb_core::workflow::GraphId::path`]);
+    /// empty from a daemon that predates the field.
+    #[serde(default)]
+    pub path: String,
     /// The strategy's spec.
     pub spec: serde_json::Value,
     /// The task named, when one was.
@@ -341,14 +379,44 @@ pub struct GraphView {
     pub workflow: MachineView,
     /// The task lifecycle machine (statuses).
     pub lifecycle: MachineView,
+    /// Every role, with the jkb op classes it may run under this strategy (`rbac::role_decision`:
+    /// `jkb role matrix`, plus `land` for the roles the strategy's `lands` toggle names): the
+    /// permissions a phase's actor holds, whether or not an agent template acts as it.
+    #[serde(default)]
+    pub role_ops: BTreeMap<String, Vec<String>>,
+    /// The strategy an unpinned task runs ([`wf::default_strategy`]): [`DEFAULT_PRESET`] or the
+    /// operator's `default` definition, as `name@version`. Empty from a daemon that predates it.
+    ///
+    /// [`DEFAULT_PRESET`]: jkb_core::workflow::strategy::DEFAULT_PRESET
+    #[serde(default)]
+    pub default: String,
+    /// What this strategy changes from [`Self::default`], one line each
+    /// ([`StrategySpec::changes_from`]); empty when it is the default's spec. A client meeting an
+    /// answer without the field (an older daemon) treats the changes as unknown.
+    #[serde(default)]
+    pub changes_from_default: Vec<String>,
 }
 
-/// `roles` answers who may fire an act, or `None` for an event no role fires (jkb applies it).
-fn machine_view(
+/// What a machine's rows say beyond the table: per event, who may fire it (`None` for an event no
+/// role fires, which jkb applies), what its guard checks, and the command that fires it.
+struct Rows<R, G, C> {
+    roles: R,
+    guard: G,
+    command: C,
+}
+
+/// `next` answers who acts in a state and what they do. A row's guard is described only where the
+/// row has one, here rather than in each machine's closure.
+fn machine_view<R, G, C>(
     table: &Table,
     next: impl Fn(&str) -> Option<(String, String)>,
-    roles: impl Fn(&str) -> Option<Vec<String>>,
-) -> MachineView {
+    rows: &Rows<R, G, C>,
+) -> MachineView
+where
+    R: Fn(&str) -> Option<Vec<String>>,
+    G: Fn(&str) -> Option<String>,
+    C: Fn(&str) -> Option<String>,
+{
     MachineView {
         states: table
             .states
@@ -369,7 +437,11 @@ fn machine_view(
             .transitions
             .iter()
             .map(|t| {
-                let fired = if t.reconciled { None } else { roles(t.event) };
+                let fired = if t.reconciled {
+                    None
+                } else {
+                    (rows.roles)(t.event)
+                };
                 let fired_by = match &fired {
                     _ if t.reconciled => "observed".to_owned(),
                     None => "applied".to_owned(),
@@ -385,10 +457,97 @@ fn machine_view(
                     planned: t.planned,
                     roles: fired.unwrap_or_default(),
                     fired_by,
+                    guard: if t.guarded {
+                        (rows.guard)(t.event)
+                    } else {
+                        None
+                    },
+                    command: (rows.command)(t.event),
                 }
             })
             .collect(),
     }
+}
+
+/// The strategy's workflow machine: who acts in each phase, who may fire each act, what each guard
+/// checks under the strategy's attributes, and the command that fires each event.
+fn workflow_view(spec: &StrategySpec) -> MachineView {
+    machine_view(
+        &spec.graph.machine().table(),
+        |state| {
+            Phase::parse(state).map(|p| {
+                let (role, step) = spec.next_actor(p);
+                (role.as_str().to_owned(), step.to_owned())
+            })
+        },
+        &Rows {
+            roles: |event: &str| {
+                WorkflowEvent::parse(event).map(|e| {
+                    <Role as jkb_rbac::Role>::ALL
+                        .iter()
+                        .filter(|r| spec.authorize(&[**r], e).is_allowed())
+                        .map(|r| r.as_str().to_owned())
+                        .collect()
+                })
+            },
+            guard: |event: &str| {
+                WorkflowEvent::parse(event)
+                    .and_then(|e| e.describe_guard(&spec.attributes.repeated_area))
+            },
+            command: |event: &str| WorkflowEvent::parse(event).map(WorkflowEvent::command),
+        },
+    )
+}
+
+/// The task lifecycle machine, under the strategy. Two lifecycle acts have a role that fires them:
+/// landing, which the strategy's `lands` toggle decides (what `rbac` checks `task.land` against),
+/// and the operator's override, which is `task.set --status` and so whoever holds that op class.
+/// Every other row jkb applies as part of the op that moves it.
+fn lifecycle_view(spec: &StrategySpec) -> MachineView {
+    machine_view(
+        &jkb_core::lifecycle::machine().table(),
+        |_| None,
+        &Rows {
+            roles: |event: &str| match event {
+                "land" => Some(
+                    <Role as jkb_rbac::Role>::ALL
+                        .iter()
+                        .filter(|r| {
+                            crate::rbac::role_decision(spec, &[**r], OpPermission::Land)
+                                .is_allowed()
+                        })
+                        .map(|r| r.as_str().to_owned())
+                        .collect(),
+                ),
+                "override" => Some(
+                    OP_GRANTS
+                        .roles_for(OpPermission::TaskStatus)
+                        .into_iter()
+                        .map(|r| r.as_str().to_owned())
+                        .collect(),
+                ),
+                _ => None,
+            },
+            guard: |event: &str| {
+                jkb_core::lifecycle::TaskEvent::parse(event)
+                    .and_then(jkb_core::lifecycle::TaskEvent::describe_guard)
+                    .map(str::to_owned)
+            },
+            command: |_: &str| None,
+        },
+    )
+}
+
+/// The op classes `role` may run under `spec`, in [`OpPermission`]'s order, as the one dispatch
+/// decides them by role alone ([`crate::rbac::role_decision`]): `land` by the strategy's `lands`
+/// toggle, every other class by [`OP_GRANTS`]. What both `workflow.graph`'s `role_ops` and
+/// `workflow.roles` answer, so the two views cannot disagree.
+fn ops_under(spec: &StrategySpec, role: Role) -> Vec<OpPermission> {
+    <OpPermission as jkb_rbac::Permission>::ALL
+        .iter()
+        .copied()
+        .filter(|p| crate::rbac::role_decision(spec, &[role], *p).is_allowed())
+        .collect()
 }
 
 /// `workflow.graph`: the machines of a task's strategy (`uid`), a named one (`strategy`), or the
@@ -425,62 +584,27 @@ pub fn graph(
                 meta.status,
             )
         }
-        (None, Some(name)) => {
-            let (source, spec) = wf::resolve_strategy(conn, name)?;
-            (source, spec, None, None, None)
-        }
-        (None, None) => {
-            let (source, spec) = wf::default_strategy(conn)?;
+        (None, strategy) => {
+            let (source, spec) = named_or_default(conn, strategy)?;
             (source, spec, None, None, None)
         }
     };
-    let workflow = machine_view(
-        &spec.graph.machine().table(),
-        |state| {
-            Phase::parse(state).map(|p| {
-                let (role, step) = spec.next_actor(p);
-                (role.as_str().to_owned(), step.to_owned())
-            })
-        },
-        |event| {
-            WorkflowEvent::parse(event).map(|e| {
-                <Role as jkb_rbac::Role>::ALL
-                    .iter()
-                    .filter(|r| spec.authorize(&[**r], e).is_allowed())
-                    .map(|r| r.as_str().to_owned())
-                    .collect()
-            })
-        },
-    );
-    // Two lifecycle acts have a role that fires them: landing, which the strategy's `lands` toggle
-    // decides (what `rbac` checks `task.land` against), and the operator's override, which is
-    // `task.set --status` and so whoever holds that op class. Every other row jkb applies as part
-    // of the op that moves it.
-    let lifecycle = machine_view(
-        &jkb_core::lifecycle::machine().table(),
-        |_| None,
-        |event| match event {
-            "land" => Some(
-                <Role as jkb_rbac::Role>::ALL
-                    .iter()
-                    .filter(|r| spec.may_land(&[**r]).is_allowed())
-                    .map(|r| r.as_str().to_owned())
-                    .collect(),
-            ),
-            "override" => Some(
-                OP_GRANTS
-                    .roles_for(OpPermission::TaskStatus)
-                    .into_iter()
-                    .map(|r| r.as_str().to_owned())
-                    .collect(),
-            ),
-            _ => None,
-        },
-    );
+    // The diff against the default is a gloss on the graph, not something it needs: a stored
+    // `default` this jkb cannot read (a newer jkb's) leaves it unknown — what an older daemon
+    // answers — rather than refusing a named or pinned strategy's machines. Where the graph itself
+    // is the default's, its resolution above has already refused. Any other error is still one.
+    let (default, changes_from_default) = match wf::default_strategy(conn) {
+        Ok((default, default_spec)) => (default, spec.changes_from(&default_spec)),
+        Err(jkb_core::Error::Types(_)) => (String::new(), Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let workflow = workflow_view(&spec);
+    let lifecycle = lifecycle_view(&spec);
     Ok(GraphView {
         strategy: source,
         graph: spec.graph.as_str().to_owned(),
         describe: spec.graph.describe().to_owned(),
+        path: spec.graph.path().to_owned(),
         spec: serde_json::to_value(&spec)
             .map_err(|e| ApiError::with_code(ErrorCode::Internal, e.to_string()))?,
         task,
@@ -488,6 +612,224 @@ pub fn graph(
         status,
         workflow,
         lifecycle,
+        role_ops: <Role as jkb_rbac::Role>::ALL
+            .iter()
+            .map(|r| {
+                let ops = ops_under(&spec, *r)
+                    .into_iter()
+                    .map(|p| p.name().to_owned())
+                    .collect();
+                (r.as_str().to_owned(), ops)
+            })
+            .collect(),
+        default,
+        changes_from_default,
+    })
+}
+
+// -------------------------------------------------------------------------------------------
+// The roles, as data
+// -------------------------------------------------------------------------------------------
+
+/// An op class and what holding it lets a role do ([`OpPermission::describe`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpClassView {
+    /// Its name, as `jkb role matrix` prints it.
+    pub name: String,
+    /// One plain sentence on what it lets a role do.
+    pub describe: String,
+}
+
+/// A strategy toggle ([`TOGGLES`]) and what this strategy sets it to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToggleView {
+    /// The spec field and CLI flag (`approves_design`).
+    pub name: String,
+    /// What it grants, in a few plain words ([`ToggleDef::label`]).
+    pub label: String,
+    /// The workflow events it grants, or `["land"]` for landing, an op rather than an event.
+    pub controls: Vec<String>,
+    /// The roles it may ever name.
+    pub domain: Vec<String>,
+    /// The phase it acts in, if it acts in only one.
+    pub acts_in: Option<String>,
+    /// The roles this strategy names, as its spec stores them (the operator always holds it).
+    pub value: Vec<String>,
+}
+
+/// A toggle that can change what a role may do, and whether this strategy turns it on for the role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToggledBy {
+    /// The toggle's name.
+    pub toggle: String,
+    /// The role holds what the toggle grants under this strategy.
+    pub on: bool,
+}
+
+/// One role, under a strategy: what it may do in jkb, who grants it, and where it acts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleView {
+    /// Its name.
+    pub name: String,
+    /// One sentence on what it is for ([`Role::describe`]).
+    pub describe: String,
+    /// The op classes it may run under this strategy (`ops_under`, the same answer as
+    /// `workflow.graph`'s `role_ops`), each with its sentence.
+    pub ops: Vec<OpClassView>,
+    /// The roles it may grant ([`roles::GRANTABLE`]).
+    pub may_grant: Vec<String>,
+    /// The roles that may grant it.
+    pub granted_by: Vec<String>,
+    /// The workflow acts it may fire under this strategy ([`StrategySpec::authorize`]); an
+    /// observation is anyone's, so none is listed.
+    pub events: Vec<String>,
+    /// It may land a task under this strategy ([`StrategySpec::may_land`]).
+    pub lands: bool,
+    /// The phases of the strategy's graph where it acts next ([`StrategySpec::next_actor`]).
+    pub acts_next_in: Vec<String>,
+    /// The phases of the strategy's graph with a row it may fire.
+    pub fires_in: Vec<String>,
+    /// The toggles that can name it, and whether this strategy does.
+    pub toggled_by: Vec<ToggledBy>,
+    /// The attested agent types the operator maps to it ([`roles::agent_type_map`]).
+    pub agent_types: Vec<String>,
+}
+
+/// `workflow.roles`' answer: every role, in [`jkb_rbac::Role::ALL`]'s order, under one strategy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolesView {
+    /// The strategy read: a preset or `name@version`.
+    pub strategy: String,
+    /// Every toggle, and what this strategy sets it to.
+    pub toggles: Vec<ToggleView>,
+    /// Every role, including those no agent template acts as.
+    pub roles: Vec<RoleView>,
+}
+
+/// A named strategy, or the default.
+fn named_or_default(
+    conn: &Connection,
+    strategy: Option<&str>,
+) -> Result<(String, StrategySpec), ApiError> {
+    Ok(match strategy {
+        Some(name) => wf::resolve_strategy(conn, name)?,
+        None => wf::default_strategy(conn)?,
+    })
+}
+
+/// Whether `role` holds what toggle `t` grants under `spec`, decided by the deciders the dispatch and
+/// the workflow use rather than by reading the list: the operator holds every toggle whatever it lists.
+fn toggle_on(spec: &StrategySpec, t: &ToggleDef, role: Role) -> bool {
+    match t.controls {
+        Controls::Land => {
+            crate::rbac::role_decision(spec, &[role], OpPermission::Land).is_allowed()
+        }
+        Controls::Events(events) => events
+            .iter()
+            .all(|e| spec.authorize(&[role], *e).is_allowed()),
+    }
+}
+
+fn names(roles: &[Role]) -> Vec<String> {
+    roles.iter().map(|r| r.as_str().to_owned()).collect()
+}
+
+/// `workflow.roles`: every role under a named strategy or the default — its op classes, who grants
+/// it, the acts it may fire, whether it lands, the phases where it acts, the toggles that change it
+/// and the agent types mapped to it. Agent templates are not joined here: each already names its role
+/// in `workflow.agents`.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for an unknown strategy; a database error.
+pub fn roles(conn: &Connection, strategy: Option<&str>) -> Result<RolesView, ApiError> {
+    let (source, spec) = named_or_default(conn, strategy)?;
+    let table = spec.graph.machine().table();
+    let phases: Vec<Phase> = table
+        .states
+        .iter()
+        .filter_map(|s| Phase::parse(s.name))
+        .collect();
+    let mapped = jkb_core::roles::agent_type_map(conn)?;
+    let all = <Role as jkb_rbac::Role>::ALL;
+    let view = |r: Role| {
+        let may_fire = |event: &str| {
+            WorkflowEvent::parse(event).is_some_and(|e| spec.authorize(&[r], e).is_allowed())
+        };
+        RoleView {
+            name: r.as_str().to_owned(),
+            describe: r.describe().to_owned(),
+            ops: ops_under(&spec, r)
+                .into_iter()
+                .map(|p| OpClassView {
+                    name: p.name().to_owned(),
+                    describe: p.describe().to_owned(),
+                })
+                .collect(),
+            may_grant: names(&jkb_core::roles::GRANTABLE.permissions_of(r)),
+            granted_by: names(
+                &all.iter()
+                    .copied()
+                    .filter(|g| jkb_core::roles::GRANTABLE.permits(*g, r))
+                    .collect::<Vec<_>>(),
+            ),
+            events: <WorkflowEvent as jkb_fsm::Event>::ALL
+                .iter()
+                .filter(|e| {
+                    jkb_fsm::Event::kind(**e) == jkb_fsm::EventKind::Applied
+                        && spec.authorize(&[r], **e).is_allowed()
+                })
+                .map(|e| e.as_str().to_owned())
+                .collect(),
+            lands: spec.may_land(&[r]).is_allowed(),
+            acts_next_in: phases
+                .iter()
+                .filter(|p| spec.next_actor(**p).0 == r)
+                .map(|p| p.as_str().to_owned())
+                .collect(),
+            fires_in: phases
+                .iter()
+                .filter(|p| {
+                    table
+                        .transitions
+                        .iter()
+                        .any(|t| !t.reconciled && t.from == p.as_str() && may_fire(t.event))
+                })
+                .map(|p| p.as_str().to_owned())
+                .collect(),
+            toggled_by: TOGGLES
+                .iter()
+                .filter(|t| t.domain.contains(&r))
+                .map(|t| ToggledBy {
+                    toggle: t.name.to_owned(),
+                    on: toggle_on(&spec, t, r),
+                })
+                .collect(),
+            agent_types: mapped
+                .iter()
+                .filter(|(_, role)| *role == r)
+                .map(|(t, _)| t.clone())
+                .collect(),
+        }
+    };
+    Ok(RolesView {
+        strategy: source,
+        toggles: TOGGLES
+            .iter()
+            .map(|t| ToggleView {
+                name: t.name.to_owned(),
+                label: t.label.to_owned(),
+                controls: match t.controls {
+                    Controls::Events(events) => {
+                        events.iter().map(|e| e.as_str().to_owned()).collect()
+                    }
+                    Controls::Land => vec![OpPermission::Land.name().to_owned()],
+                },
+                domain: names(t.domain),
+                acts_in: t.acts_in.map(|p| p.as_str().to_owned()),
+                value: names(spec.toggles.get(t.name)),
+            })
+            .collect(),
+        roles: all.iter().map(|r| view(*r)).collect(),
     })
 }
 

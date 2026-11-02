@@ -1,0 +1,3576 @@
+{
+  "autonomous": {
+    "changes_from_default": [
+      "graph: direct (default: design-gate)",
+      "lands: operator, coordinator (default: operator)"
+    ],
+    "default": "design-reviewed",
+    "describe": "A written design goes straight to implementation.",
+    "graph": "direct",
+    "lifecycle": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "open",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "in_progress",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "needs_review",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "done",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "command": null,
+          "event": "start",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "start",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "start",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "command": null,
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "command": null,
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "land",
+          "fired_by": "operator, coordinator",
+          "from": "in_progress",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "land",
+          "fired_by": "operator, coordinator",
+          "from": "needs_review",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "land",
+          "fired_by": "operator, coordinator",
+          "from": "done",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": "the session has no uncommitted changes",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": "the session has no uncommitted changes",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": "the session has no uncommitted changes",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "done",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "done",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "open",
+          "guard": "something holds the claim, and its owner is proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guard": "something holds the claim, and its owner is proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guard": "something holds the claim, and its owner is proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "open",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "done",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "open",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "done",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "cancelled",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        }
+      ]
+    },
+    "path": "design → implement ⇄ review (⇄ systemic review) → landable",
+    "phase": null,
+    "role_ops": {
+      "coordinator": [
+        "read",
+        "hook",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "land",
+        "workflow",
+        "design",
+        "design_approve",
+        "grant",
+        "exec_request"
+      ],
+      "designer": [
+        "read",
+        "hook",
+        "task_write",
+        "workflow",
+        "design",
+        "design_approve",
+        "exec_request"
+      ],
+      "implementer": [
+        "read",
+        "hook",
+        "task_write",
+        "task_claim",
+        "workflow",
+        "exec_request"
+      ],
+      "operator": [
+        "read",
+        "hook",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "review",
+        "land",
+        "workflow",
+        "design",
+        "design_approve",
+        "grant",
+        "attest",
+        "exec_request",
+        "admin"
+      ],
+      "reviewer": [
+        "read",
+        "hook",
+        "review",
+        "workflow",
+        "design_approve",
+        "exec_request"
+      ],
+      "systemic_reviewer": [
+        "read",
+        "hook",
+        "task_write",
+        "workflow",
+        "exec_request"
+      ]
+    },
+    "spec": {
+      "attributes": {
+        "repeated_area": {
+          "rounds": 2,
+          "scope": "file"
+        }
+      },
+      "graph": "direct",
+      "toggles": {
+        "approves_design": [
+          "operator"
+        ],
+        "lands": [
+          "operator",
+          "coordinator"
+        ]
+      }
+    },
+    "status": null,
+    "strategy": "autonomous",
+    "task": null,
+    "workflow": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "design",
+          "next_role": "designer",
+          "next_step": "write the design into the task, then `jkb workflow fire <uid> submit_design`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "design_review",
+          "next_role": "operator",
+          "next_step": "read the design, then `jkb workflow fire <uid> approve_design` (or `reject_design`)",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "implement",
+          "next_role": "implementer",
+          "next_step": "implement and commit, then `jkb workflow fire <uid> submit_work`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "review",
+          "next_role": "reviewer",
+          "next_step": "run a review round (`/jkb-review`), then `jkb workflow observe <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "systemic_review",
+          "next_role": "systemic_reviewer",
+          "next_step": "find the systemic cause and record it, then `jkb workflow fire <uid> submit_systemic --reason …` — or `systemic_redesign --reason …` if the fix changes how the operator understands the system",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landable",
+          "next_role": "coordinator",
+          "next_step": "land it: `jkb task land <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landed",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "command": "jkb workflow fire <uid> submit_design",
+          "event": "submit_design",
+          "fired_by": "operator, designer",
+          "from": "design",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "designer"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> approve_design",
+          "event": "approve_design",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> reject_design",
+          "event": "reject_design",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "design"
+        },
+        {
+          "command": "jkb workflow fire <uid> submit_work",
+          "event": "submit_work",
+          "fired_by": "operator, coordinator, implementer",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "implementer"
+          ],
+          "to": "review"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "review_passed",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a review round was filed since the work was submitted and found no must-fix; the work has not landed and the task is not cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landable"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "review_failed",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, but not the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "review_repeated",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, and the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "systemic_review"
+        },
+        {
+          "command": "jkb workflow fire <uid> submit_systemic --reason <why>",
+          "event": "submit_systemic",
+          "fired_by": "operator, systemic_reviewer",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "systemic_reviewer"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> systemic_redesign --reason <why>",
+          "event": "systemic_redesign",
+          "fired_by": "operator, systemic_reviewer",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "systemic_reviewer"
+          ],
+          "to": "design"
+        },
+        {
+          "command": "jkb workflow fire <uid> rework",
+          "event": "rework",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "implement",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "landable",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "implement",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "landable",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> reopen",
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "landed",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> reopen",
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> reopen",
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landable",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landed",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        }
+      ]
+    }
+  },
+  "coordinated": {
+    "changes_from_default": [
+      "approves designs: operator, coordinator (default: operator)"
+    ],
+    "default": "design-reviewed",
+    "describe": "A written design waits for approval before implementation starts.",
+    "graph": "design-gate",
+    "lifecycle": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "open",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "in_progress",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "needs_review",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "done",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "command": null,
+          "event": "start",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "start",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "start",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "command": null,
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "command": null,
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "land",
+          "fired_by": "operator",
+          "from": "in_progress",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "land",
+          "fired_by": "operator",
+          "from": "needs_review",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "land",
+          "fired_by": "operator",
+          "from": "done",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": "the session has no uncommitted changes",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": "the session has no uncommitted changes",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": "the session has no uncommitted changes",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "done",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "done",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "open",
+          "guard": "something holds the claim, and its owner is proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guard": "something holds the claim, and its owner is proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guard": "something holds the claim, and its owner is proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "open",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "done",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "open",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "done",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "cancelled",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        }
+      ]
+    },
+    "path": "design → design review → implement ⇄ review (⇄ systemic review) → landable",
+    "phase": null,
+    "role_ops": {
+      "coordinator": [
+        "read",
+        "hook",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "workflow",
+        "design",
+        "design_approve",
+        "grant",
+        "exec_request"
+      ],
+      "designer": [
+        "read",
+        "hook",
+        "task_write",
+        "workflow",
+        "design",
+        "design_approve",
+        "exec_request"
+      ],
+      "implementer": [
+        "read",
+        "hook",
+        "task_write",
+        "task_claim",
+        "workflow",
+        "exec_request"
+      ],
+      "operator": [
+        "read",
+        "hook",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "review",
+        "land",
+        "workflow",
+        "design",
+        "design_approve",
+        "grant",
+        "attest",
+        "exec_request",
+        "admin"
+      ],
+      "reviewer": [
+        "read",
+        "hook",
+        "review",
+        "workflow",
+        "design_approve",
+        "exec_request"
+      ],
+      "systemic_reviewer": [
+        "read",
+        "hook",
+        "task_write",
+        "workflow",
+        "exec_request"
+      ]
+    },
+    "spec": {
+      "attributes": {
+        "repeated_area": {
+          "rounds": 2,
+          "scope": "file"
+        }
+      },
+      "graph": "design-gate",
+      "toggles": {
+        "approves_design": [
+          "operator",
+          "coordinator"
+        ],
+        "lands": [
+          "operator"
+        ]
+      }
+    },
+    "status": null,
+    "strategy": "coordinated",
+    "task": null,
+    "workflow": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "design",
+          "next_role": "designer",
+          "next_step": "write the design into the task, then `jkb workflow fire <uid> submit_design`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "design_review",
+          "next_role": "coordinator",
+          "next_step": "read the design, then `jkb workflow fire <uid> approve_design` (or `reject_design`)",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "implement",
+          "next_role": "implementer",
+          "next_step": "implement and commit, then `jkb workflow fire <uid> submit_work`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "review",
+          "next_role": "reviewer",
+          "next_step": "run a review round (`/jkb-review`), then `jkb workflow observe <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "systemic_review",
+          "next_role": "systemic_reviewer",
+          "next_step": "find the systemic cause and record it, then `jkb workflow fire <uid> submit_systemic --reason …` — or `systemic_redesign --reason …` if the fix changes how the operator understands the system",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landable",
+          "next_role": "operator",
+          "next_step": "land it: `jkb task land <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landed",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "command": "jkb workflow fire <uid> submit_design",
+          "event": "submit_design",
+          "fired_by": "operator, designer",
+          "from": "design",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "designer"
+          ],
+          "to": "design_review"
+        },
+        {
+          "command": "jkb workflow fire <uid> approve_design",
+          "event": "approve_design",
+          "fired_by": "operator, coordinator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> reject_design",
+          "event": "reject_design",
+          "fired_by": "operator, coordinator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "design"
+        },
+        {
+          "command": "jkb workflow fire <uid> submit_work",
+          "event": "submit_work",
+          "fired_by": "operator, coordinator, implementer",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "implementer"
+          ],
+          "to": "review"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "review_passed",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a review round was filed since the work was submitted and found no must-fix; the work has not landed and the task is not cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landable"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "review_failed",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, but not the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "review_repeated",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, and the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "systemic_review"
+        },
+        {
+          "command": "jkb workflow fire <uid> submit_systemic --reason <why>",
+          "event": "submit_systemic",
+          "fired_by": "operator, systemic_reviewer",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "systemic_reviewer"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> systemic_redesign --reason <why>",
+          "event": "systemic_redesign",
+          "fired_by": "operator, systemic_reviewer",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "systemic_reviewer"
+          ],
+          "to": "design"
+        },
+        {
+          "command": "jkb workflow fire <uid> rework",
+          "event": "rework",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "implement",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "landable",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "implement",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "landable",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> reopen",
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "landed",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> reopen",
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> reopen",
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landable",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landed",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        }
+      ]
+    }
+  },
+  "design-reviewed": {
+    "changes_from_default": [],
+    "default": "design-reviewed",
+    "describe": "A written design waits for approval before implementation starts.",
+    "graph": "design-gate",
+    "lifecycle": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "open",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "in_progress",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "needs_review",
+          "next_role": null,
+          "next_step": null,
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "done",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": null,
+          "next_step": null,
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "command": null,
+          "event": "start",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "start",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "start",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": "the task is unclaimed, held by whoever starts it, or held by an owner proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "command": null,
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "submit_for_review",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "command": null,
+          "event": "request_changes",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "land",
+          "fired_by": "operator",
+          "from": "in_progress",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "land",
+          "fired_by": "operator",
+          "from": "needs_review",
+          "guard": "there is work to land: a session or commits; the session has no uncommitted changes; it has commits the target lacks; no subtask is open; the checkout the graft happens in is clean; and a review of the current head has no open must-fix (unless landed with `--no-review`)",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "land",
+          "fired_by": "operator",
+          "from": "done",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": "the session has no uncommitted changes",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": "the session has no uncommitted changes",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "abandon",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": "the session has no uncommitted changes",
+          "guarded": true,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "cancel",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": null,
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "done",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "open",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "reopen",
+          "fired_by": "applied",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "done",
+          "guard": "a merged pull request, or jkb's own merge queue, proves the work reached its target, and no subtask is open",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "done"
+        },
+        {
+          "command": null,
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "open",
+          "guard": "something holds the claim, and its owner is proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "open"
+        },
+        {
+          "command": null,
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guard": "something holds the claim, and its owner is proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "in_progress"
+        },
+        {
+          "command": null,
+          "event": "observed_owner_gone",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guard": "something holds the claim, and its owner is proven gone",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": "needs_review"
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "open",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "in_progress",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "needs_review",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "done",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "override",
+          "fired_by": "operator, coordinator",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": true,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "open",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "in_progress",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "needs_review",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "done",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        },
+        {
+          "command": null,
+          "event": "set_from_file",
+          "fired_by": "observed",
+          "from": "cancelled",
+          "guard": "the task is backed by a synced file that states a status for it",
+          "guarded": true,
+          "planned": true,
+          "reconciled": true,
+          "roles": [],
+          "to": null
+        }
+      ]
+    },
+    "path": "design → design review → implement ⇄ review (⇄ systemic review) → landable",
+    "phase": null,
+    "role_ops": {
+      "coordinator": [
+        "read",
+        "hook",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "workflow",
+        "design",
+        "design_approve",
+        "grant",
+        "exec_request"
+      ],
+      "designer": [
+        "read",
+        "hook",
+        "task_write",
+        "workflow",
+        "design",
+        "design_approve",
+        "exec_request"
+      ],
+      "implementer": [
+        "read",
+        "hook",
+        "task_write",
+        "task_claim",
+        "workflow",
+        "exec_request"
+      ],
+      "operator": [
+        "read",
+        "hook",
+        "task_write",
+        "task_status",
+        "task_claim",
+        "review",
+        "land",
+        "workflow",
+        "design",
+        "design_approve",
+        "grant",
+        "attest",
+        "exec_request",
+        "admin"
+      ],
+      "reviewer": [
+        "read",
+        "hook",
+        "review",
+        "workflow",
+        "design_approve",
+        "exec_request"
+      ],
+      "systemic_reviewer": [
+        "read",
+        "hook",
+        "task_write",
+        "workflow",
+        "exec_request"
+      ]
+    },
+    "spec": {
+      "attributes": {
+        "repeated_area": {
+          "rounds": 2,
+          "scope": "file"
+        }
+      },
+      "graph": "design-gate",
+      "toggles": {
+        "approves_design": [
+          "operator"
+        ],
+        "lands": [
+          "operator"
+        ]
+      }
+    },
+    "status": null,
+    "strategy": "design-reviewed",
+    "task": null,
+    "workflow": {
+      "states": [
+        {
+          "awaits_input": false,
+          "initial": true,
+          "name": "design",
+          "next_role": "designer",
+          "next_step": "write the design into the task, then `jkb workflow fire <uid> submit_design`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "design_review",
+          "next_role": "operator",
+          "next_step": "read the design, then `jkb workflow fire <uid> approve_design` (or `reject_design`)",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "implement",
+          "next_role": "implementer",
+          "next_step": "implement and commit, then `jkb workflow fire <uid> submit_work`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "review",
+          "next_role": "reviewer",
+          "next_step": "run a review round (`/jkb-review`), then `jkb workflow observe <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "systemic_review",
+          "next_role": "systemic_reviewer",
+          "next_step": "find the systemic cause and record it, then `jkb workflow fire <uid> submit_systemic --reason …` — or `systemic_redesign --reason …` if the fix changes how the operator understands the system",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landable",
+          "next_role": "operator",
+          "next_step": "land it: `jkb task land <uid>`",
+          "settled": false
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "landed",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        },
+        {
+          "awaits_input": false,
+          "initial": false,
+          "name": "cancelled",
+          "next_role": "operator",
+          "next_step": "nothing: the task is settled",
+          "settled": true
+        }
+      ],
+      "transitions": [
+        {
+          "command": "jkb workflow fire <uid> submit_design",
+          "event": "submit_design",
+          "fired_by": "operator, designer",
+          "from": "design",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "designer"
+          ],
+          "to": "design_review"
+        },
+        {
+          "command": "jkb workflow fire <uid> approve_design",
+          "event": "approve_design",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> reject_design",
+          "event": "reject_design",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "design"
+        },
+        {
+          "command": "jkb workflow fire <uid> submit_work",
+          "event": "submit_work",
+          "fired_by": "operator, coordinator, implementer",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator",
+            "implementer"
+          ],
+          "to": "review"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "review_passed",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a review round was filed since the work was submitted and found no must-fix; the work has not landed and the task is not cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landable"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "review_failed",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, but not the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "review_repeated",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a review round was filed since the work was submitted and found must-fixes, and the newest 2 rounds all flagged must-fixes in the same file; the work has not landed and the task is not cancelled",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "systemic_review"
+        },
+        {
+          "command": "jkb workflow fire <uid> submit_systemic --reason <why>",
+          "event": "submit_systemic",
+          "fired_by": "operator, systemic_reviewer",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "systemic_reviewer"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> systemic_redesign --reason <why>",
+          "event": "systemic_redesign",
+          "fired_by": "operator, systemic_reviewer",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "systemic_reviewer"
+          ],
+          "to": "design"
+        },
+        {
+          "command": "jkb workflow fire <uid> rework",
+          "event": "rework",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "implement",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_landed",
+          "fired_by": "observed",
+          "from": "landable",
+          "guard": "a landing is recorded for the work (a `done` checkbox is not a landing)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "landed"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "design_review",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "implement",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "review",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "systemic_review",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow observe <uid>",
+          "event": "observed_cancelled",
+          "fired_by": "observed",
+          "from": "landable",
+          "guard": "the task is cancelled and its work has not landed",
+          "guarded": true,
+          "planned": false,
+          "reconciled": true,
+          "roles": [],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> cancel",
+          "event": "cancel",
+          "fired_by": "operator, coordinator",
+          "from": "landable",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator",
+            "coordinator"
+          ],
+          "to": "cancelled"
+        },
+        {
+          "command": "jkb workflow fire <uid> reopen",
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "landed",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> reopen",
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guard": "the task itself is back to work: no landing speaks for it and its status is neither done nor cancelled (`jkb task set <uid> --status open` first)",
+          "guarded": true,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> reopen",
+          "event": "reopen",
+          "fired_by": "operator",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": "implement"
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "design_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "implement",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "systemic_review",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landable",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "landed",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        },
+        {
+          "command": "jkb workflow fire <uid> override --to <phase> --reason <why>",
+          "event": "override",
+          "fired_by": "operator",
+          "from": "cancelled",
+          "guard": null,
+          "guarded": false,
+          "planned": false,
+          "reconciled": false,
+          "roles": [
+            "operator"
+          ],
+          "to": null
+        }
+      ]
+    }
+  }
+}

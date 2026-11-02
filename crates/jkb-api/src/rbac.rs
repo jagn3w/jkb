@@ -62,6 +62,10 @@ pub enum OpPermission {
     Grant,
     /// Mint and release harness tickets — the container credential's own job.
     Attest,
+    /// Ask the operator to run one command (the Executions design). Held by every role but the
+    /// operator, statically; the op itself also needs an attested session ([`crate::exec::requester`]).
+    /// Approving, declining and running are [`OpPermission::Admin`], so no session approves its own.
+    ExecRequest,
     /// The operator's: reclaim, break leases, remove items, move namespaces, compact the queue,
     /// choose strategies, map agent types, rotate the container credential.
     Admin,
@@ -81,6 +85,7 @@ impl jkb_rbac::Permission for OpPermission {
         Self::DesignApprove,
         Self::Grant,
         Self::Attest,
+        Self::ExecRequest,
         Self::Admin,
     ];
 
@@ -98,7 +103,64 @@ impl jkb_rbac::Permission for OpPermission {
             Self::DesignApprove => "design_approve",
             Self::Grant => "grant",
             Self::Attest => "attest",
+            Self::ExecRequest => "exec_request",
             Self::Admin => "admin",
+        }
+    }
+}
+
+impl OpPermission {
+    /// What holding this class lets a role do, in one plain sentence: what the Workflows tab's Roles
+    /// view and `jkb workflow roles` print beside the class's name. Beside
+    /// [`Role::describe`](jkb_core::roles::Role::describe), so a role and its op classes read in the
+    /// same words everywhere.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Read => {
+                "Read the knowledge base: tasks, items, namespaces, views, history, designs, \
+                 workflows, roles, timelines, leases, removals and its own run requests; and bind \
+                 an attested agent to its task."
+            }
+            Self::Hook => {
+                "Send what every agent's hooks send: notifications, the session registry, and \
+                 messages on the queue."
+            }
+            Self::TaskWrite => {
+                "Add tasks and change their text, fields, tags, dependencies, placement and \
+                 bindings; record a task's worktree location and its pull request; ingest text; \
+                 write investigations."
+            }
+            Self::TaskStatus => "Set a task's status directly, past its workflow.",
+            Self::TaskClaim => {
+                "Claim, start, take, abandon or release work; take and release a repo's land \
+                 lease; queue, archive, cancel and drop worktree removals."
+            }
+            Self::Review => "File and record a review round.",
+            Self::Land => {
+                "Land a task's branch, check whether it may land, record a landing and close tasks \
+                 merged elsewhere, where the task's strategy lets the role."
+            }
+            Self::Workflow => {
+                "Fire or observe workflow events, each as the task's strategy allows."
+            }
+            Self::Design => {
+                "Write design documents: create, move, split, edit and stage them and their parts, \
+                 apply changes, reply to threads, and record plans, prompts, targets and sources."
+            }
+            Self::DesignApprove => "Approve a part of a design, when it names this reviewer.",
+            Self::Grant => "Hand out and revoke role grants, of the roles it may grant.",
+            Self::Attest => {
+                "Vouch for which agent made a tool call: the dev container's credential alone."
+            }
+            Self::ExecRequest => "Ask the operator to run one command.",
+            Self::Admin => {
+                "The operator's own: choose and define strategies, edit agent templates, map agent \
+                 types, rotate the container credential, reclaim work, break leases, waive \
+                 reviews, record what ran on the host, remove items, move namespaces, compact the \
+                 queue and designs, start and resolve design threads, approve selections, retire \
+                 and restore designs, and approve, decline, refuse, run and finish run requests."
+            }
         }
     }
 }
@@ -118,6 +180,7 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
             permits: &[
                 OpPermission::Read,
                 OpPermission::Hook,
+                OpPermission::ExecRequest,
                 OpPermission::TaskWrite,
                 OpPermission::TaskStatus,
                 OpPermission::TaskClaim,
@@ -135,6 +198,7 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
             permits: &[
                 OpPermission::Read,
                 OpPermission::Hook,
+                OpPermission::ExecRequest,
                 OpPermission::TaskWrite,
                 OpPermission::Workflow,
                 // The design is the designer's to write, and a span naming `claude` is a Claude
@@ -148,6 +212,7 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
             permits: &[
                 OpPermission::Read,
                 OpPermission::Hook,
+                OpPermission::ExecRequest,
                 OpPermission::TaskWrite,
                 OpPermission::TaskClaim,
                 OpPermission::Workflow,
@@ -158,6 +223,7 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
             permits: &[
                 OpPermission::Read,
                 OpPermission::Hook,
+                OpPermission::ExecRequest,
                 OpPermission::Review,
                 OpPermission::Workflow,
                 OpPermission::DesignApprove,
@@ -168,6 +234,7 @@ pub static OP_GRANTS: RoleTable<Role, OpPermission> = RoleTable {
             permits: &[
                 OpPermission::Read,
                 OpPermission::Hook,
+                OpPermission::ExecRequest,
                 OpPermission::TaskWrite,
                 OpPermission::Workflow,
             ],
@@ -219,6 +286,7 @@ impl Request {
             | Self::WorkflowShow { .. }
             | Self::WorkflowStrategies {}
             | Self::WorkflowGraph { .. }
+            | Self::WorkflowRoles { .. }
             | Self::WorkflowAgents {}
             | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }
@@ -231,7 +299,16 @@ impl Request {
             | Self::DesignPlans { .. }
             | Self::DesignPrompt { .. }
             | Self::DesignPrompts { .. }
-            | Self::DesignPromptOf { .. } => OpPermission::Read,
+            | Self::DesignPromptOf { .. }
+            | Self::TimelineSessions {}
+            | Self::TimelineSession { .. }
+            | Self::TimelineTask { .. }
+            | Self::TimelinePlan { .. }
+            // Held to the reader's own session by the op ([`crate::exec::reader`]).
+            | Self::ExecStatus { .. }
+            | Self::ExecList { .. }
+            | Self::ExecFollow { .. } => OpPermission::Read,
+            Self::ExecRequest(_) => OpPermission::ExecRequest,
             Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -323,7 +400,13 @@ impl Request {
             | Self::DesignCompact { .. }
             // Hiding a design from every role is the operator's call, as deleting an item is.
             | Self::DesignRetire { .. }
-            | Self::DesignRestore { .. } => OpPermission::Admin,
+            | Self::DesignRestore { .. }
+            // Approving, declining and running a run request: never the session that asked.
+            | Self::ExecBegin { .. }
+            | Self::ExecDecline { .. }
+            | Self::ExecRefuse { .. }
+            | Self::ExecFinish { .. }
+            | Self::ExecOutput { .. } => OpPermission::Admin,
         }
     }
 
@@ -405,7 +488,13 @@ impl Request {
             | Self::DesignSources { .. }
             | Self::DesignCompact { .. }
             | Self::DesignRetire { .. }
-            | Self::DesignRestore { .. } => Target::Shared,
+            | Self::DesignRestore { .. }
+            // The runner's moves are the operator's alone.
+            | Self::ExecBegin { .. }
+            | Self::ExecDecline { .. }
+            | Self::ExecRefuse { .. }
+            | Self::ExecFinish { .. }
+            | Self::ExecOutput { .. } => Target::Shared,
             // An approval is held to the reviewer the span names by the engine (`design::approve`),
             // and is how a mapped `reviewer` subagent — attested, so held to one task for shared
             // writes — signs off a span naming `claude` (D53.5). Shared, it could never run.
@@ -457,6 +546,7 @@ impl Request {
             | Self::WorkflowShow { .. }
             | Self::WorkflowStrategies {}
             | Self::WorkflowGraph { .. }
+            | Self::WorkflowRoles { .. }
             | Self::WorkflowAgents {}
             | Self::WorkflowAgent { .. }
             | Self::DesignList { .. }
@@ -470,6 +560,10 @@ impl Request {
             | Self::DesignPrompt { .. }
             | Self::DesignPrompts { .. }
             | Self::DesignPromptOf { .. }
+            | Self::TimelineSessions {}
+            | Self::TimelineSession { .. }
+            | Self::TimelineTask { .. }
+            | Self::TimelinePlan { .. }
             | Self::MqTopicCreate { .. }
             | Self::MqSend { .. }
             | Self::MqGroupCreate { .. }
@@ -485,7 +579,14 @@ impl Request {
             | Self::SessionEnded { .. }
             | Self::SessionGone { .. }
             | Self::SessionList { .. }
-            | Self::SessionState { .. } => Target::Free,
+            | Self::SessionState { .. }
+            // A run request is the asking session's own record, whatever task it is bound to — and a
+            // bound worker is exactly who asks. Its callee takes the requester from the principal
+            // and holds a reader to its own session.
+            | Self::ExecRequest(_)
+            | Self::ExecStatus { .. }
+            | Self::ExecList { .. }
+            | Self::ExecFollow { .. } => Target::Free,
         }
     }
 }
@@ -954,6 +1055,23 @@ fn reference_of<'r>(
     })
 }
 
+/// Whether [`OP_GRANTS`] lets `roles` run ops of class `permission`.
+fn grants_decision(roles: &[Role], permission: OpPermission) -> Decision {
+    RoleBased::new(&OP_GRANTS).decide(roles, Requirement::Permission(permission))
+}
+
+/// Whether `roles` may run ops of class `permission` under `spec`, by role alone, as [`authorize`]
+/// decides it: `land` by the strategy (`StrategySpec::may_land`, its `lands` toggle), every other
+/// class by [`OP_GRANTS`]. A task's scope and the container-only `attest` are `authorize`'s further
+/// checks on top.
+#[must_use]
+pub fn role_decision(spec: &StrategySpec, roles: &[Role], permission: OpPermission) -> Decision {
+    match permission {
+        OpPermission::Land => spec.may_land(roles),
+        _ => grants_decision(roles, permission),
+    }
+}
+
 /// May `principal` run `request`? The operator may run anything. Everyone else is held to
 /// [`OP_GRANTS`], to its task scope for an op that writes one task, to the task's strategy for a
 /// landing, and — for attestation — to being the container credential itself.
@@ -998,9 +1116,7 @@ pub fn authorize(
         }
         OpPermission::Land => {}
         _ => {
-            if let Decision::Deny(no) = RoleBased::new(&OP_GRANTS)
-                .decide(&principal.roles, Requirement::Permission(permission))
-            {
+            if let Decision::Deny(no) = grants_decision(&principal.roles, permission) {
                 let mut e = deny(&no, op);
                 if permission == OpPermission::Review {
                     e.message.push_str(
@@ -1023,7 +1139,9 @@ pub fn authorize(
     };
     if permission == OpPermission::Land {
         let current = wf::current(conn, target)?;
-        if let Decision::Deny(no) = current.spec.may_land(&principal.roles) {
+        if let Decision::Deny(no) =
+            role_decision(&current.spec, &principal.roles, OpPermission::Land)
+        {
             return Err(deny(&no, op));
         }
         // A workflow parked at `landed`/`cancelled` is picked back up by the operator alone
@@ -1503,10 +1621,19 @@ pub struct StrategyInfo {
     pub name: String,
     /// A preset, or an operator definition.
     pub preset: bool,
-    /// One line.
+    /// One sentence on why to choose it. A definition written before descriptions were recorded
+    /// reads `No description recorded (graph: <graph sentence>)`.
     pub describe: String,
+    /// One sentence on its graph ([`jkb_core::workflow::GraphId::describe`]); empty from a daemon
+    /// that predates the field.
+    #[serde(default)]
+    pub graph: String,
     /// Its spec.
     pub spec: serde_json::Value,
+    /// When a definition's listed version was defined (RFC 3339, UTC); absent for a preset, and from
+    /// a daemon that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defined_at: Option<String>,
 }
 
 /// `workflow.strategies`: the presets, then the operator's definitions, and which is the default.
@@ -1519,20 +1646,27 @@ pub fn strategies(conn: &Connection) -> Result<(Vec<StrategyInfo>, String), ApiE
     };
     let mut out = Vec::new();
     for p in PRESETS {
+        let spec = (p.spec)();
         out.push(StrategyInfo {
             name: p.name.to_owned(),
             preset: true,
             describe: p.describe.to_owned(),
-            spec: json(&(p.spec)())?,
+            graph: spec.graph.describe().to_owned(),
+            spec: json(&spec)?,
+            defined_at: None,
         });
     }
-    for (name, version, spec) in wf::definitions(conn)? {
-        let spec = StrategySpec::from_json(&spec)?;
+    for d in wf::definitions(conn)? {
+        let spec = StrategySpec::from_json(&d.spec)?;
         out.push(StrategyInfo {
-            name: format!("{name}@{version}"),
+            name: format!("{}@{}", d.name, d.version),
             preset: false,
-            describe: spec.graph.describe().to_owned(),
+            describe: d.describe.unwrap_or_else(|| {
+                format!("No description recorded (graph: {})", spec.graph.describe())
+            }),
+            graph: spec.graph.describe().to_owned(),
             spec: json(&spec)?,
+            defined_at: Some(d.defined_at),
         });
     }
     Ok((out, wf::default_strategy(conn)?.0))
@@ -1541,15 +1675,17 @@ pub fn strategies(conn: &Connection) -> Result<(Vec<StrategyInfo>, String), ApiE
 /// `workflow.define` (operator).
 ///
 /// # Errors
-/// [`ErrorCode::Invalid`] for a spec that does not parse or validate.
+/// [`ErrorCode::Invalid`] for an empty or over-long description, or a spec that does not parse or
+/// validate.
 pub fn define(
     conn: &Connection,
     meta: &WriteMeta,
     name: &str,
+    describe: &str,
     spec: &serde_json::Value,
 ) -> Result<i64, ApiError> {
     let spec = StrategySpec::from_json(&spec.to_string())?;
-    Ok(wf::define(conn, meta, name, &spec)?)
+    Ok(wf::define(conn, meta, name, describe, &spec)?)
 }
 
 /// `attest.mint`: a ticket for one tool call, carrying what the harness reported. Only the container

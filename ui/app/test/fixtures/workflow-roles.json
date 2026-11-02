@@ -1,0 +1,1251 @@
+{
+  "autonomous": {
+    "roles": [
+      {
+        "acts_next_in": [
+          "design_review",
+          "landed",
+          "cancelled"
+        ],
+        "agent_types": [],
+        "describe": "The human. Holds everything, and is the only role whose credential never enters the dev container.",
+        "events": [
+          "submit_design",
+          "approve_design",
+          "reject_design",
+          "submit_work",
+          "submit_systemic",
+          "systemic_redesign",
+          "rework",
+          "cancel",
+          "reopen",
+          "override"
+        ],
+        "fires_in": [
+          "design",
+          "design_review",
+          "implement",
+          "review",
+          "systemic_review",
+          "landable",
+          "landed",
+          "cancelled"
+        ],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": true,
+        "may_grant": [
+          "operator",
+          "coordinator",
+          "designer",
+          "implementer",
+          "reviewer",
+          "systemic_reviewer"
+        ],
+        "name": "operator",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Set a task's status directly, past its workflow.",
+            "name": "task_status"
+          },
+          {
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
+            "name": "task_claim"
+          },
+          {
+            "describe": "File and record a review round.",
+            "name": "review"
+          },
+          {
+            "describe": "Land a task's branch, check whether it may land, record a landing and close tasks merged elsewhere, where the task's strategy lets the role.",
+            "name": "land"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
+            "name": "design"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Hand out and revoke role grants, of the roles it may grant.",
+            "name": "grant"
+          },
+          {
+            "describe": "Vouch for which agent made a tool call: the dev container's credential alone.",
+            "name": "attest"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          },
+          {
+            "describe": "The operator's own: choose and define strategies, edit agent templates, map agent types, rotate the container credential, reclaim work, break leases, waive reviews, record what ran on the host, remove items, move namespaces, compact the queue and designs, start and resolve design threads, approve selections, retire and restore designs, and approve, decline, refuse, run and finish run requests.",
+            "name": "admin"
+          }
+        ],
+        "toggled_by": [
+          {
+            "on": true,
+            "toggle": "approves_design"
+          },
+          {
+            "on": true,
+            "toggle": "lands"
+          }
+        ]
+      },
+      {
+        "acts_next_in": [
+          "landable"
+        ],
+        "agent_types": [],
+        "describe": "The session driving a task: spawns workers, advances the workflow, never approves what the operator approves unless the task's strategy toggles say so.",
+        "events": [
+          "submit_work",
+          "rework",
+          "cancel"
+        ],
+        "fires_in": [
+          "design",
+          "design_review",
+          "implement",
+          "review",
+          "systemic_review",
+          "landable"
+        ],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": true,
+        "may_grant": [
+          "designer",
+          "implementer"
+        ],
+        "name": "coordinator",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Set a task's status directly, past its workflow.",
+            "name": "task_status"
+          },
+          {
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
+            "name": "task_claim"
+          },
+          {
+            "describe": "Land a task's branch, check whether it may land, record a landing and close tasks merged elsewhere, where the task's strategy lets the role.",
+            "name": "land"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
+            "name": "design"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Hand out and revoke role grants, of the roles it may grant.",
+            "name": "grant"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": [
+          {
+            "on": false,
+            "toggle": "approves_design"
+          },
+          {
+            "on": true,
+            "toggle": "lands"
+          }
+        ]
+      },
+      {
+        "acts_next_in": [
+          "design"
+        ],
+        "agent_types": [],
+        "describe": "Gathers details and writes the design.",
+        "events": [
+          "submit_design"
+        ],
+        "fires_in": [
+          "design"
+        ],
+        "granted_by": [
+          "operator",
+          "coordinator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "designer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
+            "name": "design"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      },
+      {
+        "acts_next_in": [
+          "implement"
+        ],
+        "agent_types": [],
+        "describe": "Writes the code.",
+        "events": [
+          "submit_work"
+        ],
+        "fires_in": [
+          "implement"
+        ],
+        "granted_by": [
+          "operator",
+          "coordinator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "implementer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
+            "name": "task_claim"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      },
+      {
+        "acts_next_in": [
+          "review"
+        ],
+        "agent_types": [],
+        "describe": "Reviews it and files findings.",
+        "events": [],
+        "fires_in": [],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "reviewer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "File and record a review round.",
+            "name": "review"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      },
+      {
+        "acts_next_in": [
+          "systemic_review"
+        ],
+        "agent_types": [],
+        "describe": "Looks for the systemic cause when review keeps finding the same areas.",
+        "events": [
+          "submit_systemic",
+          "systemic_redesign"
+        ],
+        "fires_in": [
+          "systemic_review"
+        ],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "systemic_reviewer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      }
+    ],
+    "strategy": "autonomous",
+    "toggles": [
+      {
+        "acts_in": "design_review",
+        "controls": [
+          "approve_design",
+          "reject_design"
+        ],
+        "domain": [
+          "operator",
+          "coordinator"
+        ],
+        "label": "approves designs",
+        "name": "approves_design",
+        "value": [
+          "operator"
+        ]
+      },
+      {
+        "acts_in": null,
+        "controls": [
+          "land"
+        ],
+        "domain": [
+          "operator",
+          "coordinator"
+        ],
+        "label": "lands",
+        "name": "lands",
+        "value": [
+          "operator",
+          "coordinator"
+        ]
+      }
+    ]
+  },
+  "coordinated": {
+    "roles": [
+      {
+        "acts_next_in": [
+          "landable",
+          "landed",
+          "cancelled"
+        ],
+        "agent_types": [],
+        "describe": "The human. Holds everything, and is the only role whose credential never enters the dev container.",
+        "events": [
+          "submit_design",
+          "approve_design",
+          "reject_design",
+          "submit_work",
+          "submit_systemic",
+          "systemic_redesign",
+          "rework",
+          "cancel",
+          "reopen",
+          "override"
+        ],
+        "fires_in": [
+          "design",
+          "design_review",
+          "implement",
+          "review",
+          "systemic_review",
+          "landable",
+          "landed",
+          "cancelled"
+        ],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": true,
+        "may_grant": [
+          "operator",
+          "coordinator",
+          "designer",
+          "implementer",
+          "reviewer",
+          "systemic_reviewer"
+        ],
+        "name": "operator",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Set a task's status directly, past its workflow.",
+            "name": "task_status"
+          },
+          {
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
+            "name": "task_claim"
+          },
+          {
+            "describe": "File and record a review round.",
+            "name": "review"
+          },
+          {
+            "describe": "Land a task's branch, check whether it may land, record a landing and close tasks merged elsewhere, where the task's strategy lets the role.",
+            "name": "land"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
+            "name": "design"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Hand out and revoke role grants, of the roles it may grant.",
+            "name": "grant"
+          },
+          {
+            "describe": "Vouch for which agent made a tool call: the dev container's credential alone.",
+            "name": "attest"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          },
+          {
+            "describe": "The operator's own: choose and define strategies, edit agent templates, map agent types, rotate the container credential, reclaim work, break leases, waive reviews, record what ran on the host, remove items, move namespaces, compact the queue and designs, start and resolve design threads, approve selections, retire and restore designs, and approve, decline, refuse, run and finish run requests.",
+            "name": "admin"
+          }
+        ],
+        "toggled_by": [
+          {
+            "on": true,
+            "toggle": "approves_design"
+          },
+          {
+            "on": true,
+            "toggle": "lands"
+          }
+        ]
+      },
+      {
+        "acts_next_in": [
+          "design_review"
+        ],
+        "agent_types": [],
+        "describe": "The session driving a task: spawns workers, advances the workflow, never approves what the operator approves unless the task's strategy toggles say so.",
+        "events": [
+          "approve_design",
+          "reject_design",
+          "submit_work",
+          "rework",
+          "cancel"
+        ],
+        "fires_in": [
+          "design",
+          "design_review",
+          "implement",
+          "review",
+          "systemic_review",
+          "landable"
+        ],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": false,
+        "may_grant": [
+          "designer",
+          "implementer"
+        ],
+        "name": "coordinator",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Set a task's status directly, past its workflow.",
+            "name": "task_status"
+          },
+          {
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
+            "name": "task_claim"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
+            "name": "design"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Hand out and revoke role grants, of the roles it may grant.",
+            "name": "grant"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": [
+          {
+            "on": true,
+            "toggle": "approves_design"
+          },
+          {
+            "on": false,
+            "toggle": "lands"
+          }
+        ]
+      },
+      {
+        "acts_next_in": [
+          "design"
+        ],
+        "agent_types": [],
+        "describe": "Gathers details and writes the design.",
+        "events": [
+          "submit_design"
+        ],
+        "fires_in": [
+          "design"
+        ],
+        "granted_by": [
+          "operator",
+          "coordinator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "designer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
+            "name": "design"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      },
+      {
+        "acts_next_in": [
+          "implement"
+        ],
+        "agent_types": [],
+        "describe": "Writes the code.",
+        "events": [
+          "submit_work"
+        ],
+        "fires_in": [
+          "implement"
+        ],
+        "granted_by": [
+          "operator",
+          "coordinator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "implementer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
+            "name": "task_claim"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      },
+      {
+        "acts_next_in": [
+          "review"
+        ],
+        "agent_types": [],
+        "describe": "Reviews it and files findings.",
+        "events": [],
+        "fires_in": [],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "reviewer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "File and record a review round.",
+            "name": "review"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      },
+      {
+        "acts_next_in": [
+          "systemic_review"
+        ],
+        "agent_types": [],
+        "describe": "Looks for the systemic cause when review keeps finding the same areas.",
+        "events": [
+          "submit_systemic",
+          "systemic_redesign"
+        ],
+        "fires_in": [
+          "systemic_review"
+        ],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "systemic_reviewer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      }
+    ],
+    "strategy": "coordinated",
+    "toggles": [
+      {
+        "acts_in": "design_review",
+        "controls": [
+          "approve_design",
+          "reject_design"
+        ],
+        "domain": [
+          "operator",
+          "coordinator"
+        ],
+        "label": "approves designs",
+        "name": "approves_design",
+        "value": [
+          "operator",
+          "coordinator"
+        ]
+      },
+      {
+        "acts_in": null,
+        "controls": [
+          "land"
+        ],
+        "domain": [
+          "operator",
+          "coordinator"
+        ],
+        "label": "lands",
+        "name": "lands",
+        "value": [
+          "operator"
+        ]
+      }
+    ]
+  },
+  "design-reviewed": {
+    "roles": [
+      {
+        "acts_next_in": [
+          "design_review",
+          "landable",
+          "landed",
+          "cancelled"
+        ],
+        "agent_types": [],
+        "describe": "The human. Holds everything, and is the only role whose credential never enters the dev container.",
+        "events": [
+          "submit_design",
+          "approve_design",
+          "reject_design",
+          "submit_work",
+          "submit_systemic",
+          "systemic_redesign",
+          "rework",
+          "cancel",
+          "reopen",
+          "override"
+        ],
+        "fires_in": [
+          "design",
+          "design_review",
+          "implement",
+          "review",
+          "systemic_review",
+          "landable",
+          "landed",
+          "cancelled"
+        ],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": true,
+        "may_grant": [
+          "operator",
+          "coordinator",
+          "designer",
+          "implementer",
+          "reviewer",
+          "systemic_reviewer"
+        ],
+        "name": "operator",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Set a task's status directly, past its workflow.",
+            "name": "task_status"
+          },
+          {
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
+            "name": "task_claim"
+          },
+          {
+            "describe": "File and record a review round.",
+            "name": "review"
+          },
+          {
+            "describe": "Land a task's branch, check whether it may land, record a landing and close tasks merged elsewhere, where the task's strategy lets the role.",
+            "name": "land"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
+            "name": "design"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Hand out and revoke role grants, of the roles it may grant.",
+            "name": "grant"
+          },
+          {
+            "describe": "Vouch for which agent made a tool call: the dev container's credential alone.",
+            "name": "attest"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          },
+          {
+            "describe": "The operator's own: choose and define strategies, edit agent templates, map agent types, rotate the container credential, reclaim work, break leases, waive reviews, record what ran on the host, remove items, move namespaces, compact the queue and designs, start and resolve design threads, approve selections, retire and restore designs, and approve, decline, refuse, run and finish run requests.",
+            "name": "admin"
+          }
+        ],
+        "toggled_by": [
+          {
+            "on": true,
+            "toggle": "approves_design"
+          },
+          {
+            "on": true,
+            "toggle": "lands"
+          }
+        ]
+      },
+      {
+        "acts_next_in": [],
+        "agent_types": [],
+        "describe": "The session driving a task: spawns workers, advances the workflow, never approves what the operator approves unless the task's strategy toggles say so.",
+        "events": [
+          "submit_work",
+          "rework",
+          "cancel"
+        ],
+        "fires_in": [
+          "design",
+          "design_review",
+          "implement",
+          "review",
+          "systemic_review",
+          "landable"
+        ],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": false,
+        "may_grant": [
+          "designer",
+          "implementer"
+        ],
+        "name": "coordinator",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Set a task's status directly, past its workflow.",
+            "name": "task_status"
+          },
+          {
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
+            "name": "task_claim"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
+            "name": "design"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Hand out and revoke role grants, of the roles it may grant.",
+            "name": "grant"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": [
+          {
+            "on": false,
+            "toggle": "approves_design"
+          },
+          {
+            "on": false,
+            "toggle": "lands"
+          }
+        ]
+      },
+      {
+        "acts_next_in": [
+          "design"
+        ],
+        "agent_types": [],
+        "describe": "Gathers details and writes the design.",
+        "events": [
+          "submit_design"
+        ],
+        "fires_in": [
+          "design"
+        ],
+        "granted_by": [
+          "operator",
+          "coordinator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "designer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Write design documents: create, move, split, edit and stage them and their parts, apply changes, reply to threads, and record plans, prompts, targets and sources.",
+            "name": "design"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      },
+      {
+        "acts_next_in": [
+          "implement"
+        ],
+        "agent_types": [],
+        "describe": "Writes the code.",
+        "events": [
+          "submit_work"
+        ],
+        "fires_in": [
+          "implement"
+        ],
+        "granted_by": [
+          "operator",
+          "coordinator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "implementer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Claim, start, take, abandon or release work; take and release a repo's land lease; queue, archive, cancel and drop worktree removals.",
+            "name": "task_claim"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      },
+      {
+        "acts_next_in": [
+          "review"
+        ],
+        "agent_types": [],
+        "describe": "Reviews it and files findings.",
+        "events": [],
+        "fires_in": [],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "reviewer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "File and record a review round.",
+            "name": "review"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Approve a part of a design, when it names this reviewer.",
+            "name": "design_approve"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      },
+      {
+        "acts_next_in": [
+          "systemic_review"
+        ],
+        "agent_types": [],
+        "describe": "Looks for the systemic cause when review keeps finding the same areas.",
+        "events": [
+          "submit_systemic",
+          "systemic_redesign"
+        ],
+        "fires_in": [
+          "systemic_review"
+        ],
+        "granted_by": [
+          "operator"
+        ],
+        "lands": false,
+        "may_grant": [],
+        "name": "systemic_reviewer",
+        "ops": [
+          {
+            "describe": "Read the knowledge base: tasks, items, namespaces, views, history, designs, workflows, roles, timelines, leases, removals and its own run requests; and bind an attested agent to its task.",
+            "name": "read"
+          },
+          {
+            "describe": "Send what every agent's hooks send: notifications, the session registry, and messages on the queue.",
+            "name": "hook"
+          },
+          {
+            "describe": "Add tasks and change their text, fields, tags, dependencies, placement and bindings; record a task's worktree location and its pull request; ingest text; write investigations.",
+            "name": "task_write"
+          },
+          {
+            "describe": "Fire or observe workflow events, each as the task's strategy allows.",
+            "name": "workflow"
+          },
+          {
+            "describe": "Ask the operator to run one command.",
+            "name": "exec_request"
+          }
+        ],
+        "toggled_by": []
+      }
+    ],
+    "strategy": "design-reviewed",
+    "toggles": [
+      {
+        "acts_in": "design_review",
+        "controls": [
+          "approve_design",
+          "reject_design"
+        ],
+        "domain": [
+          "operator",
+          "coordinator"
+        ],
+        "label": "approves designs",
+        "name": "approves_design",
+        "value": [
+          "operator"
+        ]
+      },
+      {
+        "acts_in": null,
+        "controls": [
+          "land"
+        ],
+        "domain": [
+          "operator",
+          "coordinator"
+        ],
+        "label": "lands",
+        "name": "lands",
+        "value": [
+          "operator"
+        ]
+      }
+    ]
+  }
+}
