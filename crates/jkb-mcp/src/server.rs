@@ -86,7 +86,7 @@ impl JkbServer {
 
     /// Structured query over the item substrate.
     #[tool(
-        description = "Run a structured query (DSL: kind:, status:, ns:.../**, tag:, is:ready, ...) and return matching items."
+        description = "Run a structured query (DSL: kind:, status:, ns:.../**, tag:, is:ready, is:unplanned, ...) and return matching items."
     )]
     async fn query(&self, params: Parameters<QueryArgs>) -> Result<CallToolResult, ErrorData> {
         self.run(move |t| logic::query(&t, &params.0)).await

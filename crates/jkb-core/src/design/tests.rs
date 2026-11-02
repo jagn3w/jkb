@@ -3581,3 +3581,122 @@ fn a_retired_design_is_refused_by_export_and_by_set_doc_target() {
     let u = uid.clone();
     db.read(move |c| export::export(c, &u)).unwrap();
 }
+
+/// The uids `dsl` selects, sorted.
+fn dsl_uids(db: &Db, dsl: &str) -> Vec<String> {
+    let dsl = dsl.to_owned();
+    let mut uids = db
+        .read(move |c| {
+            let ids = crate::query::parse(&dsl)?.evaluate(c)?;
+            ids.into_iter()
+                .map(|id| Ok(item::get(c, id)?.unwrap().uid))
+                .collect::<Result<Vec<_>>>()
+        })
+        .unwrap();
+    uids.sort();
+    uids
+}
+
+fn unplanned_uids(db: &Db) -> Vec<String> {
+    let mut uids: Vec<String> = db
+        .read(plan::unplanned)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.uid)
+        .collect();
+    uids.sort();
+    uids
+}
+
+/// A task homed only by namespace, with no parent.
+fn loose_task(db: &Db, uid: &str, home: &str) -> ItemId {
+    let (uid, home) = (uid.to_owned(), home.to_owned());
+    db.write_txn("t", move |c, m| {
+        let mut t = task::NewTask::new(uid, "loose");
+        t.home = home;
+        task::create(c, m, &t)
+    })
+    .unwrap()
+}
+
+/// Unplanned is "contained at no depth under any step", whatever the namespace: a task under a
+/// step or under a step's subtask is planned; one under the plan itself (only a pre-guard build
+/// wrote one), a design one-off, and a task homed only by an inbox, a backlog or a review are not;
+/// a terminal task is never unplanned. `-is:unplanned` is the exact complement, and the core read
+/// agrees with the DSL.
+#[test]
+fn unplanned_is_every_open_task_no_step_reaches() {
+    let db = db();
+    let uid = create(&db, "x");
+    let p = new_plan(&db, &uid, &["one"]).unwrap();
+    let step = step_id(&db, &p.steps[0].uid);
+    let under_step = task_under(&db, step, "task:step");
+    let _under_subtask = task_under(&db, under_step, "task:sub");
+    let _under_plan = task_under(&db, step_id(&db, &p.uid), "task:plan");
+    let u = uid.clone();
+    let design = db.read(move |c| design_id(c, &u)).unwrap();
+    let _one_off = task_under(&db, design, "task:oneoff");
+    loose_task(&db, "task:backlog", "tasks/repos/x/.backlog");
+    loose_task(&db, "task:inbox", "tasks/repos/x/inbox");
+    loose_task(&db, "task:finding", "repos/x/codereviews/r1/nit");
+    let done = loose_task(&db, "task:done", "tasks/repos/x/.backlog");
+    set_status(&db, done, TaskStatus::Done);
+    let cancelled = loose_task(&db, "task:cancelled", "tasks/repos/x/.backlog");
+    set_status(&db, cancelled, TaskStatus::Cancelled);
+
+    let unplanned = [
+        "task:backlog",
+        "task:finding",
+        "task:inbox",
+        "task:oneoff",
+        "task:plan",
+    ];
+    assert_eq!(dsl_uids(&db, "is:unplanned"), unplanned);
+    assert_eq!(unplanned_uids(&db), unplanned);
+    assert_eq!(
+        dsl_uids(&db, "kind:task -is:unplanned"),
+        ["task:cancelled", "task:done", "task:step", "task:sub"]
+    );
+    // The complement covers every item, the plan and its step included.
+    let all = dsl_uids(&db, "");
+    let mut both = dsl_uids(&db, "is:unplanned");
+    both.extend(dsl_uids(&db, "-is:unplanned"));
+    both.sort();
+    assert_eq!(both, all);
+    // It composes with scope, and with a bound term after it: the clause binds nothing, so the
+    // tag's value is not shifted onto another placeholder.
+    assert_eq!(
+        dsl_uids(&db, "is:unplanned ns:tasks/repos/x/**"),
+        ["task:backlog", "task:inbox"]
+    );
+    let backlog = step_id(&db, "task:backlog");
+    db.write_txn("t", move |c, m| {
+        crate::tag::apply(c, m, backlog, "size", "s")
+    })
+    .unwrap();
+    assert_eq!(dsl_uids(&db, "is:unplanned tag:size=s"), ["task:backlog"]);
+}
+
+/// `archived` and unplanned read one walk: reopening a plan's only task brings the plan back and
+/// leaves the task planned; closing it archives the plan, and the task is still not unplanned.
+#[test]
+fn archived_and_unplanned_agree_on_what_a_step_holds() {
+    let db = db();
+    let uid = create(&db, "x");
+    let p = new_plan(&db, &uid, &["one"]).unwrap();
+    let t = task_under(&db, step_id(&db, &p.steps[0].uid), "task:a");
+    let sub = task_under(&db, t, "task:b");
+    set_status(&db, sub, TaskStatus::Done);
+    set_status(&db, t, TaskStatus::Done);
+    assert!(plans_of(&db, &uid, true).plans[0].archived);
+    assert!(unplanned_uids(&db).is_empty());
+    set_status(&db, sub, TaskStatus::Open);
+    assert!(!plans_of(&db, &uid, true).plans[0].archived, "reopened");
+    assert!(unplanned_uids(&db).is_empty(), "and still planned");
+}
+
+#[test]
+fn the_step_kind_literal_is_the_step_kind() {
+    assert_eq!(STEP_KIND, step_kind!());
+    assert_eq!(STEP_KIND, "plan_step");
+}

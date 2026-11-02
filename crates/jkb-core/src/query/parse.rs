@@ -5,7 +5,7 @@
 //! `phase:<p>`/`phase:<a>,<b>` (the workflow phase; negate with `-phase:…`)
 //! `priority<op><n>` `due<op><date>`/`due:today` `tag:<facet><op><value>` (negate with `-tag:…`)
 //! `ns:<path>`/`ns:<path>/**` (comma-unions, repeatable)
-//! `is:ready`/`is:frontier`/`is:tombstone`/`is:claimed`/`is:unclaimed`
+//! `is:ready`/`is:frontier`/`is:tombstone`/`is:claimed`/`is:unclaimed`/`is:unplanned`/`-is:unplanned`
 //! `blocks:<uid>` `~"<vector term>"` and bare/quoted words for FTS.
 //! Operators: `=`,`<`,`<=`,`>`,`>=` (and `:` as `=`). Malformed predicates produce
 //! an actionable [`crate::Error`].
@@ -78,6 +78,14 @@ pub fn parse(input: &str) -> Result<Query> {
             query.tags.push(parse_tag(v, &token)?);
         } else if let Some(v) = token.strip_prefix("ns:") {
             parse_ns(v, &token, &mut scopes)?;
+        } else if let Some(v) = token.strip_prefix("-is:") {
+            // Only `unplanned` has a negation: the others either pair already (`claimed`/
+            // `unclaimed`) or have no complement anyone asks for. Refused by name rather than read
+            // as a full-text word, which would silently match nothing.
+            if v != "unplanned" {
+                return Err(bad(&token, "the only `-is:` predicate is `-is:unplanned`"));
+            }
+            query.unplanned = Some(false);
         } else if let Some(v) = token.strip_prefix("is:") {
             parse_is(v, &token, &mut query)?;
         } else if let Some(v) = token.strip_prefix("blocks:") {
@@ -148,12 +156,11 @@ fn parse_is(predicate: &str, token: &str, query: &mut Query) -> Result<()> {
         "tombstone" => query.tombstone = true,
         "claimed" => query.claimed = Some(true),
         "unclaimed" => query.claimed = Some(false),
-        _ => {
-            return Err(bad(
-                token,
-                "the `is:` predicates are ready, frontier, tombstone, claimed, unclaimed",
-            ))
-        }
+        "unplanned" => query.unplanned = Some(true),
+        _ => return Err(bad(
+            token,
+            "the `is:` predicates are ready, frontier, tombstone, claimed, unclaimed, unplanned",
+        )),
     }
     Ok(())
 }
@@ -314,6 +321,19 @@ mod tests {
         assert!(err.contains("dead_end"), "{err}");
         let err = parse("is:blocked").unwrap_err().to_string();
         assert!(err.contains("frontier"), "{err}");
+        assert!(err.contains("unplanned"), "{err}");
+    }
+
+    #[test]
+    fn unplanned_parses_and_only_it_negates() {
+        assert_eq!(parse("is:unplanned").unwrap().unplanned, Some(true));
+        let q = parse("kind:task -is:unplanned").unwrap();
+        assert_eq!(q.unplanned, Some(false));
+        assert_eq!(q.kind.as_deref(), Some("task"));
+        assert!(q.fts.is_none(), "not read as a full-text word");
+        // Any other `-is:` used to fall through to a full-text word that matched nothing.
+        let err = parse("-is:ready").unwrap_err().to_string();
+        assert!(err.contains("-is:unplanned"), "{err}");
     }
 
     #[test]

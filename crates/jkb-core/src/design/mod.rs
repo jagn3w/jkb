@@ -22,6 +22,15 @@
 //! text against them. STAGED (a `stages` edge to a plan step) and IMPLEMENTED (every staged step has
 //! tasks, all `done`) are read from the graph, never stored.
 
+/// The item kind of a plan step, as a literal: [`STEP_KIND`] is defined from it, and the SQL in
+/// [`plan`] that walks the steps `concat!`s it, so the constant and the queries cannot drift. A
+/// macro because `concat!` takes only literals; defined before `mod plan` so it is in scope there.
+macro_rules! step_kind {
+    () => {
+        "plan_step"
+    };
+}
+
 pub mod crdt;
 mod discuss;
 pub mod export;
@@ -58,7 +67,7 @@ pub const KIND: &str = "design";
 /// The item kind of a span: the item a design's span is mirrored to, so edges can point at it.
 pub const SPAN_KIND: &str = "design_span";
 /// The item kind of an execution plan's step — what a span is staged into (D53.6).
-pub const STEP_KIND: &str = "plan_step";
+pub const STEP_KIND: &str = step_kind!();
 /// The namespace root designs live under: `designs/<repo>/`.
 pub const ROOT: &str = "designs";
 /// The longest slug prefix carried into a minted design uid.

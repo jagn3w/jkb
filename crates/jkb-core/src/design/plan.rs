@@ -305,6 +305,80 @@ fn view(
     })
 }
 
+/// `WITH RECURSIVE under(id) AS (…)`: every item contained, at any depth, under the containment
+/// children `$roots` selects. **The one walk** of what a step holds: [`step_tasks`] (behind a span's
+/// IMPLEMENTED and a plan's `archived`) runs it from one step, and [`UNPLANNED_SQL`] from every
+/// step, so what a plan counts as its work and what the unplanned read counts as homed cannot
+/// disagree.
+///
+/// It goes down through items of any kind. `tasks_under`, which lists a step's tasks, goes down
+/// through tasks only; the two differ only for a task under a non-task item under a step.
+/// Containment is a tree (`child_item_id` is its primary key), and `UNION` rather than `UNION ALL`
+/// ends the recursion even on a corrupted cycle.
+macro_rules! under_steps {
+    ($($roots:tt)+) => {
+        concat!(
+            "WITH RECURSIVE under(id) AS (",
+            $($roots)+,
+            " UNION SELECT c.child_item_id FROM containment c JOIN under u ON c.parent_item_id = u.id)"
+        )
+    };
+}
+
+/// *"Item `i` is an unplanned task"*: a task, not terminal, and contained at no depth under any
+/// plan step (by [`under_steps!`], the walk `archived` uses). A task under a plan directly, a
+/// design's one-off, and a task homed only by namespace (an inbox, a `.backlog`, a review's
+/// findings, a synced `tasks.md`) are all unplanned: where a task is placed plays no part.
+///
+/// Binds **no parameter**, so it can sit among the query DSL's anonymous `?` bindings (a `?1` here
+/// would renumber every later one), and it is never NULL: `sql_not_terminal!` is NULL-safe and the
+/// walk yields only the non-null `child_item_id`. Behind both `is:unplanned` and [`unplanned`].
+pub(crate) const UNPLANNED_SQL: &str = concat!(
+    "(i.kind = 'task' AND ",
+    jkb_types::sql_not_terminal!("i.status"),
+    " AND i.id NOT IN (",
+    under_steps!(
+        "SELECT child_item_id FROM containment WHERE parent_item_id IN (SELECT id FROM items WHERE kind = '",
+        step_kind!(),
+        "')"
+    ),
+    " SELECT id FROM under))"
+);
+
+/// A task no execution plan's step reaches ([`UNPLANNED_SQL`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnplannedTask {
+    /// Its uid.
+    pub uid: String,
+    /// Its title (the first line of its content).
+    pub title: String,
+}
+
+/// Every unplanned task ([`UNPLANNED_SQL`]), most urgent first: by priority (none last), then by
+/// age.
+///
+/// # Errors
+/// A database error.
+pub fn unplanned(conn: &Connection) -> Result<Vec<UnplannedTask>> {
+    let sql = format!(
+        "SELECT i.uid, i.content FROM items i WHERE {UNPLANNED_SQL}
+          ORDER BY i.priority IS NULL, i.priority, i.id"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(uid, content)| UnplannedTask {
+            title: item::title_from(&uid, content.as_deref()),
+            uid,
+        })
+        .collect())
+}
+
 /// The tasks contained under a plan step, at any depth: how many, how many are `done`, and how
 /// many are terminal (`done` or `cancelled`). **The one count** behind both a span's IMPLEMENTED
 /// and a plan's `archived`, so the two cannot disagree about what a step holds — they once did, a
@@ -338,11 +412,8 @@ impl StepTasks {
 pub(crate) fn step_tasks(conn: &Connection, step: ItemId) -> Result<StepTasks> {
     Ok(conn
         .prepare_cached(concat!(
-            "WITH RECURSIVE under(id) AS (
-                 SELECT child_item_id FROM containment WHERE parent_item_id = ?1
-                 UNION
-                 SELECT c.child_item_id FROM containment c JOIN under u ON c.parent_item_id = u.id
-             )
+            under_steps!("SELECT child_item_id FROM containment WHERE parent_item_id = ?1"),
+            "
              SELECT COUNT(*), COALESCE(SUM(i.status IS ?2), 0),
                     COALESCE(SUM(i.status IN ",
             jkb_types::sql_terminal_list!(),

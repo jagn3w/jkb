@@ -114,7 +114,9 @@ enum Command {
         /// Query DSL terms, e.g. `kind:task is:ready ns:tasks/**`. `phase:<p>[,<p>…]` matches a
         /// task's workflow phase (`design`, `design_review`, `implement`, `review`,
         /// `systemic_review`, `landable`, `landed`, `cancelled`; no workflow yet is `design`), and
-        /// `-phase:…` excludes those phases.
+        /// `-phase:…` excludes those phases. `is:unplanned` is every open task no execution plan's
+        /// step reaches, and `-is:unplanned` its complement. Quote a query with a `-` term as one
+        /// argument (`jkb query "kind:task -is:unplanned"`), or the term reads as a flag.
         #[arg(required = true, num_args = 1..)]
         terms: Vec<String>,
         /// Maximum number of results.

@@ -281,6 +281,10 @@ pub(crate) fn run(
         }
     }
 
+    for line in unplanned_report(&health) {
+        println!("{line}");
+    }
+
     report_claims(kb, fix)?;
 
     let swept = match (host, fix) {
@@ -310,6 +314,29 @@ pub(crate) fn run(
         }
     }
     Ok(())
+}
+
+/// The unplanned-task lines of `jkb doctor`: every open task no execution plan's step reaches, as
+/// many as `kb.health` listed, and how many it left out. Reported, not yet a failure.
+fn unplanned_report(health: &jkb_api::health::Health) -> Vec<String> {
+    let (Some(listed), Some(count)) = (&health.unplanned, health.unplanned_count) else {
+        return vec!["unplanned tasks: not reported (the daemon predates the check)".to_owned()];
+    };
+    if count == 0 {
+        return vec!["unplanned tasks: none".to_owned()];
+    }
+    let mut lines = vec![format!(
+        "unplanned tasks: {count} open task(s) under no execution plan's step \
+         (`jkb task move <uid> --under <step>` homes one)"
+    )];
+    lines.extend(listed.iter().map(|t| format!("  {}  {}", t.uid, t.title)));
+    if count > listed.len() {
+        lines.push(format!(
+            "  … and {} more (`jkb query \"kind:task is:unplanned\"` lists them all)",
+            count - listed.len()
+        ));
+    }
+    lines
 }
 
 /// The vector-index lines of `jkb doctor`. `swept` is the stale-row count `--fix` removed, when it
@@ -366,7 +393,7 @@ fn vector_report(health: &jkb_api::health::Health, swept: Option<usize>) -> Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::{free, probe_with, vector_report};
+    use super::{free, probe_with, unplanned_report, vector_report};
     use jkb_api::health::Health;
 
     fn health(vector_tables: usize, stale: usize, unguarded: Option<&[&str]>) -> Health {
@@ -378,7 +405,37 @@ mod tests {
             vector_tables,
             stale_vectors: stale,
             unguarded_vector_tables: unguarded.map(|t| t.iter().map(|s| (*s).to_owned()).collect()),
+            unplanned: Some(Vec::new()),
+            unplanned_count: Some(0),
         }
+    }
+
+    /// None, some, past the cap, and a daemon too old to say — which is not read as none.
+    #[test]
+    fn unplanned_tasks_are_counted_listed_and_never_assumed_absent() {
+        let mut h = health(0, 0, Some(&[]));
+        assert_eq!(unplanned_report(&h), ["unplanned tasks: none"]);
+
+        h.unplanned = Some(vec![jkb_api::health::Unplanned {
+            uid: "task:a".to_owned(),
+            title: "A".to_owned(),
+        }]);
+        h.unplanned_count = Some(1);
+        let lines = unplanned_report(&h);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with("unplanned tasks: 1 open task(s)"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "  task:a  A");
+
+        h.unplanned_count = Some(3);
+        let lines = unplanned_report(&h);
+        assert!(lines[2].starts_with("  … and 2 more"), "{lines:?}");
+
+        h.unplanned = None;
+        h.unplanned_count = None;
+        assert!(unplanned_report(&h)[0].contains("not reported"));
     }
 
     /// A legacy database with no stale rows yet but no GC trigger is NOT reported ok: the row count
