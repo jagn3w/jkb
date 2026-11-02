@@ -692,9 +692,10 @@ impl Read {
 /// `/task-swarm`'s default designer budget.
 const DEFAULT_DESIGNERS: usize = 3;
 
-/// The terms every read adds: nothing this run settled, and no review finding.
+/// The terms every read adds: nothing this run settled, no review finding, and no work an earlier
+/// run grafted without recording the landing.
 fn every_read() -> String {
-    format!("-tag:swarm-settled={OWNER} -tag:finding=review")
+    format!("-tag:swarm-settled={OWNER} -tag:finding=review -tag:swarm-landing=unrecorded")
 }
 
 /// What step 1b reads of a task the frontier offered: its phase and its last history line (`jkb
