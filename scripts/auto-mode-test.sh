@@ -68,8 +68,8 @@ check_that "install succeeds on an existing settings file" \
 
 check_that "install preserves unrelated top-level keys" \
     "$(jq -e '.theme == "dark" and .skipWorkflowUsageWarning == true' "$settings" >/dev/null && echo yes || echo no)"
-check_that "install preserves the existing permissions.allow list, in order, ahead of the posture's" \
-    "$(jq -e '.permissions.allow[:2] == ["Bash(jkb grep *)", "Bash(git diff *)"]' "$settings" >/dev/null && echo yes || echo no)"
+check_that "install preserves the existing permissions.allow list, in order" \
+    "$(jq -e '.permissions.allow == ["Bash(jkb grep *)", "Bash(git diff *)"]' "$settings" >/dev/null && echo yes || echo no)"
 
 run_check
 check_that "check passes on freshly installed settings" \
@@ -122,8 +122,9 @@ while IFS= read -r p; do
     n="$(jq --argjson p "$p" '.require | getpath($p) | length' "$posture")"
     for ((i = 0; i < n; i++)); do
         want="$(jq -c --argjson p "$p" --argjson i "$i" '.require | getpath($p)[$i]' "$posture")"
-        # By value, not by index: the user's own entries sit before the posture's in a list both
-        # write (`permissions.allow`), so the posture's index names a different element there.
+        # By value, not by index: in a list both the user and the posture write
+        # (`permissions.allow`), the user's own entries come first, so the posture's index would
+        # name a different element there.
         jq --argjson p "$p" --argjson w "$want" 'setpath($p; getpath($p) | map(select(. != $w)))' "$tmp/good" > "$settings"
         run_check
         if [ "$rc" -ne 0 ] && grep -qF "$want" <<<"$out"; then
@@ -135,6 +136,15 @@ while IFS= read -r p; do
 done <<<"$(jq -c '.require | paths(type == "array")' "$posture")"
 check_that "every posture list entry ($dropped) is required individually" \
     "$([ "$dropped" -gt 0 ] && echo yes || echo no)"
+
+# The server-review opt-out is a string, which neither loop above generates: losing it would put
+# sandboxed Bash back in front of the server-side classifier with nothing reporting it.
+for bad_value in 'del(.env.CLAUDE_CODE_AUTO_MODE_SERVER)' '.env.CLAUDE_CODE_AUTO_MODE_SERVER = "1"'; do
+    jq "$bad_value" "$tmp/good" > "$settings"
+    run_check
+    check_that "check refuses the server-review opt-out changed by $bad_value, by name" \
+        "$([ "$rc" -ne 0 ] && grep -qF 'CLAUDE_CODE_AUTO_MODE_SERVER' <<<"$out" && echo yes || echo no)"
+done
 
 # An array the user has EXTENDED is still intact: the posture is a subset, never an equality.
 jq '.sandbox.network.allowedDomains += ["example.internal"]' "$tmp/good" > "$settings"
@@ -310,8 +320,8 @@ else
     "$tool" run --model sonnet >/dev/null 2>&1
     rc=$?
     set -e
-    check_that "run launches acceptEdits mode and passes user args through" \
-        "$([ "$rc" -eq 0 ] && [ "$(tr '\n' ' ' < "$CLAUDE_ARGV_OUT")" = "--permission-mode acceptEdits --model sonnet " ] && echo yes || echo no)"
+    check_that "run launches auto mode and passes user args through" \
+        "$([ "$rc" -eq 0 ] && [ "$(tr '\n' ' ' < "$CLAUDE_ARGV_OUT")" = "--permission-mode auto --model sonnet " ] && echo yes || echo no)"
 
     rm -f "$CLAUDE_ARGV_OUT"
     set +e

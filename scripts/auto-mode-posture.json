@@ -1,32 +1,13 @@
 {
   "require": {
+    "env": {
+      "CLAUDE_CODE_AUTO_MODE_SERVER": "0"
+    },
     "permissions": {
-      "defaultMode": "acceptEdits",
+      "defaultMode": "auto",
       "disableBypassPermissionsMode": "disable",
       "ask": [
-        "WebFetch",
-        "Bash(git push * main)",
-        "Bash(git push * main:*)",
-        "Bash(git push * HEAD:main)",
-        "Bash(git push *--force*)",
-        "Bash(git push * -f*)",
-        "Bash(git push *--delete*)",
-        "Bash(gh pr merge*)",
-        "Bash(gh api*)",
-        "Bash(gh repo*)",
-        "Bash(gh gist*)"
-      ],
-      "allow": [
-        "Read(//tmp/**)",
-        "Read(~/.jkb/**)",
-        "Read(~/.cache/**)",
-        "Read(~/.cargo/registry/**)",
-        "Read(~/.cargo/git/**)",
-        "Read(~/.rustup/**)",
-        "Read(~/repos/**)",
-        "Edit(//tmp/claude-*/**)",
-        "Edit(~/.jkb/claude-memory/**)",
-        "Edit(~/.cache/jkb-wt/**)"
+        "WebFetch"
       ],
       "deny": [
         "Read(~/.ssh/**)",

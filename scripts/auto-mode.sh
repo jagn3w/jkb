@@ -7,36 +7,35 @@
 #   ./scripts/auto-mode.sh preflight        # would this posture let THIS machine work?
 #   ./scripts/auto-mode.sh install          # merge it into ~/.claude/settings.json
 #   ./scripts/auto-mode.sh check            # is the posture still intact? (exit 1 if not)
-#   ./scripts/auto-mode.sh run [args…]      # check, then exec `claude --permission-mode acceptEdits`
+#   ./scripts/auto-mode.sh run [args…]      # check, then exec `claude --permission-mode auto`
 #   ./scripts/auto-mode.sh sandboxed        # is THIS shell confined? (no session, no cost)
 #   ./scripts/auto-mode.sh probe            # live end-to-end smoke (costs a real session)
 #
-# THE SANDBOX IS THE CHECK. Claude Code's *sandbox* (macOS seatbelt via `sandbox-exec`, Linux
-# bubblewrap + seccomp) bounds every Bash command and what it spawns, and `autoAllowBashIfSandboxed`
-# runs a sandboxed command with no prompt — the OS boundary *is* the check. What a `jkb` call may
-# DO is the daemon's RBAC.
+# TWO LAYERS, BECAUSE THEY FAIL DIFFERENTLY. `--permission-mode auto` is a *classifier*: it
+# decides what is worth asking about, it is a model judgment, and it buys ergonomics. Claude
+# Code's *sandbox* (macOS seatbelt via `sandbox-exec`, Linux bubblewrap + seccomp) bounds what
+# can happen when that judgment is wrong, and it buys the guarantee. They meet in one setting:
+# `autoAllowBashIfSandboxed` means a sandboxed command is never shown to the classifier — the OS
+# boundary *is* the check.
 #
-# WHY acceptEdits, NOT auto (superseded 2026-11-02). The posture used to run in auto mode, a
-# *classifier* that judged what the sandbox did not cover. Auto mode now also sends sandboxed
-# commands to "server-side classifier review" (the sandboxing docs list it as the one exception to
-# auto-allow in auto mode, rolled out from 2.1.271), and neither allow rules nor `autoMode` prose
-# override it. Measured on 2.1.293 across three sessions in one day: plain `ls`/`grep`, commits in a
-# task worktree, `jkb` reads and lands blocked, and the same land blocked three times and allowed
-# twice on identical input. In acceptEdits the classifier is out of the loop: sandboxed Bash is
-# auto-allowed (measured: a non-read-only `python3 -c` ran with no prompt), edits inside the
-# working directory need none, and the `ask` rules keep the few operations only the classifier
-# used to stop — writes to `main`, force-pushes, `gh` merges and API calls — in front of a person.
-# What still prompts: Bash that writes outside the working directory or into `.git`, a `jkb` line
-# the attest hook defers (one that also runs anything but `jkb`/`cd`/`echo`), WebFetch/WebSearch
-# and MCP tools.
+# `env.CLAUDE_CODE_AUTO_MODE_SERVER: "0"` keeps that true (2026-11-02). Auto mode now also sends
+# sandboxed commands to "server-side classifier review", the one exception the sandboxing docs
+# list to auto-allow in auto mode, and neither allow rules nor `autoMode` prose override it.
+# Measured on 2.1.293 across three sessions in one day: plain `ls`/`grep`, commits in a task
+# worktree, `jkb` reads and lands blocked, the same land blocked three times and allowed twice on
+# identical input. The variable is the documented switch back to Claude Code's own classifier,
+# which reads `autoMode`. Rejected: `acceptEdits`, tried the same day, which prompts on every
+# commit (`.git` is a protected path), on Bash writes outside the working directory, and on every
+# `jkb` line the attest hook defers (anything but `jkb`/`cd`/`echo` on it, a stdin redirect, or
+# `jkb exec request`). If the switch is ever removed, those prompts are the cost of leaving auto.
 #
 # WHY NOT `--dangerously-skip-permissions`. The sandbox confines Bash and everything it spawns.
 # It does NOT confine Claude Code's in-process tools; the settings schema says so about
 # `strictAllowlist` in as many words ("in-process tools such as WebFetch are not gated by this
 # setting"). Bypassing permissions therefore leaves Read/Edit/Write/WebFetch unbounded — a hole
-# exactly the shape of the file-editing tools. acceptEdits keeps the permission rules over
-# precisely what the kernel does not cover, and the posture's `permissions.deny` rules close the
-# named paths in BOTH layers at once (the schema merges `Read(...)` deny rules into `filesystem.denyRead` and
+# exactly the shape of the file-editing tools. `auto` keeps the classifier over precisely what
+# the kernel does not cover, and the posture's `permissions.deny` rules close the named paths in
+# BOTH layers at once (the schema merges `Read(...)` deny rules into `filesystem.denyRead` and
 # `Edit(...)` into `denyWrite`) — one list, two enforcers, rather than two lists that drift.
 #
 # WHY USER SETTINGS. Several posture keys are honored only from user / managed / `--settings`
@@ -52,14 +51,11 @@
 # `Read(...)` deny rules only), Write/Edit/NotebookEdit (deny rules plus the permission scope),
 # WebFetch/WebSearch (permission rules only), MCP servers (long-lived processes started at session
 # start, never per-command wrapped), and hooks (nothing in the binary evidences hook sandboxing).
-# Three posture keys aim at that column: `permissions.ask` keeps `WebFetch`, because Read-anything
+# Three posture keys aim at that column: `permissions.ask: ["WebFetch"]`, because Read-anything
 # composed with fetch-anywhere is read-everything-send-anywhere outside the kernel boundary and is
-# the one composition that defeats the posture; `disableBypassPermissionsMode`, because the
-# in-process layer is the ONLY bound those tools have; and `defaultMode: "acceptEdits"`, so an IDE
-# session that never touched this script gets the same posture. `permissions.allow` names the
-# paths outside the working directory that sessions read (scratchpads, `~/.jkb`, toolchain and
-# dependency sources, the other repos) and the few they write (Claude's scratchpads, the shared
-# memory store, `~/.cache/jkb-wt` worktrees), so the Read and Edit tools do not prompt for them.
+# the one composition that defeats the posture — so it is the single surviving prompt;
+# `disableBypassPermissionsMode`, because the in-process layer is the ONLY bound those tools have;
+# and `defaultMode: "auto"`, so an IDE session that never touched this script is prompt-free too.
 #
 # FILE ACCESS IS AN ALLOWLIST. Writes were already default-deny (the workspace only), so
 # `filesystem.allowWrite` is the list. Reads are default-deny too — `denyRead: ["~", "/Volumes"]`
@@ -78,8 +74,8 @@
 # the sandbox's own bypass list. Adding a key to either half extends the check, and the tests
 # that generate their cases from it, by construction.
 #
-# The IDE needs no launcher: it reads the same user settings, `permissions.defaultMode:
-# "acceptEdits"` gives it the same behaviour, and `failIfUnavailable: true` makes Claude Code refuse
+# The IDE needs no launcher: it reads the same user settings, `permissions.defaultMode: "auto"`
+# gives it the same prompt-free behaviour, and `failIfUnavailable: true` makes Claude Code refuse
 # to start unsandboxed however it was started. `check` is the drift preflight, not the gate.
 set -euo pipefail
 
@@ -294,8 +290,8 @@ cmd_install() {
     rm -f "$tmp_prev"
     echo
     echo "This is your USER posture: it applies to every repo and to the IDE, not just to jkb."
-    echo "It sets permissions.defaultMode=acceptEdits, so EVERY Claude Code session on this machine"
-    echo "now starts in acceptEdits mode. That is the point — but it is machine-wide, so say it out"
+    echo "It sets permissions.defaultMode=auto, so EVERY Claude Code session on this machine"
+    echo "now starts in auto mode. That is the point — but it is machine-wide, so say it out"
     echo "loud rather than let it be discovered. To undo: restore the backup printed above."
     cmd_check
 }
@@ -537,7 +533,7 @@ cmd_check() {
         return 0
     fi
 
-    printf '\033[31mposture NOT intact\033[0m in %s — do not run unattended sessions:\n' "$settings" >&2
+    printf '\033[31mposture NOT intact\033[0m in %s — do not run auto mode:\n' "$settings" >&2
     jq -r '.[] | "  \(.path): want \(.want|tojson), have \(.got|tojson)"' <<<"$diff" >&2
     jq -r '.[] | "  \(.path): must be empty or absent (\(.why)), have \(.have|tojson)"' <<<"$extra" >&2
     jq -r '.[] | "  \(.path): still holds retired entr(y|ies) \(.retired|tojson) — the posture withdrew them"' <<<"$stale" >&2
@@ -576,8 +572,8 @@ cmd_run() {
         fi
     fi
 
-    say "claude --permission-mode acceptEdits"
-    exec "$claude" --permission-mode acceptEdits ${overlay[@]+"${overlay[@]}"} "$@"
+    say "claude --permission-mode auto"
+    exec "$claude" --permission-mode auto ${overlay[@]+"${overlay[@]}"} "$@"
 }
 
 # The live smoke. It needs a real Claude Code session, so it is this change's #[ignore] test:
@@ -586,9 +582,9 @@ cmd_run() {
 #
 # TWO files, because one cannot tell the two failures apart. "The canary is absent" is only
 # evidence the sandbox denied the write if the session ran the command at all: with the sandbox
-# OFF — the state this exists to detect — Bash is no longer auto-allowed, so the out-of-bounds
-# write goes to a permission prompt, which `-p` refuses, and an absent canary would read as a
-# clean pass. The control file, written inside the workspace where both layers allow it,
+# OFF — the state this exists to detect — Bash is no longer auto-allowed, so the *classifier*
+# gets the out-of-bounds write and will very likely refuse it, and an absent canary would read as
+# a clean pass. The control file, written inside the workspace where both layers allow it,
 # separates "denied at the boundary" from "never ran", and the second is reported as INCONCLUSIVE
 # rather than as a pass.
 cmd_probe() {
@@ -604,7 +600,7 @@ cmd_probe() {
     rm -f "$canary" "$control"
 
     say "probing the sandbox with a live session"
-    "$claude" -p --permission-mode acceptEdits "$(cat <<PROMPT
+    "$claude" -p --permission-mode auto "$(cat <<PROMPT
 This is a sandbox self-test. Run each of these with the Bash tool, exactly once, in order, and
 report the exit status and output of each verbatim. Do NOT work around a failure, do not retry
 with a different path or tool, and do not use dangerouslyDisableSandbox: a failure IS the
@@ -621,7 +617,7 @@ PROMPT
     echo
     if [ ! -e "$control" ]; then
         rm -f "$canary"
-        die "PROBE INCONCLUSIVE: the session never wrote $control, so it did not run the commands (a permission refusal, or a session error). Nothing was learned about the sandbox — read the transcript above."
+        die "PROBE INCONCLUSIVE: the session never wrote $control, so it did not run the commands (a classifier refusal, or a session error). Nothing was learned about the sandbox — read the transcript above."
     fi
     rm -f "$control"
 
