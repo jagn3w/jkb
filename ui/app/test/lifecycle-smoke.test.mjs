@@ -6,7 +6,7 @@
 //! transitions table.
 //
 // The app talks to a stand-in `jkb serve` on loopback (the daemon-client.test.mjs pattern) that
-// answers `hello`, `workflow.agents`, `plan.strategies`, and `workflow.graph` from
+// answers `hello`, `workflow.agents`, `workflow.strategies`, and `workflow.graph` from
 // fixtures/workflow-graphs.json, which `graph_fixture_matches_presets` in crates/jkb-api holds to
 // the tables, and `workflow.roles` from fixtures/workflow-roles.json (`roles_fixture_matches_presets`);
 // anything else is refused. The skip, and where a skip is a failure, are
@@ -62,7 +62,7 @@ function answer(req) {
   switch (req.op) {
     case "workflow.agents":
       return { result: "workflow_agents", agents: [IMPLEMENTER], roles: Object.keys(presets[DEFAULT].role_ops) };
-    case "plan.strategies":
+    case "workflow.strategies":
       return {
         result: "strategies",
         default: DEFAULT,
@@ -101,7 +101,7 @@ before(async () => {
       };
       if (req.headers.authorization !== `Bearer ${TOKEN}`) return reply(401, { code: "unauthorized", message: "bad token" });
       if (req.method === "GET" && req.url === "/v1/hello") {
-        return reply(200, { protocol: 1, schema_version: 1, supported_schema: 1, ops: ["workflow.agents", "plan.strategies", "workflow.graph", "workflow.roles"] });
+        return reply(200, { protocol: 1, schema_version: 1, supported_schema: 1, ops: ["workflow.agents", "workflow.strategies", "workflow.graph", "workflow.roles"] });
       }
       let parsed;
       try {
