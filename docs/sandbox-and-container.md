@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:sandbox-and-container-18dcdf1cb383c738d9fcf2, edit there (version 151.lQGBxILJ67HaCwGBiPTuw_2eCAGC7L6l55ObDQGF4qvB7aP5CgGI9qLNgb3oBAGIxpOayp6bBgGN8q_q5rrRCQGP9PG1nterDwGT9MiXrtGuAQGUnrS1lq3iDAGWyPvL5_T7BgGWlKv16a73BwGXpuOvn_WFBQGZnJv575T6BwGW8s2L0Kq8DwGbwpLagd3DBAGcvMGb_omVAQGXwsagj9fWAQGhrvmpibqDCAGh6ovDpZAxAaHamdTYnrECAafG8IPXmK8OAamq79bt5OMNAaq4wuqL-fsEAa2mucfgtEoBrvyTs-i4ngwBr_Cx6am01gkBsMCv5enc6w0BsezKp46yqQ4BssblgK-U5gwBteKfv6L2pQEBtrCJw6nqsgEBt6aqgoOZ5g0Bt56mz4qj3gMBuvSonOS3-wwBuuSukNT1rgsBvPaI7cG2wQoBu4bRkrme7wEBu864taKv0wIBvqai1emCmwIBuu6RsKuWmgcBwaDIy-u2mggBxebSx9CWiAMBx7ru8_q72g8Bx5j3vY6-kwoBz_K0lcrmzAUB0KDLg_SknAIB0diSxpKxuA4B0pS6no3xKwHTpvbRu86gBAHQ7suh3bv4BwHVuKDZkuLzBQHe4ISxqaPtDgHj_vLu6NCKCwHlpuC78tptAebC7YbAnekJAenE0Jvw2PIJAeu-p4m02uYCAeyk34qe0eMKAe3sg6j7xPgHAe3go9-Q7_IIAe-CioHN8ZYOAfDOy_awkvsBAfCS2e7F4-wEAfP8r5aAsnkB857Es4el4AYB97Ti8Y6k2wQB-Pi2gcT9jwwB97rG9cH26g4B_L7uqceqXwH9_P-hoLvEAwH_yM3c8r6RBwGDi-W66ZZmAYSnuqn2lxkBh4mq27TznwEBidW-76jTuwMBiruwmZal1QkBirGFmPi8kwMBjMHW7P-NwgoBjdez65qB8gwBjv2J0PztbgGO1_-ChI6HCQGQr9Hzr-_9AgGRt-qA_NHXBAGSw8f3tYy1CgGTkYv61PufDQGUl4DgnOOGBgGU2dqq-sAPAZnFv97S6bQMAZnjm4zvsMQDAZqTpMDSjMcGAaPN6PX3veMCAaXL643AjfsNAaWp4ZGj4tQPAaj_x5fUk4gJAarz3u7l-MkPAauZhoCHocIGAayV9J3hlWHongetm--v_qzfCQGu2feK6ICJCQGq5Yvsv9ySAQGwt7eL8_u4BQGxuaSnmOCJAQGui8nTsZyBAwGu482vy_3yCQGy--bz4YGZCQG1397qi9z8DgG2_--j88X7BgG3n8rKkqOaDgG03_Pn9IeLAQG64e_q0pLcCAG8u8Pa3tgTAb2967XCoeAGAb6bvaaDyLcNAb_D_b3Tw8IBAcDRsfXy6asFAb7rsYrW6doLAb6rsJ_kvwIBvefvz8mKwgUBxIXAoqjJrw8Bv9ua_7vwmwMBxoHq0bKA9wgBv__51peWyAgByfvVn-CR8wIBy524geGnyw0Bzru5n4GKgQ0B0MXXvf-msAUB0cfI6MTerQ0B0YnfgrK-gAEB0aWd3ezMvgMB2s-suoyshQcB3IPEsLKw7gUB4Jej3MP9wgQB47_j2OWuiAEB55-i2daO_gwB5_2G9_j1ggYB7dOt88yL1QIB74-2mrCt7wIB8OHEh5z94gUB8a3m0Nuf5QYB89uZmN-WoQcB9bXRy6yo0gYB9fXX68TmtAIB97Xty4z00wMB-L_qs4vyzAMB-NPczcLtrgUB_fPflNCmggEB_emK9K2WjAMB_ZPkx-PiVAE, blake3 aafe114720cb13725371c56ccebf03149f49431da92d154c2977790097d7b0af) -->
+<!-- generated from jkb design design:sandbox-and-container-18dcdf1cb383c738d9fcf2, edit there (version 151.lQGBxILJ67HaCwGBiPTuw_2eCAGC7L6l55ObDQGF4qvB7aP5CgGI9qLNgb3oBAGIxpOayp6bBgGN8q_q5rrRCQGP9PG1nterDwGT9MiXrtGuAQGUnrS1lq3iDAGWyPvL5_T7BgGWlKv16a73BwGXpuOvn_WFBQGZnJv575T6BwGW8s2L0Kq8DwGbwpLagd3DBAGcvMGb_omVAQGXwsagj9fWAQGhrvmpibqDCAGh6ovDpZAxAaHamdTYnrECAafG8IPXmK8OAamq79bt5OMNAaq4wuqL-fsEAa2mucfgtEoBrvyTs-i4ngwBr_Cx6am01gkBsMCv5enc6w0BsezKp46yqQ4BssblgK-U5gwBteKfv6L2pQEBtrCJw6nqsgEBt6aqgoOZ5g0Bt56mz4qj3gMBuvSonOS3-wwBuuSukNT1rgsBvPaI7cG2wQoBu4bRkrme7wEBu864taKv0wIBvqai1emCmwIBuu6RsKuWmgcBwaDIy-u2mggBxebSx9CWiAMBx7ru8_q72g8Bx5j3vY6-kwoBz_K0lcrmzAUB0KDLg_SknAIB0diSxpKxuA4B0pS6no3xKwHTpvbRu86gBAHQ7suh3bv4BwHVuKDZkuLzBQHe4ISxqaPtDgHj_vLu6NCKCwHlpuC78tptAebC7YbAnekJAenE0Jvw2PIJAeu-p4m02uYCAeyk34qe0eMKAe3sg6j7xPgHAe3go9-Q7_IIAe-CioHN8ZYOAfDOy_awkvsBAfCS2e7F4-wEAfP8r5aAsnkB857Es4el4AYB97Ti8Y6k2wQB-Pi2gcT9jwwB97rG9cH26g4B_L7uqceqXwH9_P-hoLvEAwH_yM3c8r6RBwGDi-W66ZZmAYSnuqn2lxkBh4mq27TznwEBidW-76jTuwMBiruwmZal1QkBirGFmPi8kwMBjMHW7P-NwgoBjdez65qB8gwBjv2J0PztbgGO1_-ChI6HCQGQr9Hzr-_9AgGRt-qA_NHXBAGSw8f3tYy1CgGTkYv61PufDQGUl4DgnOOGBgGU2dqq-sAPAZnFv97S6bQMAZnjm4zvsMQDAZqTpMDSjMcGAaPN6PX3veMCAaXL643AjfsNAaWp4ZGj4tQPAaj_x5fUk4gJAarz3u7l-MkPAauZhoCHocIGAayV9J3hlWHongetm--v_qzfCQGu2feK6ICJCQGq5Yvsv9ySAQGwt7eL8_u4BQGxuaSnmOCJAQGui8nTsZyBAwGu482vy_3yCQGy--bz4YGZCQG1397qi9z8DgG2_--j88X7BgG3n8rKkqOaDgG03_Pn9IeLAQG64e_q0pLcCAG8u8Pa3tgTAb2967XCoeAGAb6bvaaDyLcNAb_D_b3Tw8IBAcDRsfXy6asFAb7rsYrW6doLAb6rsJ_kvwIBvefvz8mKwgUBxIXAoqjJrw8Bv9ua_7vwmwMBxoHq0bKA9wgBv__51peWyAgByfvVn-CR8wIBy524geGnyw0Bzru5n4GKgQ0B0MXXvf-msAUB0cfI6MTerQ0B0YnfgrK-gAEB0aWd3ezMvgMB2s-suoyshQcB3IPEsLKw7gUB4Jej3MP9wgQB47_j2OWuiAEB55-i2daO_gwB5_2G9_j1ggYB7dOt88yL1QIB74-2mrCt7wIB8OHEh5z94gUB8a3m0Nuf5QYB89uZmN-WoQcB9bXRy6yo0gYB9fXX68TmtAIB97Xty4z00wMB-L_qs4vyzAMB-NPczcLtrgUB_fPflNCmggEB_emK9K2WjAMB_ZPkx-PiVAE, blake3 325555a7efec846bb58b6a97afdaa17b739a21fb2a988719b01ef6aef4c698b5) -->
 # Sandbox and container
 
 This design records the boundary that holds when the model is wrong. Claude Code runs in the
@@ -40,6 +40,23 @@ English prose): it decides what is worth asking about, it can be wrong, and it b
 The sandbox bounds what happens when the classifier is wrong, and it buys the guarantee.
 `autoAllowBashIfSandboxed` joins them: a sandboxed command is never shown to the classifier, so
 the OS boundary is the check.
+
+**Amended 2026-11-02: the posture opts out of server-side classifier review.** Auto mode now
+also sends sandboxed commands to "server-side classifier review", which the sandboxing docs list
+as the one exception to auto-allow in auto mode (rolled out from Claude Code 2.1.271), and
+neither `permissions.allow` rules nor `autoMode` prose override it. Measured on 2.1.293 across
+three sessions in one day: plain `ls` and `grep`, commits in a task worktree, `jkb` reads and
+lands were blocked, and the same `jkb task land` was blocked three times and allowed twice on
+identical input. So the posture requires `env.CLAUDE_CODE_AUTO_MODE_SERVER: "0"`, the documented
+switch back to Claude Code's own classifier, which reads `autoMode`; `check` refuses it missing
+or changed. On 2.1.293 the local classifier also ignores a `/permissions` approval when a command
+is retried, denying the retry as "Auto-Mode Bypass"; 2.1.307 fixes it.
+
+Rejected, the same day: `acceptEdits`. It keeps the classifier out entirely, and sandboxed Bash
+did run unprompted (measured), but it prompts on every commit (`.git` is a protected path), on
+Bash whose command line writes outside the working directory, and on every `jkb` line the attest
+hook defers (anything but `jkb`, `cd` or `echo` on it, a stdin redirect, or `jkb exec request`).
+If the opt-out is ever removed, those prompts are what leaving auto mode costs.
 
 ### `auto`, never `bypassPermissions`
 
