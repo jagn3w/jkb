@@ -53,10 +53,27 @@ impl Fixture {
         cmd
     }
 
+    /// A `jkb` invocation from a checkout of repo `t`, mounted at `repos/t` on first use: where a
+    /// task naming no step is added, so it is filed in `t`'s Open work › Inbox. Not the fixture's
+    /// own repo, which stays unmounted so every other command here runs unscoped as it always has.
+    fn jkb_in_t(&self) -> Command {
+        let dir = self.home.path().join("repo-t");
+        if !dir.exists() {
+            std::fs::create_dir(&dir).unwrap();
+            jkb(Some(&self.db))
+                .args(["mount", "create", "repos/t", dir.to_str().unwrap()])
+                .assert()
+                .success();
+        }
+        let mut cmd = jkb(Some(&self.db));
+        cmd.current_dir(&dir);
+        cmd
+    }
+
     /// Add a task and return its uid.
     fn add_task(&self, text: &str) -> String {
         let out = self
-            .jkb()
+            .jkb_in_t()
             .args(["--global", "task", "add", text, "--json"])
             .output()
             .unwrap();
@@ -1528,7 +1545,7 @@ impl Fixture {
     /// File a must-fix finding under `ns` and return its uid.
     fn add_finding(&self, ns: &str, text: &str) -> String {
         let out = self
-            .jkb()
+            .jkb_in_t()
             .args([
                 "--global",
                 "task",
@@ -1547,7 +1564,7 @@ impl Fixture {
 
     /// A concern (`!p2`) under `ns`: a round holding one has findings and no must-fix.
     fn add_concern(&self, ns: &str, text: &str) {
-        self.jkb()
+        self.jkb_in_t()
             .args(["--global", "task", "add", text, "!p2", &format!("+{ns}")])
             .assert()
             .success();
@@ -2639,7 +2656,7 @@ fn a_land_target_cannot_be_written_as_a_tag() {
             .failure()
             .stderr(predicate::str::contains("jkb task work"));
     }
-    f.jkb()
+    f.jkb_in_t()
         .args(["--global", "task", "add", "planted #onto=batch"])
         .assert()
         .failure()
@@ -3958,7 +3975,7 @@ fn a_spent_landing_is_context_and_does_not_stop_the_other_evidence() {
 fn one_task_close_merged_cannot_decide_does_not_stop_the_rest() {
     let f = Fixture::new();
     // Refused at the store, so it cannot be planted through the CLI at all.
-    f.jkb()
+    f.jkb_in_t()
         .args(["--global", "task", "add", "hostile #branch=--upload-pack=x"])
         .assert()
         .failure()

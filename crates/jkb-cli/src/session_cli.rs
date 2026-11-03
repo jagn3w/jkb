@@ -2201,11 +2201,14 @@ mod tests {
             b.call(serde_json::from_value::<Request>(r).unwrap())
                 .unwrap()
         };
-        let add =
-            |text: &str| match call(&op, serde_json::json!({ "op": "task.add", "text": text })) {
-                Response::Added { added } => added.uid,
-                other => panic!("{other:?}"),
-            };
+        let add = |text: &str| match call(
+            &op,
+            // In repo `t`, so it is filed in `t`'s Open work › Inbox.
+            serde_json::json!({ "op": "task.add", "text": text, "home": "tasks/repos/t/inbox" }),
+        ) {
+            Response::Added { added } => added.uid,
+            other => panic!("{other:?}"),
+        };
         let (parked, open) = (add("parked"), add("open"));
         for uid in [&parked, &open] {
             call(
@@ -2307,7 +2310,8 @@ mod tests {
         };
         let merged = match call(
             &op,
-            serde_json::json!({ "op": "task.add", "text": "merged", "managed": true }),
+            serde_json::json!({ "op": "task.add", "text": "merged", "managed": true,
+                                "home": "tasks/repos/t/inbox" }),
         ) {
             Response::Added { added } => added.uid,
             other => panic!("{other:?}"),
@@ -2406,7 +2410,7 @@ mod tests {
         let Response::Added { added } = b
             .call(
                 serde_json::from_value(serde_json::json!({
-                    "op": "task.add", "text": "t +tasks/x", "managed": true
+                    "op": "task.add", "text": "t +tasks/repos/t/x", "managed": true
                 }))
                 .unwrap(),
             )

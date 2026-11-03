@@ -124,7 +124,6 @@ pub(crate) fn repo_ctx() -> Result<RepoCtx> {
 #[cfg(test)]
 mod tests {
     use super::{facet_values, FACET_BRANCH};
-    use jkb_core::item::NewItem;
     use jkb_core::location::{set_location_facets, Location};
     use jkb_core::Db;
 
@@ -140,16 +139,14 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .write_txn("t", |conn, meta| {
-                let id = jkb_core::item::upsert(
+                let id = jkb_core::task::create(
                     conn,
                     meta,
-                    &NewItem {
-                        uid: "task:t".to_owned(),
-                        kind: "task".to_owned(),
-                        content: None,
-                        content_hash: None,
-                        mime: None,
-                    },
+                    &jkb_core::task::NewTask::new(
+                        "task:t",
+                        "t",
+                        jkb_core::task::Under::inbox_of("t"),
+                    ),
                 )?;
                 for (branch, onto) in [("task/a", "batch/one"), ("task/b", "batch/two")] {
                     set_location_facets(

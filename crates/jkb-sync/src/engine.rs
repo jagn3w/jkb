@@ -2822,18 +2822,28 @@ fn reconcile_containment(
             continue;
         }
         let cur = containment::parent(conn, child)?;
-        let adopt = match cur {
-            None => true,
-            Some(cur) => {
-                !plan::homes_tasks(conn, cur)?
-                    || item::get(conn, cur)?.is_some_and(|m| plan::is_triage_step_uid(&m.uid))
-            }
+        let planned = match cur {
+            Some(cur) => plan::homes_tasks(conn, cur)?,
+            None => false,
         };
-        if !adopt {
-            continue;
+        let in_triage = match cur {
+            Some(cur) => item::get(conn, cur)?.is_some_and(|m| plan::is_triage_step_uid(&m.uid)),
+            None => false,
+        };
+        if planned && !in_triage {
+            continue; // moved by hand to a real step
         }
         let home = item::primary_namespace(conn, child)?.unwrap_or_else(|| file_ns_path.to_owned());
-        check_has_step(conn, &home, file_ns_path)?;
+        if planned {
+            // In an Inbox: it moves only when its home names a step to move to.
+            if mount::repo_of_namespace(&home).is_none()
+                && plan::mapped_step(conn, &home)?.is_none()
+            {
+                continue;
+            }
+        } else {
+            check_has_step(conn, &home, file_ns_path)?;
+        }
         let step = plan::step_for_home(conn, meta, &home, None)?;
         if cur != Some(step) {
             task::add_subtask(conn, meta, step, child)?;

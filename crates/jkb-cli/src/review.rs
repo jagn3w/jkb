@@ -458,7 +458,9 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let backend = jkb_api::LocalBackend::new(db.clone());
         let n = jkb_api::sessions::MAX_REVIEW_NAMESPACES + 1;
-        let nss: Vec<String> = (0..n).map(|i| format!("reviews/r{i}")).collect();
+        let nss: Vec<String> = (0..n)
+            .map(|i| format!("repos/t/codereviews/r{i}"))
+            .collect();
         for ns in [&nss[0], &nss[n - 1]] {
             jkb_api::Backend::call(
                 &backend,

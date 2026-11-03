@@ -44,6 +44,37 @@ fn db() -> Db {
     Db::open_in_memory_with(&[jkb_index::register]).unwrap()
 }
 
+/// Mount this process's working directory at `repos/<repo>`: the MCP server sends it as the client's
+/// directory, as `jkb mcp` started in a checkout does, so its tasks are filed in that repo's Inbox.
+fn mount_cwd(db: &Db, repo: &str) {
+    let ns_path = format!("repos/{repo}");
+    let cwd = std::env::current_dir().unwrap();
+    db.write_txn("t", move |conn, meta| {
+        let ns_id = ns::ensure(conn, meta, &ns_path)?;
+        mount::create(
+            conn,
+            meta,
+            ns_id,
+            &format!("file://{}", cwd.display()),
+            SyncMode::Bidirectional,
+            "document",
+            None,
+            None,
+            ConflictPolicy::Manual,
+        )
+    })
+    .unwrap();
+}
+
+/// Every task no plan step reaches: none, once every creator files under one.
+fn unplanned(db: &Db) -> Vec<String> {
+    db.read(jkb_core::design::plan::unplanned)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.uid)
+        .collect()
+}
+
 fn uri_for(path: &std::path::Path) -> String {
     format!("file://{}", path.to_string_lossy())
 }
@@ -286,6 +317,8 @@ fn end_to_end_full_flow() {
 
     // Every mutation was audited.
     assert!(changelog_count(&db) > 0);
+    // And every task is in a plan.
+    assert!(unplanned(&db).is_empty(), "{:?}", unplanned(&db));
 }
 
 /// 14.3 — re-running ingest and sync are no-ops, and the changelog grows only when
@@ -353,6 +386,7 @@ fn mcp_smoke_flow() {
     use jkb_mcp::logic;
 
     let db = db();
+    mount_cwd(&db, "t");
     let tools = jkb_mcp::Tools {
         backend: std::sync::Arc::new(
             jkb_api::LocalBackend::new(db.clone()).with_embedder(embedder()),
@@ -467,4 +501,115 @@ fn ready_uids(db: &Db) -> Vec<String> {
         })
         .unwrap();
     rows.into_iter().map(|r| r.uid).collect()
+}
+
+/// 22 — **every creator files under a step.** One repo, `app` (its tasks.md mounted at
+/// `repos/app/plan`, so a review elsewhere in it is no file's), and a task made through each surface
+/// that makes one: `task.add` (the op `jkb task add` sends) plain, with `--backlog` and with
+/// `--under`; the MCP `task_create`; a review's findings; a tasks.md import with nested lines; and
+/// `task.move`. Afterwards no task is unplanned and each one's ancestry names a step. A creator that
+/// went back to `item::upsert` is refused by its gate; one that wrote rows any other way leaves a
+/// loose task and fails the emptiness check.
+#[test]
+fn every_creator_files_under_a_step() {
+    use jkb_api::{Backend as _, Response};
+
+    let db = db();
+    let repo = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let file = repo.path().join("tasks.md");
+    std::fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n    - [ ] Outline ^outline\n",
+    )
+    .unwrap();
+    let repo_dir = repo.path().to_string_lossy().into_owned();
+    {
+        let repo_dir = repo_dir.clone();
+        db.write_txn("t", move |conn, meta| {
+            let ns_id = ns::ensure(conn, meta, "repos/app/plan")?;
+            mount::create(
+                conn,
+                meta,
+                ns_id,
+                &format!("file://{repo_dir}"),
+                SyncMode::Bidirectional,
+                "tasks",
+                Some("**/*.md"),
+                None,
+                ConflictPolicy::Manual,
+            )
+        })
+        .unwrap();
+    }
+    mount_cwd(&db, "mcp");
+    let step = db
+        .write_txn("t", |conn, meta| {
+            let d = jkb_core::design::create(conn, meta, "app", "Factory", "")?.uid;
+            let p = jkb_core::design::plan::create(conn, meta, &d, "Ship", &["one".to_owned()])?;
+            Ok(p.steps[0].uid.clone())
+        })
+        .unwrap();
+    let backend = jkb_api::LocalBackend::new(db.clone()).with_embedder(embedder());
+    let call = |r: serde_json::Value| backend.call(serde_json::from_value(r).unwrap()).unwrap();
+    let mut uids = Vec::new();
+
+    // `jkb task add`, from inside the repo: plain, `--backlog`, `--under <step>`.
+    for ask in [
+        serde_json::json!({ "op": "task.add", "text": "plain", "cwd": repo_dir }),
+        serde_json::json!({ "op": "task.add", "text": "later", "backlog": true, "cwd": repo_dir }),
+        serde_json::json!({ "op": "task.add", "text": "planned", "under": step, "cwd": repo_dir }),
+    ] {
+        match call(ask) {
+            Response::Added { added } => uids.push(added.uid),
+            other => panic!("{other:?}"),
+        }
+    }
+    // The MCP `task_create`, in the server's own working directory.
+    let tools = jkb_mcp::Tools {
+        backend: std::sync::Arc::new(jkb_api::LocalBackend::new(db.clone())),
+    };
+    let created = jkb_mcp::logic::task_create(
+        &tools,
+        &jkb_mcp::logic::TaskCreateArgs {
+            title: "from an agent".to_owned(),
+            priority: None,
+            due: None,
+            namespace: None,
+            under: None,
+        },
+    )
+    .unwrap();
+    uids.push(created.value["uid"].as_str().unwrap().to_owned());
+    // A review's findings.
+    match call(serde_json::json!({
+        "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
+        "ns": "repos/app/codereviews/r1",
+        "findings": [{ "severity": "must-fix", "summary": "a bug" },
+                     { "severity": "nit", "summary": "a nit" }],
+    })) {
+        Response::ReviewFiled { filed } => uids.extend(filed.uids),
+        other => panic!("{other:?}"),
+    }
+    // A tasks.md import, nested two deep.
+    let report = jkb_sync::sync(&db, "repos/app/plan").unwrap();
+    assert_eq!(report.count(Outcome::Failed), 0, "{report:?}");
+    let uri = uri_for(&file);
+    uids.extend(["ship", "write", "outline"].map(|id| format!("{uri}#{id}")));
+    // `task.move`: the plain task out of the Inbox, under the planned one.
+    call(serde_json::json!({ "op": "task.move", "uid": uids[0], "under": uids[2] }));
+
+    assert!(unplanned(&db).is_empty(), "{:?}", unplanned(&db));
+    for uid in uids {
+        let u = uid.clone();
+        let ancestry = db
+            .read(move |conn| {
+                let id = item::id_for_uid(conn, &u)?.unwrap();
+                jkb_core::design::plan::ancestry_of(conn, id)
+            })
+            .unwrap();
+        assert!(
+            ancestry.is_some_and(|a| a.step.is_some()),
+            "{uid} is under no step"
+        );
+    }
 }

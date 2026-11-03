@@ -498,7 +498,9 @@ mod tests {
             let added = backend
                 .call(
                     serde_json::from_value(serde_json::json!({
-                        "op": "task.add", "text": text, "managed": true
+                        "op": "task.add", "text": text, "managed": true,
+                        // In repo `t`, so it is filed in `t`'s Open work › Inbox.
+                        "home": "tasks/repos/t/inbox"
                     }))
                     .unwrap(),
                 )

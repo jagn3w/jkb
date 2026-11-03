@@ -781,7 +781,9 @@ mod tests {
     fn started(b: &LocalBackend, title: &str, branch: &str) -> String {
         let uid = match op(
             b,
-            serde_json::json!({ "op": "task.add", "text": title, "managed": true }),
+            serde_json::json!({ "op": "task.add", "text": title, "managed": true,
+                                // In repo `t`, so it is filed in `t`'s Open work › Inbox.
+                                "home": "tasks/repos/t/inbox" }),
         ) {
             Response::Added { added } => added.uid,
             other => panic!("{other:?}"),
