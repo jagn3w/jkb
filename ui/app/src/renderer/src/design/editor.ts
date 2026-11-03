@@ -31,6 +31,8 @@ import {
 
 import { SPAN_STATES, type SpanState, type StateMap } from "@jkb/core";
 
+import { APPROVE_BUSY } from "./approve";
+
 // ---- live preview -----------------------------------------------------------------------------
 
 /** Markup hidden on lines the cursor is not on, so the line reads as rendered text. */
@@ -293,12 +295,22 @@ export const spanStates: Extension = [
 /** What a selection offers, beside it: each action gets the selection as UTF-16 offsets. */
 export interface SelectionActions {
   readonly comment: (from: number, to: number) => void;
-  /** Present only for a viewer who may approve: the operator. */
-  readonly approve?: (from: number, to: number) => void;
+  /** Always shown; disabled while `approveBlocked` says why it cannot be pressed. */
+  readonly approve: (from: number, to: number) => void;
+  /**
+   * Why Approve cannot be pressed now — the caller is not the operator, or an action on this design
+   * is still being sent — shown as the disabled icon's title. `undefined` when it can.
+   */
+  readonly approveBlocked?: string | undefined;
   readonly discuss: (from: number, to: number) => void;
 }
 
-const ICONS: Record<keyof SelectionActions, { readonly glyph: string; readonly title: string }> = {
+/** Redraw the selection's actions: dispatched when what they read (`approveBlocked`) changed. */
+export const refreshActions = StateEffect.define<null>();
+
+type Action = "comment" | "approve" | "discuss";
+
+const ICONS: Record<Action, { readonly glyph: string; readonly title: string }> = {
   comment: { glyph: "💬", title: "Comment: start a thread on the selected words" },
   approve: { glyph: "✓", title: "Approve exactly the selected words" },
   discuss: { glyph: "✦", title: "Discuss the selected text with Claude" },
@@ -308,7 +320,9 @@ const ICONS: Record<keyof SelectionActions, { readonly glyph: string; readonly t
  * The selection's actions (operator feedback, 2026-10-11): a short column of icons at the right end
  * of the selection's first line, like Google Docs — *Comment*, *Approve* (the operator's) and
  * *Discuss*, which used to be a button floating over the selection. Not offered while `enabled()`
- * is false — before the design has loaded, and once its session has stopped.
+ * is false — before the design has loaded, and once its session has stopped. Approve is shown to
+ * everyone, disabled with the reason as its title while `approveBlocked` says why; a
+ * [`refreshActions`] effect redraws it when that changes.
  */
 export function selectionActions(actions: () => SelectionActions, enabled: () => boolean = () => true): Extension {
   const tooltip = (state: EditorState): Tooltip | null => {
@@ -323,16 +337,25 @@ export function selectionActions(actions: () => SelectionActions, enabled: () =>
         const now = actions();
         for (const key of ["comment", "approve", "discuss"] as const) {
           const run = now[key];
-          if (run === undefined) continue;
+          const blocked = key === "approve" ? now.approveBlocked : undefined;
           const button = document.createElement("button");
           button.type = "button";
           button.dataset["action"] = key;
           button.textContent = ICONS[key].glyph;
-          button.title = ICONS[key].title;
+          button.title = blocked ?? ICONS[key].title;
           button.setAttribute("aria-label", ICONS[key].title);
+          if (blocked !== undefined) {
+            button.disabled = true;
+            button.setAttribute("aria-disabled", "true");
+            const busy = blocked === APPROVE_BUSY;
+            button.dataset["blocked"] = busy ? "busy" : "caller";
+            if (busy) button.setAttribute("aria-busy", "true");
+          }
           // Keep the selection: a press on the button must not move the cursor first.
           button.addEventListener("mousedown", (e) => e.preventDefault());
-          button.addEventListener("click", () => run(sel.from, sel.to));
+          button.addEventListener("click", () => {
+            if (blocked === undefined) run(sel.from, sel.to);
+          });
           dom.appendChild(button);
         }
         return { dom };
@@ -342,7 +365,10 @@ export function selectionActions(actions: () => SelectionActions, enabled: () =>
   return StateField.define<Tooltip | null>({
     create: tooltip,
     // Re-read on a reconfigure too: that is how the pane says the session stopped or loaded.
-    update: (value, tr) => (tr.docChanged || tr.selection !== undefined || tr.reconfigured ? tooltip(tr.state) : value),
+    update: (value, tr) =>
+      tr.docChanged || tr.selection !== undefined || tr.reconfigured || tr.effects.some((e) => e.is(refreshActions))
+        ? tooltip(tr.state)
+        : value,
     provide: (f) => showTooltip.from(f),
   });
 }

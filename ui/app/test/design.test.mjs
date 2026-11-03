@@ -50,6 +50,7 @@ const { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading } = await 
 const { LAUNCH_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
 const { createAndOpen, createDesign, createTargets, defaultTarget } = await load(path.join(src, "renderer", "src", "design", "create.ts"));
 const { SIDEBAR_WIDTH, clampSidebarWidth, parseSidebarWidth } = await load(path.join(src, "renderer", "src", "design", "sidebarWidth.ts"));
+const { APPROVE_BUSY, approveBlocked, approveSelection, inFlight, settle, IDLE_TIMEOUT_MS } = await load(path.join(src, "renderer", "src", "design", "approve.ts"));
 const Y = require("yjs");
 
 const TOPIC = "design/design.factory-1";
@@ -972,4 +973,245 @@ test("the sidebar's width stays between 180px and half the window, and an unread
   assert.equal(parseSidebarWidth(""), 260);
   assert.equal(parseSidebarWidth("wide"), 260);
   assert.equal(parseSidebarWidth("320"), 320);
+});
+
+// Approve (approve.ts): every way it ends puts exactly one notice on screen, success included — an
+// Approve that showed nothing could not be told from one never clicked.
+const approvedSpan = { uid: "span:new", reviewer: "operator", anchored: true, start: 4, end: 9, text: "world", state: "APPROVED", demoted: false, pieces: [], approved_by: "operator", approved_at: null, steps: [] };
+const settledOn = (text, version = "7.1") => ({ settledVersion: async () => ({ ok: true, doc: { text, version } }) });
+async function approveWith(over = {}) {
+  // `session: undefined` is a case of its own, so it is not defaulted away.
+  const session = "session" in over ? over.session : settledOn("hello world");
+  const { op, idleTimeoutMs } = over;
+  const notices = [];
+  const asked = [];
+  const busy = [];
+  const out = await approveSelection({
+    design: "design:d",
+    session,
+    from: 4,
+    to: 9,
+    shown: "hello world",
+    op: op ?? (async (request) => {
+      asked.push(request);
+      return ok({ result: "design_span", span: approvedSpan });
+    }),
+    onNotice: (m) => notices.push(m),
+    onBusy: (b) => busy.push(b),
+    idleTimeoutMs,
+  });
+  return { out, notices, asked, busy };
+}
+
+test("an approval with no session yet says the design is still opening", async () => {
+  const { out, notices, busy } = await approveWith({ session: undefined, op: async () => assert.fail("no op without a version") });
+  assert.equal(out, undefined);
+  assert.deepEqual(notices, ["The design is still opening — select the text again."]);
+  assert.deepEqual(busy, [true, false]);
+});
+
+test("an approval whose settle rejects says so, instead of an unhandled rejection", async () => {
+  const session = { settledVersion: async () => { throw new Error("Error invoking remote method 'jkb:op': boom"); } };
+  const { out, notices, busy } = await approveWith({ session, op: async () => assert.fail("no op without a version") });
+  assert.equal(out, undefined);
+  assert.deepEqual(notices, ["Cannot approve: Error invoking remote method 'jkb:op': boom"]);
+  assert.deepEqual(busy, [true, false]);
+});
+
+test("an approval waiting on edits that are never saved stops waiting and says so", async () => {
+  assert.equal(IDLE_TIMEOUT_MS, 10_000);
+  const session = { settledVersion: () => new Promise(() => undefined) };
+  const { out, notices, busy } = await approveWith({ session, idleTimeoutMs: 5, op: async () => assert.fail("no op without a version") });
+  assert.equal(out, undefined);
+  assert.deepEqual(notices, ["Edits are still being saved — try again in a moment."]);
+  assert.deepEqual(busy, [true, false]);
+  // A settle that rejects after the wait was abandoned is swallowed, not left unhandled.
+  let reject;
+  const late = { settledVersion: () => new Promise((_, r) => { reject = r; }) };
+  const second = await approveWith({ session: late, idleTimeoutMs: 5 });
+  assert.deepEqual(second.notices, ["Edits are still being saved — try again in a moment."]);
+  const unhandled = [];
+  const listen = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", listen);
+  try {
+    reject(new Error("late"));
+    await tick();
+    await tick();
+  } finally {
+    process.off("unhandledRejection", listen);
+  }
+  assert.deepEqual(unhandled, []);
+});
+
+test("an approval whose op rejects says so, and is no longer busy", async () => {
+  const { out, notices, busy } = await approveWith({ op: async () => { throw new Error("main process died"); } });
+  assert.equal(out, undefined);
+  assert.deepEqual(notices, ["Cannot approve: main process died"]);
+  assert.deepEqual(busy, [true, false]);
+});
+
+test("an approval jkb refuses says jkb's reason", async () => {
+  const { out, notices, busy } = await approveWith({ op: async () => err("forbidden", "only the operator may approve") });
+  assert.equal(out, undefined);
+  assert.deepEqual(notices, ["only the operator may approve"]);
+  assert.deepEqual(busy, [true, false]);
+});
+
+test("an approval over text that moved says to select it again", async () => {
+  const { out, notices, busy } = await approveWith({ session: settledOn("hello there"), op: async () => assert.fail("no op on moved text") });
+  assert.equal(out, undefined);
+  assert.deepEqual(notices, ["The text changed while the approval was being sent — select it again."]);
+  assert.deepEqual(busy, [true, false]);
+  const moved = await approveWith({ session: { settledVersion: async () => ({ ok: false, why: { kind: "moved" } }) } });
+  assert.deepEqual(moved.notices, ["The text changed while the approval was being sent — select it again."]);
+  assert.deepEqual(moved.busy, [true, false]);
+});
+
+test("an approval is busy from the click: through the wait for the session to settle, until it ends", async () => {
+  let settleNow;
+  const session = { settledVersion: () => new Promise((resolve) => { settleNow = () => resolve({ ok: true, doc: { text: "hello world", version: "7.1" } }); }) };
+  const busy = [];
+  const notices = [];
+  const out = approveSelection({
+    design: "design:d",
+    session,
+    from: 4,
+    to: 9,
+    shown: "hello world",
+    op: async () => ok({ result: "design_span", span: approvedSpan }),
+    onNotice: (m) => notices.push(m),
+    onBusy: (b) => busy.push(b),
+  });
+  await tick();
+  assert.ok(settleNow, "the session is being waited on");
+  assert.deepEqual(busy, [true], "busy before the session has settled");
+  assert.deepEqual(notices, []);
+  settleNow();
+  assert.equal((await out).uid, "span:new");
+  assert.deepEqual(busy, [true, false]);
+  assert.deepEqual(notices, ["Approved 5 characters (span:new)."]);
+});
+
+// Actions in flight (approve.ts `inFlight`): one action ending releases only its own busy, so a
+// comment that finishes mid-approval cannot re-enable Approve.
+function heldApproval(f) {
+  let settleNow;
+  const session = { settledVersion: () => new Promise((resolve) => { settleNow = () => resolve({ ok: true, doc: { text: "hello world", version: "7.1" } }); }) };
+  const out = approveSelection({
+    design: "design:d",
+    session,
+    from: 4,
+    to: 9,
+    shown: "hello world",
+    op: async () => ok({ result: "design_span", span: approvedSpan }),
+    onNotice: () => undefined,
+    onBusy: f.track(),
+  });
+  return { out, settle: () => settleNow() };
+}
+
+test("two overlapping actions: the first to end does not clear the other's busy", async () => {
+  const seen = [];
+  const f = inFlight((b) => seen.push(b));
+  assert.equal(f.busy, false);
+  const approval = heldApproval(f);
+  await tick();
+  assert.equal(f.busy, true, "busy from the approval's click");
+  // A comment's `run`, start to end, while the approval waits on the session.
+  const comment = f.track();
+  comment(true);
+  comment(false);
+  assert.equal(f.busy, true, "the comment ending leaves the approval busy");
+  assert.equal(approveBlocked(undefined, f.busy), APPROVE_BUSY);
+  approval.settle();
+  assert.equal((await approval.out).uid, "span:new");
+  assert.equal(f.busy, false);
+  assert.deepEqual(seen, [true, false], "told only when busy flips");
+});
+
+test("an in-flight handle holds once and releases once", () => {
+  const seen = [];
+  const f = inFlight((b) => seen.push(b));
+  const a = f.track();
+  const b = f.track();
+  a(true);
+  b(true);
+  assert.deepEqual(seen, [true], "the second hold is 1→2: no change told");
+  a(false);
+  a(false);
+  assert.equal(f.busy, true, "a doubled release does not take b's hold");
+  assert.deepEqual(seen, [true]);
+  b(false);
+  assert.equal(f.busy, false);
+  assert.deepEqual(seen, [true, false]);
+  a(true);
+  assert.equal(f.busy, false, "a handle used once does not hold again");
+  const c = f.track();
+  c(false);
+  assert.equal(f.busy, false, "a release with no hold does nothing");
+  c(true);
+  c(true);
+  assert.equal(f.busy, true);
+  c(false);
+  assert.equal(f.busy, false, "a doubled hold counts once");
+  assert.deepEqual(seen, [true, false, true, false]);
+});
+
+test("a comment started before an approval and ending first keeps busy until the approval ends", async () => {
+  const seen = [];
+  const f = inFlight((b) => seen.push(b));
+  const comment = f.track();
+  comment(true);
+  assert.equal(approveBlocked(undefined, f.busy), APPROVE_BUSY);
+  const approval = heldApproval(f);
+  await tick();
+  assert.equal(approveBlocked(undefined, f.busy), APPROVE_BUSY);
+  comment(false);
+  assert.equal(f.busy, true);
+  assert.equal(approveBlocked(undefined, f.busy), APPROVE_BUSY);
+  approval.settle();
+  await approval.out;
+  assert.equal(f.busy, false);
+  assert.equal(approveBlocked(undefined, f.busy), undefined);
+  assert.deepEqual(seen, [true, false]);
+});
+
+test("Approve is blocked while busy, and for a caller known not to be the operator, saying why", () => {
+  const operator = { label: "operator", roles: ["operator"], task: null };
+  const designer = { label: "grant:3", roles: ["designer", "reviewer"], task: null };
+  const roleless = { label: "grant:4", roles: [], task: null };
+  assert.equal(approveBlocked(operator, false), undefined);
+  // The role decides, not the label: a grant holding the operator role may approve.
+  assert.equal(approveBlocked({ label: "grant:7", roles: ["reviewer", "operator"], task: null }, false), undefined);
+  assert.equal(
+    approveBlocked(designer, false),
+    "Only the operator approves a selection. Code Factory is connected as grant:3 (designer, reviewer).",
+  );
+  assert.equal(
+    approveBlocked(roleless, false),
+    "Only the operator approves a selection. Code Factory is connected as grant:4 (no role).",
+  );
+  // An unknown caller (whoami pending, refused or failed) is offered Approve: the server decides.
+  assert.equal(approveBlocked(undefined, false), undefined);
+  for (const caller of [operator, designer, roleless, undefined]) {
+    assert.equal(approveBlocked(caller, true), APPROVE_BUSY, "busy wins over every caller");
+  }
+  assert.equal(APPROVE_BUSY, "Wait: an action on this design is still being sent.");
+});
+
+test("a successful approval says what it approved, sent against the settled version", async () => {
+  const { out, notices, asked, busy } = await approveWith();
+  assert.equal(out.uid, "span:new");
+  assert.deepEqual(asked, [{ op: "design.approve_selection", uid: "design:d", base: "7.1", start: 4, end: 9 }]);
+  assert.deepEqual(notices, ["Approved 5 characters (span:new)."]);
+  assert.deepEqual(busy, [true, false]);
+});
+
+test("a request that rejects is noticed with its verb; a refusal with its message", async () => {
+  const notices = [];
+  const doing = { during: "the reply was being sent", verb: "reply" };
+  assert.equal(await settle(async () => { throw new Error("gone"); }, doing, (m) => notices.push(m)), undefined);
+  assert.equal(await settle(async () => err("invalid", "no such thread"), doing, (m) => notices.push(m)), undefined);
+  assert.equal(await settle(async () => ok(3), doing, (m) => notices.push(m)), 3);
+  assert.deepEqual(notices, ["Cannot reply: gone", "no such thread"]);
 });

@@ -370,6 +370,7 @@ function DesignView({
                   onDiscuss={onDiscuss}
                   onComment={threads.comment}
                   onApprove={threads.approve}
+                  approveBlocked={threads.approveBlocked}
                   onView={onView}
                   onCursor={setHead}
                   onGeometry={onGeometry}

@@ -30,8 +30,9 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   run designed whose design you rejected (tagged `swarm-designed=<owner>`; a re-design uses no
   budget, so this read is never limited by it), then the tasks at `design` tagged
   `design=approved`, then the other tasks at `design`, limited to the designers the budget has
-  left. Every read leaves out review findings (tagged `finding=review` when filed) and
-  what the run has settled. It admits a group only if every task in it is admitted. A task at
+  left. Every read leaves out review findings (tagged `finding=review` when filed),
+  what the run has settled, and work an earlier run grafted whose landing was never recorded
+  (tagged `swarm-landing=unrecorded`). It admits a group only if every task in it is admitted. A task at
   `implement`, `review` or `landable` is a *workflow* task. A task still at `design` that the run's design gate let through
   (the `design=approved` tag, a hand-pick by uid, or `--no-design-gate`), and whose design was never
   turned down, is a *legacy* task: its design was never approved in jkb, so it is built on the
@@ -115,13 +116,13 @@ not in it. Ask whether to continue.
 ## 3. Scout and preview
 
 In scope mode, the coordinator's reads, as counts and lists (every read leaves out review
-findings). Its re-design read is empty before the run starts: it holds only tasks the run itself
+findings, and work an earlier run grafted whose landing was never recorded: `swarm-landing=unrecorded`). Its re-design read is empty before the run starts: it holds only tasks the run itself
 designed, so the scout skips it.
 
 ```sh
-jkb task next --global --json '<SCOPE> -tag:finding=review phase:implement,review,landable,systemic_review' --limit 100   # A, build
-jkb task next --global --json '<SCOPE> -tag:finding=review phase:design tag:design=approved' --limit 100                  # B, legacy
-jkb query --global --count 'kind:task is:ready <SCOPE> -tag:finding=review phase:design -tag:design=approved'             # C, design
+jkb task next --global --json '<SCOPE> -tag:finding=review -tag:swarm-landing=unrecorded phase:implement,review,landable,systemic_review' --limit 100   # A, build
+jkb task next --global --json '<SCOPE> -tag:finding=review -tag:swarm-landing=unrecorded phase:design tag:design=approved' --limit 100                  # B, legacy
+jkb query --global --count 'kind:task is:ready <SCOPE> -tag:finding=review -tag:swarm-landing=unrecorded phase:design -tag:design=approved'             # C, design
 jkb query --global --json 'kind:task <SCOPE> phase:design_review' --limit 1000                                            # awaiting you
 ```
 
@@ -131,7 +132,8 @@ goes to a systemic reviewer; `design` goes to a designer if its last workflow mo
 down (`reject_design` or `systemic_redesign`), and is otherwise built (tagged). Read C's tasks go to
 designers with the gate on, as many as the budget allows, or are built with it off. In uid mode,
 read each named task instead (`jkb task show <uid>`, `jkb workflow show <uid>`): a finding is
-refused, and the phase routes the rest the same way.
+refused, one tagged `swarm-landing=unrecorded` is listed as awaiting `jkb task landed`, and the
+phase routes the rest the same way.
 
 Print:
 - how many ready tasks are admitted on the workflow path, and how many on the legacy path;
@@ -193,7 +195,8 @@ jkb workflow agent show swarm-coordinator \
   `jkb task show <uid> --json` shows it open, unblocked and unclaimed, and it belongs to the read
   whose terms its tags and its phase (`jkb workflow show <uid> --json`) match. One tagged
   `finding=review` is a review finding: no run builds it, so leave it and report it as a finding
-  you named. They are hand-picked: step 1b builds one at `design` on the legacy path, unless its
+  you named. One tagged `swarm-landing=unrecorded` is work a run already grafted: leave it and
+  report it as awaiting `jkb task landed`. They are hand-picked: step 1b builds one at `design` on the legacy path, unless its
   design was turned down."
 
 ## 7. When it is done

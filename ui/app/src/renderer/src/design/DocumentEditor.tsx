@@ -7,7 +7,7 @@ import * as Y from "yjs";
 
 import { stateRuns, type DesignDoc } from "@jkb/core";
 
-import { livePreview, selectionActions, setStateMap, spanStates } from "./editor";
+import { livePreview, refreshActions, selectionActions, setStateMap, spanStates } from "./editor";
 import type { DesignSession } from "./session";
 
 /**
@@ -20,6 +20,7 @@ export function DocumentEditor({
   onDiscuss,
   onComment,
   onApprove,
+  approveBlocked,
   onView,
   onCursor,
   onGeometry,
@@ -30,6 +31,8 @@ export function DocumentEditor({
   readonly onComment: (from: number, to: number, text: string) => void;
   /** Approve exactly the selection (the operator's). */
   readonly onApprove: (from: number, to: number, text: string) => void;
+  /** Why Approve cannot be pressed now, shown as the disabled icon's title; `undefined` when it can. */
+  readonly approveBlocked: string | undefined;
   /** The editor once it exists, and `undefined` once it is gone: what *See next* moves. */
   readonly onView?: (view: EditorView | undefined) => void;
   /** Where the cursor is, each time it moves: the place *See next* walks from. */
@@ -44,6 +47,9 @@ export function DocumentEditor({
   comment.current = onComment;
   const approve = useRef(onApprove);
   approve.current = onApprove;
+  const blocked = useRef(approveBlocked);
+  blocked.current = approveBlocked;
+  const editor = useRef<EditorView | undefined>(undefined);
   const viewed = useRef(onView);
   viewed.current = onView;
   const cursor = useRef(onCursor);
@@ -70,6 +76,7 @@ export function DocumentEditor({
             () => ({
               comment: (from, to) => comment.current(from, to, view.state.doc.toString()),
               approve: (from, to) => approve.current(from, to, view.state.doc.toString()),
+              approveBlocked: blocked.current,
               discuss: (from, to) => discuss.current(from, to, view.state.doc.toString()),
             }),
             writable,
@@ -104,14 +111,21 @@ export function DocumentEditor({
     };
     sync();
     const off = session.onChange(sync);
+    editor.current = view;
     viewed.current?.(view);
     return () => {
       off();
+      editor.current = undefined;
       viewed.current?.(undefined);
       view.destroy();
       undo.destroy();
     };
   }, [session]);
+
+  // The selection's icons are drawn once per selection: redraw them when Approve's block changes.
+  useEffect(() => {
+    editor.current?.dispatch({ effects: refreshActions.of(null) });
+  }, [approveBlocked]);
 
   return <div className="design-editor" ref={host} />;
 }

@@ -1,24 +1,32 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
-  decodeDesignSpan,
+  callerOps,
   decodeNewPrompt,
   decodeThread,
   decodeThreads,
+  decodeWhoAmI,
   newPromptTitle,
   promptOps,
   threadOps,
+  type Caller,
   type Design,
   type Outcome,
   type Thread,
 } from "@jkb/core";
 
 import { useTerminals } from "../terminal/TerminalProvider";
+import { approveBlocked, approveSelection, inFlight, settle, versionOf, type Doing } from "./approve";
 import { launchSpec } from "./launch";
 import type { DesignSession } from "./session";
 import type { Draft } from "./ThreadMargin";
 
 const op = (request: Parameters<typeof window.jkb.op>[0]) => window.jkb.op(request);
+
+const STARTING: Doing = { during: "the comment was being started", verb: "start the comment" };
+const REPLYING: Doing = { during: "the reply was being sent", verb: "reply" };
+const RESOLVING: Doing = { during: "the thread was being resolved", verb: "resolve the thread" };
+const ASKING: Doing = { during: "Claude was being asked", verb: "ask Claude" };
 
 /** A selection, and the text it is offsets into: a comment or approval acts only on that text. */
 interface Selected extends Draft {
@@ -42,7 +50,10 @@ export interface Threads {
   /** Resolves true once the reply is in. */
   readonly reply: (thread: Thread, text: string) => Promise<boolean>;
   readonly resolve: (thread: Thread) => void;
+  /** Does nothing while an action on this design is being sent: a stale icon cannot start a second. */
   readonly approve: (from: number, to: number, shown: string) => void;
+  /** Why Approve cannot be pressed now (`approveBlocked`), or `undefined` when it can. */
+  readonly approveBlocked: string | undefined;
   readonly askClaude: (thread: Thread) => void;
 }
 
@@ -66,7 +77,28 @@ export function useThreads(
   // The version on screen: a thread's offsets are good only against the text they were read for.
   const shownVersion = session?.onScreen()?.version;
   const [draft, setDraft] = useState<Selected | undefined>(undefined);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusyState] = useState(false);
+  // The actions in flight, counted: each holds and releases only its own busy, so one ending cannot
+  // clear another's. Built once; `flight.busy` is read by the callbacks, which a click can reach
+  // before React has re-rendered `busy`.
+  const [flight] = useState(() => inFlight(setBusyState));
+  // Who Code Factory is connected as, asked once: `undefined` until answered, and after a failure —
+  // which says nothing, since the server's refusal on a click still says why.
+  const [caller, setCaller] = useState<Caller | undefined>(undefined);
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const answer = decodeWhoAmI(await op(callerOps.whoami()));
+        if (live && answer.ok) setCaller(answer.value);
+      } catch {
+        // Left unknown: Approve stays offered and the server decides.
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     // The answer names the version its offsets are into: fresh only while that is the screen's.
@@ -89,74 +121,44 @@ export function useThreads(
     [design.topic, load],
   );
 
-  /**
-   * The version whose text is `shown`, or `undefined` with a notice saying why not — each way a
-   * session can fail to settle said as *Discuss* says it, never all as "the text changed".
-   */
-  const versionOf = useCallback(
-    async (shown: string, doing: string): Promise<string | undefined> => {
-      if (session === undefined) return undefined;
-      const settled = await session.settledVersion();
-      if (!settled.ok) {
-        const why = settled.why;
-        switch (why.kind) {
-          case "closed":
-            onNotice(`The design was left before its edits were saved, while ${doing} — select the text again.`);
-            return undefined;
-          case "failed":
-            onNotice(`${why.message} — reopen the design.`);
-            return undefined;
-          case "unread":
-            onNotice(`Cannot read the design: ${why.message}`);
-            return undefined;
-          case "moved":
-            break;
-        }
-      }
-      if (!settled.ok || settled.doc.text !== shown) {
-        onNotice(`The text changed while ${doing} — select it again.`);
-        return undefined;
-      }
-      return settled.doc.version;
-    },
-    [session, onNotice],
-  );
-
   const run = useCallback(
-    async <T>(request: Promise<Outcome<T>>): Promise<T | undefined> => {
-      setBusy(true);
+    // `mark` is the action's own busy: `start` passes the one it already holds.
+    async <T>(request: () => Promise<Outcome<T>>, doing: Doing, mark = flight.track()): Promise<T | undefined> => {
+      mark(true);
       try {
-        const answer = await request;
-        if (!answer.ok) {
-          onNotice(answer.error.message);
-          return undefined;
-        }
-        return answer.value;
+        return await settle(request, doing, onNotice);
       } finally {
-        setBusy(false);
+        mark(false);
       }
     },
-    [onNotice],
+    [onNotice, flight],
   );
 
   const start = useCallback(
     async (text: string): Promise<boolean> => {
       const d = draft;
       if (d === undefined) return false;
-      const base = await versionOf(d.shown, "the comment was being started");
-      if (base === undefined) return false;
-      const made = await run(op(threadOps.start(design.uid, base, d.from, d.to, text)).then(decodeThread));
-      if (made === undefined) return false;
+      // Busy from the call, as Approve is: the wait for the session to settle is in flight too.
+      const mark = flight.track();
+      mark(true);
+      try {
+        const base = await versionOf({ session, shown: d.shown, doing: STARTING, onNotice });
+        if (base === undefined) return false;
+        const made = await run(() => op(threadOps.start(design.uid, base, d.from, d.to, text)).then(decodeThread), STARTING, mark);
+        if (made === undefined) return false;
+      } finally {
+        mark(false);
+      }
       setDraft(undefined);
       void load();
       return true;
     },
-    [draft, versionOf, run, design.uid, load],
+    [draft, session, onNotice, run, design.uid, load, flight],
   );
 
   const reply = useCallback(
     async (thread: Thread, text: string): Promise<boolean> => {
-      const done = await run(op(threadOps.reply(thread.uid, text)).then(decodeThread));
+      const done = await run(() => op(threadOps.reply(thread.uid, text)).then(decodeThread), REPLYING);
       void load();
       return done !== undefined;
     },
@@ -165,20 +167,17 @@ export function useThreads(
 
   const resolve = useCallback(
     (thread: Thread) => {
-      void run(op(threadOps.resolve(thread.uid)).then(decodeThread)).then(() => load());
+      void run(() => op(threadOps.resolve(thread.uid)).then(decodeThread), RESOLVING).then(() => load());
     },
     [run, load],
   );
 
   const approve = useCallback(
     (from: number, to: number, shown: string) => {
-      void (async () => {
-        const base = await versionOf(shown, "the approval was being sent");
-        if (base === undefined) return;
-        await run(op(threadOps.approveSelection(design.uid, base, from, to)).then(decodeDesignSpan));
-      })();
+      if (flight.busy) return;
+      void approveSelection({ design: design.uid, session, from, to, shown, op, onNotice, onBusy: flight.track() });
     },
-    [versionOf, run, design.uid],
+    [session, onNotice, design.uid, flight],
   );
 
   const askClaude = useCallback(
@@ -195,7 +194,7 @@ export function useThreads(
         `\`jkb design thread reply ${thread.uid} --text -\` (the reply on stdin). Do not resolve it: ` +
         `that is the operator's.`;
       void (async () => {
-        const answer = await run(op(promptOps.newPrompt(design.uid, ask)).then(decodeNewPrompt));
+        const answer = await run(() => op(promptOps.newPrompt(design.uid, ask)).then(decodeNewPrompt), ASKING);
         if (answer === undefined) return;
         const spec = launchSpec(
           {
@@ -226,6 +225,7 @@ export function useThreads(
     reply,
     resolve,
     approve,
+    approveBlocked: approveBlocked(caller, busy),
     askClaude,
   };
 }

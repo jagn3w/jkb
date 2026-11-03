@@ -566,6 +566,16 @@
   font-weight: 700;
 }
 
+/* Approve for a caller who is not the operator, or while an action is being sent: the title says why. */
+.cm-selection-actions button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.cm-selection-actions button:disabled:hover {
+  background: transparent;
+}
+
 /* ---- the thread margin ---------------------------------------------------------------------- */
 
 .document-with-margin {

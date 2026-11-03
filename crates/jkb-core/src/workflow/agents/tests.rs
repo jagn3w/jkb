@@ -412,7 +412,7 @@ fn the_coordinator_reads_the_frontier_by_phase() {
         .template;
     let at = |s: &str| coord.find(s).unwrap_or_else(|| panic!("{s}"));
     let step = &coord[at("1. READ THE FRONTIER, BY PHASE")..at("1b. ROUTE BY PHASE")];
-    let every = "-tag:swarm-settled={{owner}} -tag:finding=review";
+    let every = "-tag:swarm-settled={{owner}} -tag:finding=review -tag:swarm-landing=unrecorded";
     assert!(step.contains(&format!("\n  {every}\n")), "{step}");
     let reads = [
         (
@@ -460,7 +460,7 @@ fn the_coordinator_reads_the_frontier_by_phase() {
             !q.phases.iter().any(|p| p == "design_review"),
             "no read offers a design awaiting the operator: {terms}"
         );
-        for facet in ["swarm-settled", "finding"] {
+        for facet in ["swarm-settled", "finding", "swarm-landing"] {
             assert!(
                 q.exclude_tags.iter().any(|t| t.facet == facet),
                 "{terms}: -tag:{facet}"
@@ -707,9 +707,9 @@ fn the_slash_command_reads_the_frontier_by_phase_with_a_designer_budget() {
         "Make each read with `jkb task next --global --json\n  '<SCOPE> <the read's terms>' --limit <the read's limit>`"
     ));
     for read in [
-        "'<SCOPE> -tag:finding=review phase:implement,review,landable,systemic_review' --limit 100",
-        "'<SCOPE> -tag:finding=review phase:design tag:design=approved' --limit 100",
-        "'kind:task is:ready <SCOPE> -tag:finding=review phase:design -tag:design=approved'",
+        "'<SCOPE> -tag:finding=review -tag:swarm-landing=unrecorded phase:implement,review,landable,systemic_review' --limit 100",
+        "'<SCOPE> -tag:finding=review -tag:swarm-landing=unrecorded phase:design tag:design=approved' --limit 100",
+        "'kind:task is:ready <SCOPE> -tag:finding=review -tag:swarm-landing=unrecorded phase:design -tag:design=approved'",
         "'kind:task <SCOPE> phase:design_review'",
     ] {
         assert!(md.contains(read), "the scout's read: {read}");
