@@ -580,22 +580,23 @@ pub enum Moved {
 /// Move the existing task `child` under `new_parent` — another task, or an execution plan's step.
 ///
 /// Its old `parent_of` edge goes through [`edge::unlink`] (journalled, so `jkb undo` restores
-/// it) and the new parent is attached through [`add_subtask`], so the plan/span refusal and the
-/// cycle guard are the ones a new subtask meets. `containment::contain` is an upsert, journalled
+/// it) and the new parent is attached through [`add_subtask`], so the unplanned-parent refusal and
+/// the cycle guard are the ones a new subtask meets. `containment::contain` is an upsert, journalled
 /// as an update of the existing row, so undo puts the old container back (or removes the row the
 /// task never had). Its placements and binding are untouched: a move changes what the task is
 /// part of, not where it is filed.
 ///
-/// Refused for a task whose container is a line of its own synced `file://` file: the tasks
-/// serializer owns that parent through the file's indentation, so the next sync would put it back.
-/// A top-level file task (its container outside the file) moves freely — that is how one leaves its
-/// repo's Open work › Inbox — and the next import leaves it at its new step. Refused, too, under a
-/// parent bound to a file, by [`add_subtask`].
+/// Refused for a task bound to a synced `file://` line whose container, or whose new parent, is a
+/// line of that same file: the tasks serializer owns that parent through the file's indentation, so
+/// the next sync would put it back. A top-level file task (its container outside the file) moves to
+/// a parent outside its file — that is how one leaves its repo's Open work › Inbox — and the next
+/// import leaves it at its new step. Refused, too, under a parent bound to another file, by
+/// [`add_subtask`].
 ///
 /// # Errors
 /// [`TypeError::NotFound`] when either item is missing; a validation error when `child` is not a
-/// task, either is bound to a file, or the move is refused by [`add_subtask`]; otherwise a database
-/// error.
+/// task, `child` is a synced line moving under or out from under a line of its own file, or the
+/// move is refused by [`add_subtask`]; otherwise a database error.
 pub fn move_under(
     conn: &Connection,
     meta: &WriteMeta,
@@ -623,13 +624,17 @@ pub fn move_under(
             .and_then(|b| binding::file_path(&b.uri))
             .map(str::to_owned))
     };
-    if let (Some(file), Some(container)) = (file_of(child)?, contained_in) {
-        if file_of(container)?.as_deref() == Some(file.as_str()) {
-            return Err(invalid(format!(
-                "`{}` is an indented line of {file}, whose indentation is its parent: edit the file \
-                 to move it (a move here would be put back by the next sync)",
-                task.uid
-            )));
+    if let Some(file) = file_of(child)? {
+        // Under a line of its own file, or out from under one: the file's indentation says, and
+        // the next sync would put it back.
+        for line in contained_in.into_iter().chain([new_parent]) {
+            if file_of(line)?.as_deref() == Some(file.as_str()) {
+                return Err(invalid(format!(
+                    "`{}` is a line of {file}, whose indentation is its parent there: edit the \
+                     file to move it (a move here would be put back by the next sync)",
+                    task.uid
+                )));
+            }
         }
     }
     let edge_parents = parent_edges(conn, child)?;

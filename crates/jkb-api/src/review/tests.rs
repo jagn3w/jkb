@@ -13,7 +13,7 @@ fn facts(b: &LocalBackend, uid: &str) -> crate::sessions::TaskState {
 }
 
 fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
-    b.call(serde_json::from_value(r).expect("request parses"))
+    b.call(serde_json::from_value(crate::test_repo::in_repo(b, r)).expect("request parses"))
 }
 
 fn file(
@@ -156,7 +156,7 @@ fn only_a_review_that_ran_fully_is_filed() {
     .into_iter()
     .enumerate()
     {
-        let ns = format!("reviews/partial{i}");
+        let ns = format!("repos/t/codereviews/partial{i}");
         let e = call(
             &b,
             json!({ "op": "task.review_file", "run": run, "ns": ns,
@@ -178,10 +178,10 @@ fn only_a_review_that_ran_fully_is_filed() {
 #[test]
 fn a_clean_review_files_one_finished_item() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
-    let filed = file(&b, "reviews/clean", &json!([])).unwrap();
+    let filed = file(&b, "repos/t/codereviews/clean", &json!([])).unwrap();
     assert!(filed.clean);
     assert_eq!(show(&b, &filed.uids[0])["item"]["status"], "done");
-    let f = findings(&b, "reviews/clean");
+    let f = findings(&b, "repos/t/codereviews/clean");
     assert_eq!((f.total, f.open_count), (1, 0));
 }
 
@@ -192,8 +192,8 @@ fn a_filing_is_refused_where_it_would_mix_runs_or_reach_a_file() {
     let (db, ..) = crate::tests::mutate_fixture();
     let b = LocalBackend::new(db);
     let one = json!([{ "severity": "nit", "summary": "x" }]);
-    file(&b, "reviews/once", &one).unwrap();
-    let e = file(&b, "reviews/once", &one).unwrap_err();
+    file(&b, "repos/t/codereviews/once", &one).unwrap();
+    let e = file(&b, "repos/t/codereviews/once", &one).unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
     assert!(e.message.contains("already holds 1"), "{e:?}");
 
@@ -211,10 +211,10 @@ fn a_filing_is_refused_where_it_would_mix_runs_or_reach_a_file() {
             super::MAX_FINDINGS + 1
         ]),
     ] {
-        let e = file(&b, "reviews/bad", &bad).unwrap_err();
+        let e = file(&b, "repos/t/codereviews/bad", &bad).unwrap_err();
         assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
     }
-    assert_eq!(findings(&b, "reviews/bad").total, 0);
+    assert_eq!(findings(&b, "repos/t/codereviews/bad").total, 0);
     // An unknown severity, or a field the op does not take, is not a request at all.
     for bad in [
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": "r", "findings": [{ "severity": "major", "summary": "x" }] }),
@@ -250,18 +250,18 @@ fn started(b: &LocalBackend, text: &str, branch: &str) -> String {
 fn a_review_is_recorded_only_against_findings_that_exist() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
     let uid = started(&b, "the work", "feat");
-    let e = record(&b, "feat", "reviews/missing").unwrap_err();
+    let e = record(&b, "feat", "repos/t/codereviews/missing").unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
     assert!(e.message.contains("no findings found"), "{e:?}");
     assert_eq!(show(&b, &uid)["item"]["status"], "in_progress");
 
     file(
         &b,
-        "reviews/r1",
+        "repos/t/codereviews/r1",
         &json!([{ "severity": "must-fix", "summary": "x" }]),
     )
     .unwrap();
-    let got = record(&b, "feat", "reviews/r1").unwrap();
+    let got = record(&b, "feat", "repos/t/codereviews/r1").unwrap();
     assert_eq!(
         got.recorded,
         vec![super::Recorded {
@@ -273,10 +273,10 @@ fn a_review_is_recorded_only_against_findings_that_exist() {
     assert_eq!(shown["item"]["status"], "needs_review");
     let review = facts(&b, &uid).review;
     assert_eq!(review.reviewed.as_deref(), Some("abc123"));
-    assert_eq!(review.namespaces, vec!["reviews/r1".to_owned()]);
+    assert_eq!(review.namespaces, vec!["repos/t/codereviews/r1".to_owned()]);
     let tags = shown["item"]["tags"].to_string();
     assert!(
-        !tags.contains("abc123") && !tags.contains("reviews/r1"),
+        !tags.contains("abc123") && !tags.contains("repos/t/codereviews/r1"),
         "the review record is not a tag (D52.7): {tags}"
     );
 
@@ -296,11 +296,11 @@ fn a_review_is_recorded_only_against_findings_that_exist() {
 
     // A task landing on the reviewed branch whose work has not been grafted there is reported, and
     // a branch nobody records tags nothing.
-    let got = record(&b, "batch", "reviews/r1").unwrap();
+    let got = record(&b, "batch", "repos/t/codereviews/r1").unwrap();
     assert_eq!(got.skipped_unlanded, vec![uid]);
     assert!(got.recorded.is_empty());
     assert_eq!(
-        record(&b, "main", "reviews/r1").unwrap(),
+        record(&b, "main", "repos/t/codereviews/r1").unwrap(),
         super::Recording::default()
     );
 
@@ -308,7 +308,7 @@ fn a_review_is_recorded_only_against_findings_that_exist() {
         let e = call(
             &b,
             json!({ "op": "task.review_record", "repo": "proj", "branch": branch, "sha": sha,
-                    "findings": "reviews/r1" }),
+                    "findings": "repos/t/codereviews/r1" }),
         )
         .unwrap_err();
         assert_eq!(e.code, ErrorCode::Invalid, "{branch} {sha}: {e:?}");
@@ -330,11 +330,11 @@ fn a_rooted_recording_skips_the_tasks_its_client_may_not_write() {
     }
     file(
         &host,
-        "reviews/r",
+        "repos/t/codereviews/r",
         &json!([{ "severity": "nit", "summary": "x" }]),
     )
     .unwrap();
-    let got = record(&crate::tests::rooted(&db), "feat", "reviews/r").unwrap();
+    let got = record(&crate::tests::rooted(&db), "feat", "repos/t/codereviews/r").unwrap();
     assert_eq!(
         got.recorded.iter().map(|r| &r.uid).collect::<Vec<_>>(),
         vec![&inside]
@@ -359,7 +359,12 @@ fn a_review_larger_than_one_filing_is_trimmed_to_fit() {
             fix: Some("é".repeat(10)),
         })
         .collect();
-    let e = file(&b, "reviews/big", &serde_json::to_value(&findings).unwrap()).unwrap_err();
+    let e = file(
+        &b,
+        "repos/t/codereviews/big",
+        &serde_json::to_value(&findings).unwrap(),
+    )
+    .unwrap_err();
     assert!(e.message.contains("one filing takes at most"), "{e:?}");
     assert!(super::fit(&mut findings));
     assert!(serde_json::to_vec(&findings).unwrap().len() <= super::MAX_FILING_BYTES);
@@ -374,7 +379,12 @@ fn a_review_larger_than_one_filing_is_trimmed_to_fit() {
         Some("é".repeat(10).as_str()),
         "a short text is kept"
     );
-    let filed = file(&b, "reviews/big", &serde_json::to_value(&findings).unwrap()).unwrap();
+    let filed = file(
+        &b,
+        "repos/t/codereviews/big",
+        &serde_json::to_value(&findings).unwrap(),
+    )
+    .unwrap();
     assert_eq!(filed.uids.len(), 150);
     // A single field past its own cap is cut to it, however small the whole review.
     let mut one = vec![super::Finding {
@@ -388,7 +398,12 @@ fn a_review_larger_than_one_filing_is_trimmed_to_fit() {
     assert!(super::fit(&mut one));
     assert!(one[0].summary.len() <= super::MAX_SUMMARY_BYTES);
     assert!(one[0].scenario.as_ref().unwrap().len() <= super::MAX_DETAIL_BYTES);
-    file(&b, "reviews/one", &serde_json::to_value(&one).unwrap()).unwrap();
+    file(
+        &b,
+        "repos/t/codereviews/one",
+        &serde_json::to_value(&one).unwrap(),
+    )
+    .unwrap();
     // A review that already fits is left alone.
     let mut small = findings[..1].to_vec();
     small[0].scenario = Some("s".to_owned());
@@ -439,7 +454,7 @@ fn a_non_operator_records_only_a_filing_and_the_gate_reads_the_recorded_round() 
     let mine = started(&b, "mine", "feat");
     call(
         &b,
-        json!({ "op": "task.add", "text": "by hand !p1", "home": "reviews/hand", "managed": true }),
+        json!({ "op": "task.add", "text": "by hand !p1", "home": "repos/t/codereviews/hand", "managed": true }),
     )
     .unwrap();
     let token = match call(
@@ -466,19 +481,19 @@ fn a_non_operator_records_only_a_filing_and_the_gate_reads_the_recorded_round() 
     assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
     assert!(e.message.contains("reviewer"), "{e:?}");
     let scoped = LocalBackend::new(db).with_caller(crate::rbac::Caller::Token(token));
-    let e = record(&scoped, "feat", "reviews/hand").unwrap_err();
+    let e = record(&scoped, "feat", "repos/t/codereviews/hand").unwrap_err();
     assert!(e.message.contains("not a namespace"), "{e:?}");
     // The operator's `/review-log` path (a mount) still records any namespace.
-    record(&b, "feat", "reviews/hand").unwrap();
+    record(&b, "feat", "repos/t/codereviews/hand").unwrap();
 
     // Someone else's filing — the operator's here — is not this caller's to record.
     file(
         &b,
-        "reviews/op",
+        "repos/t/codereviews/op",
         &json!([{ "severity": "nit", "summary": "theirs" }]),
     )
     .unwrap();
-    let e = record(&scoped, "feat", "reviews/op").unwrap_err();
+    let e = record(&scoped, "feat", "repos/t/codereviews/op").unwrap_err();
     assert!(e.message.contains("this caller filed"), "{e:?}");
     // It files only under its repository's codereviews.
     let e = file(

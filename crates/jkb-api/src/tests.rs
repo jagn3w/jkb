@@ -8,7 +8,7 @@ fn backend() -> LocalBackend {
 }
 
 fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
-    b.call(serde_json::from_value(r).expect("request parses"))
+    b.call(serde_json::from_value(crate::test_repo::in_repo(b, r)).expect("request parses"))
 }
 
 #[test]
@@ -657,6 +657,10 @@ fn samples() -> Vec<Request> {
         Request::NsMv {
             from: "a".into(),
             to: "b".into(),
+        },
+        Request::NsStep {
+            path: "a".into(),
+            step: Some("step:s".into()),
         },
         Request::TaskOpenInRepo { repo: "r".into() },
         Request::TaskPrRecord {
@@ -1854,9 +1858,14 @@ fn every_listing_read_stays_within_its_budget_and_says_when_it_was_cut() {
     ] {
         let response = call(&b, request.clone()).unwrap();
         let wire = serde_json::to_string(&response).unwrap();
+        // A task's place in its plan is part of the task itself, which `task.show` does not charge.
+        let place = match &response {
+            Response::Task { task, .. } => json!({ "place": task.place }).to_string().len(),
+            _ => 0,
+        };
         // The budget counts what the rows serialize to; the envelope around them is not charged.
         assert!(
-            wire.len() <= BUDGET + 256,
+            wire.len() <= BUDGET + 256 + place,
             "{request}: {} bytes over a {BUDGET}-byte budget",
             wire.len()
         );
@@ -2558,7 +2567,7 @@ fn many_task_writes_leave_a_task_outside_the_roots_alone(db: &Db, inside: &str, 
     // `task.review_file` files only `managed:` tasks, so it has no task of anyone's to leave alone.
     let Response::ReviewFiled { filed } = call(
         &b,
-        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": "reviews/many",
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": "repos/t/codereviews/many",
                 "findings": [{ "severity": "nit", "summary": "x" }] }),
     )
     .unwrap() else {
@@ -2569,11 +2578,14 @@ fn many_task_writes_leave_a_task_outside_the_roots_alone(db: &Db, inside: &str, 
     else {
         panic!("task")
     };
-    assert_eq!(task.item.namespace.as_deref(), Some("reviews/many/nit"));
+    assert_eq!(
+        task.item.namespace.as_deref(),
+        Some("repos/t/codereviews/many/nit")
+    );
     let Response::ReviewRecorded { recording } = call(
         &b,
         json!({ "op": "task.review_record", "repo": "r", "branch": "many",
-                "findings": "reviews/many" }),
+                "findings": "repos/t/codereviews/many" }),
     )
     .unwrap() else {
         panic!("recorded")
@@ -2703,10 +2715,39 @@ fn a_claim_owner_is_bounded() {
     }
 }
 
+/// A plan step in repo `x`, by uid.
+fn a_step(db: &Db) -> String {
+    db.write_txn("t", |c, m| {
+        let d = jkb_core::design::create(c, m, "x", "Work", "")?.uid;
+        let p = jkb_core::design::plan::create(c, m, &d, "Plan", &["one".to_owned()])?;
+        Ok(p.steps[0].uid.clone())
+    })
+    .unwrap()
+}
+
+/// Test 12: outside every repo, a task naming no step is refused with the words that say how to
+/// name one — before the global-backlog question, which only a request that would succeed is asked.
+#[test]
+fn outside_a_repo_a_task_with_no_step_is_refused_before_the_backlog_question() {
+    let (db, _inside, _outside, _managed) = mutate_fixture();
+    let b = rooted(&db);
+    for ask in [
+        json!({ "op": "task.add", "text": "later", "cwd": "/nowhere" }),
+        json!({ "op": "task.add", "text": "later", "backlog": true, "cwd": "/nowhere" }),
+    ] {
+        let e = call(&b, ask).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+        assert!(e.message.contains("outside a mounted repo"), "{e:?}");
+        assert!(e.message.contains("jkb design plan ls"), "{e:?}");
+    }
+}
+
 #[test]
 fn the_global_backlog_is_asked_about_only_once_everything_else_is_valid() {
     let (db, _inside, _outside, _managed) = mutate_fixture();
     let b = rooted(&db);
+    // Outside every repo a new task names its step, and only then is the backlog asked about.
+    let step = a_step(&db);
     let before = |b: &LocalBackend| match call(
         b,
         json!({ "op": "kb.query", "dsl": "kind:task", "count": true }),
@@ -2720,7 +2761,7 @@ fn the_global_backlog_is_asked_about_only_once_everything_else_is_valid() {
     assert_eq!(
         call(
             &b,
-            json!({ "op": "task.add", "text": "later", "backlog": true, "cwd": "/nowhere" })
+            json!({ "op": "task.add", "text": "later", "backlog": true, "cwd": "/nowhere", "under": step })
         )
         .unwrap(),
         Response::NeedsGlobalBacklogAssent {}
@@ -2728,7 +2769,7 @@ fn the_global_backlog_is_asked_about_only_once_everything_else_is_valid() {
     assert_eq!(before(&b), n, "nothing created before the user agreed");
     let e = call(
         &b,
-        json!({ "op": "task.add", "text": "later #onto=main", "backlog": true, "cwd": "/nowhere" }),
+        json!({ "op": "task.add", "text": "later #onto=main", "backlog": true, "cwd": "/nowhere", "under": step }),
     )
     .unwrap_err();
     assert_eq!(
@@ -2738,7 +2779,7 @@ fn the_global_backlog_is_asked_about_only_once_everything_else_is_valid() {
     );
     let e = call(
         &b,
-        json!({ "op": "task.add", "text": "later", "backlog": true, "sync": true, "cwd": "/nowhere" }),
+        json!({ "op": "task.add", "text": "later", "backlog": true, "sync": true, "cwd": "/nowhere", "under": step }),
     )
     .unwrap_err();
     assert_eq!(
@@ -2748,7 +2789,7 @@ fn the_global_backlog_is_asked_about_only_once_everything_else_is_valid() {
     );
     let Response::Added { added } = call(
         &b,
-        json!({ "op": "task.add", "text": "later", "backlog": true, "global_backlog": true, "cwd": "/nowhere" }),
+        json!({ "op": "task.add", "text": "later", "backlog": true, "global_backlog": true, "cwd": "/nowhere", "under": step }),
     )
     .unwrap() else {
         panic!("added")
@@ -2893,9 +2934,9 @@ fn every_task_write_holds_the_task_s_tasks_md_line_to_the_round_trip() {
         // subagent), so it is held to the line like every op there.
         json!({ "op": "task.land_check", "uid": inside,
                 "landed": { "branch": "b2", "onto": "o" } }),
-        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": "reviews/rt",
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": "repos/t/codereviews/rt",
                 "findings": [{ "severity": "nit", "summary": "x" }] }),
-        json!({ "op": "task.review_record", "repo": "r", "branch": "b2", "findings": "reviews/rt" }),
+        json!({ "op": "task.review_record", "repo": "r", "branch": "b2", "findings": "repos/t/codereviews/rt" }),
         json!({ "op": "task.review_waive", "uid": inside, "sha": "abcd" }),
         json!({ "op": "task.ran_on_host", "uid": inside, "sha": "abcd" }),
         json!({ "op": "task.claim", "uid": inside, "owner": "box:4" }),
@@ -3086,16 +3127,18 @@ fn a_backlog_add_whose_line_would_not_come_back_is_refused_before_the_question()
     })
     .unwrap();
     let b = rooted(&db);
+    // Outside every repo a new task names its step, and only then is the backlog asked about.
+    let step = a_step(&db);
     let e = call(
         &b,
-        json!({ "op": "task.add", "text": "\"first\n\nsecond\"", "backlog": true, "cwd": "/nowhere" }),
+        json!({ "op": "task.add", "text": "\"first\n\nsecond\"", "backlog": true, "cwd": "/nowhere", "under": step }),
     )
     .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
     assert_eq!(
         call(
             &b,
-            json!({ "op": "task.add", "text": "later", "backlog": true, "cwd": "/nowhere" })
+            json!({ "op": "task.add", "text": "later", "backlog": true, "cwd": "/nowhere", "under": step })
         )
         .unwrap(),
         Response::NeedsGlobalBacklogAssent {},
@@ -3217,6 +3260,8 @@ fn a_task_homed_at_the_namespace_limit_is_refused_naming_its_mirror() {
 fn the_global_backlog_question_follows_every_other_refusal_and_writes_nothing() {
     let (db, _inside, _outside, _managed) = mutate_fixture();
     let b = rooted(&db);
+    // Outside every repo a new task names its step, and only then is the backlog asked about.
+    let step = a_step(&db);
     let count =
         |b: &LocalBackend| match call(b, json!({ "op": "kb.query", "dsl": "", "count": true }))
             .unwrap()
@@ -3227,7 +3272,7 @@ fn the_global_backlog_question_follows_every_other_refusal_and_writes_nothing() 
     let before = count(&b);
     let e = call(
         &b,
-        json!({ "op": "task.add", "text": "later ^task:does-not-exist", "backlog": true, "cwd": "/nowhere" }),
+        json!({ "op": "task.add", "text": "later ^task:does-not-exist", "backlog": true, "cwd": "/nowhere", "under": step }),
     )
     .unwrap_err();
     assert_ne!(
@@ -3238,7 +3283,7 @@ fn the_global_backlog_question_follows_every_other_refusal_and_writes_nothing() 
     assert_eq!(
         call(
             &b,
-            json!({ "op": "task.add", "text": "later", "backlog": true, "cwd": "/nowhere" })
+            json!({ "op": "task.add", "text": "later", "backlog": true, "cwd": "/nowhere", "under": step })
         )
         .unwrap(),
         Response::NeedsGlobalBacklogAssent {}
@@ -4097,6 +4142,7 @@ const OP_WORDS: &[(&str, &str)] = &[
     ("lease.break", "break leases"),
     ("item.rm", "remove items"),
     ("ns.mv", "move namespaces"),
+    ("ns.step", "move namespaces"),
     ("role.map", "map agent types"),
     ("role.rotate_container", "rotate the container credential"),
     ("workflow.set", "choose"),
@@ -4133,4 +4179,94 @@ fn every_op_class_sentence_names_each_op_it_admits() {
         );
     }
     assert_eq!(OP_WORDS.len(), Request::OPS.len(), "one entry per op");
+}
+
+/// The uid of what contains the item `uid`.
+fn container_uid(db: &Db, uid: &str) -> Option<String> {
+    let uid = uid.to_owned();
+    db.read(move |c| {
+        let id = jkb_core::item::id_for_uid(c, &uid)?.unwrap();
+        Ok(match jkb_core::containment::parent(c, id)? {
+            Some(p) => jkb_core::item::get(c, p)?.map(|m| m.uid),
+            None => None,
+        })
+    })
+    .unwrap()
+}
+
+/// Test 11: from inside a mounted repo, `task.add` with no `--under` files the task in the repo's
+/// Open work › Inbox, homed in its inbox — or with `--backlog`, homed in its backlog under the same
+/// step; `--under <step>` files it there; `--under` a task in no plan is refused.
+#[test]
+fn task_add_in_a_repo_files_under_its_inbox_or_the_step_named() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let added = |r: serde_json::Value| match call(&b, r).unwrap() {
+        Response::Added { added } => added,
+        other => panic!("{other:?}"),
+    };
+    let plain = added(json!({ "op": "task.add", "text": "plain" }));
+    assert_eq!(plain.home, "tasks/repos/t/inbox");
+    assert_eq!(
+        container_uid(&db, &plain.uid).as_deref(),
+        Some("step:inbox@t")
+    );
+    let later = added(json!({ "op": "task.add", "text": "later", "backlog": true }));
+    assert_eq!(later.home, "tasks/repos/t/.backlog");
+    assert_eq!(
+        container_uid(&db, &later.uid).as_deref(),
+        Some("step:inbox@t")
+    );
+    let step = a_step(&db);
+    let planned = added(json!({ "op": "task.add", "text": "planned", "under": step }));
+    assert_eq!(
+        container_uid(&db, &planned.uid).as_deref(),
+        Some(step.as_str())
+    );
+
+    let loose = plain.uid.clone();
+    db.write_txn("t", move |c, m| {
+        let id = jkb_core::item::id_for_uid(c, &loose)?.unwrap();
+        let inbox = jkb_core::containment::parent(c, id)?.unwrap();
+        jkb_core::edge::unlink(c, m, inbox, id, jkb_types::EdgeType::ParentOf)?;
+        jkb_core::containment::uncontain(c, m, id).map(|_| ())
+    })
+    .unwrap();
+    let e = call(
+        &b,
+        json!({ "op": "task.add", "text": "under loose", "under": plain.uid }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert!(e.message.contains("under no plan step"), "{e:?}");
+}
+
+/// Test 13: a review's findings are filed in the Open work › Inbox of the repo the review's
+/// namespace names (`finding_under`).
+#[test]
+fn review_findings_are_filed_in_the_reviewed_repos_inbox() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let Response::ReviewFiled { filed } = call(
+        &b,
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
+                "ns": "repos/web/codereviews/r1",
+                "findings": [{ "severity": "nit", "summary": "a nit" },
+                             { "severity": "must-fix", "summary": "a bug" }] }),
+    )
+    .unwrap() else {
+        panic!("filed")
+    };
+    assert_eq!(filed.uids.len(), 2);
+    for uid in &filed.uids {
+        assert_eq!(container_uid(&db, uid).as_deref(), Some("step:inbox@web"));
+    }
+    // A review namespace naming no repo has no Inbox to file into.
+    let e = call(
+        &b,
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
+                "ns": "reviews/r2", "findings": [{ "severity": "nit", "summary": "x" }] }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("outside a mounted repo"), "{e:?}");
 }

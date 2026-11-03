@@ -197,13 +197,15 @@ pub fn unplace(
     Ok(rows.len())
 }
 
-/// The items placed **directly** in `namespace` — those not contained by another item —
-/// ordered by position.
+/// The items placed **directly** in `namespace` — those not contained by another item, a plan
+/// step aside — ordered by position.
 ///
 /// Distinct from [`items_in`], which returns everything placed in the namespace including
 /// contained nodes. Both answer their own question correctly: a subtask *is* in `tasks/jkb`
 /// (which is why `ns:tasks/**` scoping finds it), but it is *listed* under its container,
-/// not beside it.
+/// not beside it. A plan step is the exception: every task's top is filed under one
+/// ([`crate::task::create`]), and a step is placed in no namespace, so a task contained only by a
+/// step is listed where it is placed — otherwise no top-level task would be listed anywhere.
 ///
 /// # Errors
 /// Returns an error if the query fails.
@@ -211,10 +213,14 @@ pub fn items_directly_in(conn: &Connection, namespace: NamespaceId) -> Result<Ve
     let mut stmt = conn.prepare_cached(
         "SELECT p.item_id FROM placements p
           WHERE p.namespace_id = ?1
-            AND NOT EXISTS (SELECT 1 FROM containment c WHERE c.child_item_id = p.item_id)
+            AND NOT EXISTS (SELECT 1 FROM containment c JOIN items k ON k.id = c.parent_item_id
+                             WHERE c.child_item_id = p.item_id AND k.kind <> ?2)
           ORDER BY p.position, p.item_id",
     )?;
-    let rows = stmt.query_map([namespace.get()], |r| r.get::<_, i64>(0))?;
+    let rows = stmt.query_map(
+        rusqlite::params![namespace.get(), crate::design::STEP_KIND],
+        |r| r.get::<_, i64>(0),
+    )?;
     Ok(rows
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()

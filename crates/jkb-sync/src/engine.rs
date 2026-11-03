@@ -3743,7 +3743,7 @@ mod edge_ownership {
 #[cfg(test)]
 mod archive_skip {
     use super::archive_probe::ARCHIVE_WRITES;
-    use super::sync;
+    use super::{plan, sync};
     use jkb_core::{blob, ns, Db};
     use jkb_types::{ConflictPolicy, SyncMode};
 
@@ -3780,7 +3780,11 @@ mod archive_skip {
                 Some("**/*.md"),
                 None,
                 ConflictPolicy::KbWins,
-            )
+            )?;
+            // In no repo: its tasks are filed under a step it is mapped to.
+            plan::triage_step(conn, meta, "t")?;
+            plan::map_namespace(conn, meta, "docs/plan", Some(&plan::triage_step_uid("t")))?;
+            Ok(())
         })
         .unwrap();
         sync(&db, "docs/plan").unwrap();

@@ -180,7 +180,12 @@ mod tests {
                     format!("t{i}"),
                     jkb_core::task::Under::inbox_of("t"),
                 );
-                jkb_core::task::create(c, m, &task)?;
+                let id = jkb_core::task::create(c, m, &task)?;
+                // Loose, as a task from before every task was filed under a step.
+                if let Some(step) = jkb_core::containment::parent(c, id)? {
+                    jkb_core::edge::unlink(c, m, step, id, jkb_types::EdgeType::ParentOf)?;
+                    jkb_core::containment::uncontain(c, m, id)?;
+                }
             }
             Ok(())
         })

@@ -6,7 +6,7 @@ use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response};
 use jkb_core::Db;
 
 fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
-    b.call(serde_json::from_value(r).expect("request parses"))
+    b.call(serde_json::from_value(crate::test_repo::in_repo(b, r)).expect("request parses"))
 }
 
 fn add(b: &LocalBackend, text: &str) -> String {
@@ -119,8 +119,18 @@ fn related_walks_the_edges_it_is_asked_to() {
         ]
     );
     assert_eq!(
-        related(json!({ "op": "kb.related", "uid": d, "depth": 1, "direction": "in" })),
+        related(
+            json!({ "op": "kb.related", "uid": d, "depth": 1, "direction": "in", "edges": ["depends_on"] })
+        ),
         vec![(c.clone(), 1, "in".to_owned())]
+    );
+    // Every edge type: the Inbox step `d` was filed under is a parent too.
+    assert_eq!(
+        related(json!({ "op": "kb.related", "uid": d, "depth": 1, "direction": "in" })),
+        vec![
+            ("step:inbox@t".to_owned(), 1, "in".to_owned()),
+            (c.clone(), 1, "in".to_owned())
+        ]
     );
     for bad in [
         json!({ "op": "kb.related", "uid": a, "depth": 1, "edges": ["loves"] }),

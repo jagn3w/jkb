@@ -388,6 +388,7 @@ impl Request {
             | Self::LeaseBreak { .. }
             | Self::ItemRm { .. }
             | Self::NsMv { .. }
+            | Self::NsStep { .. }
             | Self::MqCompact { .. }
             | Self::RoleMap { .. }
             | Self::RoleRotateContainer { .. }
@@ -463,6 +464,7 @@ impl Request {
             | Self::RemovalDrop { .. }
             | Self::TaskReclaim { .. }
             | Self::NsMv { .. }
+            | Self::NsStep { .. }
             | Self::MqCompact { .. }
             | Self::RoleMap { .. }
             | Self::RoleRotateContainer { .. }

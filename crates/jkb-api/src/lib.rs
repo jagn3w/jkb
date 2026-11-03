@@ -1425,6 +1425,16 @@ pub enum Request {
         /// Its new path.
         to: String,
     },
+    /// Map a namespace to the plan step a new task homed under it is filed under, or clear the
+    /// mapping ([`jkb_core::design::plan::map_namespace`]).
+    #[serde(rename = "ns.step")]
+    NsStep {
+        /// The namespace: a tasks.md section's, a file's or a mount's.
+        path: String,
+        /// The plan step's uid; `None` clears the mapping.
+        #[serde(default)]
+        step: Option<String>,
+    },
     /// The chunks around an item ([`kb::context`]).
     #[serde(rename = "kb.context")]
     KbContext {
@@ -1917,6 +1927,7 @@ impl Request {
         "task.close_merged",
         "ns.list",
         "ns.mv",
+        "ns.step",
         "kb.context",
         "view.list",
         "view.run",
@@ -2065,6 +2076,7 @@ impl Request {
             Self::KbHistory { .. } => "kb.history",
             Self::NsList { .. } => "ns.list",
             Self::NsMv { .. } => "ns.mv",
+            Self::NsStep { .. } => "ns.step",
             Self::KbContext { .. } => "kb.context",
             Self::ViewList {} => "view.list",
             Self::ViewRun { .. } => "view.run",
@@ -2231,6 +2243,7 @@ impl Request {
             | Self::TaskPrAbsent { .. }
             | Self::TaskCloseMerged { .. }
             | Self::NsMv { .. }
+            | Self::NsStep { .. }
             | Self::DesignCreate { .. }
             | Self::DesignMove { .. }
             | Self::DesignSplit { .. }
@@ -2761,6 +2774,11 @@ pub enum Response {
         /// How many namespaces moved.
         count: usize,
     },
+    /// An `ns.step`: the step the namespace was mapped to before.
+    Mapped {
+        /// The previous mapping, if any.
+        before: Option<String>,
+    },
     /// A `task.close_merged`.
     Closed {
         /// Why it was held, if it was.
@@ -3080,6 +3098,7 @@ impl Response {
             | Self::PrFacts { .. }
             | Self::Closed { .. }
             | Self::Moved { .. }
+            | Self::Mapped { .. }
             | Self::Item { .. }
             | Self::ItemRemoved { .. }
             | Self::Blob { .. }
@@ -3224,6 +3243,7 @@ impl Response {
             | Self::Views { .. }
             | Self::Namespaces { .. }
             | Self::Moved { .. }
+            | Self::Mapped { .. }
             | Self::Inv { .. }
             | Self::Item { .. }
             | Self::ItemRemoved { .. }
@@ -5098,6 +5118,11 @@ impl LocalBackend {
                     })?,
                 }
             }
+            Request::NsStep { path, step } => Response::Mapped {
+                before: db.write_txn(actor, move |c, m| {
+                    jkb_core::design::plan::map_namespace(c, m, &path, step.as_deref())
+                })?,
+            },
             Request::KbHistory { path, home } => {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let (uri, versions, truncated) = db.read_with(move |c| {
@@ -5173,3 +5198,47 @@ fn exec_index(principal: &rbac::Principal, topic: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// The client the tests speak for stands in a checkout of repo `t`, as `jkb` run inside a mounted
+/// repo does: a new task with no `--under` is filed in `t`'s Open work › Inbox, which is what a
+/// task outside any repo cannot be.
+#[cfg(test)]
+pub(crate) mod test_repo {
+    use serde_json::Value;
+
+    /// Where repo `t` is checked out: the `cwd` a request is sent from.
+    pub(crate) const DIR: &str = "/jkb-test/repo-t";
+
+    /// `r`, sent from inside repo `t` when it is a `task.add` naming no `cwd` of its own — with `t`
+    /// mounted in `b`'s database at [`DIR`] for it. A request that names a `cwd` (`/nowhere`, to
+    /// stand outside every repo) is left as it is.
+    pub(crate) fn in_repo(b: &super::LocalBackend, mut r: Value) -> Value {
+        if r.get("op").and_then(Value::as_str) == Some("task.add") && r.get("cwd").is_none() {
+            mount(&b.db);
+            r["cwd"] = Value::from(DIR);
+        }
+        r
+    }
+
+    /// Mount `repos/t` at [`DIR`] in `db`, once.
+    pub(crate) fn mount(db: &jkb_core::Db) {
+        db.write_txn("t", |c, m| {
+            let ns = jkb_core::ns::ensure(c, m, "repos/t")?;
+            if jkb_core::mount::get(c, ns)?.is_none() {
+                jkb_core::mount::create(
+                    c,
+                    m,
+                    ns,
+                    &format!("file://{DIR}"),
+                    jkb_types::SyncMode::Bidirectional,
+                    "document",
+                    None,
+                    None,
+                    jkb_types::ConflictPolicy::Manual,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+}

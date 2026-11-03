@@ -1151,6 +1151,19 @@ enum NsCmd {
     Mv { from: String, to: String },
     /// Remove an empty namespace (no child namespaces or item placements).
     Rm { path: String },
+    /// Map a namespace — a tasks.md section's, a file's or a mount's — to the plan step a new task
+    /// homed there with no `--under` is filed under (else its repo's Open work › Inbox). A synced
+    /// file's top-level tasks still in that Inbox move to the mapped step on its next import.
+    Step {
+        /// The namespace path.
+        path: String,
+        /// The plan step's uid (`jkb design plan ls <design>` lists them).
+        #[arg(required_unless_present = "clear")]
+        step: Option<String>,
+        /// Remove the mapping.
+        #[arg(long, conflicts_with = "step")]
+        clear: bool,
+    },
     /// Show or set a namespace's type. A type states what may live in the namespace
     /// (enforced on every write) and, for an investigation strategy, the verbs that
     /// drive it. Inherited by the whole subtree. With no `<type>`, shows the current one.
@@ -2184,7 +2197,7 @@ fn cmd_guide() {
 /// The item's primary (home) namespace path, if placed.
 fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
     match cmd {
-        NsCmd::Ls { .. } | NsCmd::Mv { .. } => {
+        NsCmd::Ls { .. } | NsCmd::Mv { .. } | NsCmd::Step { .. } => {
             anyhow::bail!("internal: an ns verb served as an op missed ops_cli's dispatch")
         }
         NsCmd::Mk { paths } => {

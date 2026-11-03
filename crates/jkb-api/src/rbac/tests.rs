@@ -10,7 +10,7 @@ use super::{Caller, OpPermission, Tickets, OP_GRANTS};
 use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response};
 
 fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
-    b.call(serde_json::from_value(r).expect("request parses"))
+    b.call(serde_json::from_value(crate::test_repo::in_repo(b, r)).expect("request parses"))
 }
 
 #[allow(clippy::needless_pass_by_value)] // every call site builds its request inline
@@ -1423,4 +1423,40 @@ fn the_operator_is_not_held_to_a_reviewer() {
         Response::Landing { landing } => assert!(landing.moved, "{landing:?}"),
         other => panic!("{other:?}"),
     }
+}
+
+/// Test 15: a caller held to one task adds under it when it is planned; under its own task left
+/// loose by a build before the guard, the core refusal says to plan that task first.
+#[test]
+fn a_scoped_caller_adds_under_its_planned_task_and_not_under_its_loose_one() {
+    let kb = Kb::new();
+    let planned = add(&kb.op, "planned");
+    let (_, token) = grant(&kb.op, "coordinator", Some(&planned), "c");
+    ok(
+        &kb.as_token(&token),
+        json!({ "op": "task.add", "text": "a subtask", "under": planned }),
+    );
+
+    let loose = add(&kb.op, "loose");
+    let uid = loose.clone();
+    kb.db
+        .write_txn("t", move |c, m| {
+            let id = jkb_core::item::id_for_uid(c, &uid)?.unwrap();
+            let step = jkb_core::containment::parent(c, id)?.unwrap();
+            jkb_core::edge::unlink(c, m, step, id, jkb_types::EdgeType::ParentOf)?;
+            jkb_core::containment::uncontain(c, m, id).map(|_| ())
+        })
+        .unwrap();
+    let (_, token) = grant(&kb.op, "coordinator", Some(&loose), "d");
+    let e = call(
+        &kb.as_token(&token),
+        json!({ "op": "task.add", "text": "a subtask", "under": loose }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert!(
+        e.message
+            .contains(&format!("jkb task move {loose} --under <step>")),
+        "{e:?}"
+    );
 }

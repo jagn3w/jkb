@@ -49,7 +49,7 @@ pub const fn handles(command: &Command) -> bool {
         | Command::Design { .. }
         | Command::Timeline { .. }
         | Command::Ns {
-            cmd: NsCmd::Ls { .. } | NsCmd::Mv { .. },
+            cmd: NsCmd::Ls { .. } | NsCmd::Mv { .. } | NsCmd::Step { .. },
         }
         // The report; a repair or a backup changes the host, and `main` runs it with the database.
         | Command::Doctor {
@@ -226,6 +226,9 @@ impl<'a> Ops<'a> {
             Command::Ns {
                 cmd: NsCmd::Mv { from, to },
             } => self.ns_mv(&from, &to),
+            Command::Ns {
+                cmd: NsCmd::Step { path, step, clear },
+            } => self.ns_step(&path, if clear { None } else { step }),
             Command::Staging {
                 cmd: super::StagingCmd::Ls { all },
             } => crate::cmd_staging_ls(&crate::session_cli::Kb::from_ops(self), all, self.json),
@@ -280,6 +283,34 @@ impl<'a> Ops<'a> {
                 Ok(())
             }
             other => unexpected("ns.mv", &other),
+        }
+    }
+
+    /// `jkb ns step <path> [<step>] [--clear]`.
+    fn ns_step(&self, path: &str, step: Option<String>) -> Result<()> {
+        let to = step.clone();
+        match self.call(Request::NsStep {
+            path: path.to_owned(),
+            step,
+        })? {
+            Response::Mapped { before } => {
+                if self.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ns": path, "step": to, "before": before,
+                        }))?
+                    );
+                } else {
+                    match (&to, &before) {
+                        (Some(step), _) => println!("{path}: new tasks file under {step}"),
+                        (None, Some(was)) => println!("{path}: cleared the mapping to {was}"),
+                        (None, None) => println!("{path}: no mapping to clear"),
+                    }
+                }
+                Ok(())
+            }
+            other => unexpected("ns.step", &other),
         }
     }
 

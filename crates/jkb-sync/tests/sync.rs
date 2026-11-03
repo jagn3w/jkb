@@ -19,11 +19,15 @@ use rusqlite::OptionalExtension;
 /// canonical and sync refuses a path through a symlink (`jkb_core::nofollow`), so a test mounting a
 /// raw temp path — `/var/folders/…` on macOS, where `/var` is a link — would be refused for a reason
 /// real mounts never meet.
+use jkb_core::design::plan;
+
 fn real_tempdir() -> tempfile::TempDir {
     tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
 }
 
-/// Create a `file://` mount at `ns_path` backing `dir`.
+/// Create a `file://` mount at `ns_path` backing `dir`. A mount outside `repos/` names no repo, so
+/// its tasks would have no Open work › Inbox to fall back to: it is mapped to repo `t`'s Inbox
+/// (`jkb ns step`), as a real one outside `repos/` must be before its tasks import.
 #[allow(clippy::too_many_arguments)]
 fn mount_dir(
     db: &Db,
@@ -52,7 +56,12 @@ fn mount_dir(
             include.as_deref(),
             exclude.as_deref(),
             policy,
-        )
+        )?;
+        if jkb_core::mount::repo_of_namespace(&ns_path).is_none() {
+            plan::triage_step(conn, meta, "t")?;
+            plan::map_namespace(conn, meta, &ns_path, Some(&plan::triage_step_uid("t")))?;
+        }
+        Ok(())
     })
     .unwrap();
 }
@@ -3787,10 +3796,17 @@ fn a_disk_reindent_that_swaps_parent_and_child_is_applied() {
         );
         assert_eq!(
             container_of(&db, parent.2),
-            None,
-            "round {round}: the old container is gone"
+            Some(inbox(&db)),
+            "round {round}: the old container is gone, for the top-level line's default step"
         );
     }
+}
+
+/// Repo `t`'s Open work › Inbox step, which the tests' mounts are mapped to.
+fn inbox(db: &Db) -> jkb_types::ItemId {
+    db.read(|conn| item::id_for_uid(conn, &plan::triage_step_uid("t")))
+        .unwrap()
+        .expect("the Inbox")
 }
 
 /// The item bound to `uri`.
@@ -3890,7 +3906,7 @@ fn an_outdent_drops_the_container_and_undo_restores_it() {
     .unwrap();
     sync(&db, "docs/plan").unwrap();
     assert!(!has_parent_edge(&db, &ship, &write));
-    assert_eq!(container_of(&db, &write), None);
+    assert_eq!(container_of(&db, &write), Some(inbox(&db)));
     assert!(ready_uids(&db).contains(&ship));
 
     db.write_txn("t", jkb_core::undo::undo_last).unwrap();
@@ -3972,7 +3988,7 @@ fn a_deleted_parent_line_releases_its_open_subtask() {
     fs::write(&file, "## Work\n- [ ] Write it ^write\n").unwrap();
     sync(&db, "docs/plan").unwrap();
     assert_eq!(kb_status(&db, &ship).as_deref(), Some("cancelled"));
-    assert_eq!(container_of(&db, &write), None);
+    assert_eq!(container_of(&db, &write), Some(inbox(&db)));
     assert!(listed().contains(&write_id), "{:?}", listed());
     assert!(
         !parent_edge(),
@@ -4041,7 +4057,9 @@ fn an_unrelated_edit_rewrites_no_containment_row() {
         .unwrap()
     };
     let before = containment_entries();
-    assert_eq!(before, 1);
+    // The Open work plan and its Inbox step, each new task filed in the Inbox, and the child moved
+    // under its parent.
+    assert_eq!(before, 5);
     fs::write(
         &file,
         "## Work\n- [ ] Ship it now ^ship\n  - [ ] Write it ^write\n",
@@ -4547,4 +4565,224 @@ fn tasks_files_differing_only_in_case_keep_their_own_tasks() {
     assert!(fs::read_to_string(&lower)
         .unwrap()
         .contains("Lower task ^low"));
+}
+
+// ---- every file task is filed under a plan step -------------------------------------------------
+
+/// The uid of what contains the task bound to `uri`.
+fn container_uid(db: &Db, uri: &str) -> Option<String> {
+    let id = item_of(db, uri);
+    db.read(move |conn| {
+        Ok(match jkb_core::containment::parent(conn, id)? {
+            Some(p) => item::get(conn, p)?.map(|m| m.uid),
+            None => None,
+        })
+    })
+    .unwrap()
+}
+
+fn unplanned(db: &Db) -> Vec<String> {
+    db.read(plan::unplanned)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.uid)
+        .collect()
+}
+
+/// A plan step of a new design in repo `app`, by uid.
+fn app_step(db: &Db, title: &str) -> String {
+    let title = title.to_owned();
+    db.write_txn("t", move |conn, meta| {
+        let d = jkb_core::design::create(conn, meta, "app", &title, "")?.uid;
+        let p = plan::create(conn, meta, &d, &title, &["one".to_owned()])?;
+        Ok(p.steps[0].uid.clone())
+    })
+    .unwrap()
+}
+
+/// A `tasks` mount at `repos/app` over a fresh directory holding `tasks.md` with `body`.
+fn app_repo(body: &str) -> (tempfile::TempDir, Db, std::path::PathBuf) {
+    let dir = real_tempdir();
+    let file = dir.path().join("tasks.md");
+    fs::write(&file, body).unwrap();
+    let db = Db::open_in_memory().unwrap();
+    mount_dir(
+        &db,
+        "repos/app",
+        dir.path(),
+        SyncMode::Bidirectional,
+        "tasks",
+        Some("**/*.md"),
+        None,
+        ConflictPolicy::Manual,
+    );
+    (dir, db, file)
+}
+
+/// Tests 16 and 17: a new tasks.md in repo `app` files its top-level lines in `app`'s Open work ›
+/// Inbox and its indented lines under their file parents, leaving nothing unplanned; an outdented
+/// child goes back to the Inbox rather than loose.
+#[test]
+fn a_new_tasks_file_files_its_top_lines_in_the_repos_inbox() {
+    let (_dir, db, file) = app_repo("## Work\n- [ ] Ship it ^ship\n  - [ ] Write it ^write\n");
+    sync(&db, "repos/app").unwrap();
+    let uri = uri_for(&file);
+    let (ship, write) = (format!("{uri}#ship"), format!("{uri}#write"));
+    assert_eq!(container_uid(&db, &ship).as_deref(), Some("step:inbox@app"));
+    assert_eq!(container_of(&db, &write), Some(item_of(&db, &ship)));
+    assert!(unplanned(&db).is_empty(), "{:?}", unplanned(&db));
+
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it ^ship\n- [ ] Write it ^write\n",
+    )
+    .unwrap();
+    sync(&db, "repos/app").unwrap();
+    assert_eq!(
+        container_uid(&db, &write).as_deref(),
+        Some("step:inbox@app")
+    );
+    assert!(!has_parent_edge(&db, &ship, &write));
+    assert!(unplanned(&db).is_empty());
+}
+
+/// Tests 18 and 19: a top-level line moved to a real step stays there through the next import,
+/// and a line left loose by a build before the guard is adopted into the Inbox by the next one.
+#[test]
+fn a_moved_top_line_stays_and_a_loose_one_is_adopted() {
+    let (_dir, db, file) = app_repo("## Work\n- [ ] Ship it ^ship\n- [ ] Loose ^loose\n");
+    sync(&db, "repos/app").unwrap();
+    let uri = uri_for(&file);
+    let (ship, loose) = (format!("{uri}#ship"), format!("{uri}#loose"));
+    let step = app_step(&db, "Real");
+    let (ship_id, step_id) = (item_of(&db, &ship), {
+        let s = step.clone();
+        db.read(move |c| item::id_for_uid(c, &s)).unwrap().unwrap()
+    });
+    db.write_txn("t", move |c, m| task::move_under(c, m, ship_id, step_id))
+        .unwrap();
+    // Loose, as a pre-guard build left a line: no container, no edge.
+    let loose_id = item_of(&db, &loose);
+    db.write_txn("t", move |c, m| {
+        let inbox = jkb_core::containment::parent(c, loose_id)?.unwrap();
+        jkb_core::edge::unlink(c, m, inbox, loose_id, jkb_types::EdgeType::ParentOf)?;
+        jkb_core::containment::uncontain(c, m, loose_id)?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(unplanned(&db), [loose.clone()]);
+
+    fs::write(
+        &file,
+        "## Work\n- [ ] Ship it now ^ship\n- [ ] Loose ^loose\n",
+    )
+    .unwrap();
+    sync(&db, "repos/app").unwrap();
+    assert_eq!(container_uid(&db, &ship).as_deref(), Some(step.as_str()));
+    assert_eq!(
+        container_uid(&db, &loose).as_deref(),
+        Some("step:inbox@app")
+    );
+    assert!(unplanned(&db).is_empty());
+}
+
+/// Test 20: a section mapped to a step (`jkb ns step`) files its new lines there; a line still in
+/// the Inbox follows on the next import; a line moved by hand to another step stays.
+#[test]
+fn a_mapped_section_files_its_lines_under_its_step() {
+    let (_dir, db, file) = app_repo("## Work\n- [ ] Waiting ^waiting\n- [ ] Moved ^moved\n");
+    sync(&db, "repos/app").unwrap();
+    let uri = uri_for(&file);
+    let (waiting, moved, new) = (
+        format!("{uri}#waiting"),
+        format!("{uri}#moved"),
+        format!("{uri}#new"),
+    );
+    let (mapped, by_hand) = (app_step(&db, "Mapped"), app_step(&db, "By hand"));
+    let moved_id = item_of(&db, &moved);
+    let hand = by_hand.clone();
+    db.write_txn("t", move |c, m| {
+        let to = item::id_for_uid(c, &hand)?.unwrap();
+        task::move_under(c, m, moved_id, to).map(|_| ())
+    })
+    .unwrap();
+    let section = db
+        .read(move |c| item::primary_namespace(c, moved_id))
+        .unwrap()
+        .expect("the section's namespace");
+    let to = mapped.clone();
+    db.write_txn("t", move |c, m| {
+        plan::map_namespace(c, m, &section, Some(&to)).map(|_| ())
+    })
+    .unwrap();
+
+    fs::write(
+        &file,
+        "## Work\n- [ ] Waiting ^waiting\n- [ ] Moved ^moved\n- [ ] New ^new\n",
+    )
+    .unwrap();
+    sync(&db, "repos/app").unwrap();
+    assert_eq!(container_uid(&db, &new).as_deref(), Some(mapped.as_str()));
+    assert_eq!(
+        container_uid(&db, &waiting).as_deref(),
+        Some(mapped.as_str())
+    );
+    assert_eq!(
+        container_uid(&db, &moved).as_deref(),
+        Some(by_hand.as_str())
+    );
+}
+
+/// Test 21: a tasks.md in no repo and mapped to no step fails — that file alone, saying how to map
+/// it — and a mapped sibling in the same mount still syncs.
+#[test]
+fn a_file_in_no_repo_and_no_mapping_fails_alone() {
+    let dir = real_tempdir();
+    fs::write(dir.path().join("one.md"), "- [ ] Orphan ^orphan\n").unwrap();
+    fs::write(dir.path().join("two.md"), "- [ ] Homed ^homed\n").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let backing = format!("file://{}", dir.path().to_string_lossy());
+    db.write_txn("t", move |conn, meta| {
+        let ns_id = ns::ensure(conn, meta, "docs/x")?;
+        jkb_core::mount::create(
+            conn,
+            meta,
+            ns_id,
+            &backing,
+            SyncMode::Bidirectional,
+            "tasks",
+            Some("**/*.md"),
+            None,
+            ConflictPolicy::Manual,
+        )?;
+        plan::triage_step(conn, meta, "t")?;
+        plan::map_namespace(
+            conn,
+            meta,
+            "docs/x/two.md",
+            Some(&plan::triage_step_uid("t")),
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let report = sync(&db, "docs/x").unwrap();
+    let outcome = |name: &str| {
+        report
+            .results
+            .iter()
+            .find(|r| r.path.ends_with(name))
+            .unwrap_or_else(|| panic!("{name}: {report:?}"))
+            .clone()
+    };
+    let one = outcome("one.md");
+    assert_eq!(one.outcome, Outcome::Failed, "{one:?}");
+    let why = one.reason.unwrap_or_default();
+    assert!(why.contains("outside a mounted repo"), "{why}");
+    assert!(why.contains("jkb ns step docs/x/one.md <step>"), "{why}");
+    assert_ne!(outcome("two.md").outcome, Outcome::Failed);
+    let homed = uri_for(&dir.path().join("two.md"));
+    assert_eq!(
+        container_uid(&db, &format!("{homed}#homed")).as_deref(),
+        Some("step:inbox@t")
+    );
 }
