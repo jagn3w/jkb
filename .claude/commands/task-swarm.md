@@ -27,7 +27,8 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   (`jkb-reviewer` → `reviewer`), never from a grant the coordinator mints.
 - **Workflow.** The coordinator reads the frontier by workflow phase, in up to four reads: first
   the tasks past design (`implement`, `review`, `landable`, `systemic_review`), then the tasks this
-  run designed whose design you rejected (tagged `swarm-designed=<owner>`; a re-design uses no
+  run designed whose design you rejected (tagged `swarm-designed=<owner>`, and not
+  `design-failed=<owner>`: a failed design gets no second designer; a re-design uses no
   budget, so this read is never limited by it), then the tasks at `design` tagged
   `design=approved`, then the other tasks at `design`, limited to the designers the budget has
   left. Every read leaves out review findings (tagged `finding=review` when filed),
@@ -143,7 +144,9 @@ Print:
   approving them before the run lets it build them;
 - for named uids, any still at `design`, which go on the legacy path unless their design was
   turned down (then they go to a designer), and any review finding, which is refused;
-- the tasks at `systemic_review`, each of which gets a systemic reviewer;
+- the tasks at `systemic_review`, each of which gets a systemic reviewer, with the tasks on its
+  branch in its group (a task on the branch of a SYSTEMIC task outside the run is left out and
+  reported);
 - a rough agent count: one designer per task designed, up to the budget, one systemic reviewer per
   task at `systemic_review`, plus about two per group per attempt (an implementer and a reviewer),
   with up to 3 attempts per group, and a systemic reviewer for a group whose review keeps failing in

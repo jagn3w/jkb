@@ -422,7 +422,7 @@ fn the_coordinator_reads_the_frontier_by_phase() {
         ),
         (
             "  R, re-design  ",
-            "phase:design tag:swarm-designed={{owner}}",
+            "phase:design tag:swarm-designed={{owner}} -tag:design-failed={{owner}}",
             "--limit 100",
         ),
         (
@@ -451,9 +451,19 @@ fn the_coordinator_reads_the_frontier_by_phase() {
         // R and the two it is carved out of never offer the same task.
         let designed =
             |t: &crate::query::TagPred| t.facet == "swarm-designed" && t.value == "box:1";
+        // A failed design gets no second designer this run, so read R leaves it out even when a
+        // compaction released it before it was settled. Only read R: read A must still offer a task
+        // whose design was approved despite a stray `design-failed=` (its phase governs). The edge
+        // this leaves — a design submitted, tagged failed, then rejected — is not re-designed in this
+        // run; the tag is per-owner, so the next run's reads offer it as usual.
+        let failed = |t: &crate::query::TagPred| t.facet == "design-failed" && t.value == "box:1";
         if label.starts_with("  R") {
             assert!(q.tags.iter().any(designed), "{terms}");
-        } else if label.starts_with("  B") || label.starts_with("  C") {
+            assert!(q.exclude_tags.iter().any(failed), "{terms}");
+        } else if label.starts_with("  A") {
+            assert!(!q.exclude_tags.iter().any(failed), "{terms}");
+        } else {
+            // B and C: carved out of R.
             assert!(q.exclude_tags.iter().any(designed), "{terms}");
         }
         assert!(
@@ -469,6 +479,7 @@ fn the_coordinator_reads_the_frontier_by_phase() {
     }
     assert!(step.contains("Read A first, so approved work is never hidden"));
     assert!(step.contains("Read R next, at\nany budget"));
+    assert!(step.contains("but never one whose designer failed (`design-failed={{owner}}`)"));
     assert!(step.contains("Read C only while DESIGNERS LEFT is above 0."));
     assert!(coord.contains(
         "Every task of\n                                read R is one: it goes to a designer"
@@ -574,27 +585,23 @@ fn the_swarm_sends_a_repeated_area_to_a_systemic_reviewer() {
         design_row.contains("`reject_design` or a\n                                `systemic_redesign`, whatever the gate says"),
         "{design_row}"
     );
-    // A task an earlier run left at `systemic_review` is not left out (every later run would settle
-    // it, and the stall would persist): step 1b takes it, as a group of one, straight to step 4b,
-    // whose exits start an implementer on its branch since it has none of this run's.
-    let row =
-        &coord[at("  systemic_review               a SYSTEMIC task")..at("THE BUDGET REFUSES")];
-    for rule in [
-        "group of one",
-        "start no implementer",
-        "go straight to step 4b",
-    ] {
-        assert!(row.contains(rule), "step 1b's systemic row: {rule}");
-    }
     // ...and nothing gives a paused group up for want of budget.
     assert!(!step.contains("redesign left for want of budget"), "{step}");
     assert!(coord.contains("a PAUSED group's redesign is exempt\n  (step 4b)"));
+    // The rule is keyed on the agent id the coordinator holds, not on whether the group ever had an
+    // implementer: after a SYSTEMIC group's first exit it has one, and a later systemic review
+    // continues it rather than starting another on the same branch.
     for rule in [
-        "NO IMPLEMENTER OF YOURS: a SYSTEMIC group never had one in this run",
+        "NO IMPLEMENTER OF YOURS: an arm below that sends the implementer something sends it to the agent id",
+        "a SYSTEMIC group before its first exit in this run",
+        "a later systemic review of this group continues it with SendMessage",
+        "While you hold an id for the group, never start another implementer for it.",
         "the branch the lead's `branch=` tag names",
+        "its implementer, if you hold one, whose agent id you keep",
     ] {
         assert!(step.contains(rule), "step 4b: {rule}");
     }
+    assert!(!step.contains("never had one in this run"), "{step}");
     assert!(at("NO IMPLEMENTER OF YOURS") < at("- implement (submit_systemic)"));
     // A paused group waits on the operator: it does not hold the run open, and after a compaction
     // its lead's phase or tag names it.
@@ -613,6 +620,54 @@ fn the_swarm_sends_a_repeated_area_to_a_systemic_reviewer() {
         .def
         .template
         .contains("an earlier one\n   was rejected"));
+}
+
+/// A task an earlier run left at `systemic_review` leads a group of itself and the tasks on its
+/// branch: its earlier group's non-leads are still at `implement`, their work is on its branch, and
+/// its landing closes them, so routing them by their own phase would build a second copy.
+#[test]
+fn a_systemic_lead_takes_up_the_tasks_on_its_branch() {
+    let agents = packaged().unwrap();
+    let coord = &agents
+        .iter()
+        .find(|a| a.name == "swarm-coordinator")
+        .unwrap()
+        .def
+        .template;
+    let at = |s: &str| coord.find(s).unwrap_or_else(|| panic!("{s}"));
+    // A task an earlier run left at `systemic_review` is not left out (every later run would settle
+    // it, and the stall would persist): step 1b takes it, leading a group of itself and the tasks on
+    // its branch, straight to step 4b, whose first exit starts an implementer on its branch, and
+    // later exits continue it.
+    let row =
+        &coord[at("  systemic_review               a SYSTEMIC task")..at("\nON ITS BRANCH: ")];
+    for rule in [
+        "It LEADS a group of its own",
+        "Never group it with any other",
+        "start no implementer",
+        "go straight to step 4b",
+        "step 4b's first exit starts one on its branch",
+        "later exits continue it",
+    ] {
+        assert!(row.contains(rule), "step 1b's systemic row: {rule}");
+    }
+    // Its earlier group's non-leads are on its branch, closed by its landing: they join its group,
+    // or are left out, but are never rebuilt off the integration branch as a second copy.
+    let on_branch = &coord[at("\nON ITS BRANCH: ")..at("THE BUDGET REFUSES")];
+    for rule in [
+        "kind:task phase:systemic_review tag:branch=<its branch>",
+        "never route it by its own phase",
+        "the task joins its group",
+        "leave the task out:\ntag it SETTLED",
+    ] {
+        assert!(on_branch.contains(rule), "ON ITS BRANCH: {rule}");
+    }
+    assert!(!coord.contains("always a group of one"));
+    assert!(!coord.contains("It is a group of one"));
+    let group = &coord[at("GROUP what you build")..at("2. START EACH GROUP")];
+    assert!(group.contains("never regroup it"), "{group}");
+    let report = &coord[at("\nREPORT\n")..];
+    assert!(report.contains("left out as ON ITS BRANCH"));
 }
 
 /// A designer's failure outlives a report a compaction loses: `swarm-designer` tags its task
@@ -634,12 +689,146 @@ fn a_failed_designer_leaves_a_tag_the_rebuild_reads() {
     let continuing =
         &coord[coord.find("\nCONTINUING\n").unwrap()..coord.find("\nREPORT\n").unwrap()];
     assert!(
-        continuing.contains(
-            "Still at `design`\nand tagged `design-failed={{owner}}`, its designer failed."
-        ),
+        continuing
+            .contains("and tagged `design-failed={{owner}}` it\nfailed whatever you remember"),
         "{continuing}"
     );
-    assert!(continuing.contains("unless the lead is tagged `design-failed={{owner}}`"));
+    assert!(continuing.contains(
+        "designer is at work while it is LIVE (DESIGNING A TASK); otherwise that designer failed."
+    ));
+}
+
+/// A designer that ended without tagging its task, or whose report a compaction lost, is not waited
+/// on forever: the rebuild finishes a task still at `design` as a failed design unless its designer
+/// is LIVE (its agent id known and no report had), the coordinator records the failure itself, and a
+/// report that comes later only changes the REPORT. Both recovery sentences refer to the one
+/// definition, so neither carries a rule of its own.
+#[test]
+fn a_designer_no_longer_live_is_finished_not_waited_on() {
+    let agents = packaged().unwrap();
+    let coord = &agents
+        .iter()
+        .find(|a| a.name == "swarm-coordinator")
+        .unwrap()
+        .def
+        .template;
+    let at = |s: &str| coord.find(s).unwrap_or_else(|| panic!("{s}"));
+    let designing = &coord[at("\nDESIGNING A TASK, one designer per task")..at("\nGROUP ")];
+    assert!(designing.contains("A designer is LIVE while you know its agent id"));
+    assert!(designing.contains("jkb task tag set <uid> design-failed={{owner}}"));
+    assert!(designing.contains("names it as designed late"));
+    assert!(designing.contains("When the designer reports, or is no longer LIVE"));
+    let continuing = &coord[at("\nCONTINUING\n")..at("\nREPORT\n")];
+    assert_eq!(
+        continuing.matches("LIVE (DESIGNING A TASK)").count(),
+        2,
+        "the paused lead and the designer-held task both use the one definition: {continuing}"
+    );
+    assert!(coord[at("\nREPORT\n")..].contains("designed late"));
+    for agent in agents {
+        for gone in [
+            "is still working, so wait",
+            "unless the lead is tagged `design-failed",
+        ] {
+            assert!(!agent.def.template.contains(gone), "{}: {gone}", agent.name);
+        }
+    }
+}
+
+/// A failed design is finished in an order a compaction cannot split into a second designer: judged
+/// by its phase first, then its failure recorded and the task SETTLED, and only then released. A
+/// release before the SETTLED tag left an unclaimed, unsettled task that read R offered again. The
+/// REPORT finds the failed designs from jkb when the reports are gone.
+#[test]
+fn a_failed_design_is_settled_before_it_is_released() {
+    let agents = packaged().unwrap();
+    let coord = &agents
+        .iter()
+        .find(|a| a.name == "swarm-coordinator")
+        .unwrap()
+        .def
+        .template;
+    let at = |s: &str| coord.find(s).unwrap_or_else(|| panic!("{s}"));
+    let designing = &coord[at("\nDESIGNING A TASK, one designer per task")..at("\nGROUP ")];
+    let at_in = |t: &str, s: &str| t.find(s).unwrap_or_else(|| panic!("{s}: {t}"));
+    let submitted = at_in(designing, "  - `phase: design_review`: submitted");
+    let failed = at_in(
+        designing,
+        "  - `phase: design`: failed, whatever the report said.",
+    );
+    let show = at_in(
+        designing,
+        "judge it\n  by the phase, before you release anything: `jkb workflow show <uid>`",
+    );
+    assert!(show < submitted && submitted < failed, "{designing}");
+    // The submitted bullet releases only after the phase was read.
+    let sub = &designing[submitted..failed];
+    assert!(
+        sub.contains("jkb task release <uid> --owner '{{owner}}'"),
+        "{sub}"
+    );
+    // The failed bullet: the failure, then SETTLED, then reopen and release.
+    let fail = &designing[failed..];
+    let tagged = at_in(fail, "`jkb task tag set <uid> design-failed={{owner}}`");
+    let settled = at_in(fail, "`jkb task tag set <uid> swarm-settled={{owner}}`");
+    let open = at_in(fail, "`jkb task set <uid> --status open`");
+    let release = at_in(fail, "`jkb task release <uid> --owner '{{owner}}'`");
+    assert!(
+        tagged < settled && settled < open && open < release,
+        "{fail}"
+    );
+    assert!(fail.contains("It gets no second designer in this run."));
+    // No "either way, release" ahead of the phase check survives.
+    assert!(
+        !designing.contains("Either way,\n  `jkb task set <uid> --status open`"),
+        "{designing}"
+    );
+    let report = &coord[at("\nREPORT\n")..];
+    assert!(report.contains("`jkb query --global 'kind:task tag:design-failed={{owner}}'`"));
+}
+
+/// Attempts are counted per run, like `swarm-settled=`: a bare count an earlier run left on a task
+/// gave the next run's group up early and misled its compaction rebuild. Every attempt tag names the
+/// run's owner, and the value is one the query parser reads back.
+#[test]
+fn the_coordinator_counts_attempts_per_run() {
+    let agents = packaged().unwrap();
+    let coord = &agents
+        .iter()
+        .find(|a| a.name == "swarm-coordinator")
+        .unwrap()
+        .def
+        .template;
+    let at = |s: &str| coord.find(s).unwrap_or_else(|| panic!("{s}"));
+    assert!(coord.contains("`jkb task tag set <uid> swarm-attempt={{owner}}/<n>`"));
+    let uses: Vec<_> = coord.match_indices("swarm-attempt=").collect();
+    assert!(uses.len() >= 3, "{uses:?}");
+    for (i, _) in uses {
+        assert!(
+            coord[i + "swarm-attempt=".len()..].starts_with("{{owner}}/"),
+            "an attempt count not keyed on the run: {}",
+            &coord[i..(i + 40).min(coord.len())]
+        );
+    }
+    let give_up = &coord[at("6. GIVING UP AND RELEASING")..at("\nNEVER\n")];
+    assert!(give_up.contains("swarm-attempt={{owner}}/"), "{give_up}");
+    assert!(
+        give_up.contains("another owner's tag\ncounts as 0"),
+        "{give_up}"
+    );
+    let continuing = &coord[at("\nCONTINUING\n")..at("\nREPORT\n")];
+    assert!(
+        continuing.contains("swarm-attempt={{owner}}/<n>"),
+        "{continuing}"
+    );
+    assert!(
+        continuing.contains("another owner is an earlier run's"),
+        "{continuing}"
+    );
+    let q = crate::query::parse("tag:swarm-attempt=box:1/2").unwrap();
+    assert_eq!(q.tags.len(), 1, "{q:?}");
+    assert_eq!(q.tags[0].facet, "swarm-attempt");
+    assert_eq!(q.tags[0].value, "box:1/2");
 }
 
 /// CLOSING FINDINGS writes tasks outside SCOPE, so the NEVER rule that keeps the coordinator inside
@@ -727,7 +916,8 @@ fn the_slash_command_reads_the_frontier_by_phase_with_a_designer_budget() {
     assert!(md.contains("- `--designers <n>` → `DESIGNERS=<n>`"));
     assert!(md.contains("Default 3; `0` designs nothing."));
     assert!(md.contains("A paused group's redesign (below) is\n  exempt"));
-    assert!(md.contains("(tagged `swarm-designed=<owner>`; a re-design uses no\n  budget, so this read is never limited by it)"));
+    assert!(md.contains("(tagged `swarm-designed=<owner>`, and not\n  `design-failed=<owner>`: a failed design gets no second designer; a re-design uses no\n  budget, so this read is never limited by it)"));
+    assert!(md.contains("with the tasks on its\n  branch in its group"));
     assert!(md.contains("(always\n  started, whatever the designer budget has left)"));
     assert!(md.contains("--var designers=\"${DESIGNERS:-3}\""));
     assert!(md.contains(
