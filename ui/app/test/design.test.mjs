@@ -50,7 +50,7 @@ const { INITIAL_LISTING, listingFailed, listingLoaded, listingLoading } = await 
 const { LAUNCH_SCRIPT } = await load(path.join(src, "renderer", "src", "design", "launch.ts"));
 const { createAndOpen, createDesign, createTargets, defaultTarget } = await load(path.join(src, "renderer", "src", "design", "create.ts"));
 const { SIDEBAR_WIDTH, clampSidebarWidth, parseSidebarWidth } = await load(path.join(src, "renderer", "src", "design", "sidebarWidth.ts"));
-const { APPROVE_BUSY, approveBlocked, approveSelection, settle, IDLE_TIMEOUT_MS } = await load(path.join(src, "renderer", "src", "design", "approve.ts"));
+const { APPROVE_BUSY, approveBlocked, approveSelection, inFlight, settle, IDLE_TIMEOUT_MS } = await load(path.join(src, "renderer", "src", "design", "approve.ts"));
 const Y = require("yjs");
 
 const TOPIC = "design/design.factory-1";
@@ -1090,6 +1090,90 @@ test("an approval is busy from the click: through the wait for the session to se
   assert.equal((await out).uid, "span:new");
   assert.deepEqual(busy, [true, false]);
   assert.deepEqual(notices, ["Approved 5 characters (span:new)."]);
+});
+
+// Actions in flight (approve.ts `inFlight`): one action ending releases only its own busy, so a
+// comment that finishes mid-approval cannot re-enable Approve.
+function heldApproval(f) {
+  let settleNow;
+  const session = { settledVersion: () => new Promise((resolve) => { settleNow = () => resolve({ ok: true, doc: { text: "hello world", version: "7.1" } }); }) };
+  const out = approveSelection({
+    design: "design:d",
+    session,
+    from: 4,
+    to: 9,
+    shown: "hello world",
+    op: async () => ok({ result: "design_span", span: approvedSpan }),
+    onNotice: () => undefined,
+    onBusy: f.track(),
+  });
+  return { out, settle: () => settleNow() };
+}
+
+test("two overlapping actions: the first to end does not clear the other's busy", async () => {
+  const seen = [];
+  const f = inFlight((b) => seen.push(b));
+  assert.equal(f.busy, false);
+  const approval = heldApproval(f);
+  await tick();
+  assert.equal(f.busy, true, "busy from the approval's click");
+  // A comment's `run`, start to end, while the approval waits on the session.
+  const comment = f.track();
+  comment(true);
+  comment(false);
+  assert.equal(f.busy, true, "the comment ending leaves the approval busy");
+  assert.equal(approveBlocked(undefined, f.busy), APPROVE_BUSY);
+  approval.settle();
+  assert.equal((await approval.out).uid, "span:new");
+  assert.equal(f.busy, false);
+  assert.deepEqual(seen, [true, false], "told only when busy flips");
+});
+
+test("an in-flight handle holds once and releases once", () => {
+  const seen = [];
+  const f = inFlight((b) => seen.push(b));
+  const a = f.track();
+  const b = f.track();
+  a(true);
+  b(true);
+  assert.deepEqual(seen, [true], "the second hold is 1→2: no change told");
+  a(false);
+  a(false);
+  assert.equal(f.busy, true, "a doubled release does not take b's hold");
+  assert.deepEqual(seen, [true]);
+  b(false);
+  assert.equal(f.busy, false);
+  assert.deepEqual(seen, [true, false]);
+  a(true);
+  assert.equal(f.busy, false, "a handle used once does not hold again");
+  const c = f.track();
+  c(false);
+  assert.equal(f.busy, false, "a release with no hold does nothing");
+  c(true);
+  c(true);
+  assert.equal(f.busy, true);
+  c(false);
+  assert.equal(f.busy, false, "a doubled hold counts once");
+  assert.deepEqual(seen, [true, false, true, false]);
+});
+
+test("a comment started before an approval and ending first keeps busy until the approval ends", async () => {
+  const seen = [];
+  const f = inFlight((b) => seen.push(b));
+  const comment = f.track();
+  comment(true);
+  assert.equal(approveBlocked(undefined, f.busy), APPROVE_BUSY);
+  const approval = heldApproval(f);
+  await tick();
+  assert.equal(approveBlocked(undefined, f.busy), APPROVE_BUSY);
+  comment(false);
+  assert.equal(f.busy, true);
+  assert.equal(approveBlocked(undefined, f.busy), APPROVE_BUSY);
+  approval.settle();
+  await approval.out;
+  assert.equal(f.busy, false);
+  assert.equal(approveBlocked(undefined, f.busy), undefined);
+  assert.deepEqual(seen, [true, false]);
 });
 
 test("Approve is blocked while busy, and for a caller known not to be the operator, saying why", () => {

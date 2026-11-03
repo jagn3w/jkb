@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import {
   callerOps,
@@ -16,7 +16,7 @@ import {
 } from "@jkb/core";
 
 import { useTerminals } from "../terminal/TerminalProvider";
-import { approveBlocked, approveSelection, settle, versionOf, type Doing } from "./approve";
+import { approveBlocked, approveSelection, inFlight, settle, versionOf, type Doing } from "./approve";
 import { launchSpec } from "./launch";
 import type { DesignSession } from "./session";
 import type { Draft } from "./ThreadMargin";
@@ -78,12 +78,10 @@ export function useThreads(
   const shownVersion = session?.onScreen()?.version;
   const [draft, setDraft] = useState<Selected | undefined>(undefined);
   const [busy, setBusyState] = useState(false);
-  // Mirrors `busy` for the callbacks, which a click can reach before React has re-rendered.
-  const busyRef = useRef(false);
-  const setBusy = useCallback((b: boolean) => {
-    busyRef.current = b;
-    setBusyState(b);
-  }, []);
+  // The actions in flight, counted: each holds and releases only its own busy, so one ending cannot
+  // clear another's. Built once; `flight.busy` is read by the callbacks, which a click can reach
+  // before React has re-rendered `busy`.
+  const [flight] = useState(() => inFlight(setBusyState));
   // Who Code Factory is connected as, asked once: `undefined` until answered, and after a failure —
   // which says nothing, since the server's refusal on a click still says why.
   const [caller, setCaller] = useState<Caller | undefined>(undefined);
@@ -124,30 +122,38 @@ export function useThreads(
   );
 
   const run = useCallback(
-    async <T>(request: () => Promise<Outcome<T>>, doing: Doing): Promise<T | undefined> => {
-      setBusy(true);
+    // `mark` is the action's own busy: `start` passes the one it already holds.
+    async <T>(request: () => Promise<Outcome<T>>, doing: Doing, mark = flight.track()): Promise<T | undefined> => {
+      mark(true);
       try {
         return await settle(request, doing, onNotice);
       } finally {
-        setBusy(false);
+        mark(false);
       }
     },
-    [onNotice, setBusy],
+    [onNotice, flight],
   );
 
   const start = useCallback(
     async (text: string): Promise<boolean> => {
       const d = draft;
       if (d === undefined) return false;
-      const base = await versionOf({ session, shown: d.shown, doing: STARTING, onNotice });
-      if (base === undefined) return false;
-      const made = await run(() => op(threadOps.start(design.uid, base, d.from, d.to, text)).then(decodeThread), STARTING);
-      if (made === undefined) return false;
+      // Busy from the call, as Approve is: the wait for the session to settle is in flight too.
+      const mark = flight.track();
+      mark(true);
+      try {
+        const base = await versionOf({ session, shown: d.shown, doing: STARTING, onNotice });
+        if (base === undefined) return false;
+        const made = await run(() => op(threadOps.start(design.uid, base, d.from, d.to, text)).then(decodeThread), STARTING, mark);
+        if (made === undefined) return false;
+      } finally {
+        mark(false);
+      }
       setDraft(undefined);
       void load();
       return true;
     },
-    [draft, session, onNotice, run, design.uid, load],
+    [draft, session, onNotice, run, design.uid, load, flight],
   );
 
   const reply = useCallback(
@@ -168,10 +174,10 @@ export function useThreads(
 
   const approve = useCallback(
     (from: number, to: number, shown: string) => {
-      if (busyRef.current) return;
-      void approveSelection({ design: design.uid, session, from, to, shown, op, onNotice, onBusy: setBusy });
+      if (flight.busy) return;
+      void approveSelection({ design: design.uid, session, from, to, shown, op, onNotice, onBusy: flight.track() });
     },
-    [session, onNotice, design.uid, setBusy],
+    [session, onNotice, design.uid, flight],
   );
 
   const askClaude = useCallback(

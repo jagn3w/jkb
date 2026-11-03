@@ -115,6 +115,48 @@ export async function versionOf({ session, shown, doing, onNotice, idleTimeoutMs
   return settled.doc.version;
 }
 
+/** Actions in flight on one design: busy while any is. */
+export interface InFlight {
+  readonly busy: boolean;
+  /**
+   * One action's busy, as [`approveSelection`]'s `onBusy` takes it: `true` holds, `false` releases,
+   * each at most once. A doubled `false` cannot release another action's hold, and a `true` after
+   * the release does not hold again: a handle is used once.
+   */
+  track(): (busy: boolean) => void;
+}
+
+/**
+ * A count of the actions in flight, so one action ending releases only its own hold: a boolean
+ * shared by every action let a comment that finished clear an approval's busy mid-approval.
+ * `onChange` is told only when busy flips — the first hold (0→1) and the last release (1→0).
+ */
+export function inFlight(onChange: (busy: boolean) => void): InFlight {
+  let count = 0;
+  return {
+    get busy() {
+      return count > 0;
+    },
+    track() {
+      let held = false;
+      let released = false;
+      return (busy: boolean) => {
+        if (busy) {
+          if (held) return;
+          held = true;
+          count += 1;
+          if (count === 1) onChange(true);
+        } else {
+          if (!held || released) return;
+          released = true;
+          count -= 1;
+          if (count === 0) onChange(false);
+        }
+      };
+    },
+  };
+}
+
 export const APPROVING: Doing = { during: "the approval was being sent", verb: "approve" };
 
 /** [`approveBlocked`]'s reason while busy: the icon also reads `aria-busy` then. */
