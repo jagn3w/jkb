@@ -24,7 +24,7 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # No credential left in .git/config: nothing in this job pushes, and jkb's audited git refuses
       # a repository whose local config carries `http.*.extraheader`. (The generated-docs check
@@ -138,7 +138,7 @@ jobs:
   # Everything that needs no Rust build, in parallel with `check` rather than after its tests: the
   # shell and container checks take seconds but waited behind the whole compile, and fail fast here.
   static:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -218,7 +218,7 @@ jobs:
   # The dependency audit reads Cargo.lock and the advisory database; it builds nothing, so it does
   # not wait for `check`'s compile either.
   deny:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -259,7 +259,7 @@ jobs:
   # build rather than being narrated. The static layer has now been observed green against this job,
   # which is the precondition D52.6 attaches to deleting any of it — a separate piece of work.
   container:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # JKB_ACCEPT_NO_BWRAP IS DELIBERATELY NOT SET. It parked the bubblewrap failure while the cause
     # was unknown; the cause is established (docker-default denies `mount`, and names no pivot_root
     # rule at all), the container ships a profile that fixes it, and the job is green with it. So a
@@ -362,7 +362,7 @@ jobs:
   # This job exists because `scripts/check.sh` *skips* the UI when pnpm is missing. A skip
   # locally must not become a skip in CI, or a type error merges on a green tick.
   ui:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Install, build and every package's tests take a few minutes. Bounded so a hung Electron
     # smoke fails here rather than holding a runner for GitHub's six-hour default.
     timeout-minutes: 20
