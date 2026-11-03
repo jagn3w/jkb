@@ -4250,5 +4250,9 @@ fn review_findings_are_filed_in_the_reviewed_repos_inbox() {
                 "ns": "reviews/r2", "findings": [{ "severity": "nit", "summary": "x" }] }),
     )
     .unwrap_err();
-    assert!(e.message.contains("outside a mounted repo"), "{e:?}");
+    assert!(e.message.contains("repos/<repo>/codereviews/"), "{e:?}");
+    assert!(
+        !e.message.contains("--under"),
+        "no advice this surface cannot take: {e:?}"
+    );
 }

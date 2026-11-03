@@ -425,9 +425,9 @@ fn two_concurrent_creators_share_one_triage_tree() {
 }
 
 /// Test 8: a triage uid that names the wrong kind, or sits in the wrong place, is refused rather
-/// than built beside; the Open work design is never retired.
+/// than built beside.
 #[test]
-fn a_mismatched_triage_tree_is_refused_and_open_work_is_never_retired() {
+fn a_mismatched_triage_tree_is_refused() {
     let db = db();
     db.write_txn("t", |c, m| {
         let d = plan::triage_design_uid("app");
@@ -483,12 +483,92 @@ fn a_mismatched_triage_tree_is_refused_and_open_work_is_never_retired() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("`step:inbox@web` is not where"), "{e}");
+}
 
+fn retired(db: &Db, uid: &str) -> bool {
+    let uid = uid.to_owned();
+    db.read(move |c| super::is_retired(c, &uid)).unwrap()
+}
+
+/// An Open work design is retired like any other — refused while it holds open work, so one a
+/// mistyped `repos/<repo>` home made can be removed — and the next capture there restores it, so no
+/// task is filed under a design no listing shows.
+#[test]
+fn an_open_work_design_retires_when_empty_and_the_next_capture_restores_it() {
+    let db = db();
+    let typo = default_create(&db, "task:typo", "repos/jbk/notes", None).unwrap();
     let e = db
-        .write_txn("t", |c, m| super::retire(c, m, "design:open-work@web"))
+        .write_txn("t", |c, m| super::retire(c, m, "design:open-work@jbk"))
         .unwrap_err()
         .to_string();
-    assert!(e.contains("never retired"), "{e}");
+    assert!(e.contains("task:typo"), "open work holds it: {e}");
+    db.write_txn("t", move |c, m| {
+        task::set_status(c, m, typo, TaskStatus::Cancelled)
+    })
+    .unwrap();
+    db.write_txn("t", |c, m| super::retire(c, m, "design:open-work@jbk"))
+        .unwrap();
+    assert!(retired(&db, "design:open-work@jbk"));
+    let listed = |db: &Db| {
+        db.read(|c| super::list(c, Some("jbk"), false))
+            .unwrap()
+            .into_iter()
+            .any(|d| d.uid == "design:open-work@jbk")
+    };
+    assert!(!listed(&db));
+
+    let again = default_create(&db, "task:again", "repos/jbk/notes", None).unwrap();
+    assert!(
+        !retired(&db, "design:open-work@jbk"),
+        "restored by the capture"
+    );
+    assert!(listed(&db));
+    assert_eq!(parent_uid(&db, again).as_deref(), Some("step:inbox@jbk"));
+    assert_eq!(uid_rows(&db, "design:open-work@jbk"), 1);
+}
+
+/// A namespace mapped to a step of a design since retired is a stale mapping: refused by name, not
+/// honoured, or the task would be planned under a design no listing shows.
+#[test]
+fn a_mapping_into_a_retired_design_is_refused() {
+    let db = db();
+    let (d, _, step) = planned(&db);
+    let step_uid = db
+        .read(move |c| Ok(item::get(c, step)?.unwrap().uid))
+        .unwrap();
+    db.write_txn("t", move |c, m| {
+        ns::ensure(c, m, "repos/app/notes")?;
+        plan::map_namespace(c, m, "repos/app/notes", Some(&step_uid))
+    })
+    .unwrap();
+    db.write_txn("t", move |c, m| super::retire(c, m, &d).map(|_| ()))
+        .unwrap();
+    let e = default_create(&db, "task:late", "repos/app/notes/x", None)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("which is retired"), "{e}");
+    assert!(e.contains("jkb ns step repos/app/notes --clear"), "{e}");
+}
+
+/// Mapping never creates the namespace: a mistyped path is refused, not made and mapped.
+#[test]
+fn mapping_a_namespace_that_does_not_exist_is_refused() {
+    let db = db();
+    let (_, _, step) = planned(&db);
+    let step_uid = db
+        .read(move |c| Ok(item::get(c, step)?.unwrap().uid))
+        .unwrap();
+    let e = db
+        .write_txn("t", move |c, m| {
+            plan::map_namespace(c, m, "repos/app/taks.md", Some(&step_uid))
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("no namespace `repos/app/taks.md`"), "{e}");
+    assert!(db
+        .read(|c| ns::get(c, "repos/app/taks.md"))
+        .unwrap()
+        .is_none());
 }
 
 fn db_with_inbox(repo: &'static str) -> Db {

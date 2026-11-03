@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use jkb_core::design::plan;
 use jkb_core::{binding, item, ns, task, Db};
 use jkb_sync::{sync, sync_paths, Outcome};
 use jkb_types::{ConflictPolicy, SyncMode};
@@ -19,8 +20,6 @@ use rusqlite::OptionalExtension;
 /// canonical and sync refuses a path through a symlink (`jkb_core::nofollow`), so a test mounting a
 /// raw temp path — `/var/folders/…` on macOS, where `/var` is a link — would be refused for a reason
 /// real mounts never meet.
-use jkb_core::design::plan;
-
 fn real_tempdir() -> tempfile::TempDir {
     tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
 }
@@ -4756,6 +4755,8 @@ fn a_file_in_no_repo_and_no_mapping_fails_alone() {
             ConflictPolicy::Manual,
         )?;
         plan::triage_step(conn, meta, "t")?;
+        // The file's namespace, made ahead of its first import so it can be mapped.
+        ns::ensure(conn, meta, "docs/x/two.md")?;
         plan::map_namespace(
             conn,
             meta,

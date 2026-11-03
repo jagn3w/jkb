@@ -1589,12 +1589,14 @@ fn task_next_scopes_to_the_repo_task_tree() {
     std::fs::create_dir(&repo).unwrap();
     mount_repo(&db, "repos/proj", &repo);
 
-    // A purely-global task and a repo-scoped task.
+    // A purely-global task — added outside every repo, so it names its step and is homed at
+    // `tasks/inbox` — and a repo-scoped task.
+    let step = a_step(&db);
     jkb(&db)
-        .current_dir(repo_t(&db))
-        .args(["task", "add", "global only task"])
+        .args(["task", "add", "global only task", "--under", &step])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("at tasks/inbox"));
     jkb(&db)
         .current_dir(&repo)
         .args(["task", "add", "repo scoped task"])
@@ -1616,7 +1618,8 @@ fn task_unplace_removes_mirror_but_keeps_the_home() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
 
-    // Add a task (homes at tasks/inbox) and mirror it under proj/mirror.
+    // Add a task (homed at tasks/repos/t/inbox, mirrored at tasks/inbox) and mirror it under
+    // proj/mirror too.
     let out = jkb(&db)
         .current_dir(repo_t(&db))
         .args(["task", "add", "unplace target"])
@@ -1636,7 +1639,7 @@ fn task_unplace_removes_mirror_but_keeps_the_home() {
         .success()
         .stdout(predicate::str::contains("unplace target"));
 
-    // Unplace the mirror: it goes, the tasks/inbox home stays.
+    // Unplace the proj/mirror mirror: it goes, the home and its tasks/inbox mirror stay.
     jkb(&db)
         .args(["task", "unplace", &uid, "proj/mirror"])
         .assert()
@@ -6892,5 +6895,22 @@ fn writing_bytes_into_a_closed_pipe_ends_quietly() {
         out.stderr.is_empty(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `jkb task add --help` says when a task with no `--under` is refused: only when no mapping, no
+/// repo its home names and no repo you are in gives a step — not whenever you are outside a repo.
+#[test]
+fn task_add_help_says_when_a_task_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let out = jkb(&db_path(&dir))
+        .args(["task", "add", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8(out.stdout).unwrap();
+    assert!(help.contains("the repo its home names"), "{help}");
+    assert!(
+        help.contains("refused only when none of these gives a step"),
+        "{help}"
     );
 }

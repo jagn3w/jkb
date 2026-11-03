@@ -227,6 +227,7 @@ fn ns_step_maps_a_namespace_to_a_step_and_clears() {
     let b = LocalBackend::new(db.clone());
     let step = db
         .write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "proj/notes")?;
             let d = jkb_core::design::create(c, m, "t", "Work", "")?.uid;
             let p = jkb_core::design::plan::create(c, m, &d, "Plan", &["one".to_owned()])?;
             Ok(p.steps[0].uid.clone())

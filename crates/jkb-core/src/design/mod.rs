@@ -646,12 +646,6 @@ fn open_tasks_under(conn: &Connection, design: ItemId) -> Result<Vec<String>> {
     Ok(uids)
 }
 
-/// Whether `uid` is a repo's Open work design ([`plan::triage_design_uid`]).
-fn is_triage_design_uid(uid: &str) -> bool {
-    uid.strip_prefix("design:open-work@")
-        .is_some_and(|repo| !repo.is_empty())
-}
-
 /// Retire design `uid` and every design nested under it, in this one transaction, so one `jkb undo`
 /// brings the whole tree back. A retired design leaves [`list`] (and so `jkb design ls`, the Design
 /// tab's tree and `export --all`); nothing else moves — its text, spans, approvals, plans, steps,
@@ -659,23 +653,16 @@ fn is_triage_design_uid(uid: &str) -> bool {
 /// design cat` still reads it. A design is retired, never deleted ([`item::remove`] refuses one).
 ///
 /// Refused while any task under the tree is not `done` or `cancelled`: hiding a design would hide
-/// the work still going on under it. The refusal names those tasks.
+/// the work still going on under it. The refusal names those tasks. A repo's Open work design is
+/// retired by the same rule — one made by a mistyped `repos/<repo>` home must be removable — and
+/// [`plan::triage_step`] restores it the next time a task is captured there.
 ///
 /// # Errors
-/// An unknown design, one already retired, a tree holding a repo's Open work design, an open task
-/// under the tree, or a database error.
+/// An unknown design, one already retired, an open task under the tree, or a database error.
 pub fn retire(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<DesignRow>> {
     let id = design_id(conn, uid)?;
     if retired_item(conn, id)? {
         return Err(invalid(format!("design {uid} is already retired")));
-    }
-    let mut tree = vec![(id, uid.to_owned())];
-    tree.extend(tree::descendants(conn, id)?);
-    if let Some((_, open_work)) = tree.iter().find(|(_, u)| is_triage_design_uid(u)) {
-        return Err(invalid(format!(
-            "design {open_work} is a repo's Open work, where new tasks with no plan are filed: it \
-             is never retired (the next capture would go under a design no listing shows)"
-        )));
     }
     let open = open_tasks_under(conn, id)?;
     if !open.is_empty() {
@@ -697,6 +684,8 @@ pub fn retire(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<Desi
             open.len()
         )));
     }
+    let mut tree = vec![(id, uid.to_owned())];
+    tree.extend(tree::descendants(conn, id)?);
     let mut out = Vec::with_capacity(tree.len());
     for (design, design_uid) in tree {
         // A child retired on its own before stays as it is: one more write would make undoing this

@@ -491,7 +491,8 @@ fn triage_level(
 
 /// Repo `repo`'s triage step, `step:inbox@<repo>`: found by uid, or created on demand — the design
 /// "Open work" at `designs/<repo>`, its plan "Open work", and that plan's step "Inbox" — one level
-/// at a time, each verified to be the kind it should be where it should be. Runs inside the
+/// at a time, each verified to be the kind it should be where it should be. A retired Open work
+/// design is restored ([`super::restore`]). Runs inside the
 /// caller's transaction, which `write_txn` begins `IMMEDIATE`, and `items.uid` is unique, so two
 /// creators never build two trees.
 ///
@@ -501,6 +502,11 @@ fn triage_level(
 pub fn triage_step(conn: &Connection, meta: &WriteMeta, repo: &str) -> Result<ItemId> {
     let design_uid = triage_design_uid(repo);
     let design = if let Some(id) = triage_level(conn, &design_uid, KIND, None)? {
+        // Retired once it held nothing open: capturing here again brings it back to the listings,
+        // so no task is filed under a design no listing shows.
+        if super::retired_item(conn, id)? {
+            super::restore(conn, meta, &design_uid)?;
+        }
         id
     } else {
         super::create_as(conn, meta, &design_uid, repo, TRIAGE_TITLE, TRIAGE_BODY)?;
@@ -548,8 +554,8 @@ pub fn step_for_home(
 /// it, so its `type` and a file's section keys survive. Answers the step it was mapped to before.
 ///
 /// # Errors
-/// A `step` that is no plan step, a malformed path, clearing a namespace that does not exist, or a
-/// database error.
+/// A `step` that is no plan step, a malformed path, a namespace that does not exist, or a database
+/// error.
 pub fn map_namespace(
     conn: &Connection,
     meta: &WriteMeta,
@@ -557,14 +563,16 @@ pub fn map_namespace(
     step: Option<&str>,
 ) -> Result<Option<String>> {
     let path = crate::ns::normalize(path)?;
-    let id = match step {
-        Some(step) => {
-            item_of_kind(conn, step, STEP_KIND, "plan step")?;
-            crate::ns::ensure(conn, meta, &path)?
-        }
-        None => crate::ns::get(conn, &path)?
-            .ok_or_else(|| not_found(format!("no namespace `{path}`")))?,
-    };
+    if let Some(step) = step {
+        item_of_kind(conn, step, STEP_KIND, "plan step")?;
+    }
+    // Never created here: a mistyped path would be made and mapped while the real one stayed not.
+    let id = crate::ns::get(conn, &path)?.ok_or_else(|| {
+        not_found(format!(
+            "no namespace `{path}` (a mount, a synced file or a section names one; `jkb ns mk \
+             {path}` makes it)"
+        ))
+    })?;
     let mut md = crate::ns::get_metadata(conn, id)?
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
@@ -582,11 +590,31 @@ pub fn map_namespace(
     Ok(before)
 }
 
+/// `Ok(())` when `step` is a step of a plan of a live design; otherwise why not, in words. A task
+/// filed under a step of a retired design is counted planned while no listing shows it.
+fn live_design_of_step(conn: &Connection, step: ItemId) -> Result<std::result::Result<(), String>> {
+    let plan = containment::parent(conn, step)?;
+    let design = match plan {
+        Some(plan) => containment::parent(conn, plan)?,
+        None => None,
+    };
+    let Some(design) = design.filter(|_| plan.is_some()) else {
+        return Ok(Err("belongs to no plan of any design".to_owned()));
+    };
+    let Some(meta) = item::get(conn, design)?.filter(|m| m.kind == KIND) else {
+        return Ok(Err("belongs to no plan of any design".to_owned()));
+    };
+    if super::retired_item(conn, design)? {
+        return Ok(Err(format!("is a step of {}, which is retired", meta.uid)));
+    }
+    Ok(Ok(()))
+}
+
 /// The step the nearest namespace at or above `home` is mapped to ([`PLAN_STEP_KEY`]), if any.
 ///
 /// # Errors
-/// A mapping that names no plan step (refused, naming the namespace and how to clear it), a
-/// malformed home, or a database error.
+/// A mapping that names no plan step, or a step of a retired design (refused, naming the namespace
+/// and how to clear it), a malformed home, or a database error.
 pub fn mapped_step(conn: &Connection, home: &str) -> Result<Option<ItemId>> {
     let mut cur = Some(crate::ns::normalize(home)?);
     while let Some(path) = cur {
@@ -602,7 +630,10 @@ pub fn mapped_step(conn: &Connection, home: &str) -> Result<Option<ItemId>> {
                     None => None,
                 };
                 let why = match found {
-                    Some((id, kind)) if kind == STEP_KIND => return Ok(Some(id)),
+                    Some((id, kind)) if kind == STEP_KIND => match live_design_of_step(conn, id)? {
+                        Ok(()) => return Ok(Some(id)),
+                        Err(why) => why,
+                    },
                     Some((_, kind)) => format!("is a {kind}, not a plan step"),
                     None => "no longer exists".to_owned(),
                 };

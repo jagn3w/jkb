@@ -2579,6 +2579,28 @@ fn create_task(
     Ok(id)
 }
 
+/// The step a file task homed at `home` goes to by default ([`plan::step_for_home`]), or `None`
+/// when its home names no repo and is mapped to no step.
+fn default_step(conn: &Connection, meta: &WriteMeta, home: &str) -> Result<Option<ItemId>> {
+    #[cfg(test)]
+    step_probe::LOOKUPS.with(|n| n.set(n.get() + 1));
+    if mount::repo_of_namespace(home).is_none() && plan::mapped_step(conn, home)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(plan::step_for_home(conn, meta, home, None)?))
+}
+
+/// How many default-step lookups ran, on this (the writer's) thread: what proves a pass looks each
+/// home up once.
+#[cfg(test)]
+mod step_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static LOOKUPS: Cell<usize> = const { Cell::new(0) };
+    }
+}
+
 /// Refuse a file task homed at `home_path` that no step could be found for — no mapping at or above
 /// its namespace, and no repo — with the refusal every new task gets, plus how to map the file.
 fn check_has_step(conn: &Connection, home_path: &str, file_ns_path: &str) -> Result<()> {
@@ -2816,7 +2838,10 @@ fn reconcile_containment(
             }
         }
     }
-    // (b) Top-level tasks to their default step, in file order.
+    // (b) Top-level tasks to their default step, in file order. The step is looked up once per
+    // home in a pass: a file's lines share a handful of sections, and every save of a settled file
+    // would otherwise repeat the whole lookup for each line only to find it where it already is.
+    let mut defaults: HashMap<String, Option<ItemId>> = HashMap::new();
     for &child in ids {
         if declared.contains_key(&child) || item_kind(conn, child)?.as_deref() != Some("task") {
             continue;
@@ -2834,17 +2859,20 @@ fn reconcile_containment(
             continue; // moved by hand to a real step
         }
         let home = item::primary_namespace(conn, child)?.unwrap_or_else(|| file_ns_path.to_owned());
-        if planned {
-            // In an Inbox: it moves only when its home names a step to move to.
-            if mount::repo_of_namespace(&home).is_none()
-                && plan::mapped_step(conn, &home)?.is_none()
-            {
-                continue;
-            }
+        let step = if let Some(step) = defaults.get(&home) {
+            *step
         } else {
+            let step = default_step(conn, meta, &home)?;
+            defaults.insert(home.clone(), step);
+            step
+        };
+        let Some(step) = step else {
+            if planned {
+                continue; // in an Inbox, and its home names no step to move it to
+            }
             check_has_step(conn, &home, file_ns_path)?;
-        }
-        let step = plan::step_for_home(conn, meta, &home, None)?;
+            continue;
+        };
         if cur != Some(step) {
             task::add_subtask(conn, meta, step, child)?;
         }
@@ -3842,5 +3870,52 @@ mod archive_skip {
         sync(&db, "docs/plan").unwrap();
         assert_eq!(archive_writes(), before + 1, "new bytes must be archived");
         assert!(archived(&db, edited.as_bytes()));
+    }
+}
+
+#[cfg(test)]
+mod default_step_memo {
+    use super::step_probe::LOOKUPS;
+    use super::sync;
+    use jkb_core::{ns, Db};
+    use jkb_types::{ConflictPolicy, SyncMode};
+
+    /// A pass looks up each home's default step once, not once per line: a settled file of many
+    /// top-level lines in one section costs one lookup per save.
+    #[test]
+    fn a_pass_looks_up_each_homes_step_once() {
+        let dir =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let path = dir.path().join("tasks.md");
+        let lines: String = (0..20).fold(String::new(), |mut s, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(s, "- [ ] line {i} ^l{i}");
+            s
+        });
+        std::fs::write(&path, format!("## Work\n{lines}")).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let backing = format!("file://{}", dir.path().to_string_lossy());
+        db.write_txn("t", move |conn, meta| {
+            let ns_id = ns::ensure(conn, meta, "repos/app")?;
+            jkb_core::mount::create(
+                conn,
+                meta,
+                ns_id,
+                &backing,
+                SyncMode::Bidirectional,
+                "tasks",
+                Some("**/*.md"),
+                None,
+                ConflictPolicy::Manual,
+            )
+        })
+        .unwrap();
+        // The writer thread holds the probe; read it there.
+        let lookups = |db: &Db| db.read(|_| Ok(LOOKUPS.with(std::cell::Cell::get))).unwrap();
+        sync(&db, "repos/app").unwrap();
+        let before = lookups(&db);
+        std::fs::write(&path, format!("## Work\n{lines}- [ ] one more ^more\n")).unwrap();
+        sync(&db, "repos/app").unwrap();
+        assert_eq!(lookups(&db) - before, 1, "one home, one lookup");
     }
 }

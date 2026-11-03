@@ -307,6 +307,7 @@ pub fn file(
         )));
     }
 
+    let under = finding_under(conn, ask, &root)?;
     let clean = ask.findings.is_empty();
     // The file each finding names, by position — its area, for telling repeated rounds apart.
     let files: Vec<Option<String>> = ask
@@ -347,7 +348,7 @@ pub fn file(
         }
         let title = body.lines().next().unwrap_or_default().to_owned();
         let uid = format!("{}-{i}", task::mint_uid(&title));
-        let mut spec = task::NewTask::new(uid.clone(), body, finding_under(conn, ask, &root));
+        let mut spec = task::NewTask::new(uid.clone(), body, under.clone());
         spec.priority = Some(priority);
         spec.home = home;
         let id = task::create(conn, meta, &spec)?;
@@ -373,10 +374,20 @@ pub fn file(
 
 /// Where a review's findings are filed (`root` is the review's namespace): **the one place** that
 /// decides it. For now the default step for each finding's home — a review under
-/// `repos/<R>/codereviews/…` names repo R, so its findings land in R's Open work › Inbox, and a
-/// review namespace naming no repo is refused there.
-fn finding_under(_conn: &Connection, _ask: &FileAsk, _root: &str) -> task::Under {
-    task::Under::Default { ambient_repo: None }
+/// `repos/<R>/codereviews/…` names repo R, so its findings land in R's Open work › Inbox. A review
+/// namespace that names no repo and is mapped to no step is refused here, before anything is
+/// filed, with the remedy this surface has: a namespace under `repos/<repo>/codereviews/`. (The
+/// generic refusal's `--under` and "run it in a mounted repo" are not things a filing can do.)
+fn finding_under(conn: &Connection, _ask: &FileAsk, root: &str) -> Result<task::Under, ApiError> {
+    if mount::repo_of_namespace(root).is_none()
+        && jkb_core::design::plan::mapped_step(conn, root)?.is_none()
+    {
+        return Err(invalid(format!(
+            "`{root}` names no repository, so its findings would be in no repo's Open work › Inbox: \
+             file the review under `repos/<repo>/codereviews/…`"
+        )));
+    }
+    Ok(task::Under::Default { ambient_repo: None })
 }
 
 /// A caller held to one task files only under its repository's `repos/<repo>/codereviews/`, found on

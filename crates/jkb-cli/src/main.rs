@@ -1194,9 +1194,10 @@ enum TagCmd {
 enum TaskCmd {
     /// Quick-add a task: `"text" !p1 @2026-07-15 +ns #facet=value ^dep-uid`.
     ///
-    /// Every new task is filed under a plan step: the one `--under` names, else the step its home
-    /// namespace is mapped to (`jkb ns step`), else the Open work › Inbox of the repo you are in.
-    /// Outside a mounted repo, with no `--under`, it is refused.
+    /// Every new task is filed under a plan step: the one `--under` names; else the step its home
+    /// namespace is mapped to (`jkb ns step`); else the Open work › Inbox of the repo its home names
+    /// (`repos/<repo>/…`); else that of the repo you are in. It is refused only when none of these
+    /// gives a step.
     Add {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
