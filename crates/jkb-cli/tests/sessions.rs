@@ -5975,6 +5975,7 @@ fn container_jkb(
 /// **A container files and records a review through the daemon** (tasks S6.4 stage 5): the workflow's
 /// result becomes tasks the land gate reads, filed once, and the record credits the session's task.
 #[test]
+#[allow(clippy::too_many_lines)] // one flow, end to end: work, file, record, read back
 fn a_container_files_and_records_a_review_through_the_daemon() {
     let f = Fixture::new();
     git(&f.repo, &["checkout", "-qb", "batch"]);
@@ -6019,6 +6020,11 @@ fn a_container_files_and_records_a_review_through_the_daemon() {
         "--from",
         result.to_str().unwrap(),
     ];
+    // A repo the knowledge base knows, as a mount of it would make it.
+    jkb(Some(&f.db))
+        .args(["ns", "mk", "repos/proj"])
+        .assert()
+        .success();
     let filed = remote(&file_args, None);
     assert!(filed.status.success(), "{filed:?}");
     assert!(

@@ -14,7 +14,7 @@
 //! steps has tasks, all terminal ([`StepTasks::finished`]) — is derived on every read, so a
 //! reopened task brings its plan back without a write.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use jkb_types::{ItemId, TaskStatus};
 
@@ -357,34 +357,79 @@ pub(crate) const UNPLANNED_SQL: &str = concat!(
     " SELECT id FROM under))"
 );
 
-/// Whether `parent` may hold a task: a plan step, or a task with a plan step among its containers at
-/// any depth (through items of any kind). A child of a parent this accepts is one [`UNPLANNED_SQL`]
-/// counts as planned.
+/// What [`parent_standing`] found `parent` to be, as a task's container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Standing {
+    /// A plan step of a live design, or a task under one: it may hold a task.
+    Planned,
+    /// Under no plan step: a task under it would be in no plan.
+    Unplanned,
+    /// Under a step of this design, which is retired: a task under it would be counted planned
+    /// while no listing shows it.
+    Retired(String),
+}
+
+/// Whether `parent` may hold a task ([`parent_standing`] is [`Standing::Planned`]).
+///
+/// # Errors
+/// A database error.
+pub fn homes_tasks(conn: &Connection, parent: ItemId) -> Result<bool> {
+    Ok(parent_standing(conn, parent)? == Standing::Planned)
+}
+
+/// What `parent` is as a task's container: a plan step, or a task with a plan step among its
+/// containers at any depth (through items of any kind), is planned — unless the nearest such step's
+/// plan belongs to a retired design. **The one rule** behind `task::create`, `add_subtask`,
+/// `set_container`, `move_under` and a namespace's `plan_step` mapping ([`mapped_step`]). A child of
+/// a parent it accepts is one [`UNPLANNED_SQL`] counts as planned.
 ///
 /// It walks **up** from `parent` — one indexed lookup per level, since `child_item_id` is
 /// containment's primary key — rather than down from every step as [`UNPLANNED_SQL`] does: the two
 /// ask the same question ("is a step a proper ancestor?") from opposite ends. Measured on a
 /// synthetic store the size of the real one (233 steps, 3,560 tasks all planned, release build), the
 /// downward walk cost 6.3 ms a call, over the 5 ms a write on the one writer thread may spend on it;
-/// this one cost 0.08 ms for a task three levels deep, being bounded by the parent's depth. The proptest in `triage_tests` holds the two to the
-/// same answer ([`HOMES_TASKS_DOWNWARD_SQL`]) and to the unplanned read.
+/// this one cost 0.08 ms for a task three levels deep, being bounded by the parent's depth. The
+/// proptest in `triage_tests` holds the two to the same answer ([`HOMES_TASKS_DOWNWARD_SQL`]) and to
+/// the unplanned read.
 ///
 /// # Errors
 /// A database error.
-pub fn homes_tasks(conn: &Connection, parent: ItemId) -> Result<bool> {
-    Ok(conn
+pub fn parent_standing(conn: &Connection, parent: ItemId) -> Result<Standing> {
+    // The nearest step: `parent` itself, or for a task the closest step above it. The depth bound
+    // only stops a corrupted (cyclic) table from recursing without end.
+    let step: Option<i64> = conn
         .prepare_cached(concat!(
-            "WITH RECURSIVE up(id) AS (
-               SELECT parent_item_id FROM containment WHERE child_item_id = ?1
-               UNION SELECT c.parent_item_id FROM containment c JOIN up u ON c.child_item_id = u.id)
-             SELECT EXISTS (SELECT 1 FROM items p WHERE p.id = ?1 AND (p.kind = '",
+            "WITH RECURSIVE up(id, depth) AS (
+               SELECT parent_item_id, 1 FROM containment WHERE child_item_id = ?1
+               UNION ALL SELECT c.parent_item_id, u.depth + 1 FROM containment c
+                 JOIN up u ON c.child_item_id = u.id WHERE u.depth < 1024)
+             SELECT CASE p.kind WHEN '",
             step_kind!(),
-            "' OR (p.kind = 'task' AND EXISTS (
-                     SELECT 1 FROM up u JOIN items a ON a.id = u.id WHERE a.kind = '",
+            "' THEN p.id WHEN 'task' THEN (
+                 SELECT u.id FROM up u JOIN items a ON a.id = u.id WHERE a.kind = '",
             step_kind!(),
-            "'))))"
+            "' ORDER BY u.depth LIMIT 1) END
+               FROM items p WHERE p.id = ?1"
         ))?
-        .query_row([parent.get()], |r| r.get(0))?)
+        .query_row([parent.get()], |r| r.get(0))
+        .optional()?
+        .flatten();
+    let Some(step) = step.map(ItemId::new) else {
+        return Ok(Standing::Unplanned);
+    };
+    // The step's plan's design, when the step sits where a step belongs.
+    let design = match containment::parent(conn, step)? {
+        Some(plan) => containment::parent(conn, plan)?,
+        None => None,
+    };
+    if let Some(design) = design {
+        if let Some(meta) = item::get(conn, design)?.filter(|m| m.kind == KIND) {
+            if super::retired_item(conn, design)? {
+                return Ok(Standing::Retired(meta.uid));
+            }
+        }
+    }
+    Ok(Standing::Planned)
 }
 
 /// [`homes_tasks`] asked from the other end, by the every-step walk [`UNPLANNED_SQL`] runs: the
@@ -409,6 +454,16 @@ pub(crate) fn unplanned_parent(uid: &str, kind: &str) -> crate::Error {
         "`{uid}` is a {kind} under no plan step, so a task under it would be in no plan: add it \
          under a plan step or a task under one (`--under <step>`; `jkb design plan ls <design>` \
          lists a design's plans and their steps){plan_it}"
+    ))
+}
+
+/// The refusal for a task's container written to `uid`, under a step of `design`, which is retired.
+pub(crate) fn retired_parent(uid: &str, design: &str) -> crate::Error {
+    invalid(format!(
+        "`{uid}` is under a step of design {design}, which is retired: a task filed there would be \
+         in a plan no listing shows. Add it under a step of a live design (`--under <step>`; `jkb \
+         design plan ls <design>` lists them), or restore {design} first (`jkb design restore \
+         {design}`)"
     ))
 }
 
@@ -491,8 +546,7 @@ fn triage_level(
 
 /// Repo `repo`'s triage step, `step:inbox@<repo>`: found by uid, or created on demand — the design
 /// "Open work" at `designs/<repo>`, its plan "Open work", and that plan's step "Inbox" — one level
-/// at a time, each verified to be the kind it should be where it should be. A retired Open work
-/// design is restored ([`super::restore`]). Runs inside the
+/// at a time, each verified to be the kind it should be where it should be. Runs inside the
 /// caller's transaction, which `write_txn` begins `IMMEDIATE`, and `items.uid` is unique, so two
 /// creators never build two trees.
 ///
@@ -502,11 +556,6 @@ fn triage_level(
 pub fn triage_step(conn: &Connection, meta: &WriteMeta, repo: &str) -> Result<ItemId> {
     let design_uid = triage_design_uid(repo);
     let design = if let Some(id) = triage_level(conn, &design_uid, KIND, None)? {
-        // Retired once it held nothing open: capturing here again brings it back to the listings,
-        // so no task is filed under a design no listing shows.
-        if super::retired_item(conn, id)? {
-            super::restore(conn, meta, &design_uid)?;
-        }
         id
     } else {
         super::create_as(conn, meta, &design_uid, repo, TRIAGE_TITLE, TRIAGE_BODY)?;
@@ -526,12 +575,13 @@ pub fn triage_step(conn: &Connection, meta: &WriteMeta, repo: &str) -> Result<It
 
 /// The step a new task homed at `home` is filed under when it names none, in order: the nearest
 /// namespace at or above `home` whose metadata maps it to a step ([`PLAN_STEP_KEY`]); else the
-/// triage step of the repo `home` names ([`crate::mount::repo_of_namespace`]); else that of
-/// `ambient_repo`; else refused.
+/// triage step of the repo `home` names ([`crate::mount::repo_of_namespace`]), refused when this
+/// knowledge base does not know that repo; else that of `ambient_repo`; else refused.
 ///
 /// # Errors
-/// A mapping to a uid that is gone or not a plan step (named, with how to clear it), no repo to fall
-/// back to, a malformed home, or a database error.
+/// A mapping to a uid that is gone or not a plan step (named, with how to clear it), a home naming a
+/// repo this knowledge base does not know, no repo to fall back to, a malformed home, or a database
+/// error.
 pub fn step_for_home(
     conn: &Connection,
     meta: &WriteMeta,
@@ -542,10 +592,33 @@ pub fn step_for_home(
         return Ok(step);
     }
     let normalized = crate::ns::normalize(home)?;
-    match crate::mount::repo_of_namespace(&normalized).or_else(|| ambient_repo.map(str::to_owned)) {
-        Some(repo) => triage_step(conn, meta, &repo),
+    if let Some(repo) = crate::mount::repo_of_namespace(&normalized) {
+        known_repo(conn, &repo, &normalized)?;
+        return triage_step(conn, meta, &repo);
+    }
+    match ambient_repo {
+        Some(repo) => triage_step(conn, meta, repo),
         None => Err(no_repo()),
     }
+}
+
+/// Refuse to build an Open work tree for repo `repo`, named by home `home`, that this knowledge base
+/// does not know: no `repos/<repo>` namespace and no Open work design for it. A mistyped
+/// `+repos/<repo>/…` would otherwise create a whole design for a repo that does not exist. Checked
+/// before anything of the capture is written, so the home's own namespace has not made
+/// `repos/<repo>` yet. The ambient repo needs no check: it is the repo of the mount the caller stands
+/// in, whose namespace exists.
+fn known_repo(conn: &Connection, repo: &str, home: &str) -> Result<()> {
+    let path = format!("repos/{repo}");
+    if crate::ns::get(conn, &path)?.is_some()
+        || item::id_for_uid(conn, &triage_design_uid(repo))?.is_some()
+    {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "`{home}` names repo `{repo}`, which this knowledge base does not know (there is no \
+         `{path}`): check the repo name, or file the task under a step with `--under <step>`"
+    )))
 }
 
 /// Map namespace `path` — a tasks.md section's, a file's or a mount's — to plan step `step`, or with
@@ -590,26 +663,6 @@ pub fn map_namespace(
     Ok(before)
 }
 
-/// `Ok(())` when `step` is a step of a plan of a live design; otherwise why not, in words. A task
-/// filed under a step of a retired design is counted planned while no listing shows it.
-fn live_design_of_step(conn: &Connection, step: ItemId) -> Result<std::result::Result<(), String>> {
-    let plan = containment::parent(conn, step)?;
-    let design = match plan {
-        Some(plan) => containment::parent(conn, plan)?,
-        None => None,
-    };
-    let Some(design) = design.filter(|_| plan.is_some()) else {
-        return Ok(Err("belongs to no plan of any design".to_owned()));
-    };
-    let Some(meta) = item::get(conn, design)?.filter(|m| m.kind == KIND) else {
-        return Ok(Err("belongs to no plan of any design".to_owned()));
-    };
-    if super::retired_item(conn, design)? {
-        return Ok(Err(format!("is a step of {}, which is retired", meta.uid)));
-    }
-    Ok(Ok(()))
-}
-
 /// The step the nearest namespace at or above `home` is mapped to ([`PLAN_STEP_KEY`]), if any.
 ///
 /// # Errors
@@ -630,9 +683,11 @@ pub fn mapped_step(conn: &Connection, home: &str) -> Result<Option<ItemId>> {
                     None => None,
                 };
                 let why = match found {
-                    Some((id, kind)) if kind == STEP_KIND => match live_design_of_step(conn, id)? {
-                        Ok(()) => return Ok(Some(id)),
-                        Err(why) => why,
+                    Some((id, kind)) if kind == STEP_KIND => match parent_standing(conn, id)? {
+                        Standing::Retired(design) => {
+                            format!("is a step of {design}, which is retired")
+                        }
+                        Standing::Planned | Standing::Unplanned => return Ok(Some(id)),
                     },
                     Some((_, kind)) => format!("is a {kind}, not a plan step"),
                     None => "no longer exists".to_owned(),

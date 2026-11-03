@@ -5217,7 +5217,50 @@ pub(crate) mod test_repo {
             mount(&b.db);
             r["cwd"] = Value::from(DIR);
         }
+        know_repos(&b.db, &r);
         r
+    }
+
+    /// Every repo a new task's home names (`repos/<repo>/…`, `tasks/repos/<repo>/…`, in a
+    /// `task.add` or a `task.review_file`) is one the knowledge base knows, as one with those repos
+    /// mounted does: its `repos/<repo>` namespace exists.
+    fn know_repos(db: &jkb_core::Db, r: &Value) {
+        let op = r.get("op").and_then(Value::as_str);
+        if !matches!(op, Some("task.add" | "task.review_file")) {
+            return;
+        }
+        let mut repos = Vec::new();
+        for field in ["text", "home", "ns", "also"] {
+            if let Some(v) = r.get(field) {
+                collect(v, &mut repos);
+            }
+        }
+        if repos.is_empty() {
+            return;
+        }
+        db.write_txn("t", move |c, m| {
+            for repo in &repos {
+                jkb_core::ns::ensure(c, m, &format!("repos/{repo}"))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn collect(v: &Value, out: &mut Vec<String>) {
+        let Value::String(s) = v else {
+            return;
+        };
+        for (i, _) in s.match_indices("repos/") {
+            let at_start = i == 0 || matches!(s.as_bytes()[i - 1], b'/' | b'+' | b' ');
+            let repo: String = s[i + "repos/".len()..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+                .collect();
+            if at_start && !repo.is_empty() {
+                out.push(repo);
+            }
+        }
     }
 
     /// Mount `repos/t` at [`DIR`] in `db`, once.

@@ -10,8 +10,18 @@ use super::plan;
 use crate::task::{self, NewTask, Under};
 use crate::{containment, investigation, item, ns, Db};
 
+/// A database that knows repos `app` and `web` (their `repos/<repo>` namespaces), as one mounting
+/// them would.
 fn db() -> Db {
-    Db::open_in_memory().unwrap()
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        for repo in ["repos/app", "repos/web"] {
+            ns::ensure(c, m, repo)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    db
 }
 
 /// A design in repo `app` with a one-step plan: `(design uid, plan uid, step id)`.
@@ -490,41 +500,95 @@ fn retired(db: &Db, uid: &str) -> bool {
     db.read(move |c| super::is_retired(c, &uid)).unwrap()
 }
 
-/// An Open work design is retired like any other — refused while it holds open work, so one a
-/// mistyped `repos/<repo>` home made can be removed — and the next capture there restores it, so no
-/// task is filed under a design no listing shows.
+/// The Open work design is never retired, on its own or inside a tree being retired: the next
+/// capture would go under a design no listing shows.
 #[test]
-fn an_open_work_design_retires_when_empty_and_the_next_capture_restores_it() {
-    let db = db();
-    let typo = default_create(&db, "task:typo", "repos/jbk/notes", None).unwrap();
+fn an_open_work_design_is_never_retired_alone_or_in_a_tree() {
+    let db = db_with_inbox("web");
     let e = db
-        .write_txn("t", |c, m| super::retire(c, m, "design:open-work@jbk"))
+        .write_txn("t", |c, m| super::retire(c, m, "design:open-work@web"))
         .unwrap_err()
         .to_string();
-    assert!(e.contains("task:typo"), "open work holds it: {e}");
+    assert!(e.contains("never retired"), "{e}");
+    let parent = db
+        .write_txn("t", |c, m| {
+            let p = super::create(c, m, "web", "Parent", "")?.uid;
+            super::tree::nest(c, m, "design:open-work@web", &p)?;
+            Ok(p)
+        })
+        .unwrap();
+    let e = db
+        .write_txn("t", move |c, m| super::retire(c, m, &parent))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("never retired"), "{e}");
+    assert!(!retired(&db, "design:open-work@web"));
+}
+
+/// A home naming a repo this knowledge base does not know (`+repos/jbk/…`, a typo) is refused
+/// before anything is written: no Open work tree for it, and no `repos/jbk` namespace either. A
+/// repo it knows — by its `repos/<repo>` namespace, or by an Open work design already made — is
+/// filed as before.
+#[test]
+fn a_home_naming_an_unknown_repo_is_refused_and_builds_nothing() {
+    let db = db();
+    let e = default_create(&db, "task:typo", "repos/jbk/notes", Some("t"))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("repo `jbk`"), "{e}");
+    assert!(e.contains("--under <step>"), "{e}");
+    for uid in [
+        "design:open-work@jbk",
+        "plan:open-work@jbk",
+        "step:inbox@jbk",
+        "task:typo",
+    ] {
+        assert_eq!(uid_rows(&db, uid), 0, "{uid}");
+    }
+    for path in ["repos/jbk", "repos/jbk/notes"] {
+        let p = path.to_owned();
+        assert!(
+            db.read(move |c| ns::get(c, &p)).unwrap().is_none(),
+            "{path}"
+        );
+    }
+    db.write_txn("t", |c, m| ns::ensure(c, m, "repos/jbk").map(|_| ()))
+        .unwrap();
+    let ok = default_create(&db, "task:known", "repos/jbk/notes", None).unwrap();
+    assert_eq!(parent_uid(&db, ok).as_deref(), Some("step:inbox@jbk"));
+}
+
+/// Explicitly under a step of a retired design — or a task under one — is refused like an
+/// unplanned parent, naming the design: the task would be counted planned and shown nowhere.
+#[test]
+fn a_step_of_a_retired_design_holds_no_new_task() {
+    let db = db();
+    let (d, _, step) = planned(&db);
+    let under = create_under(&db, "task:under", step).unwrap();
     db.write_txn("t", move |c, m| {
-        task::set_status(c, m, typo, TaskStatus::Cancelled)
+        task::set_status(c, m, under, TaskStatus::Done)
     })
     .unwrap();
-    db.write_txn("t", |c, m| super::retire(c, m, "design:open-work@jbk"))
+    let design = d.clone();
+    db.write_txn("t", move |c, m| super::retire(c, m, &design).map(|_| ()))
         .unwrap();
-    assert!(retired(&db, "design:open-work@jbk"));
-    let listed = |db: &Db| {
-        db.read(|c| super::list(c, Some("jbk"), false))
-            .unwrap()
-            .into_iter()
-            .any(|d| d.uid == "design:open-work@jbk")
-    };
-    assert!(!listed(&db));
-
-    let again = default_create(&db, "task:again", "repos/jbk/notes", None).unwrap();
-    assert!(
-        !retired(&db, "design:open-work@jbk"),
-        "restored by the capture"
-    );
-    assert!(listed(&db));
-    assert_eq!(parent_uid(&db, again).as_deref(), Some("step:inbox@jbk"));
-    assert_eq!(uid_rows(&db, "design:open-work@jbk"), 1);
+    for parent in [step, under] {
+        let e = create_under(&db, "task:late", parent)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(&format!("design {d}, which is retired")), "{e}");
+        assert!(!homes(&db, parent));
+    }
+    let moved = create_under(&db, "task:elsewhere", {
+        let (_, _, live) = planned(&db);
+        live
+    })
+    .unwrap();
+    let e = db
+        .write_txn("t", move |c, m| task::move_under(c, m, moved, step))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("which is retired"), "{e}");
 }
 
 /// A namespace mapped to a step of a design since retired is a stale mapping: refused by name, not

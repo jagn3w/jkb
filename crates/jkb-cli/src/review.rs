@@ -449,13 +449,11 @@ mod tests {
         }
     }
 
-    use jkb_core::Db;
-
     /// A task whose reviews outnumber what one query takes is still gated by all of them — asked in
     /// pieces, added up — rather than refused outright, which blocked even `--no-review`.
     #[test]
     fn findings_across_more_reviews_than_one_query_takes_are_added_up() {
-        let db = Db::open_in_memory().unwrap();
+        let db = crate::known_repo_t_db();
         let backend = jkb_api::LocalBackend::new(db.clone());
         let n = jkb_api::sessions::MAX_REVIEW_NAMESPACES + 1;
         let nss: Vec<String> = (0..n)

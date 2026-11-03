@@ -2608,7 +2608,8 @@ fn check_has_step(conn: &Connection, home_path: &str, file_ns_path: &str) -> Res
         && plan::mapped_step(conn, home_path)?.is_none()
     {
         return Err(Error::Types(TypeError::Validation(format!(
-            "{} — or map this file's tasks to a step: `jkb ns step {file_ns_path} <step>`",
+            "{} — or map this file's tasks to a step: `jkb ns mk {file_ns_path}`, then `jkb ns step \
+             {file_ns_path} <step>`",
             plan::NO_REPO
         ))));
     }

@@ -865,6 +865,11 @@ mod tests {
     fn a_large_write_to_a_daemon_without_the_keyed_route_falls_back() {
         let dir = tempfile::tempdir().unwrap();
         let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        // The repo `t` the requests' homes name is one this knowledge base knows.
+        db.write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+        })
+        .unwrap();
         let token = dir.path().join("daemon/token");
         let cfg = crate::server::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token.clone());
         let daemon = crate::server::spawn(db, &cfg).unwrap();
@@ -964,6 +969,11 @@ mod tests {
     fn a_write_whose_answer_was_lost_is_resent_and_applied_once() {
         let dir = tempfile::tempdir().unwrap();
         let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        // The repo `t` the requests' homes name is one this knowledge base knows.
+        db.write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+        })
+        .unwrap();
         let token = dir.path().join("daemon/token");
         let cfg = crate::server::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token.clone());
         let daemon = crate::server::spawn(db.clone(), &cfg).unwrap();

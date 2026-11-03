@@ -5133,6 +5133,18 @@ fn truncate(s: &str, n: usize) -> String {
     format!("{head}…")
 }
 
+/// An in-memory database that knows repo `t` — its `repos/t` namespace exists, as a mount of it would
+/// make — for the tests that add tasks homed in `t`.
+#[cfg(test)]
+pub(crate) fn known_repo_t_db() -> jkb_core::Db {
+    let db = jkb_core::Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+    })
+    .unwrap();
+    db
+}
+
 #[cfg(test)]
 mod tests {
 

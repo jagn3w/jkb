@@ -480,13 +480,12 @@ mod tests {
     }
     use crate::session_cli::Kb;
     use jkb_api::{Backend as _, LocalBackend};
-    use jkb_core::Db;
     use jkb_fsm::Fact;
 
     /// Each owner is probed once, a kept owner never, and only a proven absence is sent to be freed.
     #[test]
     fn owners_are_probed_once_and_only_the_proven_gone_are_freed() {
-        let backend = LocalBackend::new(Db::open_in_memory().unwrap());
+        let backend = LocalBackend::new(crate::known_repo_t_db());
         let mut uids = Vec::new();
         for (text, owner) in [
             ("a", "box:1"),

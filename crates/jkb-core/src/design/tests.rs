@@ -3644,6 +3644,10 @@ fn loose_task(db: &Db, uid: &str, home: &str) -> ItemId {
     db.write_txn("t", move |c, m| {
         let mut t = task::NewTask::new(uid, "loose", crate::task::Under::inbox_of("t"));
         t.home = home;
+        // Whatever repo the home names is one the knowledge base knows.
+        if let Some(repo) = crate::mount::repo_of_namespace(&t.home) {
+            crate::ns::ensure(c, m, &format!("repos/{repo}"))?;
+        }
         let id = task::create(c, m, &t)?;
         task::make_loose(c, m, id)?;
         Ok(id)

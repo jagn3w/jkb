@@ -2195,7 +2195,7 @@ mod tests {
     #[test]
     fn a_task_the_caller_may_not_land_is_held_and_its_siblings_still_land() {
         use jkb_api::{Backend as _, LocalBackend, Request, Response};
-        let db = jkb_core::Db::open_in_memory().unwrap();
+        let db = crate::known_repo_t_db();
         let op = LocalBackend::new(db.clone());
         let call = |b: &LocalBackend, r: serde_json::Value| {
             b.call(serde_json::from_value::<Request>(r).unwrap())
@@ -2289,7 +2289,7 @@ mod tests {
     #[test]
     fn a_task_merged_as_a_pull_request_is_already_landed() {
         use jkb_api::{Backend as _, LocalBackend, Request, Response};
-        let db = jkb_core::Db::open_in_memory().unwrap();
+        let db = crate::known_repo_t_db();
         let op = LocalBackend::new(db.clone());
         let call = |b: &LocalBackend, r: serde_json::Value| {
             b.call(serde_json::from_value::<Request>(r).unwrap())
@@ -2387,7 +2387,6 @@ mod tests {
         assert!(task_on(&[]).is_none());
     }
     use jkb_api::{Backend, LocalBackend, Request, Response};
-    use jkb_core::Db;
 
     fn claim_of(b: &LocalBackend, uid: &str) -> Option<String> {
         match b
@@ -2406,7 +2405,7 @@ mod tests {
     /// task had.
     #[test]
     fn a_failed_worktree_releases_only_the_run_s_own_claim() {
-        let b = LocalBackend::new(Db::open_in_memory().unwrap());
+        let b = LocalBackend::new(crate::known_repo_t_db());
         let Response::Added { added } = b
             .call(
                 serde_json::from_value(serde_json::json!({

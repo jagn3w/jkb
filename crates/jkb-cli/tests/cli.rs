@@ -1042,6 +1042,8 @@ fn a_file_parent_replaces_an_outside_container_with_its_edge() {
 fn ns_ls_shows_created_namespaces() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
+    // A repo the knowledge base knows, as a mount of it would make it.
+    jkb(&db).args(["ns", "mk", "repos/app"]).assert().success();
     jkb(&db)
         .current_dir(repo_t(&db))
         .args(["task", "add", "x", "+repos/app"])
@@ -2004,6 +2006,8 @@ fn ns_rm_refuses_nonempty_and_removes_empty() {
 fn task_mirror_symlinks_repo_tasks_under_tasks() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
+    // A repo the knowledge base knows, as a mount of it would make it.
+    jkb(&db).args(["ns", "mk", "repos/jkb"]).assert().success();
     // A task homed outside tasks/ (repo content) is auto-mirrored under tasks/ on create.
     jkb(&db)
         .current_dir(repo_t(&db))
@@ -3196,6 +3200,8 @@ fn ns_type_show_distinguishes_a_missing_namespace_from_an_untyped_one() {
 fn ls_reports_subtree_leaves_broken_down_by_kind() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
+    // A repo the knowledge base knows, as a mount of it would make it.
+    jkb(&db).args(["ns", "mk", "repos/jkb"]).assert().success();
     let note = dir.path().join("n.md");
     std::fs::write(&note, "a document, not a task").unwrap();
 
@@ -6913,4 +6919,28 @@ fn task_add_help_says_when_a_task_is_refused() {
         help.contains("refused only when none of these gives a step"),
         "{help}"
     );
+}
+
+/// A mistyped repo in a home, from inside a mounted repo, is refused — and leaves neither the
+/// mistyped `repos/<repo>` namespace nor an Open work tree for it behind.
+#[test]
+fn task_add_homed_in_an_unknown_repo_is_refused_and_builds_nothing() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .current_dir(repo_t(&db))
+        .args(["task", "add", "x +repos/jbk/notes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("repo `jbk`"));
+    jkb(&db)
+        .args(["--global", "query", "kind:design"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("open-work@jbk").not());
+    jkb(&db)
+        .args(["ns", "ls", "repos"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("jbk").not());
 }

@@ -262,15 +262,19 @@ pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<Ite
 }
 
 /// Refuse `parent` as a task's container unless it holds tasks
-/// ([`crate::design::plan::homes_tasks`]): a plan step, or a task under one. The one check behind
+/// ([`crate::design::plan::parent_standing`]): a plan step of a live design, or a task under one. The one check behind
 /// [`create`], [`add_subtask`], [`set_container`] and so [`move_under`].
 fn check_parent(conn: &Connection, parent: ItemId) -> Result<()> {
     let p = crate::item::get(conn, parent)?
         .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {parent}"))))?;
-    if crate::design::plan::homes_tasks(conn, parent)? {
-        Ok(())
-    } else {
-        Err(crate::design::plan::unplanned_parent(&p.uid, &p.kind))
+    match crate::design::plan::parent_standing(conn, parent)? {
+        crate::design::plan::Standing::Planned => Ok(()),
+        crate::design::plan::Standing::Unplanned => {
+            Err(crate::design::plan::unplanned_parent(&p.uid, &p.kind))
+        }
+        crate::design::plan::Standing::Retired(design) => {
+            Err(crate::design::plan::retired_parent(&p.uid, &design))
+        }
     }
 }
 
@@ -1491,6 +1495,7 @@ mod tests {
         let qa = parse_quick_add("do it +repos/jkb/a").unwrap();
         let id = db
             .write_txn("t", move |conn, meta| {
+                ns::ensure(conn, meta, "repos/jkb")?; // the repo the home names is known
                 create(
                     conn,
                     meta,

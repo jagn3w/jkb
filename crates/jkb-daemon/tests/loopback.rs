@@ -27,6 +27,11 @@ impl Fixture {
     fn with(tune: impl FnOnce(&mut ServeConfig)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path().join("jkb.db")).unwrap();
+        // The repo `t` the requests' homes name is one this knowledge base knows.
+        db.write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+        })
+        .unwrap();
         let token = dir.path().join("daemon/token");
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut cfg = ServeConfig::new(addr, token.clone());
@@ -252,6 +257,11 @@ fn a_wrong_or_missing_token_is_unauthorized_and_a_rotated_one_is_picked_up() {
 fn an_unspecified_address_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("jkb.db")).unwrap();
+    // The repo `t` the requests' homes name is one this knowledge base knows.
+    db.write_txn("t", |c, m| {
+        jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+    })
+    .unwrap();
     for addr in ["0.0.0.0:0", "[::]:0"] {
         let err = spawn(
             db.clone(),
@@ -270,6 +280,11 @@ fn an_unspecified_address_is_refused() {
 fn a_port_held_by_another_process_is_named_with_how_to_find_it() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("jkb.db")).unwrap();
+    // The repo `t` the requests' homes name is one this knowledge base knows.
+    db.write_txn("t", |c, m| {
+        jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+    })
+    .unwrap();
     let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = holder.local_addr().unwrap();
     let token = dir.path().join("daemon/token");
@@ -750,6 +765,11 @@ fn a_daemon_whose_database_will_not_open_answers_why_and_recovers_when_it_does()
     let dir = tempfile::tempdir().unwrap();
     let token = dir.path().join("daemon/token");
     let db = Db::open(dir.path().join("jkb.db")).unwrap();
+    // The repo `t` the requests' homes name is one this knowledge base knows.
+    db.write_txn("t", |c, m| {
+        jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+    })
+    .unwrap();
     let fixed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let opener: jkb_daemon::server::Opener = {

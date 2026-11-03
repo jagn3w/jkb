@@ -4779,7 +4779,11 @@ fn a_file_in_no_repo_and_no_mapping_fails_alone() {
     assert_eq!(one.outcome, Outcome::Failed, "{one:?}");
     let why = one.reason.unwrap_or_default();
     assert!(why.contains("outside a mounted repo"), "{why}");
-    assert!(why.contains("jkb ns step docs/x/one.md <step>"), "{why}");
+    // The file's namespace first, since a mapping never makes one, then the mapping.
+    assert!(
+        why.contains("`jkb ns mk docs/x/one.md`, then `jkb ns step docs/x/one.md <step>`"),
+        "{why}"
+    );
     assert_ne!(outcome("two.md").outcome, Outcome::Failed);
     let homed = uri_for(&dir.path().join("two.md"));
     assert_eq!(
