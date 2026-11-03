@@ -191,11 +191,22 @@ fn save_bucket_views(conn: &Connection, meta: &WriteMeta, ns_path: &str) -> Resu
 /// **untyped** namespace accepts any kind: the engine does not require an investigation to
 /// be typed before you can record something in it.
 ///
+/// A `task` is never added here: a task is filed under a plan step by `jkb task add`, which can
+/// place it in the investigation too (`+<ns>`), and an investigation's own unit would be a task in
+/// no plan. `task` stays an accepted kind, so a task placed in the namespace that way is welcome.
+///
 /// # Errors
-/// Returns a validation error if the kind is not one the strategy accepts, if an edge names
-/// a uid that does not exist, or if an edge would create a `depends_on` cycle; otherwise a
+/// Returns a validation error for a `task`, if the kind is not one the strategy accepts, if an edge
+/// names a uid that does not exist, or if an edge would create a `depends_on` cycle; otherwise a
 /// database error.
 pub fn add(conn: &Connection, meta: &WriteMeta, unit: &NewUnit) -> Result<ItemId> {
+    if unit.kind == "task" {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "a task is filed with `jkb task add … --under <step> +{}`, which also places it in this \
+             investigation",
+            unit.namespace
+        ))));
+    }
     if let Some((_, strategy)) = nstype::for_namespace(conn, &unit.namespace)? {
         if !strategy.accepts_kind(&unit.kind) {
             return Err(reject_kind(strategy, &unit.kind));

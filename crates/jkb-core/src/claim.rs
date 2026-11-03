@@ -372,7 +372,11 @@ mod tests {
     fn make_task(db: &Db, uid: &str) -> jkb_types::ItemId {
         let uid = uid.to_owned();
         db.write_txn("t", move |conn, meta| {
-            create(conn, meta, &NewTask::new(uid.as_str(), "a task"))
+            create(
+                conn,
+                meta,
+                &NewTask::new(uid.as_str(), "a task", crate::task::Under::inbox_of("t")),
+            )
         })
         .unwrap()
     }

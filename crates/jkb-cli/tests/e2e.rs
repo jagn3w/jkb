@@ -188,18 +188,27 @@ fn end_to_end_full_flow() {
     db.write_txn("t", {
         let today = today.clone();
         move |conn, meta| {
-            let mut b = task::NewTask::new("task:b", "set up CI");
+            let mut b =
+                task::NewTask::new("task:b", "set up CI", jkb_core::task::Under::inbox_of("t"));
             b.tags = vec![("size".to_owned(), "small".to_owned())];
             b.priority = Some(3);
             task::create(conn, meta, &b)?;
 
-            let mut c = task::NewTask::new("task:c", "write README");
+            let mut c = task::NewTask::new(
+                "task:c",
+                "write README",
+                jkb_core::task::Under::inbox_of("t"),
+            );
             c.tags = vec![("size".to_owned(), "small".to_owned())];
             c.priority = Some(2);
             c.due = Some(today.clone());
             task::create(conn, meta, &c)?;
 
-            let mut a = task::NewTask::new("task:a", "ship release");
+            let mut a = task::NewTask::new(
+                "task:a",
+                "ship release",
+                jkb_core::task::Under::inbox_of("t"),
+            );
             a.tags = vec![("size".to_owned(), "small".to_owned())];
             a.priority = Some(1);
             a.due = Some(today.clone());
@@ -259,7 +268,15 @@ fn end_to_end_full_flow() {
     // --- undo reverts the last change ---
     let before = count_kind(&db, "task");
     db.write_txn("cli", |conn, meta| {
-        task::create(conn, meta, &task::NewTask::new("task:throwaway", "temp"))
+        task::create(
+            conn,
+            meta,
+            &task::NewTask::new(
+                "task:throwaway",
+                "temp",
+                jkb_core::task::Under::inbox_of("t"),
+            ),
+        )
     })
     .unwrap();
     assert_eq!(count_kind(&db, "task"), before + 1);
@@ -389,6 +406,7 @@ fn mcp_smoke_flow() {
             priority: Some(1),
             due: None,
             namespace: Some("repos/app".to_owned()),
+            under: None,
         },
     )
     .unwrap();

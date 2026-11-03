@@ -270,18 +270,16 @@ mod tests {
             .write_txn("t", |conn, meta| {
                 let home = ns::ensure(conn, meta, "tasks/inbox")?;
                 let mirror = ns::ensure(conn, meta, "repos/monorepo/backend")?;
-                let task_id = upsert(
+                // Homed (primary) at `tasks/inbox` by `task::create`.
+                let task_id = crate::task::create(
                     conn,
                     meta,
-                    &NewItem {
-                        uid: "task:1".to_owned(),
-                        kind: "task".to_owned(),
-                        content: None,
-                        content_hash: None,
-                        mime: None,
-                    },
+                    &crate::task::NewTask::new(
+                        "task:1",
+                        "task:1",
+                        crate::task::Under::inbox_of("t"),
+                    ),
                 )?;
-                place(conn, meta, task_id, home, PlacementRole::Primary, 0)?;
                 place(conn, meta, task_id, mirror, PlacementRole::Reference, 0)?;
                 Ok((task_id, home, mirror))
             })
@@ -306,7 +304,7 @@ mod tests {
                     meta,
                     &NewItem {
                         uid: "i".to_owned(),
-                        kind: "task".to_owned(),
+                        kind: "note".to_owned(),
                         content: None,
                         content_hash: None,
                         mime: None,
@@ -354,16 +352,14 @@ mod tests {
             .write_txn("t", |conn, meta| {
                 let home = ns::ensure(conn, meta, "tasks/jkb/.backlog")?;
                 let mirror = ns::ensure(conn, meta, ".backlog")?;
-                let item = upsert(
+                let item = crate::task::create(
                     conn,
                     meta,
-                    &NewItem {
-                        uid: "i".to_owned(),
-                        kind: "task".to_owned(),
-                        content: None,
-                        content_hash: None,
-                        mime: None,
-                    },
+                    &crate::task::NewTask::new(
+                        "task:i",
+                        "task:i",
+                        crate::task::Under::inbox_of("t"),
+                    ),
                 )?;
                 set_primary(conn, meta, item, home, 0)?;
                 place(conn, meta, item, mirror, PlacementRole::Reference, 0)?;

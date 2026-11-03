@@ -347,7 +347,7 @@ pub fn file(
         }
         let title = body.lines().next().unwrap_or_default().to_owned();
         let uid = format!("{}-{i}", task::mint_uid(&title));
-        let mut spec = task::NewTask::new(uid.clone(), body);
+        let mut spec = task::NewTask::new(uid.clone(), body, finding_under(conn, ask, &root));
         spec.priority = Some(priority);
         spec.home = home;
         let id = task::create(conn, meta, &spec)?;
@@ -369,6 +369,14 @@ pub fn file(
         uids,
         clean,
     })
+}
+
+/// Where a review's findings are filed (`root` is the review's namespace): **the one place** that
+/// decides it. For now the default step for each finding's home — a review under
+/// `repos/<R>/codereviews/…` names repo R, so its findings land in R's Open work › Inbox, and a
+/// review namespace naming no repo is refused there.
+fn finding_under(_conn: &Connection, _ask: &FileAsk, _root: &str) -> task::Under {
+    task::Under::Default { ambient_repo: None }
 }
 
 /// A caller held to one task files only under its repository's `repos/<repo>/codereviews/`, found on

@@ -433,7 +433,7 @@ impl<'a> Ops<'a> {
     pub(crate) fn ambient_repo_at(&self, dir: &std::path::Path) -> Result<Option<String>> {
         Ok(self
             .ambient_at(dir)?
-            .and_then(|mount| repo_of_mount(&mount)))
+            .and_then(|mount| jkb_core::mount::repo_of_namespace(&mount)))
     }
 
     /// The ambient namespace, `--global` or not — task homing always reflects where you are.
@@ -1187,31 +1187,10 @@ fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// The repo a mount is in: the first segment after `repos/`; `None` for a mount outside `repos/`.
-fn repo_of_mount(mount: &str) -> Option<String> {
-    mount
-        .strip_prefix("repos/")?
-        .split('/')
-        .next()
-        .filter(|r| !r.is_empty())
-        .map(str::to_owned)
-}
-
 #[cfg(test)]
 mod tests {
     use clap::Parser as _;
 
-    #[test]
-    fn only_a_mount_under_repos_names_a_repo() {
-        assert_eq!(super::repo_of_mount("repos/jkb").as_deref(), Some("jkb"));
-        assert_eq!(
-            super::repo_of_mount("repos/jkb/crates").as_deref(),
-            Some("jkb")
-        );
-        for none in ["references/papers", "repos/", "repos", "jkb"] {
-            assert_eq!(super::repo_of_mount(none), None, "{none}");
-        }
-    }
     use jkb_api::kb::{GrepAnswer, GrepHit, ItemDetail, TaskDetail};
     use jkb_api::{ApiError, Backend, Request, Response};
 

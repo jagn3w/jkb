@@ -13,8 +13,16 @@ use jkb_types::Error as TypeError;
 fn tasks(db: &Db) -> (ItemId, ItemId) {
     db.write_txn("test", |c, m| {
         Ok((
-            create(c, m, &NewTask::new("task:a", "A"))?,
-            create(c, m, &NewTask::new("task:b", "B"))?,
+            create(
+                c,
+                m,
+                &NewTask::new("task:a", "A", crate::task::Under::inbox_of("t")),
+            )?,
+            create(
+                c,
+                m,
+                &NewTask::new("task:b", "B", crate::task::Under::inbox_of("t")),
+            )?,
         ))
     })
     .unwrap()
@@ -224,12 +232,20 @@ fn scope_reaches_subtasks_and_the_task_s_own_findings_and_nothing_else() {
     let (a, b) = tasks(&db);
     let (sub, finding, stray) = db
         .write_txn("test", move |c, m| {
-            let sub = create(c, m, &NewTask::new("task:a1", "A1"))?;
+            let sub = create(
+                c,
+                m,
+                &NewTask::new("task:a1", "A1", crate::task::Under::inbox_of("t")),
+            )?;
             crate::task::add_subtask(c, m, a, sub)?;
-            let mut f = NewTask::new("task:f", "a finding");
+            let mut f = NewTask::new("task:f", "a finding", crate::task::Under::inbox_of("t"));
             f.home = "reviews/a-1/must-fix".into();
             let finding = create(c, m, &f)?;
-            let mut s = NewTask::new("task:s", "someone else's finding");
+            let mut s = NewTask::new(
+                "task:s",
+                "someone else's finding",
+                crate::task::Under::inbox_of("t"),
+            );
             s.home = "reviews/a-10/must-fix".into();
             let stray = create(c, m, &s)?;
             crate::reviews::record(

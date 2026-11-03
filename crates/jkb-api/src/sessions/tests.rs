@@ -890,7 +890,11 @@ fn review_findings_are_bounded() {
     }
     db.write_txn("t", |c, m| {
         for i in 0..=super::MAX_EXAMINED_FINDINGS {
-            let mut t = jkb_core::task::NewTask::new(format!("task:huge-{i}"), format!("t{i}"));
+            let mut t = jkb_core::task::NewTask::new(
+                format!("task:huge-{i}"),
+                format!("t{i}"),
+                jkb_core::task::Under::inbox_of("t"),
+            );
             "reviews/huge".clone_into(&mut t.home);
             jkb_core::task::create(c, m, &t)?;
         }

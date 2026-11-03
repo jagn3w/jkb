@@ -808,7 +808,11 @@ mod tests {
 
     fn a_task(db: &Db) -> jkb_types::ItemId {
         db.write_txn("test", |conn, meta| {
-            create(conn, meta, &NewTask::new("task:t", "T"))
+            create(
+                conn,
+                meta,
+                &NewTask::new("task:t", "T", crate::task::Under::inbox_of("t")),
+            )
         })
         .expect("create")
     }
@@ -943,7 +947,11 @@ mod tests {
     fn make_task(db: &Db, uid: &str) -> jkb_types::ItemId {
         let uid = uid.to_owned();
         db.write_txn("t", move |conn, meta| {
-            create(conn, meta, &NewTask::new(uid, "T"))
+            create(
+                conn,
+                meta,
+                &NewTask::new(uid, "T", crate::task::Under::inbox_of("t")),
+            )
         })
         .expect("create")
     }

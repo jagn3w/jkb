@@ -138,7 +138,7 @@ impl JkbServer {
 
     /// Create a task (audited, undoable).
     #[tool(
-        description = "Create a task (title, optional priority/due/namespace). Written via the audited writer-actor, so `jkb undo` reverts it."
+        description = "Create a task (title, optional priority/due/namespace/under). Filed under the plan step `under` names (a step uid, or a task under one); without it, in the Open work > Inbox step of the repo this server runs in, and refused outside any repo. Written via the audited writer-actor, so `jkb undo` reverts it."
     )]
     async fn task_create(
         &self,

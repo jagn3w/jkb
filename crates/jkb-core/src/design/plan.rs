@@ -325,6 +325,19 @@ macro_rules! under_steps {
     };
 }
 
+/// The roots of the every-step walk: each item a plan step contains directly. One text, so
+/// [`UNPLANNED_SQL`] and [`homes_tasks`] expand the same walk and cannot disagree about what is
+/// planned.
+macro_rules! every_step_roots {
+    () => {
+        concat!(
+            "SELECT child_item_id FROM containment WHERE parent_item_id IN (SELECT id FROM items WHERE kind = '",
+            step_kind!(),
+            "')"
+        )
+    };
+}
+
 /// *"Item `i` is an unplanned task"*: a task, not terminal, and contained at no depth under any
 /// plan step (by [`under_steps!`], the walk `archived` uses). A task under a plan directly, a
 /// design's one-off, and a task homed only by namespace (an inbox, a `.backlog`, a review's
@@ -337,13 +350,248 @@ pub(crate) const UNPLANNED_SQL: &str = concat!(
     "(i.kind = 'task' AND ",
     jkb_types::sql_not_terminal!("i.status"),
     " AND i.id NOT IN (",
-    under_steps!(
-        "SELECT child_item_id FROM containment WHERE parent_item_id IN (SELECT id FROM items WHERE kind = '",
-        step_kind!(),
-        "')"
-    ),
+    under_steps!(every_step_roots!()),
     " SELECT id FROM under))"
 );
+
+/// Whether `parent` may hold a task: a plan step, or a task the every-step walk reaches (contained
+/// at any depth under any step, through items of any kind). A child of a parent this accepts is one
+/// [`UNPLANNED_SQL`] counts as planned, because both expand [`every_step_roots!`] through
+/// [`under_steps!`].
+///
+/// # Errors
+/// A database error.
+pub fn homes_tasks(conn: &Connection, parent: ItemId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(concat!(
+            under_steps!(every_step_roots!()),
+            " SELECT EXISTS (SELECT 1 FROM items p WHERE p.id = ?1 AND (p.kind = '",
+            step_kind!(),
+            "' OR (p.kind = 'task' AND p.id IN (SELECT id FROM under))))"
+        ))?
+        .query_row([parent.get()], |r| r.get(0))?)
+}
+
+/// The refusal for a task's container written to `uid`, a `kind` under no plan step: the same
+/// words on every surface.
+pub(crate) fn unplanned_parent(uid: &str, kind: &str) -> crate::Error {
+    let plan_it = if kind == "task" {
+        format!(", or plan `{uid}` first (`jkb task move {uid} --under <step>`)")
+    } else {
+        String::new()
+    };
+    invalid(format!(
+        "`{uid}` is a {kind} under no plan step, so a task under it would be in no plan: add it \
+         under a plan step or a task under one (`--under <step>`; `jkb design plan ls <design>` \
+         lists a design's plans and their steps){plan_it}"
+    ))
+}
+
+/// Why a new task nothing files under a step is refused: no `--under`, and no repo to fall back to.
+pub const NO_REPO: &str = "a new task is filed under a plan step, and nothing names one here: \
+outside a mounted repo there is no Open work inbox to fall back to. Pass `--under <step>` (`jkb \
+design ls --repo <repo>`, then `jkb design plan ls <design>`, lists the steps), or run it inside a \
+mounted repo, where it lands in that repo's Open work \u{203a} Inbox";
+
+fn no_repo() -> crate::Error {
+    invalid(NO_REPO)
+}
+
+/// The title of every repo's triage design, and of its one plan.
+pub const TRIAGE_TITLE: &str = "Open work";
+/// The text of the triage plan's one step.
+pub const TRIAGE_STEP_TEXT: &str = "Inbox";
+/// The triage design's body.
+const TRIAGE_BODY: &str = "Where work is captured before it is planned: `jkb task add` with no \
+`--under`, `--backlog`, review findings about pre-existing code, and synced tasks.md tasks whose \
+section maps to no step land in Open work \u{203a} Inbox. Triage moves each to the step of the \
+plan it belongs to (`jkb task move <uid> --under <step>`) or cancels it.";
+/// The namespace metadata key mapping a namespace (and everything under it) to a plan step, by uid.
+pub const PLAN_STEP_KEY: &str = "plan_step";
+
+/// The uid of repo `repo`'s triage design. Minted uids are `<prefix>:<slug>-<hex>`, and a slug never
+/// holds `@`, so these fixed ones cannot collide with a minted one.
+#[must_use]
+pub fn triage_design_uid(repo: &str) -> String {
+    format!("{KIND}:open-work@{repo}")
+}
+
+/// The uid of repo `repo`'s triage plan.
+#[must_use]
+pub fn triage_plan_uid(repo: &str) -> String {
+    format!("plan:open-work@{repo}")
+}
+
+/// The uid of repo `repo`'s triage step, where a task with no plan of its own is filed.
+#[must_use]
+pub fn triage_step_uid(repo: &str) -> String {
+    format!("step:inbox@{repo}")
+}
+
+/// Whether `uid` names a repo's triage step ([`triage_step_uid`]).
+#[must_use]
+pub fn is_triage_step_uid(uid: &str) -> bool {
+    uid.strip_prefix("step:inbox@")
+        .is_some_and(|repo| !repo.is_empty())
+}
+
+/// The item `uid`, when it exists: refused unless it is a `kind` contained by `parent` (when one is
+/// given), so a mismatched tree is named rather than built beside.
+fn triage_level(
+    conn: &Connection,
+    uid: &str,
+    kind: &str,
+    parent: Option<ItemId>,
+) -> Result<Option<ItemId>> {
+    let Some(id) = item::id_for_uid(conn, uid)? else {
+        return Ok(None);
+    };
+    let found = item::get(conn, id)?.map(|m| m.kind).unwrap_or_default();
+    if found != kind {
+        return Err(invalid(format!(
+            "`{uid}` is a {found}, not the {kind} the Open work triage tree needs there"
+        )));
+    }
+    if let Some(parent) = parent {
+        if containment::parent(conn, id)? != Some(parent) {
+            return Err(invalid(format!(
+                "`{uid}` is not where the Open work triage tree keeps it (under `{}`): move it back \
+                 or remove it",
+                item::get(conn, parent)?.map(|m| m.uid).unwrap_or_default()
+            )));
+        }
+    }
+    Ok(Some(id))
+}
+
+/// Repo `repo`'s triage step, `step:inbox@<repo>`: found by uid, or created on demand — the design
+/// "Open work" at `designs/<repo>`, its plan "Open work", and that plan's step "Inbox" — one level
+/// at a time, each verified to be the kind it should be where it should be. Runs inside the
+/// caller's transaction, which `write_txn` begins `IMMEDIATE`, and `items.uid` is unique, so two
+/// creators never build two trees.
+///
+/// # Errors
+/// A repo that is not one namespace segment, a uid of the tree that names the wrong kind or sits in
+/// the wrong place, or a database error.
+pub fn triage_step(conn: &Connection, meta: &WriteMeta, repo: &str) -> Result<ItemId> {
+    let design_uid = triage_design_uid(repo);
+    let design = match triage_level(conn, &design_uid, KIND, None)? {
+        Some(id) => id,
+        None => {
+            super::create_as(conn, meta, &design_uid, repo, TRIAGE_TITLE, TRIAGE_BODY)?;
+            design_id(conn, &design_uid)?
+        }
+    };
+    let plan_uid = triage_plan_uid(repo);
+    let plan = match triage_level(conn, &plan_uid, PLAN_KIND, Some(design))? {
+        Some(id) => id,
+        None => contained_item(conn, meta, design, &plan_uid, PLAN_KIND, TRIAGE_TITLE)?,
+    };
+    let step_uid = triage_step_uid(repo);
+    match triage_level(conn, &step_uid, STEP_KIND, Some(plan))? {
+        Some(id) => Ok(id),
+        None => contained_item(conn, meta, plan, &step_uid, STEP_KIND, TRIAGE_STEP_TEXT),
+    }
+}
+
+/// The step a new task homed at `home` is filed under when it names none, in order: the nearest
+/// namespace at or above `home` whose metadata maps it to a step ([`PLAN_STEP_KEY`]); else the
+/// triage step of the repo `home` names ([`crate::mount::repo_of_namespace`]); else that of
+/// `ambient_repo`; else refused.
+///
+/// # Errors
+/// A mapping to a uid that is gone or not a plan step (named, with how to clear it), no repo to fall
+/// back to, a malformed home, or a database error.
+pub fn step_for_home(
+    conn: &Connection,
+    meta: &WriteMeta,
+    home: &str,
+    ambient_repo: Option<&str>,
+) -> Result<ItemId> {
+    if let Some(step) = mapped_step(conn, home)? {
+        return Ok(step);
+    }
+    let normalized = crate::ns::normalize(home)?;
+    match crate::mount::repo_of_namespace(&normalized).or_else(|| ambient_repo.map(str::to_owned)) {
+        Some(repo) => triage_step(conn, meta, &repo),
+        None => Err(no_repo()),
+    }
+}
+
+/// Map namespace `path` — a tasks.md section's, a file's or a mount's — to plan step `step`, or with
+/// `None` clear its mapping: a new task homed there or below with no step of its own is filed under
+/// that step ([`step_for_home`]). The key is merged into the namespace's metadata, never replacing
+/// it, so its `type` and a file's section keys survive. Answers the step it was mapped to before.
+///
+/// # Errors
+/// A `step` that is no plan step, a malformed path, clearing a namespace that does not exist, or a
+/// database error.
+pub fn map_namespace(
+    conn: &Connection,
+    meta: &WriteMeta,
+    path: &str,
+    step: Option<&str>,
+) -> Result<Option<String>> {
+    let path = crate::ns::normalize(path)?;
+    let id = match step {
+        Some(step) => {
+            item_of_kind(conn, step, STEP_KIND, "plan step")?;
+            crate::ns::ensure(conn, meta, &path)?
+        }
+        None => crate::ns::get(conn, &path)?
+            .ok_or_else(|| not_found(format!("no namespace `{path}`")))?,
+    };
+    let mut md = crate::ns::get_metadata(conn, id)?
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(map) = md.as_object_mut() else {
+        return Ok(None);
+    };
+    let before = match step {
+        Some(step) => map.insert(PLAN_STEP_KEY.to_owned(), serde_json::json!(step)),
+        None => map.remove(PLAN_STEP_KEY),
+    };
+    let before = before.and_then(|v| v.as_str().map(str::to_owned));
+    if before.as_deref() != step {
+        crate::ns::set_metadata(conn, meta, id, &md)?;
+    }
+    Ok(before)
+}
+
+/// The step the nearest namespace at or above `home` is mapped to ([`PLAN_STEP_KEY`]), if any.
+///
+/// # Errors
+/// A mapping that names no plan step (refused, naming the namespace and how to clear it), a
+/// malformed home, or a database error.
+pub fn mapped_step(conn: &Connection, home: &str) -> Result<Option<ItemId>> {
+    let mut cur = Some(crate::ns::normalize(home)?);
+    while let Some(path) = cur {
+        if let Some(ns_id) = crate::ns::get(conn, &path)? {
+            let uid = crate::ns::get_metadata(conn, ns_id)?.and_then(|m| {
+                m.get(PLAN_STEP_KEY)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+            if let Some(uid) = uid {
+                let found = match item::id_for_uid(conn, &uid)? {
+                    Some(id) => item::get(conn, id)?.map(|m| (id, m.kind)),
+                    None => None,
+                };
+                let why = match found {
+                    Some((id, kind)) if kind == STEP_KIND => return Ok(Some(id)),
+                    Some((_, kind)) => format!("is a {kind}, not a plan step"),
+                    None => "no longer exists".to_owned(),
+                };
+                return Err(invalid(format!(
+                    "`{path}` maps its tasks to `{uid}`, which {why}: map it to a step (`jkb ns step \
+                     {path} <step>`) or clear the mapping (`jkb ns step {path} --clear`)"
+                )));
+            }
+        }
+        cur = path.rsplit_once('/').map(|(parent, _)| parent.to_owned());
+    }
+    Ok(None)
+}
 
 /// A task no execution plan's step reaches ([`UNPLANNED_SQL`]).
 #[derive(Debug, Clone, PartialEq, Eq)]

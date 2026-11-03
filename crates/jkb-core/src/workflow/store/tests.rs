@@ -12,8 +12,14 @@ use crate::workflow::{Phase, WorkflowEvent};
 use crate::{tag, Db};
 
 fn a_task(db: &Db) -> ItemId {
-    db.write_txn("test", |c, m| create(c, m, &NewTask::new("task:w", "W")))
-        .unwrap()
+    db.write_txn("test", |c, m| {
+        create(
+            c,
+            m,
+            &NewTask::new("task:w", "W", crate::task::Under::inbox_of("t")),
+        )
+    })
+    .unwrap()
 }
 
 fn as_role(role: Role) -> Actor {
@@ -51,7 +57,11 @@ fn file_round(db: &Db, id: ItemId, n: usize, findings: &[(i64, &str)]) {
     db.write_txn("test", move |c, m| {
         let ns = format!("reviews/r{n}");
         for (i, (priority, area)) in findings.iter().enumerate() {
-            let mut spec = NewTask::new(format!("task:f{n}-{i}"), format!("finding {i}"));
+            let mut spec = NewTask::new(
+                format!("task:f{n}-{i}"),
+                format!("finding {i}"),
+                crate::task::Under::inbox_of("t"),
+            );
             spec.home = format!("{ns}/must-fix");
             spec.priority = Some(*priority);
             let f = create(c, m, &spec)?;
@@ -228,7 +238,11 @@ fn a_title_names_the_area_for_findings_filed_before_the_area_facet() {
     let db = Db::open_in_memory().unwrap();
     let id = a_task(&db);
     db.write_txn("test", move |c, m| {
-        let mut spec = NewTask::new("task:old", "parser drops quotes — src/parse.rs:42");
+        let mut spec = NewTask::new(
+            "task:old",
+            "parser drops quotes — src/parse.rs:42",
+            crate::task::Under::inbox_of("t"),
+        );
         spec.home = "reviews/old/must-fix".into();
         spec.priority = Some(1);
         create(c, m, &spec)?;
@@ -389,7 +403,7 @@ fn a_round_is_what_it_was_when_recorded() {
     db.write_txn("test", |c, m| {
         let f = crate::item::id_for_uid(c, "task:f2-0")?.unwrap();
         crate::task::set_priority(c, m, f, Some(3))?;
-        let mut spec = NewTask::new("task:late", "late");
+        let mut spec = NewTask::new("task:late", "late", crate::task::Under::inbox_of("t"));
         spec.home = "reviews/r1/must-fix".into();
         spec.priority = Some(3);
         create(c, m, &spec)?;
@@ -416,7 +430,7 @@ fn only_a_filing_is_a_round_to_a_non_operator_and_scope_follows_the_snapshot() {
     let id = a_task(&db);
     let other = db
         .write_txn("test", |c, m| {
-            let mut spec = NewTask::new("task:other", "O");
+            let mut spec = NewTask::new("task:other", "O", crate::task::Under::inbox_of("t"));
             spec.home = "tasks/elsewhere".into();
             create(c, m, &spec)
         })
@@ -427,7 +441,7 @@ fn only_a_filing_is_a_round_to_a_non_operator_and_scope_follows_the_snapshot() {
     // A filing: exactly what was filed is the round, and so the scope.
     let f = db
         .write_txn("test", |c, m| {
-            let mut spec = NewTask::new("task:filed", "finding");
+            let mut spec = NewTask::new("task:filed", "finding", crate::task::Under::inbox_of("t"));
             spec.home = "reviews/f/must-fix".into();
             spec.priority = Some(1);
             let f = create(c, m, &spec)?;
@@ -455,7 +469,7 @@ fn only_a_filing_is_a_round_to_a_non_operator_and_scope_follows_the_snapshot() {
     // Something placed under the round's namespace afterwards is not one of its findings.
     let late = db
         .write_txn("test", |c, m| {
-            let mut spec = NewTask::new("task:late2", "late");
+            let mut spec = NewTask::new("task:late2", "late", crate::task::Under::inbox_of("t"));
             spec.home = "reviews/f/must-fix".into();
             create(c, m, &spec)
         })
@@ -465,11 +479,11 @@ fn only_a_filing_is_a_round_to_a_non_operator_and_scope_follows_the_snapshot() {
     // namespace alone still puts nothing in reach.
     let split = db
         .write_txn("test", move |c, m| {
-            let mut spec = NewTask::new("task:split", "split");
+            let mut spec = NewTask::new("task:split", "split", crate::task::Under::inbox_of("t"));
             spec.home = "tasks/elsewhere".into();
             let s = create(c, m, &spec)?;
             crate::task::add_subtask(c, m, f, s)?;
-            let mut spec = NewTask::new("task:split2", "deeper");
+            let mut spec = NewTask::new("task:split2", "deeper", crate::task::Under::inbox_of("t"));
             spec.home = "tasks/elsewhere".into();
             let d = create(c, m, &spec)?;
             crate::task::add_subtask(c, m, s, d)?;
@@ -485,7 +499,11 @@ fn redefining_default_does_not_move_a_task_that_has_started() {
     let id = a_task(&db);
     let fresh = db
         .write_txn("test", |c, m| {
-            create(c, m, &NewTask::new("task:fresh", "F"))
+            create(
+                c,
+                m,
+                &NewTask::new("task:fresh", "F", crate::task::Under::inbox_of("t")),
+            )
         })
         .unwrap();
     assert!(matches!(
@@ -599,7 +617,7 @@ fn a_round_holds_under_every_name_the_mirror_gives_it() {
     let db = Db::open_in_memory().unwrap();
     let id = a_task(&db);
     db.write_txn("test", move |c, m| {
-        let mut spec = NewTask::new("task:rf", "filed");
+        let mut spec = NewTask::new("task:rf", "filed", crate::task::Under::inbox_of("t"));
         spec.home = "reviews/f/nit".into();
         let f = create(c, m, &spec)?;
         crate::reviews::record_filing(c, "reviews/f", &[f], "w")
@@ -613,7 +631,7 @@ fn a_round_holds_under_every_name_the_mirror_gives_it() {
     assert_eq!(inside("reviews/f/nit").as_deref(), Some("reviews/f"));
     assert_eq!(inside("tasks/reviews/g"), None);
     db.write_txn("test", |c, m| {
-        let mut spec = NewTask::new("task:rm", "mirrored");
+        let mut spec = NewTask::new("task:rm", "mirrored", crate::task::Under::inbox_of("t"));
         spec.home = "tasks/x/codereviews/f/must-fix".into();
         spec.priority = Some(1);
         create(c, m, &spec).map(|_| ())
@@ -855,8 +873,14 @@ fn phase_terms_agree_with_current(db: &Db, ids: &[ItemId]) {
 fn the_phase_terms_agree_with_current_through_the_whole_graph() {
     let db = Db::open_in_memory().unwrap();
     let make = |uid: &'static str| {
-        db.write_txn("test", move |c, m| create(c, m, &NewTask::new(uid, uid)))
-            .unwrap()
+        db.write_txn("test", move |c, m| {
+            create(
+                c,
+                m,
+                &NewTask::new(uid, uid, crate::task::Under::inbox_of("t")),
+            )
+        })
+        .unwrap()
     };
     let walked = make("task:walked");
     let untouched = make("task:untouched");

@@ -601,7 +601,13 @@ fn replacing_a_spans_text_reanchors_it_over_the_new_words() {
 fn task_under(db: &Db, step: ItemId, uid: &str) -> ItemId {
     let uid = uid.to_owned();
     db.write_txn("t", move |c, m| {
-        let t = task::create(c, m, &task::NewTask::new(uid, "do it"))?;
+        let t = task::create(
+            c,
+            m,
+            &task::NewTask::new(uid, "do it", crate::task::Under::inbox_of("t")),
+        )?;
+        // Written raw, so a test can build what the guards refuse (a task under a plan or a design).
+        task::make_loose(c, m, t)?;
         containment::contain(c, m, t, step, 0)?;
         Ok(t)
     })
@@ -980,32 +986,40 @@ fn archived_is_judged_on_exactly_the_tasks_the_plan_lists() {
 }
 
 #[test]
-fn a_task_cannot_be_made_a_subtask_of_a_plan_or_a_span() {
+fn a_task_cannot_be_made_a_subtask_of_a_plan_a_span_or_a_design() {
     let db = db();
     let uid = create(&db, "Scaffold the app.");
     let p = new_plan(&db, &uid, &["one"]).unwrap();
     let sp = span(&db, &uid, "Scaffold the app.", Reviewer::Operator).unwrap();
-    for parent in [p.uid.clone(), sp] {
+    // A design is no longer a parent either: a one-off under it is in no plan.
+    for parent in [p.uid.clone(), sp, uid.clone()] {
         let pid = step_id(&db, &parent);
         let e = db
             .write_txn("t", move |c, m| {
-                let t = task::create(c, m, &task::NewTask::new("task:x", "x"))?;
+                let t = task::create(
+                    c,
+                    m,
+                    &task::NewTask::new("task:x", "x", crate::task::Under::inbox_of("t")),
+                )?;
                 task::add_subtask(c, m, pid, t)
             })
             .unwrap_err();
-        assert!(e.to_string().contains("holds no tasks"), "{parent}: {e}");
+        assert!(
+            e.to_string().contains("under no plan step"),
+            "{parent}: {e}"
+        );
     }
-    // A step and the design itself still take one.
+    // A step still takes one.
     let step = step_id(&db, &p.steps[0].uid);
-    let u = uid.clone();
-    let d = db.read(move |c| design_id(c, &u)).unwrap();
-    for (n, parent) in [step, d].into_iter().enumerate() {
-        db.write_txn("t", move |c, m| {
-            let t = task::create(c, m, &task::NewTask::new(format!("task:ok{n}"), "x"))?;
-            task::add_subtask(c, m, parent, t)
-        })
-        .unwrap();
-    }
+    db.write_txn("t", move |c, m| {
+        let t = task::create(
+            c,
+            m,
+            &task::NewTask::new("task:ok", "x", crate::task::Under::inbox_of("t")),
+        )?;
+        task::add_subtask(c, m, step, t)
+    })
+    .unwrap();
 }
 
 #[test]
@@ -1075,7 +1089,13 @@ fn a_step_lists_the_spans_staged_into_it_and_a_task_knows_its_place() {
     // A task under no design has no place.
     let loose = db
         .write_txn("t", |c, m| {
-            task::create(c, m, &task::NewTask::new("task:loose", "x"))
+            let t = task::create(
+                c,
+                m,
+                &task::NewTask::new("task:loose", "x", crate::task::Under::inbox_of("t")),
+            )?;
+            task::make_loose(c, m, t)?;
+            Ok(t)
         })
         .unwrap();
     assert!(db
@@ -1145,7 +1165,13 @@ fn a_task_knows_its_step_plan_design_and_root() {
     // Under nothing: no ancestry, and no error.
     let loose = db
         .write_txn("t", |c, m| {
-            task::create(c, m, &task::NewTask::new("task:loose", "x"))
+            let t = task::create(
+                c,
+                m,
+                &task::NewTask::new("task:loose", "x", crate::task::Under::inbox_of("t")),
+            )?;
+            task::make_loose(c, m, t)?;
+            Ok(t)
         })
         .unwrap();
     assert!(db
@@ -1384,7 +1410,11 @@ fn a_prompt_subject_is_the_launchs_kind_and_this_designs() {
     let their_step = step_id(&db, &theirs.steps[0].uid);
     task_under(&db, their_step, "task:theirs");
     db.write_txn("t", |c, m| {
-        task::create(c, m, &task::NewTask::new("task:loose", "x"))
+        task::create(
+            c,
+            m,
+            &task::NewTask::new("task:loose", "x", crate::task::Under::inbox_of("t")),
+        )
     })
     .unwrap();
 
@@ -3612,9 +3642,11 @@ fn unplanned_uids(db: &Db) -> Vec<String> {
 fn loose_task(db: &Db, uid: &str, home: &str) -> ItemId {
     let (uid, home) = (uid.to_owned(), home.to_owned());
     db.write_txn("t", move |c, m| {
-        let mut t = task::NewTask::new(uid, "loose");
+        let mut t = task::NewTask::new(uid, "loose", crate::task::Under::inbox_of("t"));
         t.home = home;
-        task::create(c, m, &t)
+        let id = task::create(c, m, &t)?;
+        task::make_loose(c, m, id)?;
+        Ok(id)
     })
     .unwrap()
 }

@@ -1277,7 +1277,11 @@ fn a_task_inside_an_investigation_never_gets_a_resolution() {
             meta,
             &jkb_core::task::NewTask {
                 home: path.to_owned(),
-                ..jkb_core::task::NewTask::new("task:in-inv", "do the thing")
+                ..jkb_core::task::NewTask::new(
+                    "task:in-inv",
+                    "do the thing",
+                    jkb_core::task::Under::inbox_of("t"),
+                )
             },
         )?;
         // Give it an incoming `verifies` edge, which the base rollup reads as success.

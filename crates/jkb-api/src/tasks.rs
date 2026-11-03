@@ -432,7 +432,9 @@ pub fn add(
     qa.tags.retain(|(f, _)| f != location::FACET_BRANCH);
     let mut explicit = !qa.placements.is_empty();
     let uid = task::mint_uid(&qa.title);
-    let mut spec = task::NewTask::from_quick_add(uid.clone(), qa);
+    // Settled below, once the parent (`--under`) or the ambient repo is known.
+    let mut spec =
+        task::NewTask::from_quick_add(uid.clone(), qa, task::Under::Default { ambient_repo: None });
 
     // `--home` wins over a `+<ns>` in the line: it is the unambiguous form, and the only one that
     // can carry a path containing whitespace.
@@ -457,6 +459,16 @@ pub fn add(
     };
 
     let assented = settle_home(conn, ask, &mut spec, explicit, server_home)?;
+    // Where it is filed: exactly the `--under` parent, else the default step for its home, with the
+    // repo the client stands in as the fallback. `create` checks either before anything is written,
+    // so a request with no step to file under is refused before the global-backlog question below.
+    spec.under = match parent {
+        Some(pid) => task::Under::Parent(pid),
+        None => task::Under::Default {
+            ambient_repo: crate::kb::ambient(conn, &ask.cwd, &ask.client_home, server_home)?
+                .and_then(|mount| jkb_core::mount::repo_of_namespace(&mount)),
+        },
+    };
     if let Some(also) = &ask.also {
         spec.mirrors.push(jkb_core::ns::normalize(also)?);
     }
@@ -470,9 +482,6 @@ pub fn add(
     let synced = file_new_task(conn, ask, &mut spec, &uid, roots)?;
 
     let id = task::create(conn, meta, &spec)?;
-    if let Some(parent) = parent {
-        task::add_subtask(conn, meta, parent, id)?;
-    }
     for branch in &branches {
         location::record_branch(conn, meta, id, branch, BranchWrite::Add)?;
     }

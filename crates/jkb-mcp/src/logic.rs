@@ -135,6 +135,10 @@ pub struct TaskCreateArgs {
     /// Optional namespace to also place the task under (a `repos/…` mirror).
     #[serde(default)]
     pub namespace: Option<String>,
+    /// The plan step (or a task under one) to file it under, by uid. Without it the task lands in the
+    /// Open work › Inbox step of the repo the server was started in; outside any repo it is refused.
+    #[serde(default)]
+    pub under: Option<String>,
 }
 
 /// `task_update` arguments.
@@ -344,19 +348,29 @@ pub fn ingest(tools: &Tools, args: &IngestArgs, kind: SourceKind) -> Result<Answ
     .into())
 }
 
-/// Create a task (audited, undoable): the title taken word for word, homed in the default inbox and
-/// placed under `namespace` too when given.
+/// Create a task (audited, undoable): the title taken word for word, filed `under` the step given or
+/// in the Open work › Inbox step of the repo this server was started in, homed in that repo's inbox
+/// as `jkb task add` homes it, and placed under `namespace` too when given.
 ///
 /// # Errors
-/// Returns a validation error for a malformed namespace or due date, or a failed write.
+/// Returns a validation error for a malformed namespace or due date, an unplanned `under`, no
+/// `under` outside a mounted repo, or a failed write.
 pub fn task_create(tools: &Tools, args: &TaskCreateArgs) -> Result<Answer> {
+    // This process's working directory and `$HOME`, as the CLI sends them: Claude Code starts
+    // `jkb mcp` in the repo, so the ambient repo is the one the agent works in.
+    let cwd = std::env::current_dir()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
     match tools.call(Request::TaskAdd(jkb_api::tasks::AddAsk {
         text: args.title.clone(),
         literal: true,
         priority: args.priority,
         due: args.due.clone(),
         also: args.namespace.clone(),
+        under: args.under.clone(),
         managed: true,
+        cwd,
+        client_home: std::env::var("HOME").unwrap_or_default(),
         ..jkb_api::tasks::AddAsk::default()
     }))? {
         Response::Added { added } => Ok(json!({ "id": added.id, "uid": added.uid }).into()),
@@ -460,8 +474,93 @@ mod tests {
         Arc::new(FakeEmbedder)
     }
 
+    /// A database with this process's working directory mounted at `repos/t`, so `task_create` —
+    /// which sends that directory, as `jkb mcp` started in a repo does — files under `t`'s Inbox.
     fn db() -> Db {
+        let db = bare_db();
+        let cwd = std::env::current_dir().unwrap();
+        db.write_txn("t", move |c, m| {
+            let ns = jkb_core::ns::ensure(c, m, "repos/t")?;
+            jkb_core::mount::create(
+                c,
+                m,
+                ns,
+                &format!("file://{}", cwd.display()),
+                jkb_types::SyncMode::Bidirectional,
+                "document",
+                None,
+                None,
+                jkb_types::ConflictPolicy::Manual,
+            )
+        })
+        .unwrap();
+        db
+    }
+
+    /// A database with nothing mounted: this process stands in no repo.
+    fn bare_db() -> Db {
         Db::open_in_memory_with(&[jkb_index::register]).unwrap()
+    }
+
+    fn create(db: &Db, title: &str, under: Option<&str>) -> super::Result<super::Answer> {
+        task_create(
+            &tools(db),
+            &TaskCreateArgs {
+                title: title.to_owned(),
+                priority: None,
+                due: None,
+                namespace: None,
+                under: under.map(str::to_owned),
+            },
+        )
+    }
+
+    /// The uid of the item containing task `uid`.
+    fn container(db: &Db, uid: &str) -> Option<String> {
+        let uid = uid.to_owned();
+        db.read(move |c| {
+            let id = jkb_core::item::id_for_uid(c, &uid)?.unwrap();
+            Ok(match jkb_core::containment::parent(c, id)? {
+                Some(p) => jkb_core::item::get(c, p)?.map(|m| m.uid),
+                None => None,
+            })
+        })
+        .unwrap()
+    }
+
+    /// Test 14: started in a mounted repo, a task goes to that repo's Open work › Inbox, homed in its
+    /// inbox; `under` is honoured; started in no repo, a task with no `under` is refused.
+    #[test]
+    fn task_create_files_under_the_repos_inbox_or_the_step_named() {
+        let db = db();
+        let made = create(&db, "plain", None).unwrap();
+        let uid = made.value["uid"].as_str().unwrap().to_owned();
+        assert_eq!(container(&db, &uid).as_deref(), Some("step:inbox@t"));
+        let u = uid.clone();
+        let home = db
+            .read(move |c| {
+                let id = jkb_core::item::id_for_uid(c, &u)?.unwrap();
+                jkb_core::item::primary_namespace(c, id)
+            })
+            .unwrap();
+        assert_eq!(home.as_deref(), Some("tasks/repos/t/inbox"));
+
+        let step = db
+            .write_txn("t", |c, m| {
+                let d = jkb_core::design::create(c, m, "t", "Factory", "")?.uid;
+                let p = jkb_core::design::plan::create(c, m, &d, "Ship", &["one".to_owned()])?;
+                Ok(p.steps[0].uid.clone())
+            })
+            .unwrap();
+        let made = create(&db, "planned", Some(&step)).unwrap();
+        let planned = made.value["uid"].as_str().unwrap().to_owned();
+        assert_eq!(container(&db, &planned).as_deref(), Some(step.as_str()));
+
+        let bare = bare_db();
+        let e = create(&bare, "nowhere", None).unwrap_err();
+        assert!(e.is_user_error(), "{e}");
+        assert!(e.to_string().contains("outside a mounted repo"), "{e}");
+        assert_eq!(count_tasks(&bare), 0);
     }
 
     /// The tools over `db` in this process, with the embedder — as `jkb mcp` runs on the host.
@@ -490,6 +589,7 @@ mod tests {
             priority: Some(1),
             due: None,
             namespace: Some("repos/app".to_owned()),
+            under: None,
         };
         let created = task_create(&tools(&db), &args).unwrap();
         assert!(created.value.get("uid").is_some());
@@ -509,6 +609,7 @@ mod tests {
             priority: None,
             due: None,
             namespace: Some("repos/../secret".to_owned()),
+            under: None,
         };
         let err = task_create(&tools(&db), &args).unwrap_err();
         assert!(err.is_user_error());
@@ -525,6 +626,7 @@ mod tests {
                 priority: None,
                 due: None,
                 namespace: None,
+                under: None,
             },
         )
         .unwrap();
@@ -584,6 +686,7 @@ mod tests {
                     priority: None,
                     due: None,
                     namespace: None,
+                    under: None,
                 },
             )
             .unwrap();
@@ -677,6 +780,7 @@ mod tests {
                 priority: None,
                 due: None,
                 namespace: None,
+                under: None,
             },
         )
         .unwrap();

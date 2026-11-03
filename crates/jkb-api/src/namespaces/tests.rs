@@ -76,7 +76,11 @@ fn a_rooted_move_is_bounded() {
     let (db, ..) = crate::tests::mutate_fixture();
     db.write_txn("t", |c, m| {
         for i in 0..=super::MAX_MOVED_ITEMS {
-            let mut t = jkb_core::task::NewTask::new(format!("task:b{i}"), "b");
+            let mut t = jkb_core::task::NewTask::new(
+                format!("task:b{i}"),
+                "b",
+                jkb_core::task::Under::inbox_of("t"),
+            );
             t.home = "bulk/x".into();
             jkb_core::task::create(c, m, &t)?;
         }

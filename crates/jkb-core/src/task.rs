@@ -58,6 +58,32 @@ pub fn mint_uid(title: &str) -> String {
     format!("task:{slug}-{nanos:x}")
 }
 
+/// Where a new task is filed: what [`create`] contains it under. Required on every [`NewTask`], so
+/// every creator says where its task goes and none can leave it in no plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Under {
+    /// Exactly this parent: a plan step, or a task under one; anything else is refused.
+    Parent(ItemId),
+    /// The default step for the task's `home` ([`crate::design::plan::step_for_home`]): a step the
+    /// home's namespace is mapped to, else the Open work › Inbox step of the repo the home names,
+    /// else that of `ambient_repo`; refused when there is none.
+    Default {
+        /// The repo the caller stands in, the fallback when the home names none.
+        ambient_repo: Option<String>,
+    },
+}
+
+impl Under {
+    /// The default step for the task's home, falling back to repo `repo`'s Open work › Inbox when the
+    /// home names no repo: what a caller standing in `repo` files a task under.
+    #[must_use]
+    pub fn inbox_of(repo: impl Into<String>) -> Self {
+        Self::Default {
+            ambient_repo: Some(repo.into()),
+        }
+    }
+}
+
 /// A specification for creating a task. Build it directly (fields are public) or via
 /// [`NewTask::new`] / [`NewTask::from_quick_add`] for sane defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,13 +106,15 @@ pub struct NewTask {
     pub depends_on: Vec<String>,
     /// The storage binding uri (default [`MANAGED_BINDING`]).
     pub binding: String,
+    /// Where it is filed: the plan step (or planned task) [`create`] contains it under.
+    pub under: Under,
 }
 
 impl NewTask {
     /// A task with the given `uid` and `title` and all defaults (home
-    /// [`DEFAULT_HOME`], [`MANAGED_BINDING`] binding, no priority/due/tags/deps).
+    /// [`DEFAULT_HOME`], [`MANAGED_BINDING`] binding, no priority/due/tags/deps), filed `under`.
     #[must_use]
-    pub fn new(uid: impl Into<String>, title: impl Into<String>) -> Self {
+    pub fn new(uid: impl Into<String>, title: impl Into<String>, under: Under) -> Self {
         Self {
             uid: uid.into(),
             title: title.into(),
@@ -97,6 +125,7 @@ impl NewTask {
             tags: Vec::new(),
             depends_on: Vec::new(),
             binding: MANAGED_BINDING.to_owned(),
+            under,
         }
     }
 
@@ -106,7 +135,7 @@ impl NewTask {
     /// was given. Binding defaults to [`MANAGED_BINDING`]. `uid` is supplied by the caller
     /// (the CLI derives one).
     #[must_use]
-    pub fn from_quick_add(uid: impl Into<String>, qa: QuickAdd) -> Self {
+    pub fn from_quick_add(uid: impl Into<String>, qa: QuickAdd, under: Under) -> Self {
         let (home, mirrors) = match qa.placements.split_first() {
             Some((first, rest)) => (first.clone(), rest.to_vec()),
             None => (DEFAULT_HOME.to_owned(), Vec::new()),
@@ -121,6 +150,7 @@ impl NewTask {
             tags: qa.tags,
             depends_on: qa.depends_on,
             binding: MANAGED_BINDING.to_owned(),
+            under,
         }
     }
 }
@@ -155,14 +185,29 @@ fn check_due(due: Option<&str>) -> Result<()> {
 }
 
 /// Create a task: insert the item (status `open`), place it under its home (and any
-/// mirrors), set its binding, apply tags, and link its `depends_on` dependencies.
+/// mirrors), set its binding, apply tags, link its `depends_on` dependencies, and — last — make it a
+/// subtask of what it is filed [`Under`], so every new task is in a plan.
+///
+/// The parent is settled before the task is written: an [`Under::Parent`] that is no plan step and
+/// no task under one is refused, as is an [`Under::Default`] with no step to fall back to. This is
+/// the one check every creator inherits; no caller makes it itself.
 ///
 /// # Errors
-/// Returns a validation error if a named dependency uid does not exist or a
-/// dependency edge would create a cycle, or the due date is over [`MAX_DUE_BYTES`];
-/// otherwise a database error.
+/// Returns a validation error if the parent is unplanned or none can be found, a named dependency
+/// uid does not exist or a dependency edge would create a cycle, or the due date is over
+/// [`MAX_DUE_BYTES`]; [`TypeError::NotFound`] for a parent that does not exist; otherwise a
+/// database error.
 pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<ItemId> {
     check_due(task.due.as_deref())?;
+    let parent = match &task.under {
+        Under::Parent(parent) => {
+            check_parent(conn, *parent)?;
+            *parent
+        }
+        Under::Default { ambient_repo } => {
+            crate::design::plan::step_for_home(conn, meta, &task.home, ambient_repo.as_deref())?
+        }
+    };
     let status = TaskStatus::Open;
     let id: i64 = conn
         .prepare_cached(
@@ -211,7 +256,22 @@ pub fn create(conn: &Connection, meta: &WriteMeta, task: &NewTask) -> Result<Ite
         add_dependency(conn, meta, item_id, dep_uid)?;
     }
     ensure_task_mirror(conn, meta, item_id, &task.home)?;
+    // `parent` was checked (or is a step) before anything was written.
+    attach(conn, meta, parent, item_id)?;
     Ok(item_id)
+}
+
+/// Refuse `parent` as a task's container unless it holds tasks
+/// ([`crate::design::plan::homes_tasks`]): a plan step, or a task under one. The one check behind
+/// [`create`], [`add_subtask`], [`set_container`] and so [`move_under`].
+fn check_parent(conn: &Connection, parent: ItemId) -> Result<()> {
+    let p = crate::item::get(conn, parent)?
+        .ok_or_else(|| Error::Types(TypeError::NotFound(format!("item {parent}"))))?;
+    if crate::design::plan::homes_tasks(conn, parent)? {
+        Ok(())
+    } else {
+        Err(crate::design::plan::unplanned_parent(&p.uid, &p.kind))
+    }
 }
 
 /// The `tasks/` mirror namespace for a task homed at `home`, or `None` if `home` is already
@@ -417,28 +477,28 @@ fn mirror_each(conn: &Connection, meta: &WriteMeta, tasks: Vec<(ItemId, String)>
 /// (the sync owns only the edges between two of the file's own tasks, so it would keep the edge
 /// and render the parent without it).
 ///
-/// An execution plan or a design span is never a task's parent (design D53.6): a plan's work is
-/// under its steps, and a plan's listing and its *archived* both walk only from the steps, so a task
-/// contained by the plan itself (or by a span) would be in neither — invisible, never prompted for.
+/// The parent must be a plan step or a task under one (`check_parent`): anything else — a plan, a
+/// span, a design, a task in no plan — would leave the subtask in no plan, which a plan's listing,
+/// its *archived* and the unplanned read all walk from the steps to judge.
 ///
 /// # Errors
-/// Returns a validation error if `child` is `parent` or one of its ancestors, if `parent` is an
-/// execution plan or a design span, or if `parent` is a line of a synced file `child` is not
-/// filed in; otherwise a database error.
+/// Returns a validation error if `child` is `parent` or one of its ancestors, if `parent` is under
+/// no plan step, or if `parent` is a line of a synced file `child` is not filed in; otherwise a
+/// database error.
 pub fn add_subtask(
     conn: &Connection,
     meta: &WriteMeta,
     parent: ItemId,
     child: ItemId,
 ) -> Result<()> {
+    check_parent(conn, parent)?;
+    attach(conn, meta, parent, child)
+}
+
+/// [`add_subtask`] once `parent` is known to hold tasks: the file-line rule, the edge, and the
+/// container.
+fn attach(conn: &Connection, meta: &WriteMeta, parent: ItemId, child: ItemId) -> Result<()> {
     if let Some(p) = crate::item::get(conn, parent)? {
-        if p.kind == crate::design::plan::PLAN_KIND || p.kind == crate::design::SPAN_KIND {
-            return Err(Error::Types(TypeError::Validation(format!(
-                "`{}` is a {}, which holds no tasks: add the task under one of its plan's steps \
-                 (`jkb design plan show` lists them) or under the design for a one-off",
-                p.uid, p.kind
-            ))));
-        }
         let file_of = |id: ItemId| -> Result<Option<String>> {
             Ok(binding::get(conn, id)?
                 .as_ref()
@@ -459,7 +519,7 @@ pub fn add_subtask(
     // inside the parent. Both here so they cannot drift — this is the only supported way to
     // make a subtask.
     edge::link(conn, meta, parent, child, EdgeType::ParentOf, None)?;
-    set_container(conn, meta, child, parent, 0)
+    replace_container(conn, meta, child, parent, 0)
 }
 
 /// Make `parent` the container of `child`, at `position` among its siblings, and drop the
@@ -472,10 +532,25 @@ pub fn add_subtask(
 /// so `jkb undo` puts the old row and its edge back. The caller links `parent`'s own edge (as
 /// [`add_subtask`] does, or the tasks file import before reconciling containment).
 ///
+/// `parent` must be a plan step or a task under one, as for [`add_subtask`].
+///
 /// # Errors
-/// A validation error from [`crate::containment::contain`] (`child` is `parent` or contains it);
-/// otherwise a database error.
+/// A validation error when `parent` is under no plan step, or from
+/// [`crate::containment::contain`] (`child` is `parent` or contains it); otherwise a database
+/// error.
 pub fn set_container(
+    conn: &Connection,
+    meta: &WriteMeta,
+    child: ItemId,
+    parent: ItemId,
+    position: i64,
+) -> Result<()> {
+    check_parent(conn, parent)?;
+    replace_container(conn, meta, child, parent, position)
+}
+
+/// [`set_container`] once its caller has checked `parent`.
+fn replace_container(
     conn: &Connection,
     meta: &WriteMeta,
     child: ItemId,
@@ -511,9 +586,11 @@ pub enum Moved {
 /// task never had). Its placements and binding are untouched: a move changes what the task is
 /// part of, not where it is filed.
 ///
-/// Refused for a task bound to a synced `file://` line: the tasks serializer owns that task's
-/// parent through the file's indentation, so the next sync would put it back. Refused, too, under
-/// a parent bound to one, by [`add_subtask`].
+/// Refused for a task whose container is a line of its own synced `file://` file: the tasks
+/// serializer owns that parent through the file's indentation, so the next sync would put it back.
+/// A top-level file task (its container outside the file) moves freely — that is how one leaves its
+/// repo's Open work › Inbox — and the next import leaves it at its new step. Refused, too, under a
+/// parent bound to a file, by [`add_subtask`].
 ///
 /// # Errors
 /// [`TypeError::NotFound`] when either item is missing; a validation error when `child` is not a
@@ -539,18 +616,23 @@ pub fn move_under(
             "item {new_parent}"
         ))));
     }
-    if let Some(file) = binding::get(conn, child)?
-        .as_ref()
-        .and_then(|b| binding::file_path(&b.uri))
-    {
-        return Err(invalid(format!(
-            "`{}` is a line of {file}, whose indentation is its parent: edit the file to move it \
-             (a move here would be put back by the next sync)",
-            task.uid
-        )));
+    let contained_in = crate::containment::parent(conn, child)?;
+    let file_of = |id: ItemId| -> Result<Option<String>> {
+        Ok(binding::get(conn, id)?
+            .as_ref()
+            .and_then(|b| binding::file_path(&b.uri))
+            .map(str::to_owned))
+    };
+    if let (Some(file), Some(container)) = (file_of(child)?, contained_in) {
+        if file_of(container)?.as_deref() == Some(file.as_str()) {
+            return Err(invalid(format!(
+                "`{}` is an indented line of {file}, whose indentation is its parent: edit the file \
+                 to move it (a move here would be put back by the next sync)",
+                task.uid
+            )));
+        }
     }
     let edge_parents = parent_edges(conn, child)?;
-    let contained_in = crate::containment::parent(conn, child)?;
     if contained_in == Some(new_parent) && edge_parents == [new_parent] {
         return Ok(Moved::Unchanged);
     }
@@ -1124,6 +1206,18 @@ fn bad(token: &str, expected: &str) -> Error {
     )))
 }
 
+/// Make `task` loose, as a task created before every task was filed under a plan step was: its
+/// container row and the `parent_of` edge beside it are removed. Tests only — what the guards
+/// refuse to write, built from the rows a pre-guard build left.
+#[cfg(test)]
+pub(crate) fn make_loose(conn: &Connection, meta: &WriteMeta, task: ItemId) -> Result<()> {
+    if let Some(parent) = crate::containment::parent(conn, task)? {
+        edge::unlink(conn, meta, parent, task, EdgeType::ParentOf)?;
+        crate::containment::uncontain(conn, meta, task)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     /// The SQL spellings of the terminal set, evaluated by `SQLite` itself, agree with
@@ -1177,7 +1271,7 @@ mod tests {
                 ("task:f", Some(2), Some("2026-09-15")),
                 ("task:g", Some(1), Some("2026-12-01")),
             ] {
-                let mut t = super::NewTask::new(uid, uid);
+                let mut t = super::NewTask::new(uid, uid, crate::task::Under::inbox_of("t"));
                 t.priority = priority;
                 t.due = due.map(str::to_owned);
                 super::create(c, m, &t)?;
@@ -1206,7 +1300,8 @@ mod tests {
                 listed[..3]
             );
             let many: Vec<_> = (1..=40_000).map(jkb_types::ItemId::new).collect();
-            assert_eq!(super::load_ordered(c, &many)?.len(), 7);
+            // Every item, the Open work design, plan and step the tasks are filed under included.
+            assert_eq!(super::load_ordered(c, &many)?.len(), 7 + 3);
             Ok(())
         })
         .unwrap();
@@ -1221,7 +1316,11 @@ mod tests {
         let db = crate::Db::open_in_memory().unwrap();
         let id = db
             .write_txn("t", |conn, meta| {
-                let id = super::create(conn, meta, &super::NewTask::new("task:c", "claimed"))?;
+                let id = super::create(
+                    conn,
+                    meta,
+                    &super::NewTask::new("task:c", "claimed", crate::task::Under::inbox_of("t")),
+                )?;
                 claim::claim(conn, meta, id, "host:1")?;
                 Ok(id)
             })
@@ -1244,7 +1343,11 @@ mod tests {
         // ...while a non-terminal transition leaves an in-flight claim alone.
         let id2 = db
             .write_txn("t", |conn, meta| {
-                let id = super::create(conn, meta, &super::NewTask::new("task:d", "wip"))?;
+                let id = super::create(
+                    conn,
+                    meta,
+                    &super::NewTask::new("task:d", "wip", crate::task::Under::inbox_of("t")),
+                )?;
                 claim::claim(conn, meta, id, "host:2")?;
                 super::set_status(conn, meta, id, jkb_types::TaskStatus::NeedsReview)?;
                 Ok(id)
@@ -1309,17 +1412,29 @@ mod tests {
     #[test]
     fn from_quick_add_homes_first_placement_rest_mirror() {
         // No placement → the default inbox is the home, no mirrors (design D26.1).
-        let t = NewTask::from_quick_add("task:a", parse_quick_add("capture this").unwrap());
+        let t = NewTask::from_quick_add(
+            "task:a",
+            parse_quick_add("capture this").unwrap(),
+            crate::task::Under::inbox_of("t"),
+        );
         assert_eq!(t.home, super::DEFAULT_HOME);
         assert!(t.mirrors.is_empty());
 
         // `+a` alone → home `a`, no forced inbox mirror.
-        let t = NewTask::from_quick_add("task:b", parse_quick_add("do it +a").unwrap());
+        let t = NewTask::from_quick_add(
+            "task:b",
+            parse_quick_add("do it +a").unwrap(),
+            crate::task::Under::inbox_of("t"),
+        );
         assert_eq!(t.home, "a");
         assert!(t.mirrors.is_empty());
 
         // `+a +b` → home `a`, mirror `b`.
-        let t = NewTask::from_quick_add("task:c", parse_quick_add("do it +a +b").unwrap());
+        let t = NewTask::from_quick_add(
+            "task:c",
+            parse_quick_add("do it +a +b").unwrap(),
+            crate::task::Under::inbox_of("t"),
+        );
         assert_eq!(t.home, "a");
         assert_eq!(t.mirrors, vec!["b".to_owned()]);
     }
@@ -1330,7 +1445,11 @@ mod tests {
         let qa = parse_quick_add("do it +proj/x +repos/y").unwrap();
         let id = db
             .write_txn("t", move |conn, meta| {
-                create(conn, meta, &NewTask::from_quick_add("task:h", qa))
+                create(
+                    conn,
+                    meta,
+                    &NewTask::from_quick_add("task:h", qa, crate::task::Under::inbox_of("t")),
+                )
             })
             .unwrap();
 
@@ -1367,7 +1486,11 @@ mod tests {
         let qa = parse_quick_add("do it +repos/jkb/a").unwrap();
         let id = db
             .write_txn("t", move |conn, meta| {
-                create(conn, meta, &NewTask::from_quick_add("task:h", qa))
+                create(
+                    conn,
+                    meta,
+                    &NewTask::from_quick_add("task:h", qa, crate::task::Under::inbox_of("t")),
+                )
             })
             .unwrap();
 
@@ -1409,7 +1532,11 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .write_txn("t", |conn, meta| {
-                create(conn, meta, &NewTask::new("task:a", "write docs"))
+                create(
+                    conn,
+                    meta,
+                    &NewTask::new("task:a", "write docs", crate::task::Under::inbox_of("t")),
+                )
             })
             .unwrap();
 
@@ -1438,7 +1565,11 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .write_txn("t", |conn, meta| {
-                create(conn, meta, &NewTask::new("task:a", "a"))
+                create(
+                    conn,
+                    meta,
+                    &NewTask::new("task:a", "a", crate::task::Under::inbox_of("t")),
+                )
             })
             .unwrap();
 
@@ -1459,8 +1590,12 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let (a, _b) = db
             .write_txn("t", |conn, meta| {
-                let a = create(conn, meta, &NewTask::new("task:a", "a"))?;
-                let mut b_spec = NewTask::new("task:b", "b");
+                let a = create(
+                    conn,
+                    meta,
+                    &NewTask::new("task:a", "a", crate::task::Under::inbox_of("t")),
+                )?;
+                let mut b_spec = NewTask::new("task:b", "b", crate::task::Under::inbox_of("t"));
                 b_spec.depends_on = vec!["task:a".to_owned()]; // b depends on a
                 let b = create(conn, meta, &b_spec)?;
                 Ok((a, b))
@@ -1479,8 +1614,12 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let (a, b) = db
             .write_txn("t", |conn, meta| {
-                let b = create(conn, meta, &NewTask::new("task:b", "b"))?;
-                let mut a_spec = NewTask::new("task:a", "a");
+                let b = create(
+                    conn,
+                    meta,
+                    &NewTask::new("task:b", "b", crate::task::Under::inbox_of("t")),
+                )?;
+                let mut a_spec = NewTask::new("task:a", "a", crate::task::Under::inbox_of("t"));
                 a_spec.depends_on = vec!["task:b".to_owned()];
                 let a = create(conn, meta, &a_spec)?;
                 Ok((a, b))
@@ -1527,8 +1666,12 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let (a, b) = db
             .write_txn("t", |conn, meta| {
-                let b = create(conn, meta, &NewTask::new("task:b", "b"))?;
-                let mut a_spec = NewTask::new("task:a", "a");
+                let b = create(
+                    conn,
+                    meta,
+                    &NewTask::new("task:b", "b", crate::task::Under::inbox_of("t")),
+                )?;
+                let mut a_spec = NewTask::new("task:a", "a", crate::task::Under::inbox_of("t"));
                 a_spec.depends_on = vec!["task:b".to_owned()];
                 let a = create(conn, meta, &a_spec)?;
                 Ok((a, b))
@@ -1564,8 +1707,12 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let (a, b) = db
             .write_txn("t", |conn, meta| {
-                let b = create(conn, meta, &NewTask::new("task:b", "b"))?;
-                let mut a_spec = NewTask::new("task:a", "a");
+                let b = create(
+                    conn,
+                    meta,
+                    &NewTask::new("task:b", "b", crate::task::Under::inbox_of("t")),
+                )?;
+                let mut a_spec = NewTask::new("task:a", "a", crate::task::Under::inbox_of("t"));
                 a_spec.depends_on = vec!["task:b".to_owned()];
                 let a = create(conn, meta, &a_spec)?;
                 Ok((a, b))
@@ -1619,17 +1766,21 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
             // Two due today, one high-priority one low; one with no priority.
-            let mut p2 = NewTask::new("task:p2", "p2");
+            let mut p2 = NewTask::new("task:p2", "p2", crate::task::Under::inbox_of("t"));
             p2.priority = Some(2);
             p2.due = Some("2026-07-02".to_owned());
             create(conn, meta, &p2)?;
 
-            let mut p1 = NewTask::new("task:p1", "p1");
+            let mut p1 = NewTask::new("task:p1", "p1", crate::task::Under::inbox_of("t"));
             p1.priority = Some(1);
             p1.due = Some("2026-07-02".to_owned());
             create(conn, meta, &p1)?;
 
-            create(conn, meta, &NewTask::new("task:none", "none"))?;
+            create(
+                conn,
+                meta,
+                &NewTask::new("task:none", "none", crate::task::Under::inbox_of("t")),
+            )?;
             Ok(())
         })
         .unwrap();
@@ -1660,10 +1811,19 @@ mod tests {
     fn ready_is_scopable_to_a_repo_mirror() {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |conn, meta| {
-            let mut spec = NewTask::new("task:repo", "repo task");
+            let mut spec =
+                NewTask::new("task:repo", "repo task", crate::task::Under::inbox_of("t"));
             spec.mirrors = vec!["repos/monorepo/backend".to_owned()];
             create(conn, meta, &spec)?;
-            create(conn, meta, &NewTask::new("task:inbox", "inbox only"))?;
+            create(
+                conn,
+                meta,
+                &NewTask::new(
+                    "task:inbox",
+                    "inbox only",
+                    crate::task::Under::inbox_of("t"),
+                ),
+            )?;
             Ok(())
         })
         .unwrap();
@@ -1700,7 +1860,11 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let id = db
             .write_txn("t", |conn, meta| {
-                create(conn, meta, &NewTask::new("task:a", "a"))
+                create(
+                    conn,
+                    meta,
+                    &NewTask::new("task:a", "a", crate::task::Under::inbox_of("t")),
+                )
             })
             .unwrap();
         db.write_txn("t", move |conn, meta| {
@@ -1738,7 +1902,11 @@ mod tests {
 
         let id = db
             .write_txn("t", move |conn, meta| {
-                create(conn, meta, &NewTask::from_quick_add("task:rn", qa))
+                create(
+                    conn,
+                    meta,
+                    &NewTask::from_quick_add("task:rn", qa, crate::task::Under::inbox_of("t")),
+                )
             })
             .unwrap();
 
@@ -1777,7 +1945,7 @@ mod tests {
     mod move_under {
         use jkb_types::{EdgeType, ItemId, SyncMode};
 
-        use super::super::{add_subtask, create, move_under, subtasks, Moved, NewTask};
+        use super::super::{create, move_under, subtasks, Moved, NewTask, Under};
         use crate::{binding, containment, design, edge, item, Db};
 
         struct Fixture {
@@ -1790,7 +1958,8 @@ mod tests {
             loose: ItemId,
         }
 
-        /// A design with a one-step plan and a span; task `a` with subtask `t`; parentless `loose`.
+        /// A design with a one-step plan and a span; task `a` under the step with subtask `t`; and
+        /// `loose`, a task with no parent as a pre-guard build left one.
         fn fixture() -> Fixture {
             let db = Db::open_in_memory().unwrap();
             let (plan, step, span, a, t, loose) = db
@@ -1811,10 +1980,14 @@ mod tests {
                     .span
                     .unwrap();
                     let span = item::id_for_uid(c, &span)?.unwrap();
-                    let a = create(c, m, &NewTask::new("task:a", "a"))?;
-                    let t = create(c, m, &NewTask::new("task:t", "t"))?;
-                    add_subtask(c, m, a, t)?;
-                    let loose = create(c, m, &NewTask::new("task:loose", "loose"))?;
+                    let a = create(c, m, &NewTask::new("task:a", "a", Under::Parent(step)))?;
+                    let t = create(c, m, &NewTask::new("task:t", "t", Under::Parent(a)))?;
+                    let loose = create(
+                        c,
+                        m,
+                        &NewTask::new("task:loose", "loose", Under::inbox_of("t")),
+                    )?;
+                    super::super::make_loose(c, m, loose)?;
                     Ok((p.uid, step, span, a, t, loose))
                 })
                 .unwrap();
@@ -1878,17 +2051,17 @@ mod tests {
                 Moved::Moved { from: Some(f.a) }
             );
             assert_eq!(parent_of(&f.db, f.t), (Some(f.step), vec![f.step]));
-            assert_eq!(kids(&f.db, f.step), ["task:t"]);
+            assert_eq!(kids(&f.db, f.step), ["task:a", "task:t"]);
             assert!(
                 kids(&f.db, f.a).is_empty(),
                 "the old parent no longer lists it"
             );
-            assert_eq!(plan_tasks(&f.db, &f.plan), ["task:t"]);
+            assert_eq!(plan_tasks(&f.db, &f.plan), ["task:a", "task:t"]);
 
             undo(&f.db);
             assert_eq!(parent_of(&f.db, f.t), (Some(f.a), vec![f.a]));
             assert_eq!(kids(&f.db, f.a), ["task:t"]);
-            assert!(kids(&f.db, f.step).is_empty());
+            assert_eq!(kids(&f.db, f.step), ["task:a"]);
         }
 
         #[test]
@@ -1899,10 +2072,13 @@ mod tests {
                 Moved::Moved { from: None }
             );
             assert_eq!(parent_of(&f.db, f.loose), (Some(f.step), vec![f.step]));
-            assert_eq!(plan_tasks(&f.db, &f.plan), ["task:loose"]);
+            assert_eq!(
+                plan_tasks(&f.db, &f.plan),
+                ["task:a", "task:t", "task:loose"]
+            );
             undo(&f.db);
             assert_eq!(parent_of(&f.db, f.loose), (None, vec![]));
-            assert!(plan_tasks(&f.db, &f.plan).is_empty());
+            assert_eq!(plan_tasks(&f.db, &f.plan), ["task:a", "task:t"]);
         }
 
         #[test]
@@ -1921,7 +2097,7 @@ mod tests {
         }
 
         #[test]
-        fn a_move_under_a_plan_or_a_span_is_refused_and_leaves_the_parent() {
+        fn a_move_under_a_plan_a_span_or_a_loose_task_is_refused_and_leaves_the_parent() {
             let f = fixture();
             let plan =
                 f.db.read({
@@ -1930,11 +2106,20 @@ mod tests {
                 })
                 .unwrap()
                 .unwrap();
-            for parent in [plan, f.span] {
+            for parent in [plan, f.span, f.loose] {
                 let e = mv(&f.db, f.t, parent).unwrap_err();
-                assert!(e.to_string().contains("holds no tasks"), "{e}");
+                assert!(e.to_string().contains("under no plan step"), "{e}");
                 assert_eq!(parent_of(&f.db, f.t), (Some(f.a), vec![f.a]));
             }
+            // Only a task is told how to plan itself first.
+            let e = mv(&f.db, f.t, f.loose).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("jkb task move task:loose --under <step>"),
+                "{e}"
+            );
+            let e = mv(&f.db, f.t, plan).unwrap_err();
+            assert!(!e.to_string().contains("jkb task move"), "{e}");
         }
 
         #[test]
@@ -1946,7 +2131,11 @@ mod tests {
             let (top, sub) = (f.a, f.t);
             let grand =
                 f.db.write_txn("t", move |c, m| {
-                    let g = create(c, m, &NewTask::new("task:g", "g"))?;
+                    let g = create(
+                        c,
+                        m,
+                        &NewTask::new("task:g", "g", crate::task::Under::inbox_of("t")),
+                    )?;
                     edge::link(c, m, sub, g, EdgeType::ParentOf, None)?;
                     Ok(g)
                 })
@@ -1955,7 +2144,7 @@ mod tests {
             assert!(e.to_string().contains("`task:g` is inside `task:a`"), "{e}");
             let e = mv(&f.db, top, top).unwrap_err();
             assert!(e.to_string().contains("its own parent"), "{e}");
-            assert_eq!(parent_of(&f.db, top), (None, vec![]));
+            assert_eq!(parent_of(&f.db, top), (Some(f.step), vec![f.step]));
             assert_eq!(parent_of(&f.db, sub), (Some(top), vec![top]));
         }
 
@@ -1967,14 +2156,18 @@ mod tests {
             let (top, sub) = (f.a, f.t);
             let grand =
                 f.db.write_txn("t", move |c, m| {
-                    let g = create(c, m, &NewTask::new("task:g", "g"))?;
+                    let g = create(
+                        c,
+                        m,
+                        &NewTask::new("task:g", "g", crate::task::Under::inbox_of("t")),
+                    )?;
                     containment::contain(c, m, g, sub, 0)?;
                     Ok(g)
                 })
                 .unwrap();
             let e = mv(&f.db, top, grand).unwrap_err();
             assert!(e.to_string().contains("cannot be contained by it"), "{e}");
-            assert_eq!(parent_of(&f.db, top), (None, vec![]));
+            assert_eq!(parent_of(&f.db, top), (Some(f.step), vec![f.step]));
         }
 
         #[test]
@@ -2000,24 +2193,34 @@ mod tests {
             assert_eq!(parent_of(&f.db, f.loose), (None, vec![]));
         }
 
+        /// An indented file line (its container a line of the same file) is the file's to move; a
+        /// top-level one (its container outside the file) moves, which is how it leaves the Inbox.
         #[test]
-        fn a_file_bound_task_or_a_non_task_is_refused() {
+        fn an_indented_file_task_or_a_non_task_is_refused_and_a_top_level_one_moves() {
             let f = fixture();
-            let t = f.t;
+            let (a, t) = (f.a, f.t);
             f.db.write_txn("t", move |c, m| {
-                binding::set(
-                    c,
-                    m,
-                    t,
-                    "file:///r/tasks.md#t1",
-                    Some(SyncMode::Bidirectional),
-                    None,
-                )
+                for (id, uri) in [(a, "file:///r/tasks.md#a1"), (t, "file:///r/tasks.md#t1")] {
+                    binding::set(c, m, id, uri, Some(SyncMode::Bidirectional), None)?;
+                }
+                Ok(())
             })
             .unwrap();
             let e = mv(&f.db, t, f.step).unwrap_err();
             assert!(e.to_string().contains("edit the file"), "{e}");
             assert_eq!(parent_of(&f.db, t), (Some(f.a), vec![f.a]));
+            // `a` is a top-level line: under the step, not under a line of its file.
+            let other =
+                f.db.write_txn("t", |c, m| {
+                    let d = design::create(c, m, "jkb", "Other", "")?.uid;
+                    let p = design::plan::create(c, m, &d, "Next", &["two".to_owned()])?;
+                    Ok(item::id_for_uid(c, &p.steps[0].uid)?.unwrap())
+                })
+                .unwrap();
+            assert_eq!(
+                mv(&f.db, a, other).unwrap(),
+                Moved::Moved { from: Some(f.step) }
+            );
             // The step is not a task.
             let e = mv(&f.db, f.step, f.a).unwrap_err();
             assert!(e.to_string().contains("not a task"), "{e}");

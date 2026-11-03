@@ -19,25 +19,15 @@ fn add_task(
     due: Option<&str>,
     size: Option<&str>,
 ) -> ItemId {
-    let id = item::upsert(
-        conn,
-        meta,
-        &item::NewItem {
-            uid: uid.to_owned(),
-            kind: "task".to_owned(),
-            content: Some(uid.to_owned()),
-            content_hash: None,
-            mime: None,
-        },
-    )
-    .unwrap();
+    // Homed at `ns_path` and filed in repo `t`'s Open work inbox by `task::create`.
+    let mut spec = jkb_core::task::NewTask::new(uid, uid, jkb_core::task::Under::inbox_of("t"));
+    spec.home = ns_path.to_owned();
+    let id = jkb_core::task::create(conn, meta, &spec).unwrap();
     conn.execute(
         "UPDATE items SET status = ?1, priority = ?2, due = ?3 WHERE id = ?4",
         rusqlite::params![status, priority, due, id.get()],
     )
     .unwrap();
-    let ns_id = ns::ensure(conn, meta, ns_path).unwrap();
-    placement::place(conn, meta, id, ns_id, PlacementRole::Primary, 0).unwrap();
     if let Some(size) = size {
         tag::apply(conn, meta, id, "size", size).unwrap();
     }
@@ -109,7 +99,8 @@ fn open_small_tasks_scoped_to_a_subtree() {
     })
     .unwrap();
 
-    let hits = uids_for(&db, "kind:task status:open tag:size=small ns:tasks/**");
+    // `tasks/proj`, not `tasks/**`: a task homed at `notes` is mirrored to `tasks/notes`.
+    let hits = uids_for(&db, "kind:task status:open tag:size=small ns:tasks/proj/**");
     assert_eq!(hits, vec!["t:small-open"]);
 }
 

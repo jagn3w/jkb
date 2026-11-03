@@ -3516,7 +3516,11 @@ fn a_database_pass_follows_the_mount_s_direction_and_writes_only_as_sync() {
     let fresh = dir.path().join("later/tasks.md");
     let fresh_uri = format!("{}#born", uri_for(&fresh));
     db.write_txn("cli", move |conn, meta| {
-        let mut new = task::NewTask::new(&fresh_uri, "Born in the database");
+        let mut new = task::NewTask::new(
+            &fresh_uri,
+            "Born in the database",
+            jkb_core::task::Under::inbox_of("t"),
+        );
         new.binding = fresh_uri.clone();
         new.home = "docs/plan/later/tasks.md".to_owned();
         task::create(conn, meta, &new).map(|_| ())
@@ -4179,7 +4183,7 @@ fn an_import_mirrors_only_its_own_tasks() {
     mount_tasks(&db, dir.path(), ConflictPolicy::Manual);
     // A task bound to no file, homed outside `tasks/`, whose mirror is missing and cannot be placed.
     db.write_txn("t", |conn, meta| {
-        let mut new = task::NewTask::new("task:stray", "A task no file declares");
+        let mut new = task::NewTask::new("task:stray", "A task no file declares", jkb_core::task::Under::inbox_of("t"));
         new.home = "elsewhere/stray".to_owned();
         task::create(conn, meta, &new)?;
         conn.execute_batch(

@@ -193,10 +193,18 @@ fn blobs_are_listed_and_read_back_as_text() {
 fn a_related_walk_is_capped() {
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let hub = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:hub", "hub"))?;
+        let hub = jkb_core::task::create(
+            c,
+            m,
+            &jkb_core::task::NewTask::new("task:hub", "hub", jkb_core::task::Under::inbox_of("t")),
+        )?;
         for i in 0..=super::MAX_RELATED_NODES {
             let uid = format!("task:n{i}");
-            let n = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new(&uid, "n"))?;
+            let n = jkb_core::task::create(
+                c,
+                m,
+                &jkb_core::task::NewTask::new(&uid, "n", jkb_core::task::Under::inbox_of("t")),
+            )?;
             jkb_core::edge::link(c, m, hub, n, jkb_types::EdgeType::Informs, None)?;
         }
         Ok(())
@@ -226,14 +234,18 @@ fn a_related_walk_is_capped() {
 fn a_walk_counts_neighbours_not_edges() {
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let hub = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:hub", "hub"))?;
+        let hub = jkb_core::task::create(
+            c,
+            m,
+            &jkb_core::task::NewTask::new("task:hub", "hub", jkb_core::task::Under::inbox_of("t")),
+        )?;
         let mut ids = Vec::new();
         for i in 0..900 {
             let uid = format!("task:n{i}");
             ids.push(jkb_core::task::create(
                 c,
                 m,
-                &jkb_core::task::NewTask::new(&uid, "n"),
+                &jkb_core::task::NewTask::new(&uid, "n", jkb_core::task::Under::inbox_of("t")),
             )?);
         }
         // The first 500 neighbours two edges each, so the walk's first page (1001 rows) holds only
@@ -275,10 +287,18 @@ fn a_walk_counts_neighbours_not_edges() {
 fn a_multi_edge_walk_is_capped() {
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let hub = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:hub", "hub"))?;
+        let hub = jkb_core::task::create(
+            c,
+            m,
+            &jkb_core::task::NewTask::new("task:hub", "hub", jkb_core::task::Under::inbox_of("t")),
+        )?;
         for i in 0..=super::MAX_RELATED_NODES {
             let uid = format!("task:n{i}");
-            let n = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new(&uid, "n"))?;
+            let n = jkb_core::task::create(
+                c,
+                m,
+                &jkb_core::task::NewTask::new(&uid, "n", jkb_core::task::Under::inbox_of("t")),
+            )?;
             for ty in [
                 jkb_types::EdgeType::References,
                 jkb_types::EdgeType::DerivedFrom,

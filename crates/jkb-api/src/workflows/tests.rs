@@ -279,7 +279,11 @@ fn the_graph_is_the_compiled_table_with_the_strategys_permissions() {
     // A task's own: its phase, its status, and the strategy pinned on it — not the default.
     kb.db
         .write_txn("test", |c, m| {
-            jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:w", "W"))
+            jkb_core::task::create(
+                c,
+                m,
+                &jkb_core::task::NewTask::new("task:w", "W", jkb_core::task::Under::inbox_of("t")),
+            )
         })
         .unwrap();
     ok(
@@ -354,7 +358,11 @@ fn an_unreadable_default_leaves_the_diff_unknown_but_draws_named_and_pinned_grap
     let kb = Kb::new();
     kb.db
         .write_txn("test", |c, m| {
-            jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("task:p", "P"))
+            jkb_core::task::create(
+                c,
+                m,
+                &jkb_core::task::NewTask::new("task:p", "P", jkb_core::task::Under::inbox_of("t")),
+            )
         })
         .unwrap();
     ok(

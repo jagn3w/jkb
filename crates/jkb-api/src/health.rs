@@ -175,7 +175,11 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.write_txn("t", |c, m| {
             for i in 0..=super::MAX_UNPLANNED {
-                let task = jkb_core::task::NewTask::new(format!("task:t{i}"), format!("t{i}"));
+                let task = jkb_core::task::NewTask::new(
+                    format!("task:t{i}"),
+                    format!("t{i}"),
+                    jkb_core::task::Under::inbox_of("t"),
+                );
                 jkb_core::task::create(c, m, &task)?;
             }
             Ok(())

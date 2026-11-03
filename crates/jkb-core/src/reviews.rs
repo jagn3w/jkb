@@ -501,7 +501,13 @@ mod tests {
     fn rounds_accumulate_in_order_and_the_newest_head_is_the_reviewed_one() {
         let db = Db::open_in_memory().unwrap();
         let id = db
-            .write_txn("t", |c, m| create(c, m, &NewTask::new("task:r", "R")))
+            .write_txn("t", |c, m| {
+                create(
+                    c,
+                    m,
+                    &NewTask::new("task:r", "R", crate::task::Under::inbox_of("t")),
+                )
+            })
             .unwrap();
         db.write_txn("t", move |c, m| {
             record(
