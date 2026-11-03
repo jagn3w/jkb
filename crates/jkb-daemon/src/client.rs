@@ -875,7 +875,7 @@ mod tests {
         let big = "x".repeat(600 * 1024);
         for i in 0..30 {
             let request: Request = serde_json::from_value(
-                serde_json::json!({ "op": "task.add", "text": format!("{i} {big}") }),
+                serde_json::json!({ "op": "task.add", "text": format!("{i} {big}"), "home": "tasks/repos/t/inbox" }),
             )
             .unwrap();
             let err = c.call(request).unwrap_err();
@@ -996,9 +996,10 @@ mod tests {
 
         let mut c = RemoteBackend::new(&proxy, token).unwrap();
         c.attempt_timeout = Duration::from_millis(300);
-        let request: Request =
-            serde_json::from_value(serde_json::json!({ "op": "task.add", "text": "once" }))
-                .unwrap();
+        let request: Request = serde_json::from_value(
+            serde_json::json!({ "op": "task.add", "text": "once" , "home": "tasks/repos/t/inbox" }),
+        )
+        .unwrap();
         let answer = c.call(request).unwrap();
         assert!(matches!(answer, Response::Added { .. }), "{answer:?}");
         assert!(

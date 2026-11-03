@@ -4,7 +4,10 @@
 //! (`kind = 'plan_step'`) contained by the plan, in order — coarse, natural-language stages such as
 //! *scaffold → database → frontend → deploy*. A span is staged into a step by a `stages` edge
 //! ([`super::stage`]), and the work is ordinary tasks contained under a step (`jkb task add …
-//! --under <step>`), or directly under the design for a one-off.
+//! --under <step>`). **Every new task is under a step** ([`homes_tasks`], checked in
+//! `task::create`); one with no plan of its own is captured in its repo's Open work › Inbox step
+//! ([`triage_step`]). A task under the design directly (a one-off) is only ever one an older build
+//! wrote, and is still listed.
 //!
 //! Nothing here is stored that the graph already says. Which tasks a plan has is containment; which
 //! spans a step implements is the `stages` edges; and **archived** — a plan every one of whose
@@ -326,8 +329,8 @@ macro_rules! under_steps {
 }
 
 /// The roots of the every-step walk: each item a plan step contains directly. One text, so
-/// [`UNPLANNED_SQL`] and [`homes_tasks`] expand the same walk and cannot disagree about what is
-/// planned.
+/// [`UNPLANNED_SQL`] and the downward form of [`homes_tasks`] the proptest checks it against expand
+/// the same walk.
 macro_rules! every_step_roots {
     () => {
         concat!(
@@ -354,23 +357,45 @@ pub(crate) const UNPLANNED_SQL: &str = concat!(
     " SELECT id FROM under))"
 );
 
-/// Whether `parent` may hold a task: a plan step, or a task the every-step walk reaches (contained
-/// at any depth under any step, through items of any kind). A child of a parent this accepts is one
-/// [`UNPLANNED_SQL`] counts as planned, because both expand [`every_step_roots!`] through
-/// [`under_steps!`].
+/// Whether `parent` may hold a task: a plan step, or a task with a plan step among its containers at
+/// any depth (through items of any kind). A child of a parent this accepts is one [`UNPLANNED_SQL`]
+/// counts as planned.
+///
+/// It walks **up** from `parent` — one indexed lookup per level, since `child_item_id` is
+/// containment's primary key — rather than down from every step as [`UNPLANNED_SQL`] does: the two
+/// ask the same question ("is a step a proper ancestor?") from opposite ends. Measured on a
+/// synthetic store the size of the real one (233 steps, 3,560 tasks all planned, release build), the
+/// downward walk cost 6.3 ms a call, over the 5 ms a write on the one writer thread may spend on it;
+/// this one cost 0.08 ms for a task three levels deep, being bounded by the parent's depth. The proptest in `triage_tests` holds the two to the
+/// same answer ([`HOMES_TASKS_DOWNWARD_SQL`]) and to the unplanned read.
 ///
 /// # Errors
 /// A database error.
 pub fn homes_tasks(conn: &Connection, parent: ItemId) -> Result<bool> {
     Ok(conn
         .prepare_cached(concat!(
-            under_steps!(every_step_roots!()),
-            " SELECT EXISTS (SELECT 1 FROM items p WHERE p.id = ?1 AND (p.kind = '",
+            "WITH RECURSIVE up(id) AS (
+               SELECT parent_item_id FROM containment WHERE child_item_id = ?1
+               UNION SELECT c.parent_item_id FROM containment c JOIN up u ON c.child_item_id = u.id)
+             SELECT EXISTS (SELECT 1 FROM items p WHERE p.id = ?1 AND (p.kind = '",
             step_kind!(),
-            "' OR (p.kind = 'task' AND p.id IN (SELECT id FROM under))))"
+            "' OR (p.kind = 'task' AND EXISTS (
+                     SELECT 1 FROM up u JOIN items a ON a.id = u.id WHERE a.kind = '",
+            step_kind!(),
+            "'))))"
         ))?
         .query_row([parent.get()], |r| r.get(0))?)
 }
+
+/// [`homes_tasks`] asked from the other end, by the every-step walk [`UNPLANNED_SQL`] runs: the
+/// oracle the proptest holds the upward walk to.
+#[cfg(test)]
+pub(crate) const HOMES_TASKS_DOWNWARD_SQL: &str = concat!(
+    under_steps!(every_step_roots!()),
+    " SELECT EXISTS (SELECT 1 FROM items p WHERE p.id = ?1 AND (p.kind = '",
+    step_kind!(),
+    "' OR (p.kind = 'task' AND p.id IN (SELECT id FROM under))))"
+);
 
 /// The refusal for a task's container written to `uid`, a `kind` under no plan step: the same
 /// words on every surface.
@@ -475,12 +500,11 @@ fn triage_level(
 /// the wrong place, or a database error.
 pub fn triage_step(conn: &Connection, meta: &WriteMeta, repo: &str) -> Result<ItemId> {
     let design_uid = triage_design_uid(repo);
-    let design = match triage_level(conn, &design_uid, KIND, None)? {
-        Some(id) => id,
-        None => {
-            super::create_as(conn, meta, &design_uid, repo, TRIAGE_TITLE, TRIAGE_BODY)?;
-            design_id(conn, &design_uid)?
-        }
+    let design = if let Some(id) = triage_level(conn, &design_uid, KIND, None)? {
+        id
+    } else {
+        super::create_as(conn, meta, &design_uid, repo, TRIAGE_TITLE, TRIAGE_BODY)?;
+        design_id(conn, &design_uid)?
     };
     let plan_uid = triage_plan_uid(repo);
     let plan = match triage_level(conn, &plan_uid, PLAN_KIND, Some(design))? {

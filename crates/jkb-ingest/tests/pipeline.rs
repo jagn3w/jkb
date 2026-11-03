@@ -660,6 +660,15 @@ fn edit(db: &Db, id: jkb_types::ItemId, content: &str) -> i64 {
 }
 
 fn new_item(db: &Db, uid: &str, kind: &str, content: &str) -> jkb_types::ItemId {
+    if kind == "task" {
+        // A task is created by `task::create`, filed in repo `t`'s Open work › Inbox.
+        let task = jkb_core::task::NewTask::new(uid, content, jkb_core::task::Under::inbox_of("t"));
+        return db
+            .write_txn("t", move |conn, meta| {
+                jkb_core::task::create(conn, meta, &task)
+            })
+            .unwrap();
+    }
     let item = jkb_core::item::NewItem {
         uid: uid.to_owned(),
         kind: kind.to_owned(),
@@ -794,7 +803,8 @@ fn an_edited_task_is_re_embedded_and_found_by_its_new_text_not_its_old() {
     let task = new_item(&db, "task:t", "task", "fix the leaking boiler valve");
     let other = new_item(&db, "note:o", "note", "a note that never changes");
     let pipe = pipeline(true);
-    assert_eq!(pipe.index_pending(&db).unwrap().embedded, 2);
+    // The two, and the Open work design, plan and Inbox step the task is filed under.
+    assert_eq!(pipe.index_pending(&db).unwrap().embedded, 2 + 3);
     let untouched = vector_by_id(&db, other);
 
     edit(&db, task, "repaint the zebra crossing");

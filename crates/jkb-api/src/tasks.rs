@@ -459,16 +459,7 @@ pub fn add(
     };
 
     let assented = settle_home(conn, ask, &mut spec, explicit, server_home)?;
-    // Where it is filed: exactly the `--under` parent, else the default step for its home, with the
-    // repo the client stands in as the fallback. `create` checks either before anything is written,
-    // so a request with no step to file under is refused before the global-backlog question below.
-    spec.under = match parent {
-        Some(pid) => task::Under::Parent(pid),
-        None => task::Under::Default {
-            ambient_repo: crate::kb::ambient(conn, &ask.cwd, &ask.client_home, server_home)?
-                .and_then(|mount| jkb_core::mount::repo_of_namespace(&mount)),
-        },
-    };
+    spec.under = filed_under(conn, ask, parent, server_home)?;
     if let Some(also) = &ask.also {
         spec.mirrors.push(jkb_core::ns::normalize(also)?);
     }
@@ -498,6 +489,25 @@ pub fn add(
         uid,
         home: spec.home,
         binding: synced,
+    })
+}
+
+/// Where `task.add` files its task: exactly the `--under` parent, else the default step for its
+/// home, with the repo the client stands in as the fallback. `task::create` checks either before
+/// anything is written, so a request with no step to file under is refused before the
+/// global-backlog question.
+fn filed_under(
+    conn: &Connection,
+    ask: &AddAsk,
+    parent: Option<ItemId>,
+    server_home: Option<&Path>,
+) -> Result<task::Under, ApiError> {
+    Ok(match parent {
+        Some(pid) => task::Under::Parent(pid),
+        None => task::Under::Default {
+            ambient_repo: crate::kb::ambient(conn, &ask.cwd, &ask.client_home, server_home)?
+                .and_then(|mount| jkb_core::mount::repo_of_namespace(&mount)),
+        },
     })
 }
 

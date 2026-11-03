@@ -4670,7 +4670,7 @@ fn a_moved_top_line_stays_and_a_loose_one_is_adopted() {
         Ok(())
     })
     .unwrap();
-    assert_eq!(unplanned(&db), [loose.clone()]);
+    assert_eq!(unplanned(&db), std::slice::from_ref(&loose));
 
     fs::write(
         &file,

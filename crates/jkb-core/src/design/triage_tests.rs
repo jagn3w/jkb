@@ -195,9 +195,9 @@ fn uid_rows(db: &Db, uid: &str) -> i64 {
 #[test]
 fn the_default_is_the_repos_open_work_inbox_made_once() {
     let db = db();
-    let a = default_create(&db, "task:a", "tasks/repos/app/inbox", None).unwrap();
-    let b = default_create(&db, "task:b", "tasks/repos/app/.backlog", None).unwrap();
-    for t in [a, b] {
+    let inbox = default_create(&db, "task:a", "tasks/repos/app/inbox", None).unwrap();
+    let backlog = default_create(&db, "task:b", "tasks/repos/app/.backlog", None).unwrap();
+    for t in [inbox, backlog] {
         assert_eq!(parent_uid(&db, t).as_deref(), Some("step:inbox@app"));
     }
     for uid in [
@@ -221,17 +221,17 @@ fn the_default_is_the_repos_open_work_inbox_made_once() {
         .any(|d| d.uid == "design:open-work@app" && d.title == "Open work"));
 
     // A home naming no repo takes the ambient one.
-    let c = default_create(&db, "task:c", "projects/alpha", Some("app")).unwrap();
-    assert_eq!(parent_uid(&db, c).as_deref(), Some("step:inbox@app"));
+    let ambient = default_create(&db, "task:c", "projects/alpha", Some("app")).unwrap();
+    assert_eq!(parent_uid(&db, ambient).as_deref(), Some("step:inbox@app"));
     // A home naming one wins over the ambient one.
-    let d = default_create(&db, "task:d", "repos/web/notes", Some("app")).unwrap();
-    assert_eq!(parent_uid(&db, d).as_deref(), Some("step:inbox@web"));
+    let named = default_create(&db, "task:d", "repos/web/notes", Some("app")).unwrap();
+    assert_eq!(parent_uid(&db, named).as_deref(), Some("step:inbox@web"));
     // Neither: refused, and nothing written.
-    let e = default_create(&db, "task:e", "projects/alpha", None)
+    let refused = default_create(&db, "task:e", "projects/alpha", None)
         .unwrap_err()
         .to_string();
-    assert!(e.contains("outside a mounted repo"), "{e}");
-    assert!(e.contains("`--under <step>`"), "{e}");
+    assert!(refused.contains("outside a mounted repo"), "{refused}");
+    assert!(refused.contains("`--under <step>`"), "{refused}");
     assert_eq!(uid_rows(&db, "task:e"), 0);
 }
 
@@ -554,8 +554,9 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
     /// Test 9: over random containment forests built from raw rows, a new task under P is accepted
-    /// exactly when `homes_tasks(P)` — which agrees with an independent upward walk — and every task
-    /// it accepts is one the unplanned read counts as planned.
+    /// exactly when `homes_tasks(P)` — which walks up, and agrees both with the downward every-step
+    /// walk `UNPLANNED_SQL` runs and with an independent walk in Rust — and every task it accepts is
+    /// one the unplanned read counts as planned.
     #[test]
     fn the_guard_agrees_with_the_unplanned_read((kinds, parents) in forest()) {
         let db = db();
@@ -584,6 +585,12 @@ proptest! {
         for (i, &p) in ids.iter().enumerate() {
             let expected = oracle(&kinds, &parents, i);
             prop_assert_eq!(homes(&db, p), expected, "item {} ({})", i, KINDS[kinds[i]]);
+            let downward: bool = db
+                .read(move |c| {
+                    Ok(c.query_row(plan::HOMES_TASKS_DOWNWARD_SQL, [p.get()], |r| r.get(0))?)
+                })
+                .unwrap();
+            prop_assert_eq!(downward, expected, "the downward walk, item {}", i);
             let uid = format!("task:new-{i}");
             let made = create_under(&db, &uid, p);
             prop_assert_eq!(made.is_ok(), expected, "item {}: {:?}", i, made.err());

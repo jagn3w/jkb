@@ -2562,8 +2562,8 @@ fn create_task(
         it.content.clone(),
         task::Under::Default { ambient_repo: None },
     );
-    spec.home = home_path.to_owned();
-    spec.binding = uri.to_owned();
+    home_path.clone_into(&mut spec.home);
+    uri.clone_into(&mut spec.binding);
     let id = task::create(conn, meta, &spec)?;
     binding::set(
         conn,

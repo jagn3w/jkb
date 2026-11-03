@@ -1089,13 +1089,13 @@ fn a_step_lists_the_spans_staged_into_it_and_a_task_knows_its_place() {
     // A task under no design has no place.
     let loose = db
         .write_txn("t", |c, m| {
-            let t = task::create(
+            let loose = task::create(
                 c,
                 m,
                 &task::NewTask::new("task:loose", "x", crate::task::Under::inbox_of("t")),
             )?;
-            task::make_loose(c, m, t)?;
-            Ok(t)
+            task::make_loose(c, m, loose)?;
+            Ok(loose)
         })
         .unwrap();
     assert!(db
@@ -1165,13 +1165,13 @@ fn a_task_knows_its_step_plan_design_and_root() {
     // Under nothing: no ancestry, and no error.
     let loose = db
         .write_txn("t", |c, m| {
-            let t = task::create(
+            let loose = task::create(
                 c,
                 m,
                 &task::NewTask::new("task:loose", "x", crate::task::Under::inbox_of("t")),
             )?;
-            task::make_loose(c, m, t)?;
-            Ok(t)
+            task::make_loose(c, m, loose)?;
+            Ok(loose)
         })
         .unwrap();
     assert!(db

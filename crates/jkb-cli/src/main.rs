@@ -1193,12 +1193,17 @@ enum TagCmd {
 #[derive(Subcommand)]
 enum TaskCmd {
     /// Quick-add a task: `"text" !p1 @2026-07-15 +ns #facet=value ^dep-uid`.
+    ///
+    /// Every new task is filed under a plan step: the one `--under` names, else the step its home
+    /// namespace is mapped to (`jkb ns step`), else the Open work › Inbox of the repo you are in.
+    /// Outside a mounted repo, with no `--under`, it is refused.
     Add {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
         /// Home the task in the ambient mount's backlog (`tasks/<mount>/.backlog`, e.g.
         /// `tasks/repos/jkb/.backlog`)
-        /// instead of its inbox. Outside a repo, confirms a global `tasks/.backlog`.
+        /// instead of its inbox; filed in the same Open work › Inbox step. Outside a repo (with
+        /// `--under`), confirms a global `tasks/.backlog`.
         #[arg(long)]
         backlog: bool,
         /// Force a synced file binding into the home's `tasks` mount (errors if none).
@@ -1207,9 +1212,10 @@ enum TaskCmd {
         /// Force a `managed:` (KB-only) binding, overriding mount inference.
         #[arg(long)]
         managed: bool,
-        /// Make this a subtask of `<uid>`: the parent leaves the ready frontier until every
-        /// subtask is terminal, so a task too big for one branch is split into the pieces
-        /// that get worked. Defaults the new task's home to the parent's.
+        /// File it under `<uid>`: a plan step, or a task under one (`jkb design plan ls <design>`
+        /// lists the steps). Under a task it is a subtask: the parent leaves the ready frontier
+        /// until every subtask is terminal, so a task too big for one branch is split into the
+        /// pieces that get worked. Defaults the new task's home to the parent's.
         #[arg(long)]
         under: Option<String>,
         /// Home the task in this namespace, taken **verbatim**.
@@ -1303,7 +1309,9 @@ enum TaskCmd {
     /// Move an existing task under another parent: a task, or an execution plan's step.
     ///
     /// Replaces its parent (one transaction; `jkb undo` restores the old one) and leaves its
-    /// placements and binding alone. A task bound to a synced file is refused — edit the file.
+    /// placements and binding alone. The new parent must be a plan step or a task under one. A
+    /// synced file's line moves only from a top-level line to a parent outside its file — to
+    /// re-indent it, edit the file.
     Move {
         /// The task uid.
         uid: String,

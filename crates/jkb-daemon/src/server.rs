@@ -1655,7 +1655,7 @@ mod tests {
         let cfg = super::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token_path.clone());
         let handle = super::spawn(db.clone(), &cfg).unwrap();
         let token = crate::token::read(&token_path).unwrap();
-        let body = serde_json::json!({ "op": "task.add", "text": format!("{SLOW_TEXT} hung-up") })
+        let body = serde_json::json!({ "op": "task.add", "text": format!("{SLOW_TEXT} hung-up"), "home": "tasks/repos/t/inbox" })
             .to_string();
         let mut raw = std::net::TcpStream::connect(handle.addr).unwrap();
         write!(
@@ -1925,7 +1925,7 @@ mod tests {
                 .bearer_auth(&token)
                 .header("content-type", "application/json")
                 .header("idempotency-key", "k")
-                .body(serde_json::json!({ "op": "task.add", "text": PANIC_TEXT }).to_string())
+                .body(serde_json::json!({ "op": "task.add", "text": PANIC_TEXT , "home": "tasks/repos/t/inbox" }).to_string())
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
                 .unwrap()
@@ -1957,7 +1957,7 @@ mod tests {
                 .bearer_auth(&token)
                 .header("content-type", "application/json")
                 .header("idempotency-key", "k")
-                .body(serde_json::json!({ "op": "task.add", "text": text }).to_string())
+                .body(serde_json::json!({ "op": "task.add", "text": text , "home": "tasks/repos/t/inbox" }).to_string())
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
                 .unwrap();

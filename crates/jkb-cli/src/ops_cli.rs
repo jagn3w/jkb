@@ -220,15 +220,7 @@ impl<'a> Ops<'a> {
             Command::Inv { cmd } => crate::inv_cli::run(self, cmd, self.global),
             Command::Design { cmd } => crate::design_cli::run(self, cmd, self.global),
             Command::Timeline { cmd } => crate::timeline_cli::run(self, cmd),
-            Command::Ns {
-                cmd: NsCmd::Ls { scope },
-            } => self.ns_ls(scope),
-            Command::Ns {
-                cmd: NsCmd::Mv { from, to },
-            } => self.ns_mv(&from, &to),
-            Command::Ns {
-                cmd: NsCmd::Step { path, step, clear },
-            } => self.ns_step(&path, if clear { None } else { step }),
+            Command::Ns { cmd } => self.ns(cmd),
             Command::Staging {
                 cmd: super::StagingCmd::Ls { all },
             } => crate::cmd_staging_ls(&crate::session_cli::Kb::from_ops(self), all, self.json),
@@ -251,6 +243,18 @@ impl<'a> Ops<'a> {
                 cmd => super::task_cli::run(self, cmd),
             },
             _ => bail!("internal: a command the read set does not handle"),
+        }
+    }
+
+    /// The `jkb ns` verbs served as ops.
+    fn ns(&self, cmd: NsCmd) -> Result<()> {
+        match cmd {
+            NsCmd::Ls { scope } => self.ns_ls(scope),
+            NsCmd::Mv { from, to } => self.ns_mv(&from, &to),
+            NsCmd::Step { path, step, clear } => {
+                self.ns_step(&path, if clear { None } else { step })
+            }
+            _ => bail!("internal: an ns verb the read set does not handle"),
         }
     }
 

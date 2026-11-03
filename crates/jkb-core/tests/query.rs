@@ -21,7 +21,7 @@ fn add_task(
 ) -> ItemId {
     // Homed at `ns_path` and filed in repo `t`'s Open work inbox by `task::create`.
     let mut spec = jkb_core::task::NewTask::new(uid, uid, jkb_core::task::Under::inbox_of("t"));
-    spec.home = ns_path.to_owned();
+    ns_path.clone_into(&mut spec.home);
     let id = jkb_core::task::create(conn, meta, &spec).unwrap();
     conn.execute(
         "UPDATE items SET status = ?1, priority = ?2, due = ?3 WHERE id = ?4",

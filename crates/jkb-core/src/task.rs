@@ -2203,32 +2203,35 @@ mod tests {
         #[test]
         fn an_indented_file_task_or_a_non_task_is_refused_and_a_top_level_one_moves() {
             let f = fixture();
-            let (a, t) = (f.a, f.t);
+            let (top, sub) = (f.a, f.t);
             f.db.write_txn("t", move |c, m| {
-                for (id, uri) in [(a, "file:///r/tasks.md#a1"), (t, "file:///r/tasks.md#t1")] {
+                for (id, uri) in [
+                    (top, "file:///r/tasks.md#a1"),
+                    (sub, "file:///r/tasks.md#t1"),
+                ] {
                     binding::set(c, m, id, uri, Some(SyncMode::Bidirectional), None)?;
                 }
                 Ok(())
             })
             .unwrap();
-            let e = mv(&f.db, t, f.step).unwrap_err();
-            assert!(e.to_string().contains("edit the file"), "{e}");
-            assert_eq!(parent_of(&f.db, t), (Some(f.a), vec![f.a]));
+            let refused = mv(&f.db, sub, f.step).unwrap_err();
+            assert!(refused.to_string().contains("edit the file"), "{refused}");
+            assert_eq!(parent_of(&f.db, sub), (Some(f.a), vec![f.a]));
             // `a` is a top-level line: under the step, not under a line of its file.
             let other =
                 f.db.write_txn("t", |c, m| {
-                    let d = design::create(c, m, "jkb", "Other", "")?.uid;
-                    let p = design::plan::create(c, m, &d, "Next", &["two".to_owned()])?;
-                    Ok(item::id_for_uid(c, &p.steps[0].uid)?.unwrap())
+                    let design = design::create(c, m, "jkb", "Other", "")?.uid;
+                    let plan = design::plan::create(c, m, &design, "Next", &["two".to_owned()])?;
+                    Ok(item::id_for_uid(c, &plan.steps[0].uid)?.unwrap())
                 })
                 .unwrap();
             assert_eq!(
-                mv(&f.db, a, other).unwrap(),
+                mv(&f.db, top, other).unwrap(),
                 Moved::Moved { from: Some(f.step) }
             );
             // The step is not a task.
-            let e = mv(&f.db, f.step, f.a).unwrap_err();
-            assert!(e.to_string().contains("not a task"), "{e}");
+            let refused = mv(&f.db, f.step, f.a).unwrap_err();
+            assert!(refused.to_string().contains("not a task"), "{refused}");
         }
     }
 }

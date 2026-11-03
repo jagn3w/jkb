@@ -1,3 +1,4 @@
+use jkb_core::task::Under;
 use serde_json::json;
 
 use super::{ApiError, Backend, ErrorCode, LocalBackend, Request, Response, SpecInput};
@@ -1172,18 +1173,11 @@ fn read_fixture() -> LocalBackend {
             },
         )?;
         placement::place(c, m, doc, repo, PlacementRole::Primary, 0)?;
-        let mut parent = task::NewTask::new(
-            "task:parent",
-            "Parent task\nbody",
-            jkb_core::task::Under::inbox_of("t"),
-        );
+        let mut parent =
+            task::NewTask::new("task:parent", "Parent task\nbody", Under::inbox_of("t"));
         parent.home = "tasks/repos/jkb".into();
         let parent = task::create(c, m, &parent)?;
-        let mut child = task::NewTask::new(
-            "task:child",
-            "Child task",
-            jkb_core::task::Under::inbox_of("t"),
-        );
+        let mut child = task::NewTask::new("task:child", "Child task", Under::inbox_of("t"));
         child.home = "tasks/repos/jkb".into();
         let child = task::create(c, m, &child)?;
         task::add_subtask(c, m, parent, child)
@@ -1780,6 +1774,7 @@ fn a_search_asking_for_a_whole_document_of_context_is_refused() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // one fixture and one loop over every listing read
 fn every_listing_read_stays_within_its_budget_and_says_when_it_was_cut() {
     const BUDGET: usize = 4096;
     use jkb_core::{item, ns, placement, task};
@@ -1805,15 +1800,14 @@ fn every_listing_read_stays_within_its_budget_and_says_when_it_was_cut() {
             )?;
             placement::place(c, m, doc, space, PlacementRole::Primary, i)?;
         }
-        let mut parent =
-            task::NewTask::new("task:big", "Big", jkb_core::task::Under::inbox_of("t"));
+        let mut parent = task::NewTask::new("task:big", "Big", Under::inbox_of("t"));
         parent.home = "big".into();
         let parent = task::create(c, m, &parent)?;
         for i in 0..200 {
             let mut child = task::NewTask::new(
                 format!("task:sub-{i:03}"),
                 format!("sub {i}"),
-                jkb_core::task::Under::inbox_of("t"),
+                Under::inbox_of("t"),
             );
             child.home = "big".into();
             let child = task::create(c, m, &child)?;
@@ -2116,7 +2110,7 @@ fn the_ready_frontier_is_in_priority_order_and_honours_its_limit() {
             ("task:none", None),
             ("task:high", Some(1)),
         ] {
-            let mut t = task::NewTask::new(uid, uid, jkb_core::task::Under::inbox_of("t"));
+            let mut t = task::NewTask::new(uid, uid, Under::inbox_of("t"));
             t.priority = priority;
             t.home = "tasks/f".into();
             task::create(c, m, &t)?;
@@ -2147,7 +2141,7 @@ fn the_ready_frontier_honours_every_predicate_it_is_given() {
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
         for (uid, priority) in [("task:settled", Some(1)), ("task:fresh", Some(3))] {
-            let mut t = task::NewTask::new(uid, uid, jkb_core::task::Under::inbox_of("t"));
+            let mut t = task::NewTask::new(uid, uid, Under::inbox_of("t"));
             t.priority = priority;
             t.home = "tasks/f".into();
             task::create(c, m, &t)?;
@@ -2220,11 +2214,7 @@ fn a_task_larger_than_the_budget_is_shown_whole_and_not_called_cut() {
         task::create(
             c,
             m,
-            &task::NewTask::new(
-                "task:huge",
-                "x".repeat(10_000),
-                jkb_core::task::Under::inbox_of("t"),
-            ),
+            &task::NewTask::new("task:huge", "x".repeat(10_000), Under::inbox_of("t")),
         )?;
         Ok(())
     })
@@ -2612,7 +2602,7 @@ fn a_task_whose_uid_names_a_file_outside_the_roots_is_refused_though_rebound_man
         let id = jkb_core::task::create(
             c,
             m,
-            &jkb_core::task::NewTask::new(uid, "detached", jkb_core::task::Under::inbox_of("t")),
+            &jkb_core::task::NewTask::new(uid, "detached", Under::inbox_of("t")),
         )?;
         jkb_core::binding::set(c, m, id, jkb_core::task::MANAGED_BINDING, None, None)
     })
@@ -3730,11 +3720,7 @@ fn a_task_edit_replace_against_a_stale_base_is_refused_and_writes_nothing() {
             jkb_core::task::create(
                 c,
                 m,
-                &jkb_core::task::NewTask::new(
-                    "task:t",
-                    "Title",
-                    jkb_core::task::Under::inbox_of("t"),
-                ),
+                &jkb_core::task::NewTask::new("task:t", "Title", Under::inbox_of("t")),
             )
         })
         .unwrap();
@@ -3937,11 +3923,7 @@ fn the_timeline_ops_are_reads_anyone_may_ask_and_answer_through_the_wire() {
 
     let b = backend();
     b.db.write_txn("t", |c, m| {
-        let mut t = jkb_core::task::NewTask::new(
-            "task:t",
-            "the task",
-            jkb_core::task::Under::inbox_of("t"),
-        );
+        let mut t = jkb_core::task::NewTask::new("task:t", "the task", Under::inbox_of("t"));
         t.home = "tasks/f".into();
         jkb_core::task::create(c, m, &t)
     })
