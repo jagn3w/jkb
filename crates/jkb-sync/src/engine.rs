@@ -2804,8 +2804,10 @@ impl FileEdges {
 /// plan step or a task under one ([`task::set_container`]): (a) the rows the file no longer declares
 /// go; (b) each file task with no declared file parent, whose container is none, unplanned, or a
 /// repo's Open work › Inbox, goes to its default step ([`plan::step_for_home`]) — a planned container
-/// outside the file stays, since that is a task someone moved by hand; (c) declared children go under
-/// their file parents in file order, a parent's line before its children's.
+/// outside the file stays, since that is a task someone moved by hand, and so does one under a step
+/// of a design since retired ([`plan::keeps_planned`], never [`plan::accepts_new_tasks`]); (c)
+/// declared children go under their file parents in file order, a parent's line before its
+/// children's.
 fn reconcile_containment(
     conn: &Connection,
     meta: &WriteMeta,
@@ -2849,7 +2851,9 @@ fn reconcile_containment(
         }
         let cur = containment::parent(conn, child)?;
         let planned = match cur {
-            Some(cur) => plan::homes_tasks(conn, cur)?,
+            // Already planned, not "may hold a new task": a step of a retired design keeps
+            // its tasks, which restoring the design brings back ([`plan::keeps_planned`]).
+            Some(cur) => plan::keeps_planned(conn, cur)?,
             None => false,
         };
         let in_triage = match cur {

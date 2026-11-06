@@ -578,6 +578,7 @@ fn rotating_with_keep_keeps_a_live_credential_and_replaces_anything_else() {
 #[test]
 fn a_scoped_caller_adds_only_under_its_task_and_records_only_its_own_review() {
     let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["r"]);
     let a = add(&kb.op, "task a");
     let (_, coord) = grant(&kb.op, "coordinator", Some(&a), "c");
     let c = kb.as_token(&coord);
@@ -980,6 +981,7 @@ fn a_parked_workflow_is_landed_again_only_after_the_operator_reopens_it() {
 #[test]
 fn a_caller_held_to_a_finding_places_nothing_in_its_round() {
     let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["p"]);
     let filed = match ok(
         &kb.op,
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
@@ -1009,6 +1011,7 @@ fn a_caller_held_to_a_finding_places_nothing_in_its_round() {
 #[test]
 fn a_subtask_under_a_round_homes_at_the_callers_own_task() {
     let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["p"]);
     ok(
         &kb.op,
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
@@ -1045,6 +1048,7 @@ fn a_subtask_under_a_round_homes_at_the_callers_own_task() {
 #[test]
 fn an_unrecorded_mounted_round_is_still_a_review_round() {
     let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["p"]);
     let finding = match ok(
         &kb.op,
         json!({ "op": "task.add", "text": "mounted finding !p1",

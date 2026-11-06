@@ -375,19 +375,28 @@ pub fn file(
 /// Where a review's findings are filed (`root` is the review's namespace): **the one place** that
 /// decides it. For now the default step for each finding's home — a review under
 /// `repos/<R>/codereviews/…` names repo R, so its findings land in R's Open work › Inbox. A review
-/// namespace that names no repo and is mapped to no step is refused here, before anything is
-/// filed, with the remedy this surface has: a namespace under `repos/<repo>/codereviews/`. (The
-/// generic refusal's `--under` and "run it in a mounted repo" are not things a filing can do.)
+/// namespace mapped to no step that names no repo, or names one this knowledge base does not know
+/// (a mistyped `repos/<repo>/…`), is refused here, before anything is filed, with the remedy this
+/// surface has: a namespace under `repos/<repo>/codereviews/` of a repo it knows. (The generic
+/// refusals' `--under` and "run it in a mounted repo" are not things a filing can do.)
 fn finding_under(conn: &Connection, _ask: &FileAsk, root: &str) -> Result<task::Under, ApiError> {
-    if mount::repo_of_namespace(root).is_none()
-        && jkb_core::design::plan::mapped_step(conn, root)?.is_none()
-    {
-        return Err(invalid(format!(
+    if jkb_core::design::plan::mapped_step(conn, root)?.is_some() {
+        return Ok(task::Under::Default { ambient_repo: None });
+    }
+    match mount::repo_of_namespace(root) {
+        Some(repo) if jkb_core::design::plan::knows_repo(conn, &repo)? => {
+            Ok(task::Under::Default { ambient_repo: None })
+        }
+        Some(repo) => Err(invalid(format!(
+            "`{root}` names repo `{repo}`, which this knowledge base does not know (there is no \
+             `repos/{repo}`): check the repo name, and file the review under \
+             `repos/<repo>/codereviews/…` of a repo it knows (`jkb ns ls repos` lists them)"
+        ))),
+        None => Err(invalid(format!(
             "`{root}` names no repository, so its findings would be in no repo's Open work › Inbox: \
              file the review under `repos/<repo>/codereviews/…`"
-        )));
+        ))),
     }
-    Ok(task::Under::Default { ambient_repo: None })
 }
 
 /// A caller held to one task files only under its repository's `repos/<repo>/codereviews/`, found on

@@ -65,6 +65,7 @@ fn show(b: &LocalBackend, uid: &str) -> serde_json::Value {
 #[test]
 fn findings_are_filed_by_severity_where_the_gate_reads_them() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    crate::test_repo::know(&b.db, &["proj"]);
     let filed = file(
         &b,
         "repos/proj/codereviews/r1",
@@ -101,6 +102,7 @@ fn findings_are_filed_by_severity_where_the_gate_reads_them() {
 #[test]
 fn every_filed_finding_is_tagged_so_a_frontier_query_leaves_it_out() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    crate::test_repo::know(&b.db, &["proj"]);
     let work = match call(&b, json!({ "op": "task.add", "text": "ordinary work" })).unwrap() {
         Response::Added { added } => added.uid,
         other => panic!("{other:?}"),
@@ -178,6 +180,7 @@ fn only_a_review_that_ran_fully_is_filed() {
 #[test]
 fn a_clean_review_files_one_finished_item() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    crate::test_repo::know(&b.db, &["t"]);
     let filed = file(&b, "repos/t/codereviews/clean", &json!([])).unwrap();
     assert!(filed.clean);
     assert_eq!(show(&b, &filed.uids[0])["item"]["status"], "done");
@@ -348,6 +351,7 @@ fn a_rooted_recording_skips_the_tasks_its_client_may_not_write() {
 #[test]
 fn a_review_larger_than_one_filing_is_trimmed_to_fit() {
     let b = LocalBackend::new(Db::open_in_memory().unwrap());
+    crate::test_repo::know(&b.db, &["t"]);
     let long = "x".repeat(7 * 1024);
     let mut findings: Vec<super::Finding> = (0..150)
         .map(|i| super::Finding {
@@ -416,6 +420,7 @@ fn a_review_larger_than_one_filing_is_trimmed_to_fit() {
 fn a_scoped_caller_s_review_credits_only_its_own_task() {
     let db = Db::open_in_memory().unwrap();
     let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&b.db, &["proj"]);
     let mine = started(&b, "mine", "shared");
     let theirs = started(&b, "theirs", "shared");
     let token = match call(
@@ -451,6 +456,7 @@ fn a_scoped_caller_s_review_credits_only_its_own_task() {
 fn a_non_operator_records_only_a_filing_and_the_gate_reads_the_recorded_round() {
     let db = Db::open_in_memory().unwrap();
     let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&b.db, &["t", "proj"]);
     let mine = started(&b, "mine", "feat");
     call(
         &b,

@@ -4229,6 +4229,7 @@ fn task_add_in_a_repo_files_under_its_inbox_or_the_step_named() {
 fn review_findings_are_filed_in_the_reviewed_repos_inbox() {
     let db = Db::open_in_memory().unwrap();
     let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&db, &["web"]);
     let Response::ReviewFiled { filed } = call(
         &b,
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
@@ -4255,6 +4256,37 @@ fn review_findings_are_filed_in_the_reviewed_repos_inbox() {
         !e.message.contains("--under"),
         "no advice this surface cannot take: {e:?}"
     );
+}
+
+/// A review namespace naming a repo the knowledge base does not know (a mistyped
+/// `repos/<repo>/codereviews/…`) is refused with this surface's own remedy — a codereviews
+/// namespace of a repo it knows, never `--under`, which a filing cannot take — and builds nothing.
+#[test]
+fn a_review_naming_an_unknown_repo_is_refused_with_its_own_remedy() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let e = call(
+        &b,
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
+                "ns": "repos/jbk/codereviews/r1",
+                "findings": [{ "severity": "nit", "summary": "x" }] }),
+    )
+    .unwrap_err();
+    assert!(e.message.contains("repo `jbk`"), "{e:?}");
+    assert!(e.message.contains("repos/<repo>/codereviews/"), "{e:?}");
+    assert!(
+        !e.message.contains("--under"),
+        "no advice this surface cannot take: {e:?}"
+    );
+    let built = db
+        .read(|c| {
+            Ok((
+                jkb_core::ns::get(c, "repos/jbk")?.is_some(),
+                jkb_core::item::id_for_uid(c, "design:open-work@jbk")?.is_some(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(built, (false, false));
 }
 
 /// `task.add --under` a step of a retired design is refused, naming the design: the task would be

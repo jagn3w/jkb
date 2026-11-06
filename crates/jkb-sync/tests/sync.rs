@@ -4685,6 +4685,45 @@ fn a_moved_top_line_stays_and_a_loose_one_is_adopted() {
     assert!(unplanned(&db).is_empty());
 }
 
+/// A done line moved by hand to a step of a design that is then retired stays under that step
+/// when another line of the file is edited: it is still in its design's plan (restoring the design
+/// brings it back), not a loose line to re-file in the Inbox.
+#[test]
+fn a_line_under_a_retired_designs_step_stays_through_an_import() {
+    let (_dir, db, file) = app_repo("## Work\n- [x] Shipped ^shipped\n- [ ] Other ^other\n");
+    sync(&db, "repos/app").unwrap();
+    let uri = uri_for(&file);
+    let shipped = format!("{uri}#shipped");
+    let step = app_step(&db, "Retiring");
+    let shipped_id = item_of(&db, &shipped);
+    let s = step.clone();
+    let design = db
+        .write_txn("t", move |c, m| {
+            let to = item::id_for_uid(c, &s)?.unwrap();
+            task::move_under(c, m, shipped_id, to)?;
+            let plan = jkb_core::containment::parent(c, to)?.unwrap();
+            let design = jkb_core::containment::parent(c, plan)?.unwrap();
+            let uid = item::get(c, design)?.unwrap().uid;
+            jkb_core::design::retire(c, m, &uid)?;
+            Ok(uid)
+        })
+        .unwrap();
+
+    fs::write(
+        &file,
+        "## Work\n- [x] Shipped ^shipped\n- [ ] Other, edited ^other\n",
+    )
+    .unwrap();
+    sync(&db, "repos/app").unwrap();
+    assert_eq!(container_uid(&db, &shipped).as_deref(), Some(step.as_str()));
+
+    db.write_txn("t", move |c, m| {
+        jkb_core::design::restore(c, m, &design).map(|_| ())
+    })
+    .unwrap();
+    assert_eq!(container_uid(&db, &shipped).as_deref(), Some(step.as_str()));
+}
+
 /// Test 20: a section mapped to a step (`jkb ns step`) files its new lines there; a line still in
 /// the Inbox follows on the next import; a line moved by hand to another step stays.
 #[test]

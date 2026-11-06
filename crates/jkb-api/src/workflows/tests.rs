@@ -797,6 +797,8 @@ impl Swarm {
     /// `/design-pass` sets only the `design=approved` tag.
     fn at_design() -> Self {
         let kb = Kb::new();
+        // The repo every review round of the loop is filed under.
+        crate::test_repo::know(&kb.db, &[REPO]);
         let lead = match ok(&kb.op, json!({ "op": "task.add", "text": "the lead" })) {
             Response::Added { added } => added.uid,
             other => panic!("{other:?}"),
