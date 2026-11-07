@@ -647,6 +647,138 @@ fn mapping_into_a_retired_designs_step_is_refused() {
     assert_eq!(mapped, None);
 }
 
+/// The uid of plan step `step`.
+fn step_uid(db: &Db, step: ItemId) -> String {
+    db.read(move |c| Ok(item::get(c, step)?.unwrap().uid))
+        .unwrap()
+}
+
+/// A mapping `jkb undo` brought back into a retired design is refused where it is read: a new task
+/// homed there is refused as a stale mapping, naming the namespace, how to clear it and how to
+/// restore the design, and nothing is written.
+fn assert_stale_mapping_refused(db: &Db, design: &str, step: &str) {
+    let before = changelog_rows(db);
+    let e = default_create(db, "task:stale", "repos/app/notes/deep", None)
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("`repos/app/notes` maps its tasks to"), "{e}");
+    assert!(e.contains(step), "{e}");
+    assert!(
+        e.contains(&format!("design {design}, which is retired")),
+        "{e}"
+    );
+    assert!(e.contains("jkb ns step repos/app/notes --clear"), "{e}");
+    assert!(e.contains(&format!("jkb design restore {design}")), "{e}");
+    assert_eq!(uid_rows(db, "task:stale"), 0);
+    assert_eq!(changelog_rows(db), before);
+    let d = design.to_owned();
+    assert!(db.read(move |c| super::is_retired(c, &d)).unwrap());
+}
+
+/// Map, clear, retire, then undo the clear: the undo writes the namespace's metadata back from the
+/// changelog, past the retire's guard, and the mapping into the retired design is back.
+#[test]
+fn a_mapping_undo_restores_into_a_retired_design_is_refused_when_read() {
+    let db = db();
+    let (d, _, step) = planned(&db);
+    let s = step_uid(&db, step);
+    let s2 = s.clone();
+    db.write_txn("t", move |c, m| {
+        ns::ensure(c, m, "repos/app/notes")?;
+        ns::ensure(c, m, "repos/app/notes/deep")?;
+        plan::map_namespace(c, m, "repos/app/notes", Some(&s2)).map(|_| ())
+    })
+    .unwrap();
+    let clear = db
+        .write_txn("t", |c, m| {
+            plan::map_namespace(c, m, "repos/app/notes", None)?;
+            Ok(m.txn_id)
+        })
+        .unwrap();
+    let design = d.clone();
+    db.write_txn("t", move |c, m| super::retire(c, m, &design).map(|_| ()))
+        .unwrap();
+    db.write_txn("t", move |c, m| crate::undo::undo(c, m, clear))
+        .unwrap();
+    assert_stale_mapping_refused(&db, &d, &s);
+}
+
+/// Retire, restore, map, then undo the restore: the design is retired again under a mapping the
+/// write-time guards let through while it was live.
+#[test]
+fn a_restore_undone_under_a_mapping_is_refused_when_read() {
+    let db = db();
+    let (d, _, step) = planned(&db);
+    let s = step_uid(&db, step);
+    let design = d.clone();
+    db.write_txn("t", move |c, m| {
+        ns::ensure(c, m, "repos/app/notes")?;
+        ns::ensure(c, m, "repos/app/notes/deep")?;
+        super::retire(c, m, &design).map(|_| ())
+    })
+    .unwrap();
+    let design = d.clone();
+    let restore = db
+        .write_txn("t", move |c, m| {
+            super::restore(c, m, &design)?;
+            Ok(m.txn_id)
+        })
+        .unwrap();
+    let s2 = s.clone();
+    db.write_txn("t", move |c, m| {
+        plan::map_namespace(c, m, "repos/app/notes", Some(&s2)).map(|_| ())
+    })
+    .unwrap();
+    db.write_txn("t", move |c, m| crate::undo::undo(c, m, restore))
+        .unwrap();
+    assert_stale_mapping_refused(&db, &d, &s);
+}
+
+/// A nested design counts as retired when a design it is nested in is: the nearest retired one is
+/// the one the refusal names. Built through undo: map the child's step and clear it, retire the
+/// child alone and then the parent (which writes only the parent), then undo the child's retire
+/// and the clear — a live child, mapped, under a retired parent.
+#[test]
+fn a_mapping_into_a_design_under_a_retired_parent_is_refused_when_read() {
+    let db = db();
+    let (parent, _, _) = planned(&db);
+    let p = parent.clone();
+    let (child, step) = db
+        .write_txn("t", move |c, m| {
+            let child = super::create(c, m, "app", "Child", "Part of it.")?.uid;
+            super::tree::nest(c, m, &child, &p)?;
+            let plan = plan::create(c, m, &child, "Its plan", &["two".to_owned()])?;
+            ns::ensure(c, m, "repos/app/notes")?;
+            ns::ensure(c, m, "repos/app/notes/deep")?;
+            let step = plan.steps[0].uid.clone();
+            plan::map_namespace(c, m, "repos/app/notes", Some(&step))?;
+            Ok((child, step))
+        })
+        .unwrap();
+    let clear = db
+        .write_txn("t", |c, m| {
+            plan::map_namespace(c, m, "repos/app/notes", None)?;
+            Ok(m.txn_id)
+        })
+        .unwrap();
+    let ch = child.clone();
+    let retire_child = db
+        .write_txn("t", move |c, m| {
+            super::retire(c, m, &ch)?;
+            Ok(m.txn_id)
+        })
+        .unwrap();
+    let p = parent.clone();
+    db.write_txn("t", move |c, m| super::retire(c, m, &p).map(|_| ()))
+        .unwrap();
+    for txn in [retire_child, clear] {
+        db.write_txn("t", move |c, m| crate::undo::undo(c, m, txn))
+            .unwrap();
+    }
+    assert!(!retired(&db, &child));
+    assert_stale_mapping_refused(&db, &parent, &step);
+}
+
 /// Mapping never creates the namespace: a mistyped path is refused, not made and mapped.
 #[test]
 fn mapping_a_namespace_that_does_not_exist_is_refused() {

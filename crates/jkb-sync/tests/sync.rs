@@ -4876,3 +4876,69 @@ fn a_file_in_no_repo_and_no_mapping_fails_alone() {
         Some("step:inbox@t")
     );
 }
+
+/// A tasks.md whose file namespace maps to a step of a retired design — a mapping `jkb undo`
+/// brought back past the write-time guards (map, clear, retire, undo the clear) — fails that file,
+/// naming the stale mapping and how to clear it, rather than filing its lines into a plan no listing
+/// shows.
+#[test]
+fn a_file_mapped_into_a_retired_design_fails_rather_than_files() {
+    let dir = real_tempdir();
+    fs::write(dir.path().join("one.md"), "- [ ] Stale ^stale\n").unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let backing = format!("file://{}", dir.path().to_string_lossy());
+    let (design, step) = db
+        .write_txn("t", move |conn, meta| {
+            let ns_id = ns::ensure(conn, meta, "docs/x")?;
+            jkb_core::mount::create(
+                conn,
+                meta,
+                ns_id,
+                &backing,
+                SyncMode::Bidirectional,
+                "tasks",
+                Some("**/*.md"),
+                None,
+                ConflictPolicy::Manual,
+            )?;
+            let d = jkb_core::design::create(conn, meta, "app", "Gone", "")?.uid;
+            let p = plan::create(conn, meta, &d, "Gone", &["one".to_owned()])?;
+            let step = p.steps[0].uid.clone();
+            ns::ensure(conn, meta, "docs/x/one.md")?;
+            plan::map_namespace(conn, meta, "docs/x/one.md", Some(&step))?;
+            Ok((d, step))
+        })
+        .unwrap();
+    let clear = db
+        .write_txn("t", |conn, meta| {
+            plan::map_namespace(conn, meta, "docs/x/one.md", None)?;
+            Ok(meta.txn_id)
+        })
+        .unwrap();
+    let d = design.clone();
+    db.write_txn("t", move |conn, meta| {
+        jkb_core::design::retire(conn, meta, &d).map(|_| ())
+    })
+    .unwrap();
+    db.write_txn("t", move |conn, meta| {
+        jkb_core::undo::undo(conn, meta, clear)
+    })
+    .unwrap();
+    let report = sync(&db, "docs/x").unwrap();
+    let one = report
+        .results
+        .iter()
+        .find(|r| r.path.ends_with("one.md"))
+        .unwrap_or_else(|| panic!("{report:?}"))
+        .clone();
+    assert_eq!(one.outcome, Outcome::Failed, "{one:?}");
+    let why = one.reason.unwrap_or_default();
+    assert!(why.contains(&step), "{why}");
+    assert!(
+        why.contains(&format!("design {design}, which is retired")),
+        "{why}"
+    );
+    assert!(why.contains("jkb ns step docs/x/one.md --clear"), "{why}");
+    let uri = uri_for(&dir.path().join("one.md"));
+    assert_eq!(content_for(&db, &format!("{uri}#stale")), None);
+}

@@ -364,9 +364,10 @@ pub(crate) const UNPLANNED_SQL: &str = concat!(
 /// planned. Whether the step's design is retired plays no part: retirement is a fact that changes
 /// after a task is placed, so a write-time gate on it would refuse every later re-assertion of a
 /// placement it once allowed. What could file *new* work into a retired design unasked — a
-/// namespace mapped to one of its steps — is closed where it arises instead: `design::retire`
-/// refuses while a namespace maps into the tree, and [`map_namespace`] refuses a retired design's
-/// step.
+/// namespace mapped to one of its steps — is closed where the mapping is read instead:
+/// [`mapped_step`] refuses a mapping into a retired design as stale. (`design::retire` refusing
+/// while a namespace maps into the tree, and [`map_namespace`] refusing a retired design's step,
+/// are the early refusals; `jkb undo` can get past both.)
 ///
 /// It walks **up** from `parent` — one indexed lookup per level, since `child_item_id` is
 /// containment's primary key — rather than down from every step as [`UNPLANNED_SQL`] does: the two
@@ -635,20 +636,12 @@ pub fn map_namespace(
 
 /// Refuse a mapping to step `uid` (item `step`) while its design is retired: a new task filed there
 /// would be in a plan no listing shows. `design::retire` refuses while a namespace maps into the
-/// tree, so this is the other half: no mapping into a retired design is ever written.
+/// tree, so between them no *write* makes a mapping into a retired design. `jkb undo` still can — it
+/// restores a namespace's metadata or a design's resolution straight from the changelog (undo a
+/// `--clear` after a retire, or a restore after a mapping) — so these two are early refusals, and
+/// the rule itself is asked where a mapping is read: [`mapped_step`].
 fn refuse_retired_step(conn: &Connection, uid: &str, step: ItemId) -> Result<()> {
-    let design = match containment::parent(conn, step)? {
-        Some(plan) => containment::parent(conn, plan)?,
-        None => None,
-    };
-    let Some(design) = design else {
-        return Ok(());
-    };
-    let Some(d) = item::get(conn, design)?.filter(|m| m.kind == KIND) else {
-        return Ok(());
-    };
-    if super::retired_item(conn, design)? {
-        let d = d.uid;
+    if let Some(d) = retired_design_of_step(conn, step)? {
         return Err(invalid(format!(
             "`{uid}` is a step of design {d}, which is retired: a task filed there would be in a \
              plan no listing shows. Map the namespace to a step of a live design, or restore {d} \
@@ -658,10 +651,32 @@ fn refuse_retired_step(conn: &Connection, uid: &str, step: ItemId) -> Result<()>
     Ok(())
 }
 
+/// The uid of the nearest retired design at or above plan step `step`'s design (step → plan →
+/// design, then up through the designs it is nested in), if any. A step under no design answers
+/// `None`.
+fn retired_design_of_step(conn: &Connection, step: ItemId) -> Result<Option<String>> {
+    let design = match containment::parent(conn, step)? {
+        Some(plan) => containment::parent(conn, plan)?,
+        None => None,
+    };
+    let mut at = match design {
+        Some(d) if item::get(conn, d)?.is_some_and(|m| m.kind == KIND) => Some(d),
+        _ => None,
+    };
+    while let Some(design) = at {
+        if super::retired_item(conn, design)? {
+            return Ok(item::get(conn, design)?.map(|m| m.uid));
+        }
+        at = super::tree::parent_of(conn, design)?;
+    }
+    Ok(None)
+}
+
 /// The step the nearest namespace at or above `home` is mapped to ([`PLAN_STEP_KEY`]), if any.
 ///
 /// # Errors
-/// A mapping that names no plan step (refused, naming the namespace and how to clear it), a
+/// A mapping that names no plan step, or a step of a retired design (a nested design counts as
+/// retired when an enclosing one is) — each refused, naming the namespace and how to clear it — a
 /// malformed home, or a database error.
 pub fn mapped_step(conn: &Connection, home: &str) -> Result<Option<ItemId>> {
     let mut cur = Some(crate::ns::normalize(home)?);
@@ -678,7 +693,21 @@ pub fn mapped_step(conn: &Connection, home: &str) -> Result<Option<ItemId>> {
                     None => None,
                 };
                 let why = match found {
-                    Some((id, kind)) if kind == STEP_KIND => return Ok(Some(id)),
+                    Some((id, kind)) if kind == STEP_KIND => {
+                        // Asked here, where the mapping is used, not only where it is written:
+                        // `jkb undo` can bring back a mapping into a retired design (see
+                        // `refuse_retired_step`).
+                        let Some(d) = retired_design_of_step(conn, id)? else {
+                            return Ok(Some(id));
+                        };
+                        return Err(invalid(format!(
+                            "`{path}` maps its tasks to `{uid}`, a step of design {d}, which is \
+                             retired: a task filed there would be in a plan no listing shows. \
+                             Clear the stale mapping (`jkb ns step {path} --clear`) or map it to a \
+                             live design's step (`jkb ns step {path} <step>`), or restore {d} (`jkb \
+                             design restore {d}`)"
+                        )));
+                    }
                     Some((_, kind)) => format!("is a {kind}, not a plan step"),
                     None => "no longer exists".to_owned(),
                 };
