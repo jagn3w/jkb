@@ -75,7 +75,7 @@ fn findings(
             reviews::record(
                 c,
                 m,
-                &[task],
+                task,
                 &ns,
                 "abc123",
                 "reviewer",
@@ -353,7 +353,7 @@ fn credit(db: &Db, task: ItemId, ns: &str) {
         reviews::record(
             c,
             m,
-            &[task],
+            task,
             &ns,
             "abc123",
             "reviewer",
@@ -383,6 +383,33 @@ fn a_round_credited_to_two_tasks_is_shelved_when_the_last_finishes() {
     assert_eq!(parent(&db, f[0]), Some(step), "t1 is still being worked");
     set_status(&db, t1, TaskStatus::Done);
     assert_eq!(parent(&db, f[0]), Some(inbox(&db)), "the last one finished");
+}
+
+/// A round recorded after its task finished (a staging branch reviewed after its tasks landed) is
+/// new work about that step, as the design's Q4 decides: nothing shelves it, at record time or on
+/// a later terminal self-loop, and it keeps the step from counting as implemented until triaged.
+#[test]
+fn a_round_recorded_after_its_task_finished_stays_under_the_step() {
+    let db = db();
+    let (_, step) = planned(&db, "Late");
+    let t = task_under(&db, "task:t", step);
+    set_status(&db, t, TaskStatus::Cancelled);
+    let f = findings(
+        &db,
+        "repos/app/codereviews/late",
+        step,
+        &[(1, TaskStatus::Open)],
+        Some(t),
+    );
+    assert_eq!(parent(&db, f[0]), Some(step), "not shelved when recorded");
+    let again = TaskFacts {
+        status: TaskStatus::Cancelled,
+        ..TaskFacts::default()
+    };
+    perform(&db, t, again, TaskEvent::Cancel);
+    assert_eq!(status(&db, t).as_deref(), Some("cancelled"));
+    assert_eq!(parent(&db, f[0]), Some(step), "not shelved by a self-loop");
+    assert!(!counts(&db, step).0, "the open finding keeps the step open");
 }
 
 /// A misplaced Open work tree never blocks a task from finishing: the finding stays where it is,
@@ -455,59 +482,4 @@ fn a_terminal_rerun_does_not_shelve_again() {
         Some(step),
         "moved back by hand, it stays"
     );
-}
-
-/// Record round `ns` (already filed) against all of `tasks`, in one call.
-fn record_all(db: &Db, tasks: Vec<ItemId>, ns: &str) {
-    let ns = ns.to_owned();
-    db.write_txn("t", move |c, m| {
-        reviews::record(
-            c,
-            m,
-            &tasks,
-            &ns,
-            "abc123",
-            "reviewer",
-            reviews::RoundSource::Filed("reviewer"),
-        )
-    })
-    .unwrap();
-}
-
-/// A round recorded against tasks that have all finished already (a staging branch reviewed after
-/// its tasks landed) is shelved when it is recorded: no transition of theirs follows to do it.
-#[test]
-fn a_round_recorded_after_its_tasks_finished_is_shelved_at_record_time() {
-    let db = db();
-    let (_, step) = planned(&db, "Late");
-    let t1 = task_under(&db, "task:t1", step);
-    let t2 = task_under(&db, "task:t2", step);
-    set_status(&db, t1, TaskStatus::Done);
-    set_status(&db, t2, TaskStatus::Cancelled);
-    let ns = "repos/app/codereviews/late";
-    let f = findings(&db, ns, step, &[(3, TaskStatus::Open)], None);
-    assert_eq!(parent(&db, f[0]), Some(step), "filed beside them");
-    record_all(&db, vec![t1, t2], ns);
-    assert_eq!(parent(&db, f[0]), Some(inbox(&db)), "shelved when recorded");
-}
-
-/// A round recorded against one finished task and one still being worked shelves nothing — judged
-/// on both, even with the finished one first — until the second finishes.
-#[test]
-fn a_late_round_with_a_task_still_open_waits_for_it() {
-    let db = db();
-    let (_, step) = planned(&db, "Waits");
-    let done = task_under(&db, "task:done", step);
-    let open = task_under(&db, "task:open", step);
-    set_status(&db, done, TaskStatus::Done);
-    let ns = "repos/app/codereviews/waits";
-    let f = findings(&db, ns, step, &[(2, TaskStatus::Open)], None);
-    record_all(&db, vec![done, open], ns);
-    assert_eq!(
-        parent(&db, f[0]),
-        Some(step),
-        "task:open is still being worked"
-    );
-    set_status(&db, open, TaskStatus::Done);
-    assert_eq!(parent(&db, f[0]), Some(inbox(&db)), "the last one finished");
 }

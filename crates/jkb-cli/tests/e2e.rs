@@ -666,7 +666,7 @@ fn every_creator_files_under_a_step() {
             jkb_core::reviews::record(
                 conn,
                 meta,
-                &[id],
+                id,
                 round,
                 "abc123",
                 "operator",

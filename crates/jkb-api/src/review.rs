@@ -642,10 +642,6 @@ pub fn record(
     }
 
     let mut out = Recording::default();
-    // Every task the review credits, with its tasks.md line's problem before any write: recorded in
-    // one call, so the round is judged on all of them (`reviews::record` shelves a round whose
-    // tasks have all finished).
-    let mut credited = Vec::new();
     let ids = jkb_core::location::tasks_in_repo(&ask.repo).evaluate(conn)?;
     let metas = item::get_many(conn, &ids)?;
     for id in ids {
@@ -689,18 +685,15 @@ pub fn record(
                 continue;
             }
         }
-        credited.push((id, m.uid.clone(), line_problem(conn, &m.uid)?));
-    }
-    let tasks: Vec<ItemId> = credited.iter().map(|(id, ..)| *id).collect();
-    jkb_core::reviews::record(conn, meta, &tasks, &findings, sha, actor, source)?;
-    for (id, uid, before) in credited {
+        let before = line_problem(conn, &m.uid)?;
+        jkb_core::reviews::record(conn, meta, id, &findings, sha, actor, source)?;
         let moved = item::get(conn, id)?.and_then(|m| m.status).as_deref() == Some("in_progress");
         if moved {
             task::set_status(conn, meta, id, TaskStatus::NeedsReview)?;
         }
-        check_line(conn, &uid, before.as_deref())?;
+        check_line(conn, &m.uid, before.as_deref())?;
         out.recorded.push(Recorded {
-            uid,
+            uid: m.uid.clone(),
             moved_to_review: moved,
         });
     }
