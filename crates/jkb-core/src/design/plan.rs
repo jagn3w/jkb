@@ -761,6 +761,13 @@ pub fn unplanned(conn: &Connection) -> Result<Vec<UnplannedTask>> {
 /// and a plan's `archived`, so the two cannot disagree about what a step holds — they once did, a
 /// plan counting all its tasks at once while IMPLEMENTED counted per step, and a plan with an empty
 /// step was archived while a span staged into that step stayed STAGED.
+///
+/// **A review finding that has reached a terminal status is left out**: findings are filed under
+/// the reviewed task's step, beside it, and a refuted finding cancelled would otherwise keep the
+/// step from ever being IMPLEMENTED, while each round's done "clean review" item would pad it. An
+/// open finding counts and is not done, so it keeps the step (and its plan) open. A finding is an
+/// item `task.review_file` filed (`review_filings`), never one merely tagged `finding=review`: a
+/// tag is content a synced file can write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StepTasks {
     count: i64,
@@ -795,7 +802,11 @@ pub(crate) fn step_tasks(conn: &Connection, step: ItemId) -> Result<StepTasks> {
                     COALESCE(SUM(i.status IN ",
             jkb_types::sql_terminal_list!(),
             "), 0)
-               FROM under u JOIN items i ON i.id = u.id WHERE i.kind = 'task'",
+               FROM under u JOIN items i ON i.id = u.id
+              WHERE i.kind = 'task'
+                AND NOT (COALESCE(i.status IN ",
+            jkb_types::sql_terminal_list!(),
+            ", 0) AND i.id IN (SELECT item_id FROM review_filings))",
         ))?
         .query_row(
             // `done` is its own count (a step is IMPLEMENTED only by landed work); the
@@ -970,6 +981,18 @@ fn climb(conn: &Connection, task: ItemId) -> Result<Option<Climb>> {
         at = parent;
     }
     Ok(None)
+}
+
+/// The nearest plan step above task `task`, walking its containers up — the same walk as
+/// [`ancestry_of`] and [`place_of`], so the step `jkb task show` names is this one. Never the task's
+/// immediate container when that is a task: a review's findings are filed here, beside the task
+/// rather than as a subtask of it or of any task above it, where they would hold that task off the
+/// ready frontier and its landing. `None` for a task under no step, or under no design.
+///
+/// # Errors
+/// A database error.
+pub fn step_of(conn: &Connection, task: ItemId) -> Result<Option<ItemId>> {
+    Ok(climb(conn, task)?.and_then(|c| c.step).map(|(id, _)| id))
 }
 
 /// The plan `step` is a step of, and its number in that plan from 1; `None` for a step no plan

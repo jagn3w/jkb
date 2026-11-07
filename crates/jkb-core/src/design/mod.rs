@@ -2199,3 +2199,6 @@ mod tests;
 
 #[cfg(test)]
 mod triage_tests;
+
+#[cfg(test)]
+mod finding_tests;

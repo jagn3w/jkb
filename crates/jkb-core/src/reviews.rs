@@ -435,6 +435,70 @@ pub fn is_finding_of(conn: &Connection, task: ItemId, target: ItemId) -> Result<
         .query_row(params![task.get(), target.get()], |r| r.get(0))?)
 }
 
+/// Move the still-open findings of `task`'s recorded rounds that sit directly under a plan step to
+/// their repo's Open work › Inbox: what a task reaching a terminal status does
+/// ([`crate::transition::perform`] calls this), so a nit left open on purpose — or a finding about
+/// work that was abandoned — does not keep the reviewed task's plan from archiving, and stays
+/// visible for triage. In the callee because the operator's own `task set --status done`, a pull
+/// request observed merged, and a cancel all finish a task, and a rule each had to remember would be
+/// forgotten by one.
+///
+/// Which findings: those of `task`'s *recorded* rounds, read from the round snapshot like
+/// [`is_finding_of`], that are open tasks contained directly by a plan step other than a triage step.
+/// A finding someone moved by hand (under a task, or already into an Inbox) is left where it is, and
+/// so is one whose round namespace names no repo this knowledge base knows — a namespace mapped to a
+/// step filed it there, which is the operator's choice. Each move is [`crate::task::move_under`],
+/// changelogged, so an undo of the transaction that finished the task puts them back. Answers the
+/// findings it moved.
+///
+/// # Errors
+/// A repo's Open work tree that is not where it should be ([`crate::design::plan::triage_step`]), or
+/// a database error.
+pub fn shelve_open_findings(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+) -> Result<Vec<ItemId>> {
+    let open: Vec<(i64, String, String)> = conn
+        .prepare_cached(concat!(
+            "SELECT f.item_id, r.ns, p.uid FROM reviews v
+               JOIN review_rounds r ON r.ns = v.ns
+               JOIN review_round_findings f ON f.round_id = r.id
+               JOIN items i ON i.id = f.item_id
+               JOIN containment c ON c.child_item_id = i.id
+               JOIN items p ON p.id = c.parent_item_id
+              WHERE v.item_id = ?1 AND v.kind = 'recorded'
+                AND i.kind = 'task' AND p.kind = ?2 AND ",
+            jkb_types::sql_not_terminal!("i.status"),
+            " ORDER BY r.id, f.item_id"
+        ))?
+        .query_map(params![task.get(), crate::design::STEP_KIND], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut moved = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (finding, ns, step) in open {
+        if !seen.insert(finding) || crate::design::plan::is_triage_step_uid(&step) {
+            continue;
+        }
+        let Some(repo) = crate::mount::repo_of_namespace(&ns) else {
+            continue;
+        };
+        if !crate::design::plan::knows_repo(conn, &repo)? {
+            continue;
+        }
+        let inbox = crate::design::plan::triage_step(conn, meta, &repo)?;
+        let finding = ItemId::new(finding);
+        if let crate::task::Moved::Moved { .. } =
+            crate::task::move_under(conn, meta, finding, inbox)?
+        {
+            moved.push(finding);
+        }
+    }
+    Ok(moved)
+}
+
 /// `task`'s review state.
 ///
 /// # Errors

@@ -64,7 +64,8 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   `systemic_reviewer`); the coordinator cannot fire either exit itself.
 - **Findings.** Whoever verifies a fix closes its finding. When a round comes back clean, the
   coordinator closes the must-fix findings of the group's earlier rounds (`jkb task set <finding>
-  --status done`) before the merge queue. Concerns and nits stay open as backlog.
+  --status done`) before the merge queue. Concerns and nits stay open; jkb moves the ones still open
+  to the repo's Open work › Inbox when the task lands.
 - **Merge queue.** `scripts/merge-queue.sh` is deterministic, not an agent. It runs the gate on the
   rebased branch, lands it on the feature branch, records the landing, and names its own outcome.
 

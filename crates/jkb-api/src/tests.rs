@@ -357,6 +357,7 @@ fn samples() -> Vec<Request> {
                 error: None,
             },
             findings: Vec::new(),
+            task: None,
         }),
         Request::TaskReviewRecord(super::review::RecordAsk {
             repo: "r".into(),

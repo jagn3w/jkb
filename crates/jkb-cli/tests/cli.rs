@@ -6944,3 +6944,57 @@ fn task_add_homed_in_an_unknown_repo_is_refused_and_builds_nothing() {
         .success()
         .stdout(predicate::str::contains("jbk").not());
 }
+
+/// `jkb task review file --task <uid>` files the findings under that task's plan step, and says which
+/// step; without it, an unbound filing goes to the repo's Open work › Inbox.
+#[test]
+fn review_file_names_the_step_its_findings_went_under() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = repo_t(&db);
+    let step = a_step(&db);
+    let out = jkb(&db)
+        .current_dir(&repo)
+        .args(["--json", "task", "add", "reviewed work", "--under", &step])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let task = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let result = dir.path().join("result.json");
+    std::fs::write(
+        &result,
+        r#"{"reviewers":1,"returned":1,"findings":[{"severity":"nit","summary":"a nit"}]}"#,
+    )
+    .unwrap();
+    let from = result.to_str().unwrap();
+    let out = jkb(&db)
+        .args([
+            "--json",
+            "task",
+            "review",
+            "file",
+            "--findings",
+            "repos/t/codereviews/r1",
+        ])
+        .args(["--from", from, "--task", &task])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let filed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(filed["step"], step.as_str(), "{filed}");
+    jkb(&db)
+        .args([
+            "task",
+            "review",
+            "file",
+            "--findings",
+            "repos/t/codereviews/r2",
+        ])
+        .args(["--from", from])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in plan step step:inbox@t"));
+}

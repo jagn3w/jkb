@@ -102,9 +102,11 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
         TaskCmd::Review { cmd } => {
             let kb = crate::session_cli::Kb::from_ops(ops);
             match cmd {
-                TaskReviewCmd::File { findings, from } => {
-                    crate::review::file_cmd(&kb, &findings, &from, ops.json)
-                }
+                TaskReviewCmd::File {
+                    findings,
+                    from,
+                    task,
+                } => crate::review::file_cmd(&kb, &findings, &from, task, ops.json),
                 TaskReviewCmd::Record {
                     branch,
                     sha,

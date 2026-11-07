@@ -227,6 +227,7 @@ pub(crate) fn file_cmd(
     kb: &crate::session_cli::Kb<'_>,
     findings_ns: &str,
     from: &std::path::Path,
+    task: Option<String>,
     json: bool,
 ) -> Result<()> {
     use std::io::Read as _;
@@ -282,16 +283,26 @@ pub(crate) fn file_cmd(
         ns: findings_ns.to_owned(),
         run,
         findings,
+        task,
     })?;
     if json {
         println!(
             "{}",
-            serde_json::json!({ "ns": filed.ns, "uids": filed.uids, "clean": filed.clean })
+            serde_json::json!({ "ns": filed.ns, "uids": filed.uids, "clean": filed.clean,
+                                "step": filed.step })
         );
     } else if filed.clean {
-        println!("filed a clean review under {}", filed.ns);
+        println!(
+            "filed a clean review under {}, in plan step {}",
+            filed.ns, filed.step
+        );
     } else {
-        println!("filed {} finding(s) under {}", filed.uids.len(), filed.ns);
+        println!(
+            "filed {} finding(s) under {}, in plan step {}",
+            filed.uids.len(),
+            filed.ns,
+            filed.step
+        );
         for uid in &filed.uids {
             println!("  {uid}");
         }

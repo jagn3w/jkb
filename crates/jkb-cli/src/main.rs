@@ -1574,6 +1574,10 @@ enum TaskReviewCmd {
     /// (`must-fix` blocks landing). Reads the reviewer workflow's result — a JSON object with a
     /// `findings` array of `{severity, summary, file, line, scenario, fix}` — from a file, or from
     /// stdin with `-`.
+    ///
+    /// The findings are filed under the reviewed task's plan step, beside it: the task this caller
+    /// is bound to, else the one `--task` names, else (neither, or a task under no step) the repo's
+    /// Open work › Inbox.
     File {
         /// The namespace to file them under, e.g. `repos/<repo>/codereviews/<folder>`. Must be new.
         #[arg(long)]
@@ -1581,6 +1585,10 @@ enum TaskReviewCmd {
         /// The workflow's result, as JSON (`-` for stdin).
         #[arg(long)]
         from: PathBuf,
+        /// The task this review is of, when this caller is bound to none: its findings go under that
+        /// task's plan step. A caller bound to a task files for that task only.
+        #[arg(long)]
+        task: Option<String>,
     },
     /// Record a review against a branch: tags every task working that branch with the
     /// reviewed SHA and the findings namespace, and moves `in_progress` to `needs_review`.

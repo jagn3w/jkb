@@ -103,6 +103,11 @@ pub fn perform(
         if *to == TaskStatus::Done && matches!(event, TaskEvent::Land | TaskEvent::ObservedLanded) {
             crate::workflow::store::follow_landing(conn, meta, task)?;
         }
+        // A finished task's still-open review findings leave its plan step for the repo's Inbox:
+        // here, because every way a task finishes comes through this function.
+        if to.is_terminal() {
+            crate::reviews::shelve_open_findings(conn, meta, task)?;
+        }
     }
     Ok(outcome)
 }

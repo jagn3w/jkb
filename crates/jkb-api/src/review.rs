@@ -226,6 +226,12 @@ pub struct FileAsk {
     /// What the reviewer found. Empty files one finished "clean review" item, so the review is on
     /// record: `task.review_record` refuses a findings namespace that holds nothing.
     pub findings: Vec<Finding>,
+    /// The task this review is of, for a caller bound to none (the operator filing by hand): its
+    /// findings are filed under that task's plan step, beside it. A caller held to one task files
+    /// for that task, and naming another is refused. Absent, an unbound filing goes where its
+    /// namespace says (a mapped step, else the repo's Open work › Inbox).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
 }
 
 /// What `task.review_file` filed.
@@ -237,6 +243,10 @@ pub struct Filed {
     pub uids: Vec<String>,
     /// No findings were given, so one finished "clean review" item was filed instead.
     pub clean: bool,
+    /// The uid of the plan step the findings were filed under. Defaulted when absent, so a newer
+    /// client still reads an older server's answer.
+    #[serde(default)]
+    pub step: String,
 }
 
 /// The title of the item a clean review files.
@@ -265,9 +275,14 @@ fn check_bytes(what: &str, value: &str, max: usize) -> Result<(), ApiError> {
 /// one — and when a `tasks` mount covers a section, where the host's sync would write the findings
 /// into a file.
 ///
+/// The findings are contained under the reviewed task's plan step, beside it ([`finding_under`]):
+/// reachable from the plan of the work they review, and holding neither that task's frontier nor
+/// its landing. [`Filed::step`] names the step.
+///
 /// # Errors
-/// [`ErrorCode::Invalid`] for a malformed or occupied namespace, a covered section, or an oversized
-/// finding; or a failed write.
+/// [`ErrorCode::Invalid`] for a malformed or occupied namespace, a covered section, an oversized
+/// finding, or an [`FileAsk::task`] that names no task; [`ErrorCode::Forbidden`] for a caller held to
+/// one task naming another; or a failed write.
 pub fn file(
     conn: &Connection,
     meta: &WriteMeta,
@@ -307,7 +322,7 @@ pub fn file(
         )));
     }
 
-    let under = finding_under(conn, ask, &root)?;
+    let under = finding_under(conn, ask, &root, scope)?;
     let clean = ask.findings.is_empty();
     // The file each finding names, by position — its area, for telling repeated rounds apart.
     let files: Vec<Option<String>> = ask
@@ -365,21 +380,47 @@ pub fn file(
     }
     // What this filing holds, so recording it makes exactly these a task's round (and its scope).
     jkb_core::reviews::record_filing(conn, &root, &ids, filed_by)?;
+    let step = match ids.first() {
+        Some(&id) => match jkb_core::containment::parent(conn, id)? {
+            Some(step) => item::get(conn, step)?.map(|m| m.uid).unwrap_or_default(),
+            None => String::new(),
+        },
+        None => String::new(),
+    };
     Ok(Filed {
         ns: root,
         uids,
         clean,
+        step,
     })
 }
 
 /// Where a review's findings are filed (`root` is the review's namespace): **the one place** that
-/// decides it. For now the default step for each finding's home — a review under
-/// `repos/<R>/codereviews/…` names repo R, so its findings land in R's Open work › Inbox. A review
-/// namespace mapped to no step that names no repo, or names one this knowledge base does not know
-/// (a mistyped `repos/<repo>/…`), is refused here, before anything is filed, with the remedy this
-/// surface has: a namespace under `repos/<repo>/codereviews/` of a repo it knows. (The generic
-/// refusals' `--under` and "run it in a mounted repo" are not things a filing can do.)
-fn finding_under(conn: &Connection, _ask: &FileAsk, root: &str) -> Result<task::Under, ApiError> {
+/// decides it, in order:
+///
+/// 1. The reviewed task — the one the caller is held to (`scope`), else the one the ask names
+///    ([`FileAsk::task`]) — when it is under a plan step: that step, the **nearest above the task**
+///    ([`jkb_core::design::plan::step_of`]), never the task's own container. Beside the task, a
+///    finding holds nothing; as a subtask of it, or of any task above it, it would hold that task
+///    off the ready frontier and its landing.
+/// 2. Otherwise (no reviewed task, or one under no step) the default step for each finding's home:
+///    a step the review namespace is mapped to, else — a review under `repos/<R>/codereviews/…`
+///    names repo R — R's Open work › Inbox. A review namespace mapped to no step that names no repo,
+///    or names one this knowledge base does not know (a mistyped `repos/<repo>/…`), is refused here,
+///    before anything is filed, with the remedy this surface has: a namespace under
+///    `repos/<repo>/codereviews/` of a repo it knows. (The generic refusals' `--under` and "run it
+///    in a mounted repo" are not things a filing can do.)
+fn finding_under(
+    conn: &Connection,
+    ask: &FileAsk,
+    root: &str,
+    scope: Option<ItemId>,
+) -> Result<task::Under, ApiError> {
+    if let Some(reviewed) = reviewed_task(conn, ask, scope)? {
+        if let Some(step) = jkb_core::design::plan::step_of(conn, reviewed)? {
+            return Ok(task::Under::Parent(step));
+        }
+    }
     if jkb_core::design::plan::mapped_step(conn, root)?.is_some() {
         return Ok(task::Under::Default { ambient_repo: None });
     }
@@ -396,6 +437,40 @@ fn finding_under(conn: &Connection, _ask: &FileAsk, root: &str) -> Result<task::
             "`{root}` names no repository, so its findings would be in no repo's Open work › Inbox: \
              file the review under `repos/<repo>/codereviews/…`"
         ))),
+    }
+}
+
+/// The task a filing reviews: the one the caller is held to, else the one the ask names. A named uid
+/// that is no task is refused, and so is a caller held to one task naming another.
+fn reviewed_task(
+    conn: &Connection,
+    ask: &FileAsk,
+    scope: Option<ItemId>,
+) -> Result<Option<ItemId>, ApiError> {
+    let named = match ask.task.as_deref() {
+        Some(uid) => {
+            let id = item::id_for_uid(conn, uid)?
+                .ok_or_else(|| invalid(format!("no task `{uid}` to file this review for")))?;
+            let kind = item::get(conn, id)?.map(|m| m.kind).unwrap_or_default();
+            if kind != "task" {
+                return Err(invalid(format!(
+                    "`{uid}` is a {kind}, not a task: a review is filed for the task it reviews"
+                )));
+            }
+            Some(id)
+        }
+        None => None,
+    };
+    match (scope, named) {
+        (Some(held), Some(named)) if held != named => {
+            let held_uid = item::get(conn, held)?.map(|m| m.uid).unwrap_or_default();
+            Err(ApiError::with_code(
+                ErrorCode::Forbidden,
+                format!("a caller held to `{held_uid}` files findings only for that task"),
+            ))
+        }
+        (Some(held), _) => Ok(Some(held)),
+        (None, named) => Ok(named),
     }
 }
 

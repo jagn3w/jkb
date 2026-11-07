@@ -548,3 +548,284 @@ fn a_non_operator_records_only_a_filing_and_the_gate_reads_the_recorded_round() 
         "{e:?}"
     );
 }
+
+// ---- findings filed beside the reviewed task, under its plan step ----
+
+use jkb_core::design::plan;
+use jkb_core::{containment, item};
+use jkb_types::ItemId;
+
+/// A design in repo `proj` with a one-step plan: the step's `(uid, id)`.
+fn a_step(db: &Db, title: &str) -> (String, ItemId) {
+    let title = title.to_owned();
+    db.write_txn("t", move |c, m| {
+        let d = jkb_core::design::create(c, m, "proj", &title, "Build it.")?.uid;
+        let p = plan::create(c, m, &d, &title, &["one".to_owned()])?;
+        let uid = p.steps[0].uid.clone();
+        let id = item::id_for_uid(c, &uid)?.unwrap();
+        Ok((uid, id))
+    })
+    .unwrap()
+}
+
+/// A task added under `under`, recording `repo=proj` as a started task does.
+fn added_under(b: &LocalBackend, text: &str, under: &str) -> String {
+    let uid = match call(b, json!({ "op": "task.add", "text": text, "under": under })).unwrap() {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    call(
+        b,
+        json!({ "op": "task.tag", "uid": uid, "facet_value": "repo=proj", "mode": "add" }),
+    )
+    .unwrap();
+    uid
+}
+
+/// A backend held to task `uid`, as a bound reviewer is.
+fn reviewer_of(db: &Db, uid: &str) -> LocalBackend {
+    let b = LocalBackend::new(db.clone());
+    let token = match call(
+        &b,
+        json!({ "op": "role.grant", "role": "reviewer", "task": uid, "agent": "r" }),
+    )
+    .unwrap()
+    {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    LocalBackend::new(db.clone()).with_caller(crate::rbac::Caller::Token(token))
+}
+
+fn id_of(db: &Db, uid: &str) -> ItemId {
+    let uid = uid.to_owned();
+    db.read(move |c| item::id_for_uid(c, &uid))
+        .unwrap()
+        .unwrap()
+}
+
+fn container(db: &Db, uid: &str) -> Option<ItemId> {
+    let id = id_of(db, uid);
+    db.read(move |c| containment::parent(c, id)).unwrap()
+}
+
+fn inbox(db: &Db) -> ItemId {
+    id_of(db, &plan::triage_step_uid("proj"))
+}
+
+/// The bodies of a nit, a concern and a must-fix.
+fn three() -> serde_json::Value {
+    json!([
+        { "severity": "nit", "summary": "typo" },
+        { "severity": "concern", "summary": "odd" },
+        { "severity": "must-fix", "summary": "breaks", "file": "src/a.rs" },
+    ])
+}
+
+/// Test 1: a reviewer bound to T, under step S, files its findings under S — beside T — and says so;
+/// nothing it filed is unplanned.
+#[test]
+fn a_bound_reviewer_files_under_the_reviewed_tasks_step() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&db, &["proj"]);
+    let (step_uid, step) = a_step(&db, "Planned");
+    let t = added_under(&b, "the work", &step_uid);
+    let filed = file(&reviewer_of(&db, &t), "repos/proj/codereviews/r1", &three()).unwrap();
+    assert_eq!(filed.step, step_uid);
+    for uid in &filed.uids {
+        assert_eq!(container(&db, uid), Some(step), "{uid}");
+    }
+    assert!(db.read(plan::unplanned).unwrap().is_empty());
+}
+
+/// Test 2: reviewing a subtask T of task P, the findings go under the step above both — never under P
+/// or T, where they would hold either off the frontier and its landing.
+#[test]
+fn a_subtasks_findings_go_under_the_step_never_under_a_task() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&db, &["proj"]);
+    let (step_uid, step) = a_step(&db, "Nested");
+    let p = added_under(&b, "the parent", &step_uid);
+    let t = added_under(&b, "the subtask", &p);
+    let (pid, tid) = (id_of(&db, &p), id_of(&db, &t));
+    let holds = |db: &Db| {
+        db.read(move |c| {
+            let ready = jkb_core::task::ready_ids(c, jkb_core::query::Query::default(), None)?;
+            Ok((
+                jkb_core::task::subtasks_all_terminal(c, pid)?,
+                jkb_core::task::subtasks_all_terminal(c, tid)?,
+                ready.contains(&pid),
+                ready.contains(&tid),
+            ))
+        })
+        .unwrap()
+    };
+    let before = holds(&db);
+    assert!(
+        before.1 && before.3,
+        "T has no subtasks and is ready: {before:?}"
+    );
+    let filed = file(&reviewer_of(&db, &t), "repos/proj/codereviews/r1", &three()).unwrap();
+    for uid in &filed.uids {
+        assert_eq!(container(&db, uid), Some(step), "{uid}");
+    }
+    assert_eq!(holds(&db), before, "the findings hold neither P nor T");
+}
+
+/// Test 3: a reviewed task under no step (a loose task from before every task had one) sends its
+/// findings to the repo's Open work › Inbox.
+#[test]
+fn a_loose_reviewed_tasks_findings_go_to_the_inbox() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&db, &["proj"]);
+    let t = started(&b, "loose work", "feat");
+    let tid = id_of(&db, &t);
+    db.write_txn("t", move |c, _| {
+        c.execute(
+            "DELETE FROM containment WHERE child_item_id = ?1",
+            [tid.get()],
+        )?;
+        c.execute(
+            "DELETE FROM edges WHERE dst_item_id = ?1 AND type = 'parent_of'",
+            [tid.get()],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let filed = file(&reviewer_of(&db, &t), "repos/proj/codereviews/r1", &three()).unwrap();
+    assert_eq!(filed.step, plan::triage_step_uid("proj"));
+    let inbox = inbox(&db);
+    for uid in &filed.uids {
+        assert_eq!(container(&db, uid), Some(inbox), "{uid}");
+    }
+}
+
+fn file_for(
+    b: &LocalBackend,
+    ns: &str,
+    task: &str,
+    findings: &serde_json::Value,
+) -> Result<super::Filed, ApiError> {
+    match call(
+        b,
+        json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": ns,
+                "findings": findings, "task": task }),
+    )? {
+        Response::ReviewFiled { filed } => Ok(filed),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn changelog_rows(db: &Db) -> i64 {
+    db.read(|c| Ok(c.query_row("SELECT count(*) FROM changelog", [], |r| r.get(0))?))
+        .unwrap()
+}
+
+/// Test 4: an unbound filing names its task with `task`; without one it goes to the Inbox; an unknown
+/// task files nothing; and a caller held to one task cannot name another.
+#[test]
+fn an_unbound_filing_names_its_task_and_a_bound_one_cannot_name_another() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&db, &["proj"]);
+    let (step_uid, step) = a_step(&db, "Named");
+    let t = added_under(&b, "the work", &step_uid);
+    let u = added_under(&b, "other work", &step_uid);
+
+    let named = file_for(&b, "repos/proj/codereviews/named", &t, &three()).unwrap();
+    assert_eq!(named.step, step_uid);
+    assert!(named.uids.iter().all(|u| container(&db, u) == Some(step)));
+
+    let unnamed = file(&b, "repos/proj/codereviews/unnamed", &three()).unwrap();
+    assert_eq!(unnamed.step, plan::triage_step_uid("proj"));
+    let inbox = inbox(&db);
+    assert!(unnamed
+        .uids
+        .iter()
+        .all(|u| container(&db, u) == Some(inbox)));
+
+    let rows = changelog_rows(&db);
+    let e = file_for(&b, "repos/proj/codereviews/unknown", "task:nope", &three()).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert_eq!(findings(&b, "repos/proj/codereviews/unknown").total, 0);
+    assert_eq!(changelog_rows(&db), rows, "nothing was written");
+    let e = file_for(&b, "repos/proj/codereviews/step", &step_uid, &three()).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "a step is not a task: {e:?}");
+
+    let e = file_for(
+        &reviewer_of(&db, &t),
+        "repos/proj/codereviews/other",
+        &u,
+        &three(),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Forbidden, "{e:?}");
+    assert!(e.message.contains(&t), "{e:?}");
+    assert_eq!(findings(&b, "repos/proj/codereviews/other").total, 0);
+    // Naming its own task is what binding already says.
+    file_for(
+        &reviewer_of(&db, &t),
+        "repos/proj/codereviews/own",
+        &t,
+        &three(),
+    )
+    .unwrap();
+}
+
+/// Test 5: beside the task, the gate still reads the round's snapshot: open nits and concerns with the
+/// must-fix closed admit; an open must-fix refuses, wherever it has been moved.
+#[test]
+fn the_gate_reads_the_round_not_where_its_findings_sit() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&db, &["proj"]);
+    let (step_uid, _) = a_step(&db, "Gated");
+    let t = added_under(&b, "the work", &step_uid);
+    call(
+        &b,
+        json!({ "op": "task.start", "uid": t, "take": { "owner": "host:1" },
+                "place": { "branch": "feat", "repo": "proj", "onto": "batch" } }),
+    )
+    .unwrap();
+    let scoped = reviewer_of(&db, &t);
+    let ns = "repos/proj/codereviews/r1";
+    let filed = file(&scoped, ns, &three()).unwrap();
+    record(&scoped, "feat", ns).unwrap();
+    call(
+        &b,
+        json!({ "op": "task.set", "uid": filed.uids[2], "status": "done" }),
+    )
+    .unwrap();
+    let f = findings(&b, ns);
+    assert!(f.open_must_fix.is_empty(), "{f:?}");
+    for uid in &filed.uids[..2] {
+        assert_eq!(
+            show(&b, uid)["item"]["status"],
+            "open",
+            "the nit and the concern stay open"
+        );
+    }
+    let open = facts(&b, &t).open_subtasks;
+    assert!(!open, "the findings are no subtasks of the task");
+
+    let ns = "repos/proj/codereviews/r2";
+    let filed = file(&scoped, ns, &three()).unwrap();
+    record(&scoped, "feat", ns).unwrap();
+    assert_eq!(findings(&b, ns).open_must_fix.len(), 1);
+    db.write_txn("t", |c, m| plan::triage_step(c, m, "proj"))
+        .unwrap();
+    call(
+        &b,
+        json!({ "op": "task.move", "uid": filed.uids[2], "under": plan::triage_step_uid("proj") }),
+    )
+    .unwrap();
+    assert_eq!(container(&db, &filed.uids[2]), Some(inbox(&db)));
+    assert_eq!(
+        findings(&b, ns).open_must_fix.len(),
+        1,
+        "moved, it still blocks"
+    );
+}

@@ -599,7 +599,7 @@ fn every_creator_files_under_a_step() {
     call(serde_json::json!({ "op": "task.move", "uid": uids[0], "under": uids[2] }));
 
     assert!(unplanned(&db).is_empty(), "{:?}", unplanned(&db));
-    for uid in uids {
+    for uid in &uids {
         let u = uid.clone();
         let ancestry = db
             .read(move |conn| {
@@ -612,4 +612,98 @@ fn every_creator_files_under_a_step() {
             "{uid} is under no step"
         );
     }
+    let step_of = |uid: &str| {
+        let uid = uid.to_owned();
+        db.read(move |conn| {
+            let id = item::id_for_uid(conn, &uid)?.unwrap();
+            let step = jkb_core::containment::parent(conn, id)?.unwrap();
+            Ok(item::get(conn, step)?.unwrap().uid)
+        })
+        .unwrap()
+    };
+    let inbox = jkb_core::design::plan::triage_step_uid("app");
+    // The pre-existing-code path (`jkb task add --backlog` in the repo) is the Inbox.
+    assert_eq!(step_of(&uids[1]), inbox);
+
+    // A reviewer bound to the planned task files its findings beside it, under its step.
+    let planned = uids[2].clone();
+    call(
+        serde_json::json!({ "op": "task.tag", "uid": planned, "facet_value": "repo=app",
+                             "mode": "add" }),
+    );
+    let token = match call(serde_json::json!({ "op": "role.grant", "role": "reviewer",
+                                               "task": planned, "agent": "r" }))
+    {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    let reviewer =
+        jkb_api::LocalBackend::new(db.clone()).with_caller(jkb_api::rbac::Caller::Token(token));
+    let round = "repos/app/codereviews/r2";
+    let filed = match reviewer
+        .call(
+            serde_json::from_value(serde_json::json!({
+                "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
+                "ns": round,
+                "findings": [{ "severity": "must-fix", "summary": "a bug" },
+                             { "severity": "nit", "summary": "a nit" }],
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    {
+        Response::ReviewFiled { filed } => filed,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(filed.step, step);
+    for uid in &filed.uids {
+        assert_eq!(step_of(uid), step, "{uid}");
+    }
+    {
+        let planned = planned.clone();
+        db.write_txn("t", move |conn, meta| {
+            let id = item::id_for_uid(conn, &planned)?.unwrap();
+            jkb_core::reviews::record(
+                conn,
+                meta,
+                id,
+                round,
+                "abc123",
+                "operator",
+                jkb_core::reviews::RoundSource::AnyNamespace,
+            )
+        })
+        .unwrap();
+    }
+    // The must-fix is fixed, the subtask moved under the planned task is done, and the task lands:
+    // the nit left open goes to the Inbox, and the plan archives.
+    for uid in [&filed.uids[0], &uids[0], &planned] {
+        call(serde_json::json!({ "op": "task.set", "uid": uid, "status": "done" }));
+    }
+    assert_eq!(step_of(&filed.uids[1]), inbox, "the open nit is shelved");
+    assert_eq!(step_of(&filed.uids[0]), step, "the fixed must-fix stays");
+    let step_uid = step.clone();
+    let plans = db
+        .read(move |conn| {
+            let design = item::get(
+                conn,
+                jkb_core::containment::parent(
+                    conn,
+                    jkb_core::containment::parent(
+                        conn,
+                        item::id_for_uid(conn, &step_uid)?.unwrap(),
+                    )?
+                    .unwrap(),
+                )?
+                .unwrap(),
+            )?
+            .unwrap()
+            .uid;
+            jkb_core::design::plan::list(conn, &design, true)
+        })
+        .unwrap();
+    assert!(
+        !plans.plans.is_empty() && plans.plans.iter().all(|p| p.archived),
+        "{plans:?}"
+    );
 }
