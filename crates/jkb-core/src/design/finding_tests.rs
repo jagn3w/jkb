@@ -423,28 +423,30 @@ fn a_misplaced_inbox_leaves_the_finding_and_the_task_still_finishes() {
     assert!(written <= 2, "{written} changelog rows");
 }
 
-/// A terminal self-loop (a re-run) does not re-shelve a finding someone moved back since.
+/// A round recorded against a task that is already terminal is shelved by its next terminal
+/// self-loop (the done-to-done landing a staging merge brings).
 #[test]
-fn a_terminal_rerun_does_not_shelve_again() {
+fn a_round_recorded_after_the_task_finished_is_shelved_by_its_self_loop() {
     let db = db();
-    let (_, step) = planned(&db, "Rerun");
+    let (_, step) = planned(&db, "Late");
     let t = task_under(&db, "task:t", step);
+    let open = TaskFacts {
+        status: TaskStatus::Open,
+        ..TaskFacts::default()
+    };
+    perform(&db, t, open, TaskEvent::Cancel);
     let f = findings(
         &db,
-        "repos/app/codereviews/re",
+        "repos/app/codereviews/late",
         step,
         &[(3, TaskStatus::Open)],
         Some(t),
     );
-    let facts = TaskFacts {
-        status: TaskStatus::Open,
-        ..TaskFacts::default()
-    };
-    perform(&db, t, facts, TaskEvent::Cancel);
-    assert_eq!(parent(&db, f[0]), Some(inbox(&db)));
-    let back = f[0];
-    db.write_txn("t", move |c, m| task::move_under(c, m, back, step))
-        .unwrap();
+    assert_eq!(
+        parent(&db, f[0]),
+        Some(step),
+        "filed after the task finished"
+    );
     let again = TaskFacts {
         status: TaskStatus::Cancelled,
         ..TaskFacts::default()
@@ -452,7 +454,7 @@ fn a_terminal_rerun_does_not_shelve_again() {
     perform(&db, t, again, TaskEvent::Cancel);
     assert_eq!(
         parent(&db, f[0]),
-        Some(step),
-        "moved back by hand, it stays"
+        Some(inbox(&db)),
+        "the self-loop shelves it"
     );
 }

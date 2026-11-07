@@ -447,8 +447,10 @@ pub fn is_finding_of(conn: &Connection, task: ItemId, target: ItemId) -> Result<
 /// [`is_finding_of`], that are open tasks contained directly by a plan step other than a triage step
 /// — and only of a round **every** task recorded against is terminal. A round of a staging branch is
 /// recorded against each task it credits, and its findings are still the open work of the ones not
-/// yet finished; the last of them to finish shelves them.
-/// A finding someone moved by hand (under a task, or already into an Inbox) is left where it is, and
+/// yet finished; the last of them to finish shelves them. A round recorded after all of them
+/// finished is shelved by the next terminal self-loop (the done-to-done landing a staging merge
+/// brings), which also re-shelves a finding someone moved back under the step since.
+/// A finding someone moved by hand under a task, or already into an Inbox, is left where it is, and
 /// so is one whose round namespace names no repo this knowledge base knows — a namespace mapped to a
 /// step filed it there, which is the operator's choice. Each move is [`crate::task::move_under`],
 /// changelogged, so an undo of the transaction that finished the task puts them back. Answers the
