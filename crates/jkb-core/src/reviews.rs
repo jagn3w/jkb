@@ -444,16 +444,23 @@ pub fn is_finding_of(conn: &Connection, task: ItemId, target: ItemId) -> Result<
 /// forgotten by one.
 ///
 /// Which findings: those of `task`'s *recorded* rounds, read from the round snapshot like
-/// [`is_finding_of`], that are open tasks contained directly by a plan step other than a triage step.
+/// [`is_finding_of`], that are open tasks contained directly by a plan step other than a triage step
+/// — and only of a round **every** task recorded against is terminal. A round of a staging branch is
+/// recorded against each task it credits, and its findings are still the open work of the ones not
+/// yet finished; the last of them to finish shelves them.
 /// A finding someone moved by hand (under a task, or already into an Inbox) is left where it is, and
 /// so is one whose round namespace names no repo this knowledge base knows — a namespace mapped to a
 /// step filed it there, which is the operator's choice. Each move is [`crate::task::move_under`],
 /// changelogged, so an undo of the transaction that finished the task puts them back. Answers the
 /// findings it moved.
 ///
+/// **Never fails a transition over where a finding goes**: when a repo's Open work tree is not
+/// where it should be ([`crate::design::plan::triage_step`] refuses it), or a move is refused, that
+/// finding is left where it is and the writes made trying are rolled back to a savepoint. Every way
+/// a task finishes runs through here, and a misplaced Inbox must not stop a landing.
+///
 /// # Errors
-/// A repo's Open work tree that is not where it should be ([`crate::design::plan::triage_step`]), or
-/// a database error.
+/// A database error.
 pub fn shelve_open_findings(
     conn: &Connection,
     meta: &WriteMeta,
@@ -470,7 +477,11 @@ pub fn shelve_open_findings(
               WHERE v.item_id = ?1 AND v.kind = 'recorded'
                 AND i.kind = 'task' AND p.kind = ?2 AND ",
             jkb_types::sql_not_terminal!("i.status"),
-            " ORDER BY r.id, f.item_id"
+            " AND NOT EXISTS (
+                 SELECT 1 FROM reviews o JOIN items t ON t.id = o.item_id
+                  WHERE o.ns = r.ns AND o.kind = 'recorded' AND ",
+            jkb_types::sql_not_terminal!("t.status"),
+            ") ORDER BY r.id, f.item_id"
         ))?
         .query_map(params![task.get(), crate::design::STEP_KIND], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -488,12 +499,23 @@ pub fn shelve_open_findings(
         if !crate::design::plan::knows_repo(conn, &repo)? {
             continue;
         }
-        let inbox = crate::design::plan::triage_step(conn, meta, &repo)?;
         let finding = ItemId::new(finding);
-        if let crate::task::Moved::Moved { .. } =
-            crate::task::move_under(conn, meta, finding, inbox)?
-        {
-            moved.push(finding);
+        conn.execute_batch("SAVEPOINT shelve_finding")?;
+        let shelved = crate::design::plan::triage_step(conn, meta, &repo)
+            .and_then(|inbox| crate::task::move_under(conn, meta, finding, inbox));
+        match shelved {
+            Ok(m) => {
+                conn.execute_batch("RELEASE shelve_finding")?;
+                if let crate::task::Moved::Moved { .. } = m {
+                    moved.push(finding);
+                }
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK TO shelve_finding; RELEASE shelve_finding")?;
+                if !matches!(e, Error::Types(TypeError::Validation(_))) {
+                    return Err(e);
+                }
+            }
         }
     }
     Ok(moved)

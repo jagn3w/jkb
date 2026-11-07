@@ -345,3 +345,114 @@ fn step_of_is_the_nearest_step_above_the_task() {
     assert_eq!(of(sub), Some(step), "never the immediate container");
     assert_eq!(of(loose), None);
 }
+
+/// Record the round `ns` (already filed) against `task` as well.
+fn credit(db: &Db, task: ItemId, ns: &str) {
+    let ns = ns.to_owned();
+    db.write_txn("t", move |c, m| {
+        reviews::record(
+            c,
+            m,
+            task,
+            &ns,
+            "abc123",
+            "reviewer",
+            reviews::RoundSource::Filed("reviewer"),
+        )
+    })
+    .unwrap();
+}
+
+/// A round credited to two tasks (a staging branch's) is still the open work of the one not yet
+/// finished: finishing the first leaves its findings under the step, finishing the second shelves
+/// them.
+#[test]
+fn a_round_credited_to_two_tasks_is_shelved_when_the_last_finishes() {
+    let db = db();
+    let (_, step) = planned(&db, "Batch");
+    let t1 = task_under(&db, "task:t1", step);
+    let t2 = task_under(&db, "task:t2", step);
+    let ns = "repos/app/codereviews/batch";
+    let f = findings(&db, ns, step, &[(1, TaskStatus::Open)], Some(t1));
+    credit(&db, t2, ns);
+    let facts = TaskFacts {
+        status: TaskStatus::Open,
+        ..TaskFacts::default()
+    };
+    perform(&db, t2, facts.clone(), TaskEvent::Cancel);
+    assert_eq!(parent(&db, f[0]), Some(step), "t1 is still being worked");
+    set_status(&db, t1, TaskStatus::Done);
+    assert_eq!(parent(&db, f[0]), Some(inbox(&db)), "the last one finished");
+}
+
+/// A misplaced Open work tree never blocks a task from finishing: the finding stays where it is,
+/// and nothing the attempt wrote survives.
+#[test]
+fn a_misplaced_inbox_leaves_the_finding_and_the_task_still_finishes() {
+    let db = db();
+    let (_, step) = planned(&db, "Misplaced");
+    let (other_plan, _) = planned(&db, "Other");
+    // Build the tree, then move its Inbox step out from under its plan.
+    db.write_txn("t", move |c, m| {
+        let inbox = plan::triage_step(c, m, "app")?;
+        let elsewhere = item::id_for_uid(c, &other_plan)?.unwrap();
+        containment::contain(c, m, inbox, elsewhere, 9)
+    })
+    .unwrap();
+    assert!(db
+        .write_txn("t", |c, m| plan::triage_step(c, m, "app"))
+        .is_err());
+    let t = task_under(&db, "task:t", step);
+    let f = findings(
+        &db,
+        "repos/app/codereviews/m",
+        step,
+        &[(3, TaskStatus::Open)],
+        Some(t),
+    );
+    let rows = |db: &Db| {
+        db.read(|c| Ok(c.query_row("SELECT count(*) FROM changelog", [], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    };
+    let before = rows(&db);
+    set_status(&db, t, TaskStatus::Done);
+    assert_eq!(status(&db, t).as_deref(), Some("done"));
+    assert_eq!(parent(&db, f[0]), Some(step), "left in place");
+    // The status write (and its claim release, if any) only: no stray move or tree survives.
+    let written = rows(&db) - before;
+    assert!(written <= 2, "{written} changelog rows");
+}
+
+/// A terminal self-loop (a re-run) does not re-shelve a finding someone moved back since.
+#[test]
+fn a_terminal_rerun_does_not_shelve_again() {
+    let db = db();
+    let (_, step) = planned(&db, "Rerun");
+    let t = task_under(&db, "task:t", step);
+    let f = findings(
+        &db,
+        "repos/app/codereviews/re",
+        step,
+        &[(3, TaskStatus::Open)],
+        Some(t),
+    );
+    let facts = TaskFacts {
+        status: TaskStatus::Open,
+        ..TaskFacts::default()
+    };
+    perform(&db, t, facts, TaskEvent::Cancel);
+    assert_eq!(parent(&db, f[0]), Some(inbox(&db)));
+    let back = f[0];
+    db.write_txn("t", move |c, m| task::move_under(c, m, back, step))
+        .unwrap();
+    let again = TaskFacts {
+        status: TaskStatus::Cancelled,
+        ..TaskFacts::default()
+    };
+    perform(&db, t, again, TaskEvent::Cancel);
+    assert_eq!(
+        parent(&db, f[0]),
+        Some(step),
+        "moved back by hand, it stays"
+    );
+}
