@@ -1,4 +1,4 @@
-//! Every new task is filed under a plan step: the guard in the callee ([`plan::accepts_new_tasks`]), the
+//! Every new task is filed under a plan step: the guard in the callee ([`plan::homes_tasks`]), the
 //! default step ([`plan::step_for_home`]) and each repo's Open work › Inbox ([`plan::triage_step`]).
 
 use proptest::prelude::*;
@@ -42,15 +42,9 @@ fn id(db: &Db, uid: &str) -> ItemId {
         .unwrap()
 }
 
-/// The write side: may a task be put under `parent`.
-fn accepts(db: &Db, parent: ItemId) -> bool {
-    db.read(move |c| plan::accepts_new_tasks(c, parent))
-        .unwrap()
-}
-
-/// The read side: is a task already under `parent` in a plan.
-fn keeps(db: &Db, parent: ItemId) -> bool {
-    db.read(move |c| plan::keeps_planned(c, parent)).unwrap()
+/// May a task be put under `parent`.
+fn homes(db: &Db, parent: ItemId) -> bool {
+    db.read(move |c| plan::homes_tasks(c, parent)).unwrap()
 }
 
 /// A task left with no container, as a build before the guard could leave one.
@@ -145,12 +139,10 @@ fn only_a_step_or_a_task_under_one_holds_tasks() {
     contain_raw(&db, under_plan, plan_id);
 
     for yes in [step, t1, t2, via_note] {
-        assert!(accepts(&db, yes), "{yes}");
-        assert!(keeps(&db, yes), "{yes}");
+        assert!(homes(&db, yes), "{yes}");
     }
     for no in [plan_id, span, id(&db, &d), lone, under_plan, note] {
-        assert!(!accepts(&db, no), "{no}");
-        assert!(!keeps(&db, no), "{no}");
+        assert!(!homes(&db, no), "{no}");
     }
 }
 
@@ -350,7 +342,7 @@ fn every_container_writer_refuses_an_unplanned_parent() {
     // The loose task is planned by a move, after which it holds tasks.
     db.write_txn("t", move |c, m| task::move_under(c, m, lone, step))
         .unwrap();
-    assert!(accepts(&db, lone));
+    assert!(homes(&db, lone));
     assert!(unplanned(&db).is_empty());
 }
 
@@ -567,45 +559,11 @@ fn a_home_naming_an_unknown_repo_is_refused_and_builds_nothing() {
     assert_eq!(parent_uid(&db, ok).as_deref(), Some("step:inbox@jbk"));
 }
 
-/// Explicitly under a step of a retired design — or a task under one — is refused like an
-/// unplanned parent, naming the design: the task would be counted planned and shown nowhere.
+/// A namespace that maps its new tasks to a step of a design is the one way new work would land
+/// in that design unasked, so retiring it is refused while one does, naming the namespace and how
+/// to clear it; once cleared, the retire goes through.
 #[test]
-fn a_step_of_a_retired_design_holds_no_new_task() {
-    let db = db();
-    let (d, _, step) = planned(&db);
-    let under = create_under(&db, "task:under", step).unwrap();
-    db.write_txn("t", move |c, m| {
-        task::set_status(c, m, under, TaskStatus::Done)
-    })
-    .unwrap();
-    let design = d.clone();
-    db.write_txn("t", move |c, m| super::retire(c, m, &design).map(|_| ()))
-        .unwrap();
-    for parent in [step, under] {
-        let e = create_under(&db, "task:late", parent)
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains(&format!("design {d}, which is retired")), "{e}");
-        assert!(!accepts(&db, parent));
-        // Refused as a container to write, yet what is already there is still in a plan.
-        assert!(keeps(&db, parent));
-    }
-    let moved = create_under(&db, "task:elsewhere", {
-        let (_, _, live) = planned(&db);
-        live
-    })
-    .unwrap();
-    let e = db
-        .write_txn("t", move |c, m| task::move_under(c, m, moved, step))
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("which is retired"), "{e}");
-}
-
-/// A namespace mapped to a step of a design since retired is a stale mapping: refused by name, not
-/// honoured, or the task would be planned under a design no listing shows.
-#[test]
-fn a_mapping_into_a_retired_design_is_refused() {
+fn retire_is_refused_while_a_namespace_maps_into_the_tree() {
     let db = db();
     let (d, _, step) = planned(&db);
     let step_uid = db
@@ -616,13 +574,77 @@ fn a_mapping_into_a_retired_design_is_refused() {
         plan::map_namespace(c, m, "repos/app/notes", Some(&step_uid))
     })
     .unwrap();
-    db.write_txn("t", move |c, m| super::retire(c, m, &d).map(|_| ()))
-        .unwrap();
-    let e = default_create(&db, "task:late", "repos/app/notes/x", None)
+    let design = d.clone();
+    let e = db
+        .write_txn("t", move |c, m| super::retire(c, m, &design).map(|_| ()))
         .unwrap_err()
         .to_string();
-    assert!(e.contains("which is retired"), "{e}");
+    assert!(e.contains("repos/app/notes"), "{e}");
     assert!(e.contains("jkb ns step repos/app/notes --clear"), "{e}");
+    let design = d.clone();
+    assert!(!db.read(move |c| super::is_retired(c, &design)).unwrap());
+    db.write_txn("t", |c, m| {
+        plan::map_namespace(c, m, "repos/app/notes", None).map(|_| ())
+    })
+    .unwrap();
+    let design = d.clone();
+    db.write_txn("t", move |c, m| super::retire(c, m, &design).map(|_| ()))
+        .unwrap();
+    assert!(db.read(move |c| super::is_retired(c, &d)).unwrap());
+}
+
+/// A step of a nested design counts as the tree's: retiring the parent is refused while a
+/// namespace maps to it.
+#[test]
+fn retire_is_refused_while_a_namespace_maps_into_a_nested_design() {
+    let db = db();
+    let (parent, _, _) = planned(&db);
+    let p = parent.clone();
+    db.write_txn("t", move |c, m| {
+        let child = super::create(c, m, "app", "Child", "Part of it.")?.uid;
+        super::tree::nest(c, m, &child, &p)?;
+        let plan = plan::create(c, m, &child, "Its plan", &["two".to_owned()])?;
+        ns::ensure(c, m, "repos/app/nested")?;
+        plan::map_namespace(c, m, "repos/app/nested", Some(&plan.steps[0].uid)).map(|_| ())
+    })
+    .unwrap();
+    let e = db
+        .write_txn("t", move |c, m| super::retire(c, m, &parent).map(|_| ()))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("jkb ns step repos/app/nested --clear"), "{e}");
+}
+
+/// No mapping into a retired design is ever written: `map_namespace` refuses a retired design's
+/// step, naming the design and how to restore it.
+#[test]
+fn mapping_into_a_retired_designs_step_is_refused() {
+    let db = db();
+    let (d, _, step) = planned(&db);
+    let step_uid = db
+        .read(move |c| Ok(item::get(c, step)?.unwrap().uid))
+        .unwrap();
+    let design = d.clone();
+    db.write_txn("t", move |c, m| {
+        ns::ensure(c, m, "repos/app/notes")?;
+        super::retire(c, m, &design).map(|_| ())
+    })
+    .unwrap();
+    let e = db
+        .write_txn("t", move |c, m| {
+            plan::map_namespace(c, m, "repos/app/notes", Some(&step_uid))
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains(&format!("design {d}, which is retired")), "{e}");
+    assert!(e.contains(&format!("jkb design restore {d}")), "{e}");
+    let mapped = db
+        .read(|c| {
+            let id = ns::get(c, "repos/app/notes")?.unwrap();
+            Ok(ns::get_metadata(c, id)?.and_then(|m| m.get(plan::PLAN_STEP_KEY).cloned()))
+        })
+        .unwrap();
+    assert_eq!(mapped, None);
 }
 
 /// Mapping never creates the namespace: a mistyped path is refused, not made and mapped.
@@ -671,77 +693,60 @@ fn a_loose_task_from_before_still_reads_and_changes_status() {
 /// The kinds a random forest is built from.
 const KINDS: [&str; 5] = ["plan_step", "exec_plan", "design", "task", "note"];
 
-/// What the upward oracle finds item `i` to be as a container, mirroring [`plan::Standing`]:
-/// `None` for unplanned (not a step, nor a task with a step among its proper ancestors), else
-/// `Some(retired)` — whether the nearest step's plan's parent is a retired design.
-fn oracle(kinds: &[usize], parents: &[Option<usize>], retired: &[bool], i: usize) -> Option<bool> {
-    let step = match KINDS[kinds[i]] {
-        "plan_step" => Some(i),
+/// The upward oracle: `kind` is a step, or a task with a step among its proper ancestors.
+fn oracle(kinds: &[usize], parents: &[Option<usize>], i: usize) -> bool {
+    match KINDS[kinds[i]] {
+        "plan_step" => true,
         "task" => {
             let mut at = parents[i];
-            loop {
-                match at {
-                    Some(p) if KINDS[kinds[p]] == "plan_step" => break Some(p),
-                    Some(p) => at = parents[p],
-                    None => break None,
+            while let Some(p) = at {
+                if KINDS[kinds[p]] == "plan_step" {
+                    return true;
                 }
+                at = parents[p];
             }
+            false
         }
-        _ => None,
-    }?;
-    let design = parents[step].and_then(|plan| parents[plan]);
-    Some(design.is_some_and(|d| KINDS[kinds[d]] == "design" && retired[d]))
+        _ => false,
+    }
 }
 
-/// Items opening every forest: a design › plan › step chain (`KINDS` indices), so about half the
-/// cases hold a step of a retired design — a random forest alone holds one in too few cases to be
-/// relied on — and every later item may hang anywhere below it.
-const CHAIN: [usize; 3] = [2, 1, 0];
-
-fn forest() -> impl Strategy<Value = (Vec<usize>, Vec<Option<usize>>, Vec<bool>)> {
+fn forest() -> impl Strategy<Value = (Vec<usize>, Vec<Option<usize>>)> {
     (2usize..10).prop_flat_map(|n| {
-        let total = CHAIN.len() + n;
-        let kinds = proptest::collection::vec(0..KINDS.len(), n).prop_map(|rest| {
-            let mut kinds = CHAIN.to_vec();
-            kinds.extend(rest);
-            kinds
-        });
-        let parents = (0..total)
-            .map(|i| match i {
-                0 => Just(None).boxed(),
-                1 | 2 => Just(Some(i - 1)).boxed(),
-                _ => proptest::option::of(0..i).boxed(),
+        let kinds = proptest::collection::vec(0..KINDS.len(), n);
+        let parents = (0..n)
+            .map(|i| {
+                if i == 0 {
+                    Just(None).boxed()
+                } else {
+                    proptest::option::of(0..i).boxed()
+                }
             })
             .collect::<Vec<_>>();
-        // Whether each item, when it is a design, is retired.
-        let retired = proptest::collection::vec(any::<bool>(), total);
-        (kinds, parents, retired)
+        (kinds, parents)
     })
 }
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
-    /// Test 9: over random containment forests built from raw rows, some of whose designs are
-    /// retired, a new task under P is accepted exactly when `accepts_new_tasks(P)` — P is under a
-    /// step of no retired design — and P counts as planned (`keeps_planned`) exactly when a step is
-    /// at or above it, retired or not, which agrees with the downward every-step walk
+    /// Test 9: over random containment forests built from raw rows, a new task under P is accepted
+    /// exactly when `homes_tasks(P)` — which walks up, and agrees with the downward every-step walk
     /// `UNPLANNED_SQL` runs, with an independent walk in Rust, and with the unplanned read of each
-    /// task the forest holds; every task it accepts is one the unplanned read counts as planned.
+    /// task the forest holds — and every task it accepts is one the unplanned read counts as
+    /// planned.
     #[test]
-    fn the_guard_agrees_with_the_unplanned_read((kinds, parents, retired) in forest()) {
+    fn the_guard_agrees_with_the_unplanned_read((kinds, parents) in forest()) {
         let db = db();
         let ids: Vec<ItemId> = {
-            let (kinds, parents, retired) = (kinds.clone(), parents.clone(), retired.clone());
+            let (kinds, parents) = (kinds.clone(), parents.clone());
             db.write_txn("t", move |c, m| {
                 let mut ids = Vec::new();
                 for (i, &k) in kinds.iter().enumerate() {
                     let status = (KINDS[k] == "task").then_some("open");
-                    let resolution = (KINDS[k] == "design" && retired[i]).then_some("abandoned");
                     let id: i64 = c.query_row(
-                        "INSERT INTO items (uid, kind, status, resolution) VALUES (?1, ?2, ?3, ?4) \
-                         RETURNING id",
-                        params![format!("x:{i}"), KINDS[k], status, resolution],
+                        "INSERT INTO items (uid, kind, status) VALUES (?1, ?2, ?3) RETURNING id",
+                        params![format!("x:{i}"), KINDS[k], status],
                         |r| r.get(0),
                     )?;
                     ids.push(ItemId::new(id));
@@ -757,25 +762,23 @@ proptest! {
         };
         let before = unplanned(&db);
         for (i, &p) in ids.iter().enumerate() {
-            let standing = oracle(&kinds, &parents, &retired, i);
-            let (planned, open) = (standing.is_some(), standing == Some(false));
+            let expected = oracle(&kinds, &parents, i);
             let kind = KINDS[kinds[i]];
-            prop_assert_eq!(accepts(&db, p), open, "accepts, item {} ({})", i, kind);
-            prop_assert_eq!(keeps(&db, p), planned, "keeps, item {} ({})", i, kind);
+            prop_assert_eq!(homes(&db, p), expected, "item {} ({})", i, kind);
             let downward: bool = db
                 .read(move |c| {
-                    Ok(c.query_row(plan::KEEPS_PLANNED_DOWNWARD_SQL, [p.get()], |r| r.get(0))?)
+                    Ok(c.query_row(plan::HOMES_TASKS_DOWNWARD_SQL, [p.get()], |r| r.get(0))?)
                 })
                 .unwrap();
-            prop_assert_eq!(downward, planned, "the downward walk, item {}", i);
+            prop_assert_eq!(downward, expected, "the downward walk, item {}", i);
             if kind == "task" {
                 let listed = before.contains(&format!("x:{i}"));
-                prop_assert_eq!(listed, !planned, "the unplanned read, item {}", i);
+                prop_assert_eq!(listed, !expected, "the unplanned read, item {}", i);
             }
             let uid = format!("task:new-{i}");
             let made = create_under(&db, &uid, p);
-            prop_assert_eq!(made.is_ok(), open, "item {}: {:?}", i, made.err());
-            if open {
+            prop_assert_eq!(made.is_ok(), expected, "item {}: {:?}", i, made.err());
+            if expected {
                 prop_assert!(!unplanned(&db).contains(&uid));
             }
         }

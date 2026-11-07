@@ -4724,6 +4724,52 @@ fn a_line_under_a_retired_designs_step_stays_through_an_import() {
     assert_eq!(container_uid(&db, &shipped).as_deref(), Some(step.as_str()));
 }
 
+/// A nested line under a parent moved by hand to a step of a design that is then retired: every
+/// later import re-asserts the child under its file parent, and that must not be refused, so
+/// editing another line imports on each pass and leaves parent and child where they were.
+#[test]
+fn a_nested_line_under_a_retired_designs_step_imports_every_pass() {
+    let (_dir, db, file) =
+        app_repo("## Work\n- [x] Parent ^par\n  - [x] Child ^kid\n- [ ] Other ^other\n");
+    sync(&db, "repos/app").unwrap();
+    let uri = uri_for(&file);
+    let (par, kid, other) = (
+        format!("{uri}#par"),
+        format!("{uri}#kid"),
+        format!("{uri}#other"),
+    );
+    let step = app_step(&db, "Retiring");
+    let par_id = item_of(&db, &par);
+    let s = step.clone();
+    db.write_txn("t", move |c, m| {
+        let to = item::id_for_uid(c, &s)?.unwrap();
+        task::move_under(c, m, par_id, to)?;
+        let plan = jkb_core::containment::parent(c, to)?.unwrap();
+        let design = jkb_core::containment::parent(c, plan)?.unwrap();
+        let uid = item::get(c, design)?.unwrap().uid;
+        jkb_core::design::retire(c, m, &uid).map(|_| ())
+    })
+    .unwrap();
+
+    for edit in ["Other, edited", "Other, edited again"] {
+        fs::write(
+            &file,
+            format!("## Work\n- [x] Parent ^par\n  - [x] Child ^kid\n- [ ] {edit} ^other\n"),
+        )
+        .unwrap();
+        let report = sync(&db, "repos/app").unwrap();
+        assert_eq!(
+            report.count(Outcome::Imported),
+            1,
+            "{edit}: {:?}",
+            report.results
+        );
+        assert_eq!(content_for(&db, &other).as_deref(), Some(edit));
+        assert_eq!(container_uid(&db, &par).as_deref(), Some(step.as_str()));
+        assert_eq!(container_of(&db, &kid), Some(item_of(&db, &par)));
+    }
+}
+
 /// Test 20: a section mapped to a step (`jkb ns step`) files its new lines there; a line still in
 /// the Inbox follows on the next import; a line moved by hand to another step stays.
 #[test]

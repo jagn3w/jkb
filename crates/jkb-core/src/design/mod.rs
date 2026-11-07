@@ -646,6 +646,29 @@ fn open_tasks_under(conn: &Connection, design: ItemId) -> Result<Vec<String>> {
     Ok(uids)
 }
 
+/// The namespaces whose metadata maps their new tasks ([`plan::PLAN_STEP_KEY`]) to a plan step
+/// anywhere under `design` — its own plans' or a nested design's — by path.
+fn namespaces_mapped_into(conn: &Connection, design: ItemId) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "WITH RECURSIVE under(id) AS (
+             SELECT child_item_id FROM containment WHERE parent_item_id = ?1
+             UNION
+             SELECT c.child_item_id FROM containment c JOIN under u ON c.parent_item_id = u.id
+         )
+         SELECT n.path FROM namespaces n
+          WHERE json_valid(n.metadata)
+            AND json_extract(n.metadata, '$.' || ?2) IN (
+                SELECT i.uid FROM under u JOIN items i ON i.id = u.id WHERE i.kind = '",
+        step_kind!(),
+        "')
+          ORDER BY n.path",
+    ))?;
+    let paths = stmt
+        .query_map(params![design.get(), plan::PLAN_STEP_KEY], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(paths)
+}
+
 /// Whether `uid` is a repo's Open work design ([`plan::triage_design_uid`]).
 fn is_triage_design_uid(uid: &str) -> bool {
     uid.strip_prefix("design:open-work@")
@@ -659,11 +682,13 @@ fn is_triage_design_uid(uid: &str) -> bool {
 /// design cat` still reads it. A design is retired, never deleted ([`item::remove`] refuses one).
 ///
 /// Refused while any task under the tree is not `done` or `cancelled`: hiding a design would hide
-/// the work still going on under it. The refusal names those tasks.
+/// the work still going on under it. The refusal names those tasks. Refused too while a namespace
+/// maps its new tasks to a step of the tree ([`plan::map_namespace`]): the next capture there would
+/// be filed in a plan no listing shows. The refusal names each namespace and how to clear it.
 ///
 /// # Errors
 /// An unknown design, one already retired, a tree holding a repo's Open work design, an open task
-/// under the tree, or a database error.
+/// under the tree, a namespace mapped to a step of the tree, or a database error.
 pub fn retire(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<DesignRow>> {
     let id = design_id(conn, uid)?;
     if retired_item(conn, id)? {
@@ -695,6 +720,20 @@ pub fn retire(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<Desi
             "design {uid} has {} task(s) under it that are not done or cancelled: {named}{more} — \
              finish or cancel them first",
             open.len()
+        )));
+    }
+    let mapped = namespaces_mapped_into(conn, id)?;
+    if !mapped.is_empty() {
+        let clear = mapped
+            .iter()
+            .map(|path| format!("`jkb ns step {path} --clear`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(invalid(format!(
+            "design {uid} has a step that namespace(s) {} map their new tasks to: retired, the next \
+             capture there would be filed in a plan no listing shows — clear or remap each first \
+             ({clear})",
+            mapped.join(", ")
         )));
     }
     let mut out = Vec::with_capacity(tree.len());

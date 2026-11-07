@@ -493,7 +493,8 @@ enum DesignCmd {
     },
     /// Retire a design and every design nested under it (operator): it leaves `ls`, the Design
     /// tab and `export --all`, and keeps its text, spans, plans and threads. Refused while a task
-    /// under it is not done or cancelled. `jkb design restore` or `jkb undo` takes it back.
+    /// under it is not done or cancelled, or while a namespace maps its new tasks to one of its
+    /// steps (`jkb ns step <path> --clear`). `jkb design restore` or `jkb undo` takes it back.
     Retire {
         /// The design.
         uid: String,

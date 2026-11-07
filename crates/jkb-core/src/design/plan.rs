@@ -4,7 +4,7 @@
 //! (`kind = 'plan_step'`) contained by the plan, in order — coarse, natural-language stages such as
 //! *scaffold → database → frontend → deploy*. A span is staged into a step by a `stages` edge
 //! ([`super::stage`]), and the work is ordinary tasks contained under a step (`jkb task add …
-//! --under <step>`). **Every new task is under a step** ([`accepts_new_tasks`], checked in
+//! --under <step>`). **Every new task is under a step** ([`homes_tasks`], checked in
 //! `task::create`); one with no plan of its own is captured in its repo's Open work › Inbox step
 //! ([`triage_step`]). A task under the design directly (a one-off) is only ever one an older build
 //! wrote, and is still listed.
@@ -329,7 +329,7 @@ macro_rules! under_steps {
 }
 
 /// The roots of the every-step walk: each item a plan step contains directly. One text, so
-/// [`UNPLANNED_SQL`] and the downward form of [`keeps_planned`] the proptest checks it against expand
+/// [`UNPLANNED_SQL`] and the downward form of [`homes_tasks`] the proptest checks it against expand
 /// the same walk.
 macro_rules! every_step_roots {
     () => {
@@ -357,48 +357,16 @@ pub(crate) const UNPLANNED_SQL: &str = concat!(
     " SELECT id FROM under))"
 );
 
-/// What [`parent_standing`] found `parent` to be, as a task's container.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Standing {
-    /// A plan step of a live design, or a task under one: it may hold a task.
-    Planned,
-    /// Under no plan step: a task under it would be in no plan.
-    Unplanned,
-    /// Under a step of this design, which is retired: a task under it would be counted planned
-    /// while no listing shows it.
-    Retired(String),
-}
-
-/// **The write side:** whether a task may be *put* under `parent` — created, added as a subtask,
-/// re-contained or moved there ([`parent_standing`] is [`Standing::Planned`]). A step of a retired
-/// design answers `false`. Ask this before writing a container; to ask whether a task already
-/// under `parent` is in a plan, ask [`keeps_planned`], which a retired design's step answers `true`.
-///
-/// # Errors
-/// A database error.
-pub fn accepts_new_tasks(conn: &Connection, parent: ItemId) -> Result<bool> {
-    Ok(parent_standing(conn, parent)? == Standing::Planned)
-}
-
-/// **The read side:** whether a task *already* under `parent` is in a plan — any plan, a retired
-/// design's included ([`parent_standing`] is not [`Standing::Unplanned`]), as [`UNPLANNED_SQL`]
-/// counts it. A step of a retired design answers `true`: its tasks are its design's, and restoring
-/// the design brings them back with it, so nothing may treat them as loose and re-file them. Never
-/// the gate for a write; that is [`accepts_new_tasks`].
-///
-/// # Errors
-/// A database error.
-pub fn keeps_planned(conn: &Connection, parent: ItemId) -> Result<bool> {
-    Ok(parent_standing(conn, parent)? != Standing::Unplanned)
-}
-
-/// What `parent` is as a task's container: a plan step, or a task with a plan step among its
-/// containers at any depth (through items of any kind), is planned — unless the nearest such step's
-/// plan belongs to a retired design. **The one rule** behind `task::create`, `add_subtask`,
-/// `set_container`, `move_under` and a namespace's `plan_step` mapping ([`mapped_step`]), which refuse
-/// all but [`Standing::Planned`] ([`accepts_new_tasks`]), and behind every read of whether a task
-/// already placed is in a plan, which counts [`Standing::Retired`] as planned ([`keeps_planned`]). A
-/// child of a parent it accepts is one [`UNPLANNED_SQL`] counts as planned.
+/// Whether `parent` may hold a task: a plan step, or a task with a plan step among its containers
+/// at any depth (through items of any kind). **The one rule** behind `task::create`, `add_subtask`,
+/// `set_container` and `move_under`, and behind the tasks.md import's question of whether a task
+/// already placed is in a plan. A child of a parent it accepts is one [`UNPLANNED_SQL`] counts as
+/// planned. Whether the step's design is retired plays no part: retirement is a fact that changes
+/// after a task is placed, so a write-time gate on it would refuse every later re-assertion of a
+/// placement it once allowed. What could file *new* work into a retired design unasked — a
+/// namespace mapped to one of its steps — is closed where it arises instead: `design::retire`
+/// refuses while a namespace maps into the tree, and [`map_namespace`] refuses a retired design's
+/// step.
 ///
 /// It walks **up** from `parent` — one indexed lookup per level, since `child_item_id` is
 /// containment's primary key — rather than down from every step as [`UNPLANNED_SQL`] does: the two
@@ -406,12 +374,12 @@ pub fn keeps_planned(conn: &Connection, parent: ItemId) -> Result<bool> {
 /// synthetic store the size of the real one (233 steps, 3,560 tasks all planned, release build), the
 /// downward walk cost 6.3 ms a call, over the 5 ms a write on the one writer thread may spend on it;
 /// this one cost 0.08 ms for a task three levels deep, being bounded by the parent's depth. The
-/// proptest in `triage_tests` holds the two to the same answer ([`KEEPS_PLANNED_DOWNWARD_SQL`]) and to
+/// proptest in `triage_tests` holds the two to the same answer ([`HOMES_TASKS_DOWNWARD_SQL`]) and to
 /// the unplanned read.
 ///
 /// # Errors
 /// A database error.
-pub fn parent_standing(conn: &Connection, parent: ItemId) -> Result<Standing> {
+pub fn homes_tasks(conn: &Connection, parent: ItemId) -> Result<bool> {
     // The nearest step: `parent` itself, or for a task the closest step above it. The depth bound
     // only stops a corrupted (cyclic) table from recursing without end.
     let step: Option<i64> = conn
@@ -431,28 +399,13 @@ pub fn parent_standing(conn: &Connection, parent: ItemId) -> Result<Standing> {
         .query_row([parent.get()], |r| r.get(0))
         .optional()?
         .flatten();
-    let Some(step) = step.map(ItemId::new) else {
-        return Ok(Standing::Unplanned);
-    };
-    // The step's plan's design, when the step sits where a step belongs.
-    let design = match containment::parent(conn, step)? {
-        Some(plan) => containment::parent(conn, plan)?,
-        None => None,
-    };
-    if let Some(design) = design {
-        if let Some(meta) = item::get(conn, design)?.filter(|m| m.kind == KIND) {
-            if super::retired_item(conn, design)? {
-                return Ok(Standing::Retired(meta.uid));
-            }
-        }
-    }
-    Ok(Standing::Planned)
+    Ok(step.is_some())
 }
 
-/// [`keeps_planned`] asked from the other end, by the every-step walk [`UNPLANNED_SQL`] runs: the
+/// [`homes_tasks`] asked from the other end, by the every-step walk [`UNPLANNED_SQL`] runs: the
 /// oracle the proptest holds the upward walk to.
 #[cfg(test)]
-pub(crate) const KEEPS_PLANNED_DOWNWARD_SQL: &str = concat!(
+pub(crate) const HOMES_TASKS_DOWNWARD_SQL: &str = concat!(
     under_steps!(every_step_roots!()),
     " SELECT EXISTS (SELECT 1 FROM items p WHERE p.id = ?1 AND (p.kind = '",
     step_kind!(),
@@ -471,16 +424,6 @@ pub(crate) fn unplanned_parent(uid: &str, kind: &str) -> crate::Error {
         "`{uid}` is a {kind} under no plan step, so a task under it would be in no plan: add it \
          under a plan step or a task under one (`--under <step>`; `jkb design plan ls <design>` \
          lists a design's plans and their steps){plan_it}"
-    ))
-}
-
-/// The refusal for a task's container written to `uid`, under a step of `design`, which is retired.
-pub(crate) fn retired_parent(uid: &str, design: &str) -> crate::Error {
-    invalid(format!(
-        "`{uid}` is under a step of design {design}, which is retired: a task filed there would be \
-         in a plan no listing shows. Add it under a step of a live design (`--under <step>`; `jkb \
-         design plan ls <design>` lists them), or restore {design} first (`jkb design restore \
-         {design}`)"
     ))
 }
 
@@ -653,8 +596,8 @@ fn known_repo(conn: &Connection, repo: &str, home: &str) -> Result<()> {
 /// it, so its `type` and a file's section keys survive. Answers the step it was mapped to before.
 ///
 /// # Errors
-/// A `step` that is no plan step, a malformed path, a namespace that does not exist, or a database
-/// error.
+/// A `step` that is no plan step or a step of a retired design, a malformed path, a namespace that
+/// does not exist, or a database error.
 pub fn map_namespace(
     conn: &Connection,
     meta: &WriteMeta,
@@ -663,7 +606,8 @@ pub fn map_namespace(
 ) -> Result<Option<String>> {
     let path = crate::ns::normalize(path)?;
     if let Some(step) = step {
-        item_of_kind(conn, step, STEP_KIND, "plan step")?;
+        let id = item_of_kind(conn, step, STEP_KIND, "plan step")?;
+        refuse_retired_step(conn, step, id)?;
     }
     // Never created here: a mistyped path would be made and mapped while the real one stayed not.
     let id = crate::ns::get(conn, &path)?.ok_or_else(|| {
@@ -689,11 +633,36 @@ pub fn map_namespace(
     Ok(before)
 }
 
+/// Refuse a mapping to step `uid` (item `step`) while its design is retired: a new task filed there
+/// would be in a plan no listing shows. `design::retire` refuses while a namespace maps into the
+/// tree, so this is the other half: no mapping into a retired design is ever written.
+fn refuse_retired_step(conn: &Connection, uid: &str, step: ItemId) -> Result<()> {
+    let design = match containment::parent(conn, step)? {
+        Some(plan) => containment::parent(conn, plan)?,
+        None => None,
+    };
+    let Some(design) = design else {
+        return Ok(());
+    };
+    let Some(d) = item::get(conn, design)?.filter(|m| m.kind == KIND) else {
+        return Ok(());
+    };
+    if super::retired_item(conn, design)? {
+        let d = d.uid;
+        return Err(invalid(format!(
+            "`{uid}` is a step of design {d}, which is retired: a task filed there would be in a \
+             plan no listing shows. Map the namespace to a step of a live design, or restore {d} \
+             first (`jkb design restore {d}`)"
+        )));
+    }
+    Ok(())
+}
+
 /// The step the nearest namespace at or above `home` is mapped to ([`PLAN_STEP_KEY`]), if any.
 ///
 /// # Errors
-/// A mapping that names no plan step, or a step of a retired design (refused, naming the namespace
-/// and how to clear it), a malformed home, or a database error.
+/// A mapping that names no plan step (refused, naming the namespace and how to clear it), a
+/// malformed home, or a database error.
 pub fn mapped_step(conn: &Connection, home: &str) -> Result<Option<ItemId>> {
     let mut cur = Some(crate::ns::normalize(home)?);
     while let Some(path) = cur {
@@ -709,12 +678,7 @@ pub fn mapped_step(conn: &Connection, home: &str) -> Result<Option<ItemId>> {
                     None => None,
                 };
                 let why = match found {
-                    Some((id, kind)) if kind == STEP_KIND => match parent_standing(conn, id)? {
-                        Standing::Retired(design) => {
-                            format!("is a step of {design}, which is retired")
-                        }
-                        Standing::Planned | Standing::Unplanned => return Ok(Some(id)),
-                    },
+                    Some((id, kind)) if kind == STEP_KIND => return Ok(Some(id)),
                     Some((_, kind)) => format!("is a {kind}, not a plan step"),
                     None => "no longer exists".to_owned(),
                 };

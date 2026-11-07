@@ -4288,30 +4288,3 @@ fn a_review_naming_an_unknown_repo_is_refused_with_its_own_remedy() {
         .unwrap();
     assert_eq!(built, (false, false));
 }
-
-/// `task.add --under` a step of a retired design is refused, naming the design: the task would be
-/// counted planned and shown nowhere.
-#[test]
-fn task_add_under_a_step_of_a_retired_design_is_refused() {
-    let db = Db::open_in_memory().unwrap();
-    let b = LocalBackend::new(db.clone());
-    let (design, step) = db
-        .write_txn("t", |c, m| {
-            let d = jkb_core::design::create(c, m, "x", "Old", "")?.uid;
-            let p = jkb_core::design::plan::create(c, m, &d, "Plan", &["one".to_owned()])?;
-            jkb_core::design::retire(c, m, &d)?;
-            Ok((d, p.steps[0].uid.clone()))
-        })
-        .unwrap();
-    let e = call(
-        &b,
-        json!({ "op": "task.add", "text": "late", "under": step }),
-    )
-    .unwrap_err();
-    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
-    assert!(
-        e.message
-            .contains(&format!("design {design}, which is retired")),
-        "{e:?}"
-    );
-}
