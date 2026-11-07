@@ -251,7 +251,7 @@ fn scope_reaches_subtasks_and_the_task_s_own_findings_and_nothing_else() {
             crate::reviews::record(
                 c,
                 m,
-                a,
+                &[a],
                 "reviews/a-1",
                 "abc",
                 "t",

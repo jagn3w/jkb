@@ -75,7 +75,7 @@ fn findings(
             reviews::record(
                 c,
                 m,
-                task,
+                &[task],
                 &ns,
                 "abc123",
                 "reviewer",
@@ -353,7 +353,7 @@ fn credit(db: &Db, task: ItemId, ns: &str) {
         reviews::record(
             c,
             m,
-            task,
+            &[task],
             &ns,
             "abc123",
             "reviewer",
@@ -423,30 +423,28 @@ fn a_misplaced_inbox_leaves_the_finding_and_the_task_still_finishes() {
     assert!(written <= 2, "{written} changelog rows");
 }
 
-/// A round recorded against a task that is already terminal is shelved by its next terminal
-/// self-loop (the done-to-done landing a staging merge brings).
+/// A terminal self-loop (a re-run) does not re-shelve a finding someone moved back since.
 #[test]
-fn a_round_recorded_after_the_task_finished_is_shelved_by_its_self_loop() {
+fn a_terminal_rerun_does_not_shelve_again() {
     let db = db();
-    let (_, step) = planned(&db, "Late");
+    let (_, step) = planned(&db, "Rerun");
     let t = task_under(&db, "task:t", step);
-    let open = TaskFacts {
-        status: TaskStatus::Open,
-        ..TaskFacts::default()
-    };
-    perform(&db, t, open, TaskEvent::Cancel);
     let f = findings(
         &db,
-        "repos/app/codereviews/late",
+        "repos/app/codereviews/re",
         step,
         &[(3, TaskStatus::Open)],
         Some(t),
     );
-    assert_eq!(
-        parent(&db, f[0]),
-        Some(step),
-        "filed after the task finished"
-    );
+    let facts = TaskFacts {
+        status: TaskStatus::Open,
+        ..TaskFacts::default()
+    };
+    perform(&db, t, facts, TaskEvent::Cancel);
+    assert_eq!(parent(&db, f[0]), Some(inbox(&db)));
+    let back = f[0];
+    db.write_txn("t", move |c, m| task::move_under(c, m, back, step))
+        .unwrap();
     let again = TaskFacts {
         status: TaskStatus::Cancelled,
         ..TaskFacts::default()
@@ -454,7 +452,62 @@ fn a_round_recorded_after_the_task_finished_is_shelved_by_its_self_loop() {
     perform(&db, t, again, TaskEvent::Cancel);
     assert_eq!(
         parent(&db, f[0]),
-        Some(inbox(&db)),
-        "the self-loop shelves it"
+        Some(step),
+        "moved back by hand, it stays"
     );
+}
+
+/// Record round `ns` (already filed) against all of `tasks`, in one call.
+fn record_all(db: &Db, tasks: Vec<ItemId>, ns: &str) {
+    let ns = ns.to_owned();
+    db.write_txn("t", move |c, m| {
+        reviews::record(
+            c,
+            m,
+            &tasks,
+            &ns,
+            "abc123",
+            "reviewer",
+            reviews::RoundSource::Filed("reviewer"),
+        )
+    })
+    .unwrap();
+}
+
+/// A round recorded against tasks that have all finished already (a staging branch reviewed after
+/// its tasks landed) is shelved when it is recorded: no transition of theirs follows to do it.
+#[test]
+fn a_round_recorded_after_its_tasks_finished_is_shelved_at_record_time() {
+    let db = db();
+    let (_, step) = planned(&db, "Late");
+    let t1 = task_under(&db, "task:t1", step);
+    let t2 = task_under(&db, "task:t2", step);
+    set_status(&db, t1, TaskStatus::Done);
+    set_status(&db, t2, TaskStatus::Cancelled);
+    let ns = "repos/app/codereviews/late";
+    let f = findings(&db, ns, step, &[(3, TaskStatus::Open)], None);
+    assert_eq!(parent(&db, f[0]), Some(step), "filed beside them");
+    record_all(&db, vec![t1, t2], ns);
+    assert_eq!(parent(&db, f[0]), Some(inbox(&db)), "shelved when recorded");
+}
+
+/// A round recorded against one finished task and one still being worked shelves nothing — judged
+/// on both, even with the finished one first — until the second finishes.
+#[test]
+fn a_late_round_with_a_task_still_open_waits_for_it() {
+    let db = db();
+    let (_, step) = planned(&db, "Waits");
+    let done = task_under(&db, "task:done", step);
+    let open = task_under(&db, "task:open", step);
+    set_status(&db, done, TaskStatus::Done);
+    let ns = "repos/app/codereviews/waits";
+    let f = findings(&db, ns, step, &[(2, TaskStatus::Open)], None);
+    record_all(&db, vec![done, open], ns);
+    assert_eq!(
+        parent(&db, f[0]),
+        Some(step),
+        "task:open is still being worked"
+    );
+    set_status(&db, open, TaskStatus::Done);
+    assert_eq!(parent(&db, f[0]), Some(inbox(&db)), "the last one finished");
 }

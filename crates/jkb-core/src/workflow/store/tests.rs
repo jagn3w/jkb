@@ -72,7 +72,7 @@ fn file_round(db: &Db, id: ItemId, n: usize, findings: &[(i64, &str)]) {
         crate::reviews::record(
             c,
             m,
-            id,
+            &[id],
             &ns,
             "abc",
             "test",
@@ -249,7 +249,7 @@ fn a_title_names_the_area_for_findings_filed_before_the_area_facet() {
         crate::reviews::record(
             c,
             m,
-            id,
+            &[id],
             "reviews/old",
             "abc",
             "test",
@@ -388,7 +388,7 @@ fn record(
 ) -> crate::Result<()> {
     let ns = ns.to_owned();
     db.write_txn("test", move |c, m| {
-        crate::reviews::record(c, m, id, &ns, "abc", "test", source)
+        crate::reviews::record(c, m, &[id], &ns, "abc", "test", source)
     })
 }
 

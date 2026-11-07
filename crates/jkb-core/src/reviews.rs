@@ -91,8 +91,15 @@ pub enum RoundSource<'a> {
     AnyNamespace,
 }
 
-/// Record that a review of `task` ran at `sha`, filing its findings under `ns`. Recording the same
-/// round twice is a no-op. The round is snapshotted the first time any task records it.
+/// Record that a review of each of `tasks` ran at `sha`, filing its findings under `ns`: every task
+/// the review credits, in one call. Recording the same round twice is a no-op. The round is
+/// snapshotted the first time any task records it.
+///
+/// **A round recorded against tasks that have all finished is shelved here**
+/// ([`shelve_round`]): a staging branch is reviewed after its tasks landed, and no transition of
+/// theirs follows to do it. Every credited task is passed at once so that a round crediting one done
+/// task and one still being worked is judged on both, not shelved after the first. Only when this
+/// call wrote a new row, so a round is shelved once.
 ///
 /// # Errors
 /// [`Error::Types`] for an empty or oversized value, a namespace `source` does not allow, or a
@@ -100,7 +107,7 @@ pub enum RoundSource<'a> {
 pub fn record(
     conn: &Connection,
     meta: &WriteMeta,
-    task: ItemId,
+    tasks: &[ItemId],
     ns: &str,
     sha: &str,
     actor: &str,
@@ -108,15 +115,25 @@ pub fn record(
 ) -> Result<()> {
     check("findings namespace", ns)?;
     check("sha", sha)?;
+    if tasks.is_empty() {
+        return Ok(());
+    }
     snapshot_round(conn, ns, actor, source)?;
-    let exists: bool = conn
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM reviews
-                            WHERE item_id = ?1 AND kind = 'recorded' AND ns = ?2 AND sha = ?3)",
-        )?
-        .query_row(params![task.get(), ns, sha], |r| r.get(0))?;
-    if !exists {
-        insert(conn, meta, task, "recorded", Some(ns), sha, actor)?;
+    let mut wrote = false;
+    for &task in tasks {
+        let exists: bool = conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM reviews
+                                WHERE item_id = ?1 AND kind = 'recorded' AND ns = ?2 AND sha = ?3)",
+            )?
+            .query_row(params![task.get(), ns, sha], |r| r.get(0))?;
+        if !exists {
+            insert(conn, meta, task, "recorded", Some(ns), sha, actor)?;
+            wrote = true;
+        }
+    }
+    if wrote {
+        shelve_round(conn, meta, ns)?;
     }
     Ok(())
 }
@@ -435,6 +452,33 @@ pub fn is_finding_of(conn: &Connection, task: ItemId, target: ItemId) -> Result<
         .query_row(params![task.get(), target.get()], |r| r.get(0))?)
 }
 
+/// The findings a shelve may move, as `(finding id, round namespace, step uid)`, of the recorded rounds
+/// `$which` selects (binding `?1`; `?2` is the step kind): open tasks contained directly by a plan
+/// step, of a round no task recorded against is still open. One text for [`shelve_open_findings`]
+/// and [`shelve_round`], so the two cannot disagree about what is shelvable.
+macro_rules! shelvable {
+    ($which:literal) => {
+        concat!(
+            "SELECT DISTINCT f.item_id, r.ns, p.uid FROM reviews v
+               JOIN review_rounds r ON r.ns = v.ns
+               JOIN review_round_findings f ON f.round_id = r.id
+               JOIN items i ON i.id = f.item_id
+               JOIN containment c ON c.child_item_id = i.id
+               JOIN items p ON p.id = c.parent_item_id
+              WHERE ",
+            $which,
+            " AND v.kind = 'recorded'
+                AND i.kind = 'task' AND p.kind = ?2 AND ",
+            jkb_types::sql_not_terminal!("i.status"),
+            " AND NOT EXISTS (
+                 SELECT 1 FROM reviews o JOIN items t ON t.id = o.item_id
+                  WHERE o.ns = r.ns AND o.kind = 'recorded' AND ",
+            jkb_types::sql_not_terminal!("t.status"),
+            ") ORDER BY r.ns, f.item_id"
+        )
+    };
+}
+
 /// Move the still-open findings of `task`'s recorded rounds that sit directly under a plan step to
 /// their repo's Open work › Inbox: what a task reaching a terminal status does
 /// ([`crate::transition::perform`] calls this), so a nit left open on purpose — or a finding about
@@ -448,8 +492,8 @@ pub fn is_finding_of(conn: &Connection, task: ItemId, target: ItemId) -> Result<
 /// — and only of a round **every** task recorded against is terminal. A round of a staging branch is
 /// recorded against each task it credits, and its findings are still the open work of the ones not
 /// yet finished; the last of them to finish shelves them. A round recorded after all of them
-/// finished is shelved by the next terminal self-loop (the done-to-done landing a staging merge
-/// brings), which also re-shelves a finding someone moved back under the step since.
+/// finished is shelved when it is recorded ([`record`], [`shelve_round`]): no transition of theirs
+/// follows. Each round is shelved once, so a finding someone moved back under the step stays.
 /// A finding someone moved by hand under a task, or already into an Inbox, is left where it is, and
 /// so is one whose round namespace names no repo this knowledge base knows — a namespace mapped to a
 /// step filed it there, which is the operator's choice. Each move is [`crate::task::move_under`],
@@ -468,27 +512,38 @@ pub fn shelve_open_findings(
     meta: &WriteMeta,
     task: ItemId,
 ) -> Result<Vec<ItemId>> {
-    let open: Vec<(i64, String, String)> = conn
-        .prepare_cached(concat!(
-            "SELECT f.item_id, r.ns, p.uid FROM reviews v
-               JOIN review_rounds r ON r.ns = v.ns
-               JOIN review_round_findings f ON f.round_id = r.id
-               JOIN items i ON i.id = f.item_id
-               JOIN containment c ON c.child_item_id = i.id
-               JOIN items p ON p.id = c.parent_item_id
-              WHERE v.item_id = ?1 AND v.kind = 'recorded'
-                AND i.kind = 'task' AND p.kind = ?2 AND ",
-            jkb_types::sql_not_terminal!("i.status"),
-            " AND NOT EXISTS (
-                 SELECT 1 FROM reviews o JOIN items t ON t.id = o.item_id
-                  WHERE o.ns = r.ns AND o.kind = 'recorded' AND ",
-            jkb_types::sql_not_terminal!("t.status"),
-            ") ORDER BY r.id, f.item_id"
-        ))?
+    let open = conn
+        .prepare_cached(shelvable!("v.item_id = ?1"))?
         .query_map(params![task.get(), crate::design::STEP_KIND], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    shelve(conn, meta, open)
+}
+
+/// [`shelve_open_findings`] for the one round `ns`, when every task it is recorded against is
+/// terminal: what [`record`] does with a round recorded after its tasks finished. The same
+/// selection, triage and soft failure. Answers the findings it moved.
+///
+/// # Errors
+/// A database error.
+pub fn shelve_round(conn: &Connection, meta: &WriteMeta, ns: &str) -> Result<Vec<ItemId>> {
+    let open = conn
+        .prepare_cached(shelvable!("r.ns = ?1"))?
+        .query_map(params![ns, crate::design::STEP_KIND], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    shelve(conn, meta, open)
+}
+
+/// Move each `(finding, round namespace, step uid)` of `open` to its round's repo's Open work ›
+/// Inbox: the triage and soft failure [`shelve_open_findings`] describes.
+fn shelve(
+    conn: &Connection,
+    meta: &WriteMeta,
+    open: Vec<(i64, String, String)>,
+) -> Result<Vec<ItemId>> {
     let mut moved = Vec::new();
     let mut seen = BTreeSet::new();
     for (finding, ns, step) in open {
@@ -601,7 +656,7 @@ mod tests {
             record(
                 c,
                 m,
-                id,
+                &[id],
                 "reviews/2",
                 "bbb",
                 "reviewer@a1",
@@ -610,7 +665,7 @@ mod tests {
             record(
                 c,
                 m,
-                id,
+                &[id],
                 "reviews/1",
                 "aaa",
                 "reviewer@a1",
@@ -619,7 +674,7 @@ mod tests {
             record(
                 c,
                 m,
-                id,
+                &[id],
                 "reviews/1",
                 "aaa",
                 "reviewer@a1",
@@ -647,7 +702,7 @@ mod tests {
             .write_txn("t", move |c, m| record(
                 c,
                 m,
-                id,
+                &[id],
                 "",
                 "x",
                 "a",

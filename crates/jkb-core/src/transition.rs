@@ -104,10 +104,11 @@ pub fn perform(
             crate::workflow::store::follow_landing(conn, meta, task)?;
         }
         // A finished task's still-open review findings leave its plan step for the repo's Inbox:
-        // here, because every way a task finishes comes through this function. A terminal
-        // self-loop shelves too: a round recorded against tasks already done is shelved by the
-        // done-to-done landing that follows, and by no other transition (review round 2).
-        if to.is_terminal() {
+        // here, because every way a task finishes comes through this function. Only on arriving
+        // at a terminal status, so a re-run (a terminal self-loop) never re-shelves a finding
+        // someone moved back since; a round recorded after its tasks finished is shelved when it
+        // is recorded (`reviews::record`), since no transition of theirs follows.
+        if to.is_terminal() && !from.is_terminal() {
             crate::reviews::shelve_open_findings(conn, meta, task)?;
         }
     }
