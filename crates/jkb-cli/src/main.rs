@@ -1457,6 +1457,17 @@ enum TaskCmd {
         /// The branch it was grafted onto.
         #[arg(long)]
         onto: String,
+        /// Record nothing: exit non-zero unless every open task on the branch could be recorded as
+        /// landed — a reviewer approved the branch's head (a clean recorded round of exactly that
+        /// commit, or the operator's waiver of it) and this caller may land it. The merge queue
+        /// asks this before it grafts, so an unapproved head never reaches the base.
+        #[arg(long)]
+        check: bool,
+        /// The commit of `branch` that was grafted (or, with `--check`, would be), instead of the
+        /// branch's tip read now — so a commit made after the queue read the branch is not
+        /// recorded as the head that landed. A full commit id.
+        #[arg(long)]
+        head: Option<String>,
     },
     /// Release a task's claim held by an owner (defaults to this process).
     Release {
@@ -2788,6 +2799,8 @@ pub(crate) fn cmd_task_landed(
     kb: &session_cli::Kb<'_>,
     branch: &str,
     onto: &str,
+    check: bool,
+    pinned: Option<&str>,
     json: bool,
 ) -> Result<()> {
     gitrepo::valid_ref(branch)?;
@@ -2795,9 +2808,18 @@ pub(crate) fn cmd_task_landed(
     let ctx = repo::repo_ctx()?;
     // The branch's own tip, read **before** anything else could move it: what a person reading
     // the history needs to recognize which work this was.
-    let head = gitrepo::branch_ref(&ctx.root, branch, gitrepo::Prefer::Local)?
-        .and_then(|r| gitrepo::rev_commit(&ctx.root, &r).transpose())
-        .transpose()?;
+    let head = match pinned {
+        Some(sha) => {
+            anyhow::ensure!(
+                sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
+                "--head takes a full commit id, not `{sha}`"
+            );
+            Some(sha.to_owned())
+        }
+        None => gitrepo::branch_ref(&ctx.root, branch, gitrepo::Prefer::Local)?
+            .and_then(|r| gitrepo::rev_commit(&ctx.root, &r).transpose())
+            .transpose()?,
+    };
 
     // Every task recorded on this branch. The queue lands a whole group at once, so this is
     // many-to-one by nature — and it needs no per-branch record to find them, because a task's
@@ -2814,6 +2836,10 @@ pub(crate) fn cmd_task_landed(
         "no task in {} records branch={branch}, so there is nothing to record a landing for",
         ctx.key
     );
+
+    if check {
+        return check_landing(kb, &uids, branch, onto, head.as_deref(), json);
+    }
 
     let mut recorded = Vec::new();
     let mut not_closed = Vec::new();
@@ -2884,6 +2910,54 @@ pub(crate) fn cmd_task_landed(
         "nothing on {branch} was recorded as landed on {onto}: every one of its tasks was refused (the reasons are above)"
     );
     Ok(())
+}
+
+/// `jkb task landed --check`: whether a reviewer approved `branch` at `head` — the rule `jkb serve`
+/// asks of a landing a non-operator records ([`jkb_api::review_gate::landing_with`] over the
+/// branch's [`jkb_api::review_gate::branch_state`]), asked here of every caller, the operator
+/// included, since the merge queue grafts before it records. Who may *record* the landing is not
+/// asked: under a strategy where only the operator lands, the queue still grafts and the operator
+/// records it afterwards. A branch whose every task is finished or already landed exactly here is
+/// the queue's re-run, and passes.
+fn check_landing(
+    kb: &session_cli::Kb<'_>,
+    uids: &[String],
+    branch: &str,
+    onto: &str,
+    head: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let here = jkb_api::sessions::LiveLanding::Grafted {
+        branch: branch.to_owned(),
+        onto: onto.to_owned(),
+    };
+    let mut states = Vec::new();
+    let mut pending = false;
+    for uid in uids {
+        let facts = kb.facts(uid)?;
+        pending |= !facts.terminal && facts.landed.as_deref() != Some(&here);
+        states.push(facts.review);
+    }
+    let review = jkb_api::review_gate::branch_state(&states, head);
+    let refusal = if pending {
+        let found = review::findings_via(kb, &review.namespaces)?;
+        jkb_api::review_gate::landing_with(&found, &review, head).short()
+    } else {
+        None
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "branch": branch, "onto": onto, "head": head,
+                "may_land": refusal.is_none(), "reason": refusal,
+            })
+        );
+    }
+    match refusal {
+        None => Ok(()),
+        Some(why) => anyhow::bail!("{branch} may not land on {onto}: {why}"),
+    }
 }
 
 /// The host-only session verbs: configure the gate that guards a landing (design D36.5), and break a

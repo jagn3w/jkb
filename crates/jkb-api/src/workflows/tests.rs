@@ -644,7 +644,8 @@ enum Path {
     Legacy,
     /// A task at `design` the gate holds back: a designer writes its design, and builds nothing.
     Design,
-    /// `systemic_review`, left by an earlier run: a group of one, straight to a systemic reviewer.
+    /// `systemic_review`, left by an earlier run: its group (it and the tasks on its branch), straight
+    /// to a systemic reviewer.
     Systemic,
 }
 
@@ -664,8 +665,8 @@ enum Gate {
 enum Read {
     /// A, build: every phase past design that a run drives.
     Build,
-    /// R, re-design: at `design`, given a designer by this run — a design the operator rejected.
-    /// At any budget: a re-design uses none.
+    /// R, re-design: at `design`, given a designer by this run — a design the operator rejected,
+    /// never one whose designer failed. At any budget: a re-design uses none.
     Redesign,
     /// B, legacy: at `design`, tagged approved, not this run's design.
     Legacy,
@@ -680,7 +681,9 @@ impl Read {
     fn terms(self) -> String {
         match self {
             Self::Build => "phase:implement,review,landable,systemic_review".to_owned(),
-            Self::Redesign => format!("phase:design tag:swarm-designed={OWNER}"),
+            Self::Redesign => {
+                format!("phase:design tag:swarm-designed={OWNER} -tag:design-failed={OWNER}")
+            }
             Self::Legacy => format!("phase:design tag:design=approved -tag:swarm-designed={OWNER}"),
             Self::Design => {
                 format!("phase:design -tag:design=approved -tag:swarm-designed={OWNER}")
@@ -953,6 +956,37 @@ impl Swarm {
         self.designer_designs(agent, design);
         self.coordinator(json!({ "op": "task.set", "uid": self.lead, "status": "open" }));
         self.coordinator(json!({ "op": "task.release", "uid": self.lead, "owner": OWNER }));
+    }
+
+    /// DESIGNING A TASK's finish for a lead still at `design` — a designer that failed, or one no
+    /// longer LIVE — in the order a compaction cannot split: the failure recorded and the task
+    /// SETTLED while it is still claimed, and only then reopened and released. `released: false`
+    /// stops where a compaction between the SETTLED tag and the release would.
+    fn coordinator_finishes_failed(&self, released: bool) {
+        assert_eq!(self.phase(), "design", "judged by the phase first");
+        for tag in [
+            format!("design-failed={OWNER}"),
+            format!("swarm-settled={OWNER}"),
+        ] {
+            self.coordinator(json!({ "op": "task.tag", "uid": self.lead,
+                                     "facet_value": tag, "mode": "set" }));
+        }
+        if released {
+            self.coordinator(json!({ "op": "task.set", "uid": self.lead, "status": "open" }));
+            self.coordinator(json!({ "op": "task.release", "uid": self.lead, "owner": OWNER }));
+        }
+    }
+
+    /// Whether the lead carries `facet=value`.
+    fn tagged(&self, facet: &str, value: &str) -> bool {
+        match ok(&self.kb.op, json!({ "op": "task.show", "uid": self.lead })) {
+            Response::Task { task, .. } => task
+                .item
+                .tags
+                .iter()
+                .any(|t| t.facet == facet && t.value == value),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The lead's body.
@@ -1281,8 +1315,8 @@ fn a_systemic_redesign_pauses_the_group_for_a_designer_and_resumes_it_once_appro
 }
 
 /// A task an earlier run left at `systemic_review` — its coordinator stopped mid-review, its claim
-/// released — is offered by the next run's frontier, and step 1b sends it, as a group of one, straight
-/// to a systemic reviewer. With no implementer of this run's, the `submit_systemic` exit starts a new
+/// released — is offered by the next run's frontier, and step 1b sends it, with the tasks on its
+/// branch as its group, straight to a systemic reviewer. With no implementer of this run's, the `submit_systemic` exit starts a new
 /// one on the task's branch, and the work goes round to `landable`.
 #[test]
 fn a_task_an_earlier_run_left_at_systemic_review_is_taken_up_by_the_next() {
@@ -1350,6 +1384,194 @@ fn a_designer_records_its_failure_on_its_task() {
                 .iter()
                 .any(|t| t.facet == "design-failed" && t.value == OWNER));
             assert!(!tags.iter().any(|t| t.facet == "swarm-lead"));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A designer that ended without tagging its task (it crashed, or reported failed without the tag)
+/// leaves the coordinator to record the failure: in `Swarm::at_design()` the coordinator claims the
+/// lead and no designer ever binds or tags. jkb lets the coordinator write `design-failed=` and
+/// `swarm-settled=` and then reopen and release, as DESIGNING A TASK says. A compaction between
+/// SETTLED and the release leaves exactly CONTINUING's recovery case (claimed, no `swarm-lead=`,
+/// at `design`, tagged failed), and once released the task is in no read: it gets no second designer.
+#[test]
+fn the_coordinator_records_a_lost_designers_failure() {
+    let s = Swarm::at_design();
+    assert_eq!(s.admission(&s.lead, Gate::On), Some(Path::Design));
+    s.coordinator(json!({ "op": "task.claim", "uid": s.lead, "owner": OWNER }));
+    s.coordinator(json!({ "op": "task.tag", "uid": s.lead,
+                          "facet_value": format!("swarm-designed={OWNER}"), "mode": "set" }));
+    // The designer is no longer LIVE and left nothing in jkb.
+    assert!(!s.tagged("design-failed", OWNER));
+    s.coordinator_finishes_failed(false);
+    // The compaction: still claimed, no `swarm-lead=`, at `design`, and tagged failed.
+    assert!(s.claimed_by(OWNER));
+    assert_eq!(s.phase(), "design");
+    assert!(s.tagged("design-failed", OWNER));
+    assert!(s.tagged("swarm-settled", OWNER));
+    match s.coordinator(json!({ "op": "task.show", "uid": s.lead })) {
+        Response::Task { task, .. } => {
+            assert!(!task.item.tags.iter().any(|t| t.facet == "swarm-lead"));
+        }
+        other => panic!("{other:?}"),
+    }
+    // CONTINUING finishes it: reopened and released, both accepted.
+    s.coordinator(json!({ "op": "task.set", "uid": s.lead, "status": "open" }));
+    s.coordinator(json!({ "op": "task.release", "uid": s.lead, "owner": OWNER }));
+    assert!(!s.claimed_by(OWNER));
+    for gate in [Gate::On, Gate::Off, Gate::HandPicked] {
+        assert_eq!(s.offered_by_under(&s.lead, gate), None, "{gate:?}");
+    }
+    // The REPORT finds it from jkb when the report is gone.
+    match s.coordinator(json!({ "op": "kb.query", "count": true,
+        "dsl": format!("kind:task tag:design-failed={OWNER}") }))
+    {
+        Response::Count { count } => assert_eq!(count, 1),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The finding's sequence: a designer tags its failure and reports, the coordinator reopens and
+/// releases it, and a compaction drops the SETTLED tag that should have followed. Unclaimed, at
+/// `design` and unsettled, it is out of CONTINUING's reach (that looks only at claimed tasks); read
+/// R, read at any budget, used to offer it to a second designer. It leaves it out, as B and C do.
+#[test]
+fn a_failed_design_released_before_it_was_settled_is_not_redesigned() {
+    let s = Swarm::at_design();
+    assert_eq!(s.budget.get(), 3);
+    s.coordinator(json!({ "op": "task.claim", "uid": s.lead, "owner": OWNER }));
+    s.coordinator(json!({ "op": "task.tag", "uid": s.lead,
+                          "facet_value": format!("swarm-designed={OWNER}"), "mode": "set" }));
+    let des = || s.as_agent(Some(("d1", "jkb-designer")));
+    ok(&des(), json!({ "op": "role.bind", "uid": s.lead }));
+    ok(
+        &des(),
+        json!({ "op": "task.tag", "uid": s.lead,
+                "facet_value": format!("design-failed={OWNER}"), "mode": "set" }),
+    );
+    let left = s.designers_left();
+    // Released without the SETTLED tag: the compaction.
+    s.coordinator(json!({ "op": "task.set", "uid": s.lead, "status": "open" }));
+    s.coordinator(json!({ "op": "task.release", "uid": s.lead, "owner": OWNER }));
+    assert!(!s.tagged("swarm-settled", OWNER));
+    assert_eq!(s.phase(), "design");
+    assert!(
+        !s.read(Read::Redesign, 100).contains(&s.lead),
+        "a failed design gets no second designer"
+    );
+    assert_eq!(s.offered_by(&s.lead), None);
+    for gate in [Gate::Off, Gate::HandPicked] {
+        assert_eq!(s.offered_by_under(&s.lead, gate), None, "{gate:?}");
+    }
+    assert_eq!(s.designers_left(), left);
+}
+
+/// A design rejected before this run started — submitted by an earlier run's designer or the
+/// operator's, so it carries no `swarm-designed=` of this run's and read R does not offer it — is
+/// offered by read B or C, and only step 1b's turned-down check keeps it off the legacy path: it goes
+/// to a designer whatever the gate, a hand-pick or an old `design=approved` tag says.
+#[test]
+fn a_design_rejected_before_the_run_goes_to_a_designer_whatever_the_gate() {
+    let s = Swarm::at_design();
+    // An earlier run's designer, never tagged by this run.
+    s.designer_designs("d0", "Design: the first approach");
+    s.operator_fires_with("reject_design", "name the files");
+    let last = s.last_history();
+    assert!(
+        last.contains("reject_design") && last.contains("name the files"),
+        "{last}"
+    );
+    assert_eq!(s.phase(), "design");
+    assert_eq!(s.designed(), 0);
+    assert!(
+        s.read(Read::Redesign, 100).is_empty(),
+        "not this run's design"
+    );
+    // Untagged: read C offers it, and it goes to a designer, not built on the legacy path.
+    for gate in [Gate::On, Gate::Off, Gate::HandPicked] {
+        assert_eq!(
+            s.offered_by_under(&s.lead, gate),
+            Some(Read::Design),
+            "{gate:?}"
+        );
+        assert_eq!(s.admission(&s.lead, gate), Some(Path::Design), "{gate:?}");
+    }
+    // Tagged approved: read B offers it, and still the tag does not build a turned-down design.
+    ok(
+        &s.kb.op,
+        json!({ "op": "task.tag", "uid": s.lead, "facet_value": "design=approved", "mode": "set" }),
+    );
+    for gate in [Gate::On, Gate::Off, Gate::HandPicked] {
+        assert_eq!(
+            s.offered_by_under(&s.lead, gate),
+            Some(Read::Legacy),
+            "{gate:?}"
+        );
+        assert_eq!(s.admission(&s.lead, gate), Some(Path::Design), "{gate:?}");
+    }
+}
+
+/// A lead an earlier run left at `systemic_review` is taken up with the tasks on its branch, not
+/// alone: its earlier group's non-lead is still at `implement` (the workflow moves only through the
+/// lead), on the same branch, so read A offers it too. Step 1b's ON ITS BRANCH query, run as the
+/// coordinator, finds the SYSTEMIC task holding that branch, so the non-lead joins the lead's group
+/// rather than being rebuilt off the integration branch as a second copy of the same work.
+#[test]
+fn a_systemic_lead_is_taken_up_with_the_tasks_on_its_branch() {
+    let s = Swarm::new();
+    let n1 = match ok(
+        &s.kb.op,
+        json!({ "op": "task.add", "text": "the non-lead" }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    for event in ["submit_design", "approve_design"] {
+        let m = Swarm::moved(ok(
+            &s.kb.op,
+            json!({ "op": "workflow.fire", "uid": n1, "event": event }),
+        ));
+        assert!(m.moved, "{event}: {m:?}");
+    }
+    s.reach_systemic_review();
+    // The earlier run had grouped N1 under the lead, on the lead's branch.
+    s.coordinator(json!({ "op": "task.claim", "uid": n1, "owner": OWNER }));
+    for tag in [format!("branch={BRANCH}"), format!("swarm-lead={}", s.lead)] {
+        s.coordinator(json!({ "op": "task.tag", "uid": n1, "facet_value": tag, "mode": "set" }));
+    }
+    // The earlier run stops: both reopened and released, nothing settled.
+    for uid in [&s.lead, &n1] {
+        s.coordinator(json!({ "op": "task.set", "uid": uid, "status": "open" }));
+        s.coordinator(json!({ "op": "task.release", "uid": uid, "owner": OWNER }));
+    }
+    // Read A offers both; the lead is SYSTEMIC, and N1's own phase would make it a WORKFLOW task.
+    assert_eq!(s.offered_by(&s.lead), Some(Read::Build));
+    assert_eq!(s.offered_by(&n1), Some(Read::Build));
+    assert_eq!(s.admission(&s.lead, Gate::On), Some(Path::Systemic));
+    assert_eq!(s.seen(&n1).phase, "implement");
+    // ON ITS BRANCH: the coordinator's query names exactly the SYSTEMIC task on N1's branch (the DSL
+    // takes the `/` in a branch name), so N1 joins its group instead.
+    let holders = match s.coordinator(json!({ "op": "kb.query",
+        "dsl": format!("kind:task phase:systemic_review tag:branch={BRANCH}") }))
+    {
+        Response::Items { items, .. } => items.into_iter().map(|i| i.uid).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(holders, vec![s.lead.clone()]);
+    // Step 2 starts the group: the lead first, then N1, each claimed and recorded under the lead.
+    s.start_group_on(Path::Systemic);
+    s.coordinator(json!({ "op": "task.claim", "uid": n1, "owner": OWNER }));
+    s.coordinator(json!({ "op": "task.tag", "uid": n1,
+                          "facet_value": format!("swarm-lead={}", s.lead), "mode": "set" }));
+    match ok(&s.kb.op, json!({ "op": "task.claims" })) {
+        Response::Claims { claims, .. } => {
+            for uid in [&s.lead, &n1] {
+                assert!(
+                    claims.iter().any(|c| &c.uid == uid && c.owner == OWNER),
+                    "{uid}: {claims:?}"
+                );
+            }
         }
         other => panic!("{other:?}"),
     }

@@ -1138,28 +1138,7 @@ pub fn authorize(
         return Ok(Admit::Run);
     };
     if permission == OpPermission::Land {
-        let current = wf::current(conn, target)?;
-        if let Decision::Deny(no) =
-            role_decision(&current.spec, &principal.roles, OpPermission::Land)
-        {
-            return Err(deny(&no, op));
-        }
-        // A workflow parked at `landed`/`cancelled` is picked back up by the operator alone
-        // (`reopen`), so nobody else lands the task again first — reopening its status and landing
-        // it would re-land a finished task with its workflow never reopened (review round 3).
-        // Except the same landing again: a merge queue re-running a branch must be told the task
-        // landed (round 5) — asked about the branch and destination its live landing already
-        // records. Anything else — a cancelled task ticked
-        // `done`, another destination — would record a landing it never had (round 6).
-        if current.phase.is_settled() && !repeats_landing(conn, target, current.phase, request)? {
-            return Err(forbidden(format!(
-                "`{op}` refused: {reference}'s workflow is parked at `{}`, and only the operator \
-                 picks it back up (`jkb task set {reference} --status open`, then `jkb workflow \
-                 fire {reference} reopen`). A merge queue records the branch's other tasks and \
-                 reports this one held.",
-                current.phase.as_str()
-            )));
-        }
+        admit_landing(conn, principal, request, target, reference)?;
     }
     match (principal.scope, principal.attested_agent()) {
         (Some(scope), _) => {
@@ -1189,6 +1168,55 @@ pub fn authorize(
     }
 }
 
+/// What a landing by anyone but the operator must pass beyond its role: the task's strategy lets the
+/// caller land, its workflow is not parked (save the same landing again), and a reviewer approved the
+/// head being landed.
+fn admit_landing(
+    conn: &Connection,
+    principal: &Principal,
+    request: &Request,
+    target: ItemId,
+    reference: &str,
+) -> Result<(), ApiError> {
+    let op = request.op();
+    let current = wf::current(conn, target)?;
+    if let Decision::Deny(no) = role_decision(&current.spec, &principal.roles, OpPermission::Land) {
+        return Err(deny(&no, op));
+    }
+    // A workflow parked at `landed`/`cancelled` is picked back up by the operator alone
+    // (`reopen`), so nobody else lands the task again first — reopening its status and landing
+    // it would re-land a finished task with its workflow never reopened (review round 3).
+    // Except the same landing again: a merge queue re-running a branch must be told the task
+    // landed (round 5) — asked about the branch and destination its live landing already
+    // records. Anything else — a cancelled task ticked
+    // `done`, another destination — would record a landing it never had (round 6).
+    let repeat = repeats_landing(conn, target, current.phase, request)?;
+    if current.phase.is_settled() && !repeat {
+        return Err(forbidden(format!(
+            "`{op}` refused: {reference}'s workflow is parked at `{}`, and only the operator \
+             picks it back up (`jkb task set {reference} --status open`, then `jkb workflow \
+             fire {reference} reopen`). A merge queue records the branch's other tasks and \
+             reports this one held.",
+            current.phase.as_str()
+        )));
+    }
+    // A reviewer's verdict, not the coordinator's word for it: the head being landed needs a
+    // clean recorded round of its own, or the operator's waiver of it. The ops state the review
+    // as gated by their caller, which holds for the operator and was only a prompt line for a
+    // coordinator running the merge queue. A repeat of a recorded landing records nothing.
+    if let (false, Some(landed)) = (repeat, landed_of(request)) {
+        let verdict =
+            crate::review_gate::landing(conn, target, &landed.branch, landed.head.as_deref())?;
+        if let Some(why) = verdict.short() {
+            return Err(forbidden(format!(
+                "`{op}` refused: no reviewer approved the head being landed. {why} Only the \
+                 operator lands past a reviewer (`jkb task land --no-review`)."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Whether `request` lands `task` exactly as its live landing already records — a workflow parked at
 /// `landed`, the same branch onto the same destination at the same head — which the lifecycle answers
 /// with a no-op. Parked at `landed`, because a live landing row is not proof of one: a landing the
@@ -1201,10 +1229,7 @@ fn repeats_landing(
     phase: jkb_core::workflow::Phase,
     request: &Request,
 ) -> Result<bool, ApiError> {
-    let (Request::TaskLand { landed, .. }
-    | Request::TaskLandCheck { landed, .. }
-    | Request::TaskLanded { landed, .. }) = request
-    else {
+    let Some(landed) = landed_of(request) else {
         return Ok(false);
     };
     if phase != jkb_core::workflow::Phase::Landed {
@@ -1219,6 +1244,16 @@ fn repeats_landing(
                 _ => true,
             }
     }))
+}
+
+/// The landing `request` asks to perform, check or record, if it is one.
+fn landed_of(request: &Request) -> Option<&crate::sessions::Landed> {
+    match request {
+        Request::TaskLand { landed, .. }
+        | Request::TaskLandCheck { landed, .. }
+        | Request::TaskLanded { landed, .. } => Some(landed),
+        _ => None,
+    }
 }
 
 // -------------------------------------------------------------------------------------------

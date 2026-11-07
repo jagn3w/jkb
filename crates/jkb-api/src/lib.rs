@@ -42,6 +42,7 @@ pub mod prs;
 pub mod rbac;
 pub mod removals;
 pub mod review;
+pub mod review_gate;
 pub mod sessions;
 pub mod staging;
 pub mod tasks;

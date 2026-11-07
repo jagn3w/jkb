@@ -1455,7 +1455,7 @@ does not classify them all:$bad. A code nobody has classified decides whether a 
     # `landed`, which is the exact harm this case's own failure message spells out. The expectation
     # is written down here and checked against the codes read from the header, so a code the header
     # grows arrives as a missing expectation rather than as silence.
-    local want_map="0=landed 1=eject 2=eject 3=stall 4=stall 5=stall"
+    local want_map="0=landed 1=eject 2=eject 3=stall 4=stall 5=stall 6=stall"
     local code want got routing_bad=""
     while IFS= read -r code; do
         [ -n "$code" ] || continue

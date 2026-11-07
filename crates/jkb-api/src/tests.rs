@@ -2154,6 +2154,42 @@ fn the_ready_frontier_honours_every_predicate_it_is_given() {
     assert_eq!(uids("priority>2"), ["task:fresh"]);
 }
 
+/// The swarm coordinator counts a group's attempts as `swarm-attempt=<run owner>/<n>` and relies on
+/// `tag set` leaving the facet one value: an earlier run's count is replaced by this run's first
+/// attempt, and each attempt replaces the last, so no stale count survives beside the live one.
+#[test]
+fn an_attempt_tag_set_replaces_an_earlier_runs_count() {
+    use jkb_core::task;
+    let db = Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        let mut t = task::NewTask::new("task:tried", "tried");
+        t.home = "tasks/f".into();
+        task::create(c, m, &t)?;
+        Ok(())
+    })
+    .unwrap();
+    let b = LocalBackend::new(db);
+    let attempts = || match call(&b, json!({ "op": "task.show", "uid": "task:tried" })).unwrap() {
+        Response::Task { task, .. } => task
+            .item
+            .tags
+            .into_iter()
+            .filter(|t| t.facet == "swarm-attempt")
+            .map(|t| t.value)
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    for value in ["host:9/3", "host:42/1", "host:42/2"] {
+        call(
+            &b,
+            json!({ "op": "task.tag", "uid": "task:tried",
+                    "facet_value": format!("swarm-attempt={value}"), "mode": "set" }),
+        )
+        .unwrap();
+        assert_eq!(attempts(), [value]);
+    }
+}
+
 #[test]
 fn a_task_larger_than_the_budget_is_shown_whole_and_not_called_cut() {
     use jkb_core::task;

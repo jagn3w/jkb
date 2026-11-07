@@ -15,12 +15,9 @@ use anyhow::{Context, Result};
 
 pub(crate) use jkb_core::reviews::ReviewState;
 
-/// A must-fix finding that is neither `done` nor `cancelled`.
-#[derive(Clone)]
-pub(crate) struct OpenFinding {
-    pub(crate) uid: String,
-    pub(crate) title: String,
-}
+pub(crate) use jkb_api::review_gate::{gate_with, GateVerdict};
+/// What a review's namespaces actually contain.
+pub(crate) use jkb_api::sessions::ReviewFindings as Findings;
 
 /// The findings of the review(s) at `review_nss`, split into open must-fix and total seen — the one
 /// query ([`jkb_api::sessions::review_findings`]), through whichever backend serves this command.
@@ -34,176 +31,26 @@ pub(crate) fn findings_via(
     chunked(review_nss, |nss| kb.review_findings(nss))
 }
 
-/// Ask `read` about `review_nss` in pieces the query accepts, and add the answers up. Every
-/// `/review-log` pass adds a `review=` value, so a long-lived branch's task outgrows one piece; a land
-/// refused for that — even with `--no-review` — would be a wedge.
+/// Ask `read` about `review_nss` in pieces the query accepts, and add the answers up
+/// ([`jkb_api::review_gate::merge`]).
 fn chunked(
     review_nss: &[String],
-    read: impl Fn(&[String]) -> Result<jkb_api::sessions::ReviewFindings>,
+    read: impl Fn(&[String]) -> Result<Findings>,
 ) -> Result<Findings> {
-    let mut out = Findings {
-        rounds_reported: true,
-        ..Findings::default()
-    };
-    for nss in review_nss.chunks(jkb_api::sessions::MAX_REVIEW_NAMESPACES) {
-        let part: Findings = read(nss)?.into();
-        out.total += part.total;
-        out.open_count += part.open_count;
-        out.rounds_reported &= part.rounds_reported;
-        out.rounds.extend(part.rounds);
-        for f in part.open_must_fix {
-            if !out.open_must_fix.iter().any(|seen| seen.uid == f.uid) {
-                out.open_must_fix.push(f);
-            }
-        }
-    }
-    out.rounds.sort_by_key(|r| r.filed);
-    Ok(out)
+    let parts = review_nss
+        .chunks(jkb_api::sessions::MAX_REVIEW_NAMESPACES)
+        .map(read)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(jkb_api::review_gate::merge(parts))
 }
 
-/// What a review's namespaces actually contain.
-#[derive(Default, Clone)]
-pub(crate) struct Findings {
-    /// Every finding item found, whatever its priority or status. Zero here means the
-    /// namespace resolved to nothing — **not** that the review was clean.
-    pub(crate) total: usize,
-    /// How many are open and must-fix.
-    pub(crate) open_count: usize,
-    /// The first of them, for a refusal to name.
-    pub(crate) open_must_fix: Vec<OpenFinding>,
-    /// Each round, oldest filing first.
-    pub(crate) rounds: Vec<jkb_api::sessions::ReviewRound>,
-    /// Whether the daemon reported rounds at all (an older one does not).
-    pub(crate) rounds_reported: bool,
-}
-
-impl From<jkb_api::sessions::ReviewFindings> for Findings {
-    fn from(f: jkb_api::sessions::ReviewFindings) -> Self {
-        Self {
-            total: f.total,
-            open_count: f.open_count,
-            open_must_fix: f
-                .open_must_fix
-                .into_iter()
-                .map(|o| OpenFinding {
-                    uid: o.uid,
-                    title: o.title,
-                })
-                .collect(),
-            rounds: f.rounds,
-            rounds_reported: f.rounds_reported,
-        }
-    }
-}
-
-/// Why a task may not land, if it may not.
-pub(crate) enum GateVerdict {
-    /// Reviewed, with nothing must-fix outstanding.
-    Passed,
-    /// No `reviewed=` facet: no review has been recorded for this task.
-    NeverReviewed,
-    /// A review is recorded, but its namespace(s) hold no finding items at all. That is not
-    /// a clean review — it is a review whose findings never reached the KB (a quarantined
-    /// `tasks.md`, a typo'd `--findings`, a namespace renamed since). Treating it as clean is
-    /// the gate failing **open**, which is the one direction a safety check must not fail.
-    NoFindingsRecorded(Vec<String>),
-    /// Reviewed, but the review has open must-fix findings: how many, and the first of them.
-    OpenFindings(usize, Vec<OpenFinding>),
-    /// Nothing is open, but the **newest** round found must-fixes (D52.6): fixing them is not a
-    /// clean review of the fix. Another round has to come back with none.
-    LastRoundNotClean {
-        /// That round's namespace.
-        ns: String,
-        /// How many must-fixes it found.
-        must_fix: usize,
-    },
-    /// The daemon answering is too old to report rounds, so the last-round clause cannot be asked.
-    /// Refused rather than skipped: skipping is the gate failing open.
-    RoundsUnknown,
-}
-
-impl GateVerdict {
-    /// One line, for a listing row: why the gate would refuse, or `None` if it would pass.
-    ///
-    /// The long form — with the remedy for each case — is [`enforce`]'s refusal, which is what
-    /// someone running `jkb task land` reads. Both spellings come from the same verdict, so a
-    /// row cannot report a different rule than the command applies.
-    pub(crate) fn short(&self) -> Option<String> {
-        match self {
-            Self::Passed => None,
-            Self::NeverReviewed => Some(
-                "No review has been recorded. Run /jkb-review in the session, or land with \
-                 --no-review."
-                    .to_owned(),
-            ),
-            Self::NoFindingsRecorded(nss) => Some(format!(
-                "Its review ({}) holds no findings at all, so they never reached the KB — this \
-                 is not a clean review. Re-run /jkb-review.",
-                nss.join(", ")
-            )),
-            Self::OpenFindings(count, _) => Some(format!(
-                "Its review left {count} open must-fix finding(s). Fix or cancel each one, then land."
-            )),
-            Self::LastRoundNotClean { ns, must_fix } => Some(format!(
-                "Its newest review round ({ns}) found {must_fix} must-fix finding(s). Fixing them is \
-                 not a review of the fix: run another round, which must come back with none."
-            )),
-            Self::RoundsUnknown => Some(
-                "The jkb serve answering is too old to report review rounds, so the last-round \
-                 check cannot run. Restart it on this jkb (./scripts/setup.sh on the host)."
-                    .to_owned(),
-            ),
-        }
-    }
-}
-
-/// Decide whether a task's review record permits a landing (design D38.5, D52.6).
-///
-/// Concerns and nits do not block. A gate everything trips is a gate nobody keeps: a previous
-/// run put 34 of 45 findings on `concern`, and blocking on those would make `--no-review` the
-/// normal path within a week.
-///
-/// **Every** recorded round is consulted for open must-fixes, not just the newest: re-running
-/// `/review-log` must not silently retire the previous run's still-open must-fix findings. And the
-/// **newest** round must itself have found none (D52.6): a round that found must-fixes is not made
-/// clean by fixing them — the fix has not been reviewed.
+/// Decide whether a task's review record permits a landing (design D38.5, D52.6): the rule is
+/// [`gate_with`]'s, which `jkb serve` also asks of a landing it records for anyone but the operator.
 ///
 /// # Errors
 /// Returns an error if the findings cannot be read.
 pub(crate) fn gate(kb: &crate::session_cli::Kb<'_>, review: &ReviewState) -> Result<GateVerdict> {
     Ok(gate_with(&findings_via(kb, &review.namespaces)?, review))
-}
-
-/// The gate's decision, given findings already read.
-///
-/// Split from [`gate`] so a caller holding the findings — `staging::collect`, which reads one
-/// namespace set once for a whole branch rather than once per row — applies the same rule
-/// without a second query. The rule itself lives here and nowhere else.
-///
-/// `found` must have been read from exactly `review.namespaces`: the caller that substitutes an
-/// empty `Findings` (for a row it does not intend to gate) would otherwise be told its intact review
-/// "holds no findings at all — re-run /review-log".
-pub(crate) fn gate_with(found: &Findings, review: &ReviewState) -> GateVerdict {
-    if review.reviewed.is_none() {
-        return GateVerdict::NeverReviewed;
-    }
-    let nss = &review.namespaces;
-    if nss.is_empty() || found.total == 0 {
-        return GateVerdict::NoFindingsRecorded(nss.clone());
-    }
-    if found.open_count > 0 {
-        return GateVerdict::OpenFindings(found.open_count, found.open_must_fix.clone());
-    }
-    if !found.rounds_reported {
-        return GateVerdict::RoundsUnknown;
-    }
-    match found.rounds.last() {
-        Some(last) if last.must_fix > 0 => GateVerdict::LastRoundNotClean {
-            ns: last.ns.clone(),
-            must_fix: last.must_fix,
-        },
-        _ => GateVerdict::Passed,
-    }
 }
 
 /// Apply the land gate, or explain why the landing is refused (design D38.5).
@@ -283,6 +130,11 @@ pub(crate) fn enforce(
             "the jkb serve answering is too old to report review rounds, so {uid}'s last-round \
              check cannot run — restart it on this jkb (./scripts/setup.sh on the host), or land \
              with --no-review"
+        ),
+        // `gate_with` never answers this — it asks nothing of a head — but the verdict is one type.
+        stale @ GateVerdict::StaleHead { .. } => anyhow::bail!(
+            "{uid}: {}",
+            stale.short().unwrap_or_default()
         ),
     }
 }

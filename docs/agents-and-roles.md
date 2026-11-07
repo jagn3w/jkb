@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 cfbe327a05707878e7d1093403df8c79305840cb4254028e64494ccd01689752) -->
+<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 e09ccfcfb5777e9ff0b58b05989974358c478e42684ec3cb460836b5f96063cc) -->
 # Agents and roles
 
 jkb is driven by agents as much as by people: a task swarm that schedules, implements, reviews
@@ -94,14 +94,21 @@ the same area twice, the task moves to `systemic_review` and the coordinator sta
 `submit_systemic` sends the cause back to the same implementer, and `systemic_redesign` pauses the
 group (its claims, branch and implementer kept) while a designer revises the design for the
 operator's approval, after which the same implementer resumes. A task an earlier run left at
-`systemic_review` is taken up by the next run as a group of one, whose exits start a new implementer
-on the task's branch; and a designer that cannot finish tags its task `design-failed=<run owner>`
-before it reports, so a coordinator rebuilding after a compaction does not wait on it.
+`systemic_review` is taken up by the next run as the lead of a group of its own, joined by the tasks
+on its branch that a read offered: their work is already on that branch and its landing closes them,
+so none is rebuilt as a second copy. The group's first exit starts a new implementer on that branch,
+and later exits continue it: while the coordinator holds a group's implementer agent id it starts no
+other. A designer is live while the coordinator holds its agent id and has not had its report. A task
+still at `design` whose designer is not live has failed, tagged or not, so a designer that crashed, or
+whose report a compaction lost, is never waited on. The coordinator tags a failed design
+`design-failed=<run owner>` itself, settles it, and only then reopens and releases it, so a compaction
+at any point leaves the task claimed or settled.
 Claiming, status moves, branch records and the post-landing check are its own `jkb` calls, not
 agents. What the script kept in memory is now in jkb, so a compaction loses none of it: a settled
 group's tasks (landed, given up or stalled) are tagged `swarm-settled=<run owner>` and every frontier
 read excludes them with `-tag:` (released, they are ready again, and the run would never end); keyed
-on the run, so a later run takes them up afresh. Attempts are counted in `swarm-attempt=`. That
+on the run, so a later run takes them up afresh. Attempts are counted in `swarm-attempt=<run owner>/<n>`, keyed on the run the same way: a count an earlier
+run left reads as none, and the next run's first `tag set` replaces it. That
 exclusion needed `task.ready` to honour the whole query: it took only the scope and tags, and dropped
 every other predicate without a word. Startup reclaim is the operator's (`task reclaim` is
 operator-only), so the coordinator reports stuck claims rather than clearing them.
@@ -471,6 +478,23 @@ refused, prints a note, and the operator lands.
 a strategy whose `lands` toggle includes the coordinator (`jkb workflow set <uid> autonomous`, or
 an operator-defined one); otherwise the operator lands it.
 
+### A swarm landing needs a reviewer's verdict, not the coordinator's word
+
+Holding a coordinator to the reviewer's verdict was a line in its prompt. A landing that anyone but
+the operator asks for (`task.land`, `task.land_check`, `task.landed`) now needs a clean recorded
+review round of exactly the head being landed, or the operator's waiver of that head: a commit made
+after the review is a commit no reviewer saw. `rbac::authorize` asks it through
+`jkb_api::review_gate`, which `jkb task land` and `jkb task landed --check` also read, so `jkb serve`
+and the CLI apply one gate. The branch is the unit of review: a swarm reviewer records its round
+against the group's lead, so a task's review state merges the records of every task carrying its
+branch in its repository, and a task borrows nothing from a branch it is not on.
+`jkb task landed --check` asks only whether a reviewer approved the head and records nothing, so
+under `design-reviewed` the queue still grafts and the operator records. `scripts/merge-queue.sh`
+reads the branch head once and uses it for the check, the graft and the record (`--head`), so a
+commit made mid-run is never grafted, and it stalls with exit 6 when no reviewer approved that head.
+Refusing a non-operator's `task set --status done` was built with this and dropped in its first
+review round, for the reason the next section gives.
+
 ### Not yet guarded: a non-operator closing an unstarted task
 
 Nothing in jkb yet stops a non-operator closing an unstarted task; the swarm simply no longer
@@ -551,8 +575,9 @@ Every frontier read of the `/task-swarm` coordinator is `is:ready is:unclaimed` 
 leaving out the run's settled tasks and review findings (tagged `finding=review` as they are filed;
 `V033` backfilled the older ones). It reads four times, in order: A,
 `phase:implement,review,landable,systemic_review`, the work to build, read first so an approved task
-is never hidden behind the tasks still at `design`; R, `phase:design tag:swarm-designed=<run owner>`,
-designs this run wrote and the operator rejected, re-designed whatever the budget has left; B,
+is never hidden behind the tasks still at `design`; R, `phase:design tag:swarm-designed=<run owner>
+-tag:design-failed=<run owner>`, designs this run wrote and the operator rejected, re-designed whatever
+the budget has left, but never one whose designer failed in this run, which gets no second designer; B,
 `phase:design tag:design=approved`, the legacy tag path while the switch to `approve_design` is under
 way; and C, `phase:design -tag:design=approved`, the tasks for designers, limited to what remains of
 the `--designers` budget (counted by task). B and C leave out R's tasks, so no task is in two reads. A

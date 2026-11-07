@@ -7132,3 +7132,73 @@ fn close_merged_tells_a_task_with_no_branch_from_one_whose_session_predates_the_
         "the named remedy did not clear the cause: {after:?}"
     );
 }
+
+/// `jkb task landed --check` is the merge queue's question before it grafts: does a clean review of
+/// exactly the branch's head stand behind every open task on it. It records nothing either way, and
+/// commits made after the review are a head no reviewer approved.
+#[test]
+fn landed_check_asks_for_a_clean_review_of_the_head_and_records_nothing() {
+    let f = Fixture::new();
+    let (uid, _) = a_group_branch_tagged_after_its_work(&f);
+    let check = || {
+        f.jkb()
+            .args([
+                "task",
+                "landed",
+                "swarm-task/group",
+                "--onto",
+                "integration",
+            ])
+            .arg("--check")
+            .assert()
+    };
+    check()
+        .failure()
+        .stderr(predicate::str::contains("No review has been recorded"));
+    assert_eq!(f.status_of(&uid), "in_progress", "a check records nothing");
+
+    let nit = f.add_finding("reviews/clean", "a nit");
+    f.jkb()
+        .args(["--global", "task", "set", &nit, "--priority", "3"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "review", "record", "--branch", "swarm-task/group"])
+        .args(["--findings", "reviews/clean"])
+        .assert()
+        .success();
+    check().success();
+    assert_ne!(f.status_of(&uid), "done", "a check records nothing");
+
+    let reviewed = git(&f.repo, &["rev-parse", "swarm-task/group"]);
+    git(&f.repo, &["checkout", "-q", "swarm-task/group"]);
+    commit_in(&f.repo, "more.txt", "more\n", "after the review");
+    git(&f.repo, &["checkout", "-q", "main"]);
+    check().failure().stderr(predicate::str::contains(
+        "no reviewer saw the commits since",
+    ));
+    // The queue pins the commit it read: the reviewed one still passes, whatever the tip is now.
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            "swarm-task/group",
+            "--onto",
+            "integration",
+        ])
+        .args(["--head", reviewed.trim(), "--check"])
+        .assert()
+        .success();
+    f.jkb()
+        .args([
+            "task",
+            "landed",
+            "swarm-task/group",
+            "--onto",
+            "integration",
+        ])
+        .args(["--head", "abc", "--check"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("full commit id"));
+}
