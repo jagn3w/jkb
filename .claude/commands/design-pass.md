@@ -61,6 +61,11 @@ Then **record it** (step 3d) before tagging.
 Never invent the decision yourself and tag it approved — that defeats the gate. If the user
 is unavailable to decide, leave the task un-tagged and move on.
 
+If settling a design splits the task or turns up new work, file each new task under the step that
+holds the task you are designing (`jkb task show <uid>` prints it), with
+`jkb task add --under <step> "…"`, or under `step:inbox@<repo>` when the task has none, for the
+operator to place.
+
 ## 3. Record + approve each task
 
 **a. (non-trivial) Record the decision.** Two homes, by size and scope:
@@ -133,7 +138,7 @@ confirming trivial).
 ## 4. Report
 
 Summarize the pass: how many tasks you triaged, how many were **approved trivially** vs
-**designed** (with the `D<N>` numbers you added), and any you **left un-tagged** (and why —
-e.g. the user deferred the decision). Remind the user that only the now-approved tasks are
-visible to `/jkb-task-swarm <PATH>`; anything still un-tagged will be held back until a future
-design pass.
+**designed** (with the `D<N>` numbers you added), the tasks you **filed** (each with its step),
+and any you **left un-tagged** (and why — e.g. the user deferred the decision). Remind the user
+that only the now-approved tasks are visible to `/jkb-task-swarm <PATH>`; anything still un-tagged
+will be held back until a future design pass.

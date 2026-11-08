@@ -5236,14 +5236,20 @@ pub(crate) mod test_repo {
 
     /// Mount `repos/t` at [`DIR`] in `db`, once.
     pub(crate) fn mount(db: &jkb_core::Db) {
-        db.write_txn("t", |c, m| {
-            let ns = jkb_core::ns::ensure(c, m, "repos/t")?;
+        mount_repo(db, "t", DIR);
+    }
+
+    /// Mount `repos/<repo>` at `dir` in `db`, once: a request sent with `cwd` `dir` stands in it.
+    pub(crate) fn mount_repo(db: &jkb_core::Db, repo: &str, dir: &str) {
+        let (path, uri) = (format!("repos/{repo}"), format!("file://{dir}"));
+        db.write_txn("t", move |c, m| {
+            let ns = jkb_core::ns::ensure(c, m, &path)?;
             if jkb_core::mount::get(c, ns)?.is_none() {
                 jkb_core::mount::create(
                     c,
                     m,
                     ns,
-                    &format!("file://{DIR}"),
+                    &uri,
                     jkb_types::SyncMode::Bidirectional,
                     "document",
                     None,

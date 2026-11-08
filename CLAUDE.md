@@ -177,6 +177,11 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
 - **Writes go through the single writer-actor**; core is synchronous, async only
   at the edges (ollama HTTP, file-watching, MCP).
 - **Indexes are derived** — anything in an index must be rebuildable from the VFS.
+- **Every task you file names its plan step.** `jkb task add … --under <step>`: use the step of the
+  work that surfaced it (`jkb task show <uid>` prints `plan:` with the step uid), or else this repo's
+  triage step, `step:inbox@jkb`, which the operator triages. It is not a parking place.
+  `--backlog` sets the home, not the step, so it goes with `--under <step>`. Workers never file:
+  they report `FOLLOW-UP` lines to their coordinator.
 - **Tests:** unit + integration + `proptest` for load-bearing invariants.
 - **Self-review before the reviewer, and reach high confidence first.** `/review` costs one to
   four agents per round. Run its step 0 — did every edit land, does each comment match its code, can each guard fire, who else implements this

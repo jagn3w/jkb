@@ -66,6 +66,10 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   coordinator closes the must-fix findings of the group's earlier rounds (`jkb task set <finding>
   --status done`) before the merge queue. Concerns and nits stay open; jkb moves the ones still open
   to the repo's Open work › Inbox when the task lands.
+- **Follow-ups.** Workers never file work outside their task. Each reports `FOLLOW-UP` lines, and the
+  coordinator files every one under the step of the task that found it, or the repo's triage step
+  when that task has none. It tags them settled, so the run does not build them. They are listed in
+  the report.
 - **Merge queue.** `scripts/merge-queue.sh` is deterministic, not an agent. It runs the gate on the
   rebased branch, lands it on the feature branch, records the landing, and names its own outcome.
 

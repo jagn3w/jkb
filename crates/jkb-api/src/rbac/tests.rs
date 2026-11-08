@@ -1464,3 +1464,82 @@ fn a_scoped_caller_adds_under_its_planned_task_and_not_under_its_loose_one() {
         "{e:?}"
     );
 }
+
+/// A repo's triage step is never in a worker's scope, whether or not it exists yet: a caller held to
+/// one task, or an attested subagent, is refused `--under step:inbox@<repo>` as it would be under an
+/// existing step outside its task, and no Open work tree is built for it. Without the guard in
+/// `authorize`, the on-demand creation would let a worker build the tree and file into it.
+#[test]
+fn a_worker_cannot_build_a_triage_step_by_filing_under_it() {
+    let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["app"]);
+    let a = add(&kb.op, "task a");
+    let sub = match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": "sub", "under": a }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    // Homed beside its task, so the home is admitted and the step is all that is judged.
+    let stray = json!({ "op": "task.add", "text": "stray", "under": "step:inbox@app",
+                        "home": "tasks/repos/t/inbox" });
+    let absent = || {
+        let found = kb
+            .db
+            .read(|c| jkb_core::item::id_for_uid(c, "design:open-work@app"))
+            .unwrap();
+        assert!(found.is_none(), "a worker built the triage tree");
+    };
+
+    let (_, coord) = grant(&kb.op, "coordinator", Some(&a), "c");
+    let scoped = kb.as_token(&coord);
+    let e = refused(&scoped, stray.clone());
+    assert!(
+        e.message
+            .contains("is scoped to another task, and `step:inbox@app` is not it"),
+        "{e:?}"
+    );
+    absent();
+    // A move under it is held to the scope too, and its refusal rolls back the tree it resolved.
+    let e = refused(
+        &scoped,
+        json!({ "op": "task.move", "uid": sub, "under": "step:inbox@app" }),
+    );
+    assert!(
+        e.message.contains("moves tasks only under that task"),
+        "{e:?}"
+    );
+    absent();
+
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "implementer", "role": "implementer" }),
+    );
+    let ticket = match ok(
+        &kb.as_token(&container),
+        json!({ "op": "attest.mint", "session": "s1", "agent_id": "ag1",
+                "agent_type": "implementer", "tool_use_id": "tool-1" }),
+    ) {
+        Response::Ticket { token } => token,
+        other => panic!("{other:?}"),
+    };
+    let e = refused(&kb.as_token(&ticket), stray);
+    assert!(e.message.contains("`step:inbox@app` is not it"), "{e:?}");
+    absent();
+
+    // The operator reaches the op, and gets the tree.
+    ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": "filed", "under": "step:inbox@app" }),
+    );
+    assert!(kb
+        .db
+        .read(|c| jkb_core::item::id_for_uid(c, "design:open-work@app"))
+        .unwrap()
+        .is_some());
+}

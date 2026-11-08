@@ -445,7 +445,7 @@ pub fn add(
     // A subtask defaults to living beside its parent.
     let parent = match &ask.under {
         Some(reference) => {
-            let pid = task::resolve_ref(conn, reference)?
+            let pid = jkb_core::design::plan::resolve_parent_ref(conn, meta, reference)?
                 .ok_or_else(|| AddFailure::Refused(no_item(reference)))?;
             if !explicit {
                 if let Some(home) = home_beside(conn, pid, scope)? {
@@ -832,7 +832,10 @@ pub fn move_under(
     scope: Option<ItemId>,
 ) -> Result<Moved, ApiError> {
     let id = writable(conn, reference, roots)?;
-    let parent = task::resolve_ref(conn, under)?.ok_or_else(|| no_item(under))?;
+    // A repo's triage step is created on demand; a caller held to a task is refused just below, and
+    // the refusal rolls the transaction back, so it builds no tree.
+    let parent = jkb_core::design::plan::resolve_parent_ref(conn, meta, under)?
+        .ok_or_else(|| no_item(under))?;
     // The op's target is the moved task; the parent is written too — it gains a subtask, which
     // holds it off the frontier and its land gate — so a scoped caller is held to it as
     // `task.add --under` is. Here, on the scope the caller has once admitted, as `task.place`.

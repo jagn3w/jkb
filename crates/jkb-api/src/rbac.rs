@@ -1005,6 +1005,14 @@ pub enum Admit {
     },
 }
 
+/// The refusal of a caller held to one task whose op names `reference`, outside that task.
+fn out_of_scope(op: &str, label: &str, reference: &str) -> ApiError {
+    forbidden(format!(
+        "`{op}` refused: {label} is scoped to another task, and `{reference}` is not it, one of its \
+         subtasks, or one of its findings"
+    ))
+}
+
 fn deny(no: &Refusal, op: &str) -> ApiError {
     forbidden(format!("`{op}` refused: {no}"))
 }
@@ -1136,6 +1144,14 @@ pub fn authorize(
         Err(admit) => return Ok(admit),
     };
     let Some(target) = task::resolve_ref(conn, reference)? else {
+        // A repo's triage step the op would create on demand (`plan::resolve_parent_ref`) is never
+        // in a worker's scope: refused as an existing one would be, so a worker cannot build a
+        // triage tree and file into it where it could not file into one already there.
+        if jkb_core::design::plan::is_triage_step_uid(reference)
+            && (principal.scope.is_some() || principal.attested_agent().is_some())
+        {
+            return Err(out_of_scope(op, &principal.label, reference));
+        }
         // Nothing to scope against; the op itself answers `not_found`.
         return Ok(Admit::Run);
     };
@@ -1145,11 +1161,7 @@ pub fn authorize(
     match (principal.scope, principal.attested_agent()) {
         (Some(scope), _) => {
             if !roles::in_scope(conn, scope, target)? {
-                return Err(forbidden(format!(
-                    "`{op}` refused: {} is scoped to another task, and `{reference}` is not it, one \
-                     of its subtasks, or one of its findings",
-                    principal.label
-                )));
+                return Err(out_of_scope(op, &principal.label, reference));
             }
             Ok(Admit::Run)
         }

@@ -563,6 +563,39 @@ pub fn step_for_home(
     }
 }
 
+/// The parent a `--under` reference names: whatever [`crate::task::resolve_ref`] finds, else — for
+/// a repo's triage step, `step:inbox@<repo>`, of a repo this knowledge base knows — that step,
+/// created on demand ([`triage_step`]). So `--under step:inbox@<repo>` works before anything has
+/// been filed there, as filing with no `--under` from inside the repo does. `None` for any other
+/// reference that names nothing.
+///
+/// # Errors
+/// A triage step of a repo this knowledge base does not know (not found, naming the repo and how to
+/// list the repos it does know), a triage tree of the wrong shape, or a database error.
+pub fn resolve_parent_ref(
+    conn: &Connection,
+    meta: &WriteMeta,
+    reference: &str,
+) -> Result<Option<ItemId>> {
+    if let Some(id) = crate::task::resolve_ref(conn, reference)? {
+        return Ok(Some(id));
+    }
+    let Some(repo) = reference
+        .strip_prefix("step:inbox@")
+        .filter(|_| is_triage_step_uid(reference))
+    else {
+        return Ok(None);
+    };
+    if !knows_repo(conn, repo)? {
+        return Err(not_found(format!(
+            "no item with uid {reference}: this knowledge base does not know repo `{repo}` (there \
+             is no `repos/{repo}`), so it has no triage step. Check the repo name: `jkb design ls \
+             --repo {repo}` lists that repo's designs, and `jkb design ls --all` every repo's"
+        )));
+    }
+    triage_step(conn, meta, repo).map(Some)
+}
+
 /// Whether this knowledge base knows repo `repo`: it has a `repos/<repo>` namespace or an Open work
 /// design for it. What [`step_for_home`] holds a home naming a repo to before filing there, so a
 /// surface with its own remedy (a review's filing) can ask first and say it in its own words.

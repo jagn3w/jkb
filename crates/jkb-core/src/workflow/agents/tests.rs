@@ -203,7 +203,7 @@ fn the_packaged_templates_are_what_the_coordinators_fill() {
         assert_eq!(get(c).def.role, Role::Coordinator, "{c}");
     }
     // `/task-swarm` fills the swarm's coordinator, the designer budget included.
-    assert_eq!(get("swarm-coordinator").version, 5);
+    assert_eq!(get("swarm-coordinator").version, 6);
     assert_eq!(
         placeholders(&get("swarm-coordinator").def.template).unwrap(),
         [
@@ -946,6 +946,118 @@ fn the_slash_command_reads_the_frontier_by_phase_with_a_designer_budget() {
     assert!(md.contains("legacy path, unless its design was turned down.\""));
     assert!(md.contains("on the legacy path, unless its\n  design was turned down.\""));
     assert!(md.contains("go on the legacy path unless their design was\n  turned down"));
+}
+
+/// `text` as logical lines: a line ending in `\` continues on the next, as a shell reads it.
+fn logical_lines(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        if let Some(head) = line.strip_suffix('\\') {
+            current.push_str(head);
+            current.push(' ');
+        } else {
+            current.push_str(line);
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Every prompt that tells an agent to file work names the step it goes under: the step of the work
+/// that found it, or the repo's triage step. None files without `--under`, none treats `--backlog`
+/// as a place to leave work, and none speaks of "the backlog" as where work goes. The workers report
+/// `FOLLOW-UP` lines instead, and their coordinators file them.
+#[test]
+fn every_filing_instruction_names_a_step() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |rel: &str| {
+        std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    };
+    let agents = packaged().unwrap();
+    let template = |n: &str| {
+        agents
+            .iter()
+            .find(|a| a.name == n)
+            .unwrap_or_else(|| panic!("no template {n}"))
+            .def
+            .template
+            .clone()
+    };
+    // (name, text, whether it is a template or command, which rule 3 holds to no bare "backlog").
+    let mut texts: Vec<(String, String, bool)> = agents
+        .iter()
+        .map(|a| (a.name.clone(), a.def.template.clone(), true))
+        .collect();
+    for cmd in ["review", "task-swarm", "next-task", "design-pass"] {
+        let rel = format!(".claude/commands/{cmd}.md");
+        texts.push((rel.clone(), read(&rel), true));
+    }
+    texts.push(("CLAUDE.md".to_owned(), read("CLAUDE.md"), false));
+
+    for (name, text, prompt) in &texts {
+        for line in logical_lines(text) {
+            // 2. `--backlog` sets a home, never the step, so it never stands alone.
+            if line.contains("--backlog") {
+                assert!(
+                    line.contains("--under "),
+                    "{name}: `--backlog` with no `--under`: {line}"
+                );
+            }
+            // 1. Every filing names its step.
+            if line.contains("jkb task add") {
+                assert!(
+                    line.contains("--under "),
+                    "{name}: a `jkb task add` with no `--under`: {line}"
+                );
+            }
+        }
+        // 3. "The backlog" is no place work goes: the word appears only as the flag.
+        if *prompt {
+            let bare = text.replace("--backlog", "").to_lowercase();
+            assert!(
+                !bare.contains("backlog"),
+                "{name} speaks of the backlog as a place: {}",
+                bare.lines().find(|l| l.contains("backlog")).unwrap_or("")
+            );
+        }
+    }
+
+    // 4. The text that carries the rule, in each place that carries it.
+    for worker in ["jkb-designer", "jkb-implementer", "jkb-systemic-reviewer"] {
+        assert!(
+            template(worker).contains("FOLLOW-UP <the uid of the task whose work found it>"),
+            "{worker} reports its follow-ups"
+        );
+    }
+    let coord = template("swarm-coordinator");
+    let section = coord
+        .split_once("FILING FOLLOW-UPS\n")
+        .and_then(|(_, rest)| rest.split("\n\n").next())
+        .expect("the swarm coordinator has a FILING FOLLOW-UPS section");
+    for needle in [
+        "place.step.uid",
+        "--under step:inbox@",
+        "swarm-settled={{owner}}",
+    ] {
+        assert!(section.contains(needle), "FILING FOLLOW-UPS: {needle}");
+    }
+    let review = template("review-coordinator");
+    assert!(review.contains("--backlog --under {{triage_step}}"));
+    assert!(placeholders(&review)
+        .unwrap()
+        .contains(&"triage_step".to_owned()));
+    assert!(read(".claude/commands/review.md").contains("--var triage_step=\"step:inbox@$repo\""));
+    for cmd in ["next-task", "design-pass"] {
+        assert!(
+            read(&format!(".claude/commands/{cmd}.md")).contains("jkb task add --under"),
+            "{cmd}"
+        );
+    }
+    assert!(read("CLAUDE.md").contains("--under <step>"));
 }
 
 /// The workers' subagent types: rendered from the packaged file, prefixed like everything the

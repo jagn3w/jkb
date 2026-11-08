@@ -6998,3 +6998,66 @@ fn review_file_names_the_step_its_findings_went_under() {
         .success()
         .stdout(predicate::str::contains("in plan step step:inbox@t"));
 }
+
+/// The review coordinator's step 3 is run exactly as it is printed: rendered with the vars
+/// `/review` passes, its filing command taken from the text and run from inside a mounted repo on a
+/// database where nothing was filed there yet. It files the pre-existing finding in the repo's
+/// triage step, homed in its backlog — the text a coordinator is told to run works.
+#[test]
+fn the_review_coordinators_filing_command_files_in_the_repos_triage_step() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = repo_t(&db);
+    let repo_s = repo.to_str().unwrap();
+    let out = jkb(&db)
+        .args(["workflow", "agent", "show", "review-coordinator"])
+        .args(["--var", &format!("repo={repo_s}")])
+        .args(["--var", "range_desc=main...HEAD"])
+        .args(["--var", "stat_cmd=git diff --stat main...HEAD"])
+        .args(["--var", "diff_cmd=git diff main...HEAD"])
+        .args(["--var", "findings_ns=repos/t/codereviews/20261108-000000-b"])
+        .args(["--var", "focus_block="])
+        .args(["--var", "triage_step=step:inbox@t"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let prompt = String::from_utf8(out.stdout).unwrap();
+    let line = prompt
+        .lines()
+        .find(|l| l.contains("jkb task add"))
+        .unwrap_or_else(|| panic!("no filing command in step 3:\n{prompt}"))
+        .trim();
+    let command = line
+        .strip_prefix(&format!("cd {repo_s} && jkb "))
+        .unwrap_or_else(|| panic!("step 3 files from the repository: {line}"));
+    // The flags as printed, then the quoted task line with its placeholders filled.
+    let (flags, quoted) = command.split_once('"').unwrap();
+    assert!(
+        quoted.starts_with("<summary> — <file>:<line> !p<"),
+        "{quoted}"
+    );
+    let flags: Vec<&str> = flags.split_whitespace().collect();
+    assert_eq!(
+        flags,
+        ["task", "add", "--backlog", "--under", "step:inbox@t"],
+        "{line}"
+    );
+    let filed = jkb(&db)
+        .current_dir(&repo)
+        .arg("--json")
+        .args(&flags)
+        .arg("A stale comment — src/lib.rs:12 !p3")
+        .output()
+        .unwrap();
+    assert!(filed.status.success(), "{filed:?}");
+    let filed: serde_json::Value = serde_json::from_slice(&filed.stdout).unwrap();
+    assert_eq!(filed["home"], "tasks/repos/t/.backlog", "{filed}");
+    let uid = filed["uid"].as_str().unwrap();
+    let shown = jkb(&db)
+        .args(["--json", "task", "show", uid])
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{shown:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["place"]["step"]["uid"], "step:inbox@t", "{shown}");
+}

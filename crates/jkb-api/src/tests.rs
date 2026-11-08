@@ -4224,6 +4224,122 @@ fn task_add_in_a_repo_files_under_its_inbox_or_the_step_named() {
     assert!(e.message.contains("under no plan step"), "{e:?}");
 }
 
+/// Where repo `app` is checked out in the triage-step tests.
+const APP_DIR: &str = "/jkb-test/repo-app";
+
+/// Whether the item `uid` exists.
+fn exists(db: &Db, uid: &str) -> bool {
+    let uid = uid.to_owned();
+    db.read(move |c| jkb_core::item::id_for_uid(c, &uid))
+        .unwrap()
+        .is_some()
+}
+
+/// How many items have uid `uid`: a second filing must reuse a triage tree, never build a second.
+fn rows_with_uid(db: &Db, uid: &str) -> i64 {
+    let uid = uid.to_owned();
+    db.read(move |c| {
+        Ok(
+            c.query_row("SELECT count(*) FROM items WHERE uid = ?1", [&uid], |r| {
+                r.get(0)
+            })?,
+        )
+    })
+    .unwrap()
+}
+
+/// `--under step:inbox@<repo>` — the triage step every filing prompt names — works on a database
+/// where nothing has been filed in that repo yet: the Open work tree is created on demand, the task
+/// homed in the repo's backlog with `--backlog`, and a second filing reuses the tree.
+#[test]
+fn task_add_under_a_repos_triage_step_creates_it_on_demand() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::mount_repo(&db, "app", APP_DIR);
+    assert!(!exists(&db, "design:open-work@app"), "no tree yet");
+    let added = |text: &str| match call(
+        &b,
+        json!({ "op": "task.add", "text": text, "backlog": true,
+                "under": "step:inbox@app", "cwd": APP_DIR }),
+    )
+    .unwrap()
+    {
+        Response::Added { added } => added,
+        other => panic!("{other:?}"),
+    };
+    let first = added("first");
+    assert_eq!(first.home, "tasks/repos/app/.backlog");
+    assert_eq!(
+        container_uid(&db, &first.uid).as_deref(),
+        Some("step:inbox@app")
+    );
+    let second = added("second");
+    assert_eq!(
+        container_uid(&db, &second.uid).as_deref(),
+        Some("step:inbox@app")
+    );
+    for uid in [
+        "design:open-work@app",
+        "plan:open-work@app",
+        "step:inbox@app",
+    ] {
+        assert_eq!(rows_with_uid(&db, uid), 1, "{uid}");
+    }
+}
+
+/// The triage step of a repo this knowledge base does not know is not found, named with how to
+/// check the repo, and builds nothing.
+#[test]
+fn task_add_under_an_unknown_repos_triage_step_is_not_found_and_builds_nothing() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let e = call(
+        &b,
+        json!({ "op": "task.add", "text": "x", "under": "step:inbox@nope" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+    assert!(
+        e.message.contains("repo `nope`") && e.message.contains("jkb design ls --repo nope"),
+        "{e:?}"
+    );
+    assert!(!exists(&db, "design:open-work@nope"));
+    assert!(!exists(&db, "plan:open-work@nope"));
+}
+
+/// `task.move --under step:inbox@<repo>` creates the triage step on demand, as `task.add` does.
+#[test]
+fn task_move_under_a_repos_triage_step_creates_it_on_demand() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let step = a_step(&db);
+    let Response::Added { added } = call(
+        &b,
+        json!({ "op": "task.add", "text": "planned", "under": step }),
+    )
+    .unwrap() else {
+        panic!("added")
+    };
+    crate::test_repo::know(&db, &["app"]);
+    assert!(!exists(&db, "step:inbox@app"));
+    match call(
+        &b,
+        json!({ "op": "task.move", "uid": added.uid, "under": "step:inbox@app" }),
+    )
+    .unwrap()
+    {
+        Response::TaskMoved { moved } => {
+            assert!(moved.moved, "{moved:?}");
+            assert_eq!(moved.under, "step:inbox@app");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        container_uid(&db, &added.uid).as_deref(),
+        Some("step:inbox@app")
+    );
+}
+
 /// Test 13: a review's findings are filed in the Open work › Inbox of the repo the review's
 /// namespace names (`finding_under`).
 #[test]

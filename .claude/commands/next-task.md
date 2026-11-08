@@ -72,6 +72,15 @@ calling it done:
 If the task is ambiguous or turns out to be wrong/obsolete, stop and report what you found
 rather than forcing a change.
 
+## 4b. Work you find along the way
+
+Do not widen the task. File what you find instead, under the step of the task you are working:
+`jkb task show <uid>` prints `plan: … (step:…)`. Run
+`jkb task add --under <that step> "<summary> — <file>:<line> !p<n>"`. If the task is in no step,
+file it under the repo's triage step, `--under step:inbox@<repo>`, where `<repo>` is the name
+`jkb design ls` shows as `[designs/<repo>]`. Never without `--under`, and not as a subtask of this
+task unless it must be done first: a subtask holds its parent off the ready frontier.
+
 ## 5. Mark it done
 
 Only after the work is complete and verified:
@@ -100,4 +109,5 @@ Only after the work is complete and verified:
 
 Summarize in a few lines: which task you worked (`id`, priority, one-line title), what you
 changed (files touched, tests/clippy result), and how you marked it done (checkbox+sync, or
-`jkb task set`). If you intentionally left it open, say why.
+`jkb task set`), and the tasks you filed, with their step. If you intentionally left it open, say
+why.
