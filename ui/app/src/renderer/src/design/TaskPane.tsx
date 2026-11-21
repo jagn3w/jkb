@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   decodePlanList,
@@ -61,8 +61,8 @@ export function TaskPane({
   readonly onNotice: (message: string) => void;
   /** The repo the task is shown for: Move to step's Inbox is its Open work › Inbox; none in no repo. */
   readonly repo: string | undefined;
-  /** That repo's designs, for Move to step's choice of a design's step. */
-  readonly designs: RepoNode | undefined;
+  /** The designs Move to step offers steps of: the repo's, or every repo's for a task in none. */
+  readonly designs: readonly RepoNode[];
   /** Whether a task is listed beside this pane, so choosing it selects it there. */
   readonly listed: (uid: string) => boolean;
   /** Select a listed task. */
@@ -387,7 +387,7 @@ function MoveToStep({
 }: {
   readonly uid: string;
   readonly repo: string | undefined;
-  readonly designs: RepoNode | undefined;
+  readonly designs: readonly RepoNode[];
   readonly onMoved: () => void;
   readonly onNotice: (message: string) => void;
 }): React.JSX.Element {
@@ -395,15 +395,20 @@ function MoveToStep({
   const [steps, setSteps] = useState<readonly StepChoice[] | undefined>(undefined);
   const [step, setStep] = useState("");
   const [busy, setBusy] = useState(false);
-  const designList = designs === undefined ? [] : treeOrder([designs]);
+  const designList = treeOrder(designs);
+  // The latest choice: a slower answer for an earlier one is dropped, not shown under this one.
+  const asked = useRef(0);
 
   const choose = async (value: string): Promise<void> => {
     setWhere(value);
     setSteps(undefined);
     setStep("");
+    const ask = ++asked.current;
     if (value === "" || value === "inbox") return;
     const answer = decodePlanList(await op(planOps.plans(value)));
+    if (ask !== asked.current) return;
     if (!answer.ok) {
+      setSteps([]);
       onNotice(`Cannot list the steps: ${answer.error.message}`);
       return;
     }

@@ -664,6 +664,7 @@ export function DesignTab(): React.JSX.Element {
         retired={retiredTree}
         onRestore={onRestore}
         unplanned={unplanned.list}
+        unplannedError={unplanned.error}
         unplannedPick={unplannedPick}
         onPickUnplanned={setUnplannedPick}
       />
@@ -704,7 +705,11 @@ export function DesignTab(): React.JSX.Element {
               list={unplanned.list}
               repo={unplannedPick.repo}
               selected={unplannedPick.uid}
-              designs={tree?.find((r) => r.repo === unplannedPick.repo)}
+              designs={
+                unplannedPick.repo === null
+                  ? (tree ?? [])
+                  : (tree ?? []).filter((r) => r.repo === unplannedPick.repo)
+              }
               onSelect={(uid) => setUnplannedPick({ repo: unplannedPick.repo, uid })}
               onMoved={() => void unplanned.load()}
               onNotice={setNotice}

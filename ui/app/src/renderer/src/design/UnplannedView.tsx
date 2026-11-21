@@ -21,8 +21,8 @@ export function UnplannedView({
   readonly list: UnplannedList | undefined;
   readonly repo: string | null;
   readonly selected: string | undefined;
-  /** The repo's designs, for Move to step. */
-  readonly designs: RepoNode | undefined;
+  /** The designs Move to step offers: the repo's, or every repo's for the Elsewhere row. */
+  readonly designs: readonly RepoNode[];
   readonly onSelect: (uid: string) => void;
   /** After a move: the unplanned list is read again. */
   readonly onMoved: () => void;

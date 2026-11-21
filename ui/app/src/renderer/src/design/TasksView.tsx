@@ -128,7 +128,7 @@ export function TasksView({
           onChanged={() => void plans.load()}
           onNotice={onNotice}
           repo={repo}
-          designs={designs}
+          designs={designs === undefined ? [] : [designs]}
           listed={(uid) => tasks.some((t) => t.uid === uid)}
           onSelect={onSelect}
           onMoved={onMoved}

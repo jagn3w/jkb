@@ -379,6 +379,13 @@ fn area_of(meta: &item::ItemMeta, tags: &[(String, String)]) -> Option<String> {
 }
 
 /// Snapshot the round `ns` if no recording has yet, returning its id (its recording order).
+/// Whether a finding of this priority is a must-fix: the one threshold the round snapshot, and so
+/// the land gate, and every display of a finding not yet recorded in a round share.
+#[must_use]
+pub fn is_must_fix(priority: Option<i64>) -> bool {
+    priority.is_some_and(|p| p <= 1)
+}
+
 fn snapshot_round(
     conn: &Connection,
     ns: &str,
@@ -447,7 +454,7 @@ fn snapshot_round(
         let Some(m) = metas.get(item_id) else {
             continue;
         };
-        let must_fix = m.priority.is_some_and(|p| p <= 1);
+        let must_fix = is_must_fix(m.priority);
         let area = area_of(m, tags.get(item_id).map_or(&[][..], Vec::as_slice));
         stmt.execute(params![id, item_id.get(), must_fix, area])?;
     }

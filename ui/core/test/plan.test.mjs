@@ -329,6 +329,16 @@ test("nestFindings: two findings of each other move neither, and nothing is lost
   assert.deepEqual(lines.map((l) => l.task.uid).sort(), ["A", "F", "G"]);
 });
 
+test("nestFindings: a loop through a moved finding's subtask loses no line", async () => {
+  const { nestFindings, visibleTasks } = await import("../dist/index.js");
+  // F is found in X and carries its subtask F1; X is found in F1. The origin chain F→X→F1 never
+  // revisits a member, so only block membership closes the loop.
+  const rows = [row("F", "open", 0, ["X"]), row("F1", "open", 1), row("X", "open", 0, ["F1"]), row("A", "open", 0)];
+  const lines = nestFindings(visibleTasks(rows, () => true));
+  assert.deepEqual(lines.map((l) => l.task.uid).sort(), ["A", "F", "F1", "X"]);
+  assert.equal(lines.length, 4, "no line drawn twice");
+});
+
 test("design.plans and task.show decode found_in and findings, and an older daemon's answer as none", async () => {
   const { decodePlanList, decodeTaskDetail } = await import("../dist/index.js");
   const list = (tasks) => ok({ result: "design_plans", list: { uid: "design:d", plans: [], hidden: 0, tasks } });

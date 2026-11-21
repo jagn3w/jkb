@@ -390,6 +390,7 @@ export function DesignSidebar({
   retired,
   onRestore,
   unplanned,
+  unplannedError,
   unplannedPick,
   onPickUnplanned,
 }: {
@@ -409,6 +410,8 @@ export function DesignSidebar({
   readonly onRestore: (uid: string) => Promise<void>;
   /** The unplanned tasks by repo (`task.unplanned`); `undefined` until read. */
   readonly unplanned: UnplannedList | undefined;
+  /** Why the unplanned tasks could not be read, so a failure is not shown as none. */
+  readonly unplannedError?: string | undefined;
   /** The unplanned task open, if one is (instead of a design). */
   readonly unplannedPick: UnplannedPick | undefined;
   readonly onPickUnplanned: (pick: UnplannedPick) => void;
@@ -486,6 +489,9 @@ export function DesignSidebar({
       </header>
       {creating && tree !== undefined && (
         <NewDesignForm tree={tree} openRepo={openRepo} onCreate={onCreate} onClose={() => setCreating(false)} />
+      )}
+      {unplannedError !== undefined && (
+        <p className="sidebar-hint muted">Cannot list unplanned tasks: {unplannedError}</p>
       )}
       {tree === undefined ? (
         <p className="sidebar-hint muted">{error !== undefined ? `Cannot list designs: ${error}` : "Loading designs…"}</p>

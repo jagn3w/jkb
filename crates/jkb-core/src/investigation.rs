@@ -888,7 +888,7 @@ pub fn link(
 fn refuse_review_edge(edge_type: EdgeType) -> Result<()> {
     if edge_type == EdgeType::FoundIn {
         return Err(Error::Types(TypeError::Validation(format!(
-            "`{}` is written only by a review filing or recording (`jkb task review file|record`);              link provenance from investigation work with `discovered_from`",
+            "`{}` is written only by a review filing or recording (`jkb task review file|record`); link provenance from investigation work with `discovered_from`",
             edge_type.as_str()
         ))));
     }

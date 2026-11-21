@@ -1476,7 +1476,7 @@ fn findings_into(
             round: f.round,
             must_fix: f
                 .must_fix
-                .unwrap_or_else(|| m.priority.is_some_and(|p| p <= 1)),
+                .unwrap_or_else(|| jkb_core::reviews::is_must_fix(m.priority)),
             step,
             step_title,
             design: in_design,
