@@ -623,10 +623,16 @@ pub enum Bound {
     To(ItemId),
     /// Already bound to a different task: the first bind wins (D52.9).
     Elsewhere(ItemId),
+    /// Not bound: the target is not an item of kind `task`. A binding is the worker's scope, and [`in_scope`] admits everything contained under it, so a
+    /// plan step, a plan or a design would hand the worker every task beneath it — the triage
+    /// tree's whole Inbox among them.
+    NotATask,
 }
 
 /// Bind an attested subagent (`session`, `agent_id`) to `task`, first bind wins. A worker cannot
-/// hop to a second task once it has acted on one.
+/// hop to a second task once it has acted on one, and binds only to an item of kind `task`
+/// ([`Bound::NotATask`] otherwise, writing nothing): the rule lives here, the one writer of a
+/// binding, rather than in each op that can bind.
 ///
 /// # Errors
 /// A database error.
@@ -638,6 +644,10 @@ pub fn bind_agent(
     task: ItemId,
 ) -> Result<Bound> {
     check_agent(agent_id)?;
+    let kind = crate::item::get(conn, task)?.map(|m| m.kind);
+    if kind.as_deref() != Some(crate::nstype::tasks::KIND_TASK) {
+        return Ok(Bound::NotATask);
+    }
     let inserted = conn
         .prepare_cached(
             "INSERT INTO agent_bindings (session, agent_id, item_id, bound_at)

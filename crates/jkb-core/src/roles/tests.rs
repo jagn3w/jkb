@@ -226,6 +226,36 @@ fn an_attested_agent_binds_to_its_first_task_and_cannot_hop() {
     assert_eq!(db.read(|c| agent_binding(c, "s1", "ag1")).unwrap(), Some(a));
 }
 
+/// A binding is a worker's scope, so it is to a task only: a design, plan or plan step — each a
+/// container of tasks — is refused, and nothing is bound.
+#[test]
+fn an_attested_agent_binds_to_nothing_but_a_task() {
+    let db = Db::open_in_memory().unwrap();
+    let (a, _) = tasks(&db);
+    let containers = db
+        .write_txn("test", |c, m| {
+            let d = crate::design::create(c, m, "app", "D", "Body.")?.uid;
+            let p = crate::design::plan::create(c, m, &d, "P", &["one".to_owned()])?;
+            let mut out = Vec::new();
+            for uid in [&d, &p.uid, &p.steps[0].uid] {
+                out.push(crate::item::id_for_uid(c, uid)?.unwrap());
+            }
+            Ok(out)
+        })
+        .unwrap();
+    for id in containers {
+        let got = db
+            .write_txn("test", move |c, m| bind_agent(c, m, "s1", "ag1", id))
+            .unwrap();
+        assert_eq!(got, Bound::NotATask);
+        assert_eq!(db.read(|c| agent_binding(c, "s1", "ag1")).unwrap(), None);
+    }
+    let first = db
+        .write_txn("test", move |c, m| bind_agent(c, m, "s1", "ag1", a))
+        .unwrap();
+    assert_eq!(first, Bound::Now(a), "a refused bind decided nothing");
+}
+
 #[test]
 fn scope_reaches_subtasks_and_the_task_s_own_findings_and_nothing_else() {
     let db = Db::open_in_memory().unwrap();

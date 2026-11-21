@@ -3611,6 +3611,18 @@ impl LocalBackend {
                         ),
                     ));
                 }
+                jkb_core::roles::Bound::NotATask => {
+                    return Err(ApiError::with_code(
+                        ErrorCode::Forbidden,
+                        format!(
+                            "`{}` refused: {} binds to a task only, and this names a plan, step, \
+                             design or other item — run `jkb role bind <task uid>` for the task it \
+                             works on",
+                            request.op(),
+                            principal.label
+                        ),
+                    ));
+                }
                 jkb_core::roles::Bound::Now(_) => Some(NewBinding {
                     session,
                     agent_id,

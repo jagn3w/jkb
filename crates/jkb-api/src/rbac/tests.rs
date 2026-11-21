@@ -1544,18 +1544,34 @@ fn a_worker_cannot_build_a_triage_step_by_filing_under_it() {
         .is_some());
 }
 
-/// An attested subagent not yet bound is refused an **existing** triage step as it is an absent
-/// one, and is left unbound. Its first task-targeted write binds it to what it names, so admitting
-/// `task.add --under step:inbox@<repo>` once the step exists bound it to the step, and every task in
-/// the inbox entered its scope. `role.bind` names the step the same way and is refused too.
+/// An attested subagent not yet bound binds to a task and nothing else. Its first task-targeted write
+/// binds it to what it names, and its scope is then everything contained under that, so a binding to
+/// the triage step, its plan or its design — or to any plan step — put every task beneath in its
+/// scope. Each is refused, by `role.bind` and by `task.add --under`, and the worker is left unbound.
 #[test]
-fn an_unbound_subagent_cannot_bind_to_an_existing_triage_step() {
+fn an_unbound_subagent_binds_to_a_task_and_nothing_else() {
     let kb = Kb::new();
     crate::test_repo::know(&kb.db, &["app"]);
-    // The operator files under the triage step, so it exists, with a task in it.
+    // The operator files under the triage step, so the Open work tree exists, with a task in it.
     let inboxed = match ok(
         &kb.op,
         json!({ "op": "task.add", "text": "filed", "under": "step:inbox@app" }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    // An ordinary design with a plan of one step, and a task under that step.
+    let (design, plan, step) = kb
+        .db
+        .write_txn("t", |c, m| {
+            let d = jkb_core::design::create(c, m, "app", "Real", "Build it.")?.uid;
+            let p = jkb_core::design::plan::create(c, m, &d, "Real", &["one".to_owned()])?;
+            Ok((d, p.uid.clone(), p.steps[0].uid.clone()))
+        })
+        .unwrap();
+    let stepped = match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": "stepped", "under": step }),
     ) {
         Response::Added { added } => added.uid,
         other => panic!("{other:?}"),
@@ -1578,29 +1594,40 @@ fn an_unbound_subagent_cannot_bind_to_an_existing_triage_step() {
         other => panic!("{other:?}"),
     };
     let worker = kb.as_token(&ticket);
-    let unbound = || match ok(&worker, json!({ "op": "role.whoami" })) {
-        Response::WhoAmI { whoami } => assert_eq!(whoami.task, None, "bound to the triage step"),
+    let unbound = |what: &str| match ok(&worker, json!({ "op": "role.whoami" })) {
+        Response::WhoAmI { whoami } => assert_eq!(whoami.task, None, "bound to {what}"),
         other => panic!("{other:?}"),
     };
 
-    let e = refused(
-        &worker,
-        json!({ "op": "task.add", "text": "stray", "under": "step:inbox@app",
-                "home": "tasks/repos/t/inbox" }),
-    );
-    assert!(e.message.contains("`step:inbox@app` is not it"), "{e:?}");
-    unbound();
-    let e = refused(
-        &worker,
-        json!({ "op": "role.bind", "uid": "step:inbox@app" }),
-    );
-    assert!(e.message.contains("`step:inbox@app` is not it"), "{e:?}");
-    unbound();
-    // Bound to a task of its own, the inbox's other tasks are outside its reach.
+    for target in [
+        "step:inbox@app".to_owned(),
+        "plan:open-work@app".to_owned(),
+        "design:open-work@app".to_owned(),
+        step.clone(),
+        plan,
+        design,
+    ] {
+        let e = refused(&worker, json!({ "op": "role.bind", "uid": target }));
+        assert!(
+            e.message.contains("binds to a task only") || e.message.contains("is not it"),
+            "{target}: {e:?}"
+        );
+        unbound(&target);
+        // Homed beside its parent's tasks, so the parent is all that is judged.
+        refused(
+            &worker,
+            json!({ "op": "task.add", "text": "stray", "under": target,
+                    "home": "tasks/repos/t/inbox" }),
+        );
+        unbound(&target);
+    }
+    // Bound to a task of its own, the tasks under those containers are outside its reach.
     let own = add(&kb.op, "its own");
     ok(&worker, json!({ "op": "role.bind", "uid": own }));
-    refused(
-        &worker,
-        json!({ "op": "task.set", "uid": inboxed, "priority": 1 }),
-    );
+    for other in [inboxed, stepped] {
+        refused(
+            &worker,
+            json!({ "op": "task.set", "uid": other, "priority": 1 }),
+        );
+    }
 }
