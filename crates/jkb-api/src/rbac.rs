@@ -1145,15 +1145,19 @@ pub fn authorize(
         Ok(r) => r,
         Err(admit) => return Ok(admit),
     };
+    // A repo's triage step is never in a worker's scope, whether it exists or the op would create it
+    // on demand (`plan::resolve_parent_ref`). Judged here, by the name, before anything resolves,
+    // because the paths below disagree about it: a scoped caller is refused an existing one by
+    // `in_scope`, but an attested subagent not yet bound would be admitted and **bound to the
+    // step** (`BindThenRun` — `roles::bind_agent` binds whatever item it is given), putting every
+    // task in the inbox in its scope. A step is only ever named by its uid (`task::resolve_ref`
+    // looks a reference with a `:` up as one), so the name is the whole test.
+    if jkb_core::design::plan::is_triage_step_uid(reference)
+        && (principal.scope.is_some() || principal.attested_agent().is_some())
+    {
+        return Err(out_of_scope(op, &principal.label, reference));
+    }
     let Some(target) = task::resolve_ref(conn, reference)? else {
-        // A repo's triage step the op would create on demand (`plan::resolve_parent_ref`) is never
-        // in a worker's scope: refused as an existing one would be, so a worker cannot build a
-        // triage tree and file into it where it could not file into one already there.
-        if jkb_core::design::plan::is_triage_step_uid(reference)
-            && (principal.scope.is_some() || principal.attested_agent().is_some())
-        {
-            return Err(out_of_scope(op, &principal.label, reference));
-        }
         // Nothing to scope against; the op itself answers `not_found`.
         return Ok(Admit::Run);
     };

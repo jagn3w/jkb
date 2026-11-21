@@ -203,7 +203,7 @@ fn the_packaged_templates_are_what_the_coordinators_fill() {
         assert_eq!(get(c).def.role, Role::Coordinator, "{c}");
     }
     // `/task-swarm` fills the swarm's coordinator, the designer budget included.
-    assert_eq!(get("swarm-coordinator").version, 6);
+    assert_eq!(get("swarm-coordinator").version, 7);
     assert_eq!(
         placeholders(&get("swarm-coordinator").def.template).unwrap(),
         [

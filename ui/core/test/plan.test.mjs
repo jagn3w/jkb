@@ -337,6 +337,28 @@ test("nestFindings: a loop through a moved finding's subtask loses no line", asy
   const lines = nestFindings(visibleTasks(rows, () => true));
   assert.deepEqual(lines.map((l) => l.task.uid).sort(), ["A", "F", "F1", "X"]);
   assert.equal(lines.length, 4, "no line drawn twice");
+  // Each line of the loop is drawn where it was listed, unmoved and noted with its origin — not
+  // after the group's last line, where F would read as A's subtask.
+  assert.deepEqual(drawn(lines), ["F(from title of X)", "F1", "X(from title of F1)", "A"]);
+
+  // Under a parent, the loop still keeps its place; a finding hanging off it (H, found in F1) is not
+  // on the loop and is drawn under its origin as usual.
+  const nested = [
+    row("P", "open", 0),
+    row("F", "open", 1, ["X"]),
+    row("F1", "open", 2),
+    row("X", "open", 0, ["F1"]),
+    row("A", "open", 0),
+    row("H", "open", 0, ["F1"]),
+  ];
+  assert.deepEqual(drawn(nestFindings(visibleTasks(nested, () => true))), [
+    "P",
+    "F(from title of X)",
+    "F1",
+    "H<F1",
+    "X(from title of F1)",
+    "A",
+  ]);
 });
 
 test("design.plans and task.show decode found_in and findings, and an older daemon's answer as none", async () => {

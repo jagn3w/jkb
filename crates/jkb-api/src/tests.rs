@@ -4294,6 +4294,72 @@ fn task_add_under_a_repos_triage_step_creates_it_on_demand() {
     }
 }
 
+/// A swarm files a follow-up already settled for its run, in one write: the coordinator's filed line
+/// carries `#swarm-settled=<owner>` (an owner is `<host>:<pid>`), and the tag is written in the
+/// transaction that creates the task, so no compaction can fall between the add and the settle.
+#[test]
+fn a_follow_up_filed_with_its_settled_tag_is_settled_in_the_same_transaction() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::mount_repo(&db, "app", APP_DIR);
+    let added = match call(
+        &b,
+        json!({ "op": "task.add", "under": "step:inbox@app", "cwd": APP_DIR,
+                "text": "a stray guard — src/lib.rs:12 !p2 #swarm-settled=box:4242" }),
+    )
+    .unwrap()
+    {
+        Response::Added { added } => added,
+        other => panic!("{other:?}"),
+    };
+    let id = added.id;
+    let (title, tags, txns) = db
+        .read(move |c| {
+            let title = jkb_core::item::get(c, jkb_types::ItemId::new(id))?
+                .unwrap()
+                .content;
+            let tags = c
+                .prepare("SELECT facet, value FROM tag_applications WHERE item_id = ?1")?
+                .query_map([id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            // The item's insert and the tag's, by the changelog: one transaction id between them.
+            let txns = c
+                .prepare(
+                    "SELECT DISTINCT c.entity_type, c.txn_id FROM changelog c
+                     WHERE (c.entity_type = 'items' AND c.entity_id = ?1)
+                        OR (c.entity_type = 'tag_applications' AND c.entity_id IN
+                            (SELECT CAST(rowid AS TEXT) FROM tag_applications WHERE item_id = ?1))",
+                )?
+                .query_map([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((title, tags, txns))
+        })
+        .unwrap();
+    let title = title.unwrap_or_default();
+    assert!(
+        title.starts_with("a stray guard — src/lib.rs:12") && !title.contains('#'),
+        "{title:?}"
+    );
+    assert!(
+        tags.contains(&("swarm-settled".to_owned(), "box:4242".to_owned())),
+        "{tags:?}"
+    );
+    let ids: std::collections::BTreeSet<i64> = txns.iter().map(|(_, t)| *t).collect();
+    let kinds: std::collections::BTreeSet<&str> = txns.iter().map(|(e, _)| e.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["items", "tag_applications"].into_iter().collect(),
+        "{txns:?}"
+    );
+    assert_eq!(
+        ids.len(),
+        1,
+        "the add and the settle are one write: {txns:?}"
+    );
+}
+
 /// The triage step of a repo this knowledge base does not know is not found, named with how to
 /// check the repo, and builds nothing.
 #[test]

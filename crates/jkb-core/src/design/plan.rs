@@ -600,9 +600,10 @@ pub fn triage_step(conn: &Connection, meta: &WriteMeta, repo: &str) -> Result<It
 /// knowledge base does not know that repo; else that of `ambient_repo`; else refused.
 ///
 /// # Errors
-/// A mapping to a uid that is gone or not a plan step (named, with how to clear it), a home naming a
-/// repo this knowledge base does not know, no repo to fall back to, a malformed home, or a database
-/// error.
+/// A mapping to a uid that is gone or not a plan step, or to a step of a retired design (a nested
+/// design counts as retired when an enclosing one is) — each named, with how to clear it — a home
+/// naming a repo this knowledge base does not know, no repo to fall back to, a malformed home, or a
+/// database error.
 pub fn step_for_home(
     conn: &Connection,
     meta: &WriteMeta,

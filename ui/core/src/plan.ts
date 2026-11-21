@@ -345,17 +345,40 @@ export function nestFindings(lines: readonly TaskLine[]): FindingLine[] {
   // A finding inside a moved block moves with it, so only a block's own head is attached.
   const attached = new Map<number, number[]>();
   const heads = new Set<number>();
-  const members = new Set<number>();
+  // The head of the moved block each line is in.
+  const headOf = new Map<number, number>();
   for (let i = 0; i < tasks.length; i += 1) {
-    if (members.has(i)) continue;
+    if (headOf.has(i)) continue;
     const origin = originOf.get(i);
     if (origin === undefined) continue;
     const end = blockEnd(i);
     // An origin inside the finding's own block cannot hold it.
     if (origin > i && origin < end) continue;
     heads.add(i);
-    for (let j = i; j < end; j += 1) members.add(j);
+    for (let j = i; j < end; j += 1) headOf.set(j, i);
     attached.set(origin, [...(attached.get(origin) ?? []), i]);
+  }
+  // A loop the check above cannot see — one through a moved block's subtask — would draw its
+  // blocks under one another and none of them under anything drawn. Each block on such a loop is
+  // not moved: it stays where it was listed, noted `from` its origin like any finding whose origin
+  // is not drawn here. A block hanging off the loop is then drawn under its origin as usual.
+  const next = (h: number): number | undefined => {
+    const origin = originOf.get(h);
+    return origin === undefined ? undefined : headOf.get(origin);
+  };
+  const onLoop = [...heads].filter((h) => {
+    let at = next(h);
+    for (let steps = 0; at !== undefined && steps < heads.size; steps += 1) {
+      if (at === h) return true;
+      at = next(at);
+    }
+    return false;
+  });
+  for (const h of onLoop) {
+    heads.delete(h);
+    const origin = originOf.get(h);
+    if (origin !== undefined) attached.set(origin, (attached.get(origin) ?? []).filter((f) => f !== h));
+    originOf.delete(h);
   }
   const note = (line: TaskLine, k: number): FindingLine => {
     if (originOf.has(k)) return line;
@@ -389,12 +412,6 @@ export function nestFindings(lines: readonly TaskLine[]): FindingLine[] {
     for (const f of attached.get(i) ?? []) emitFinding(f, line.task.uid);
   };
   walk(0, tasks.length);
-  // Nothing is lost: a loop the check above cannot see (one that runs through a moved block's
-  // subtask) leaves its lines unreached, so they are drawn where they were listed, unmoved.
-  for (let k = 0; k < lines.length; k += 1) {
-    const line = lines[k];
-    if (line !== undefined && !emitted.has(k)) out.push(line);
-  }
   return out;
 }
 

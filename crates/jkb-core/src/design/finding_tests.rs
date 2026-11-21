@@ -412,6 +412,34 @@ fn a_round_recorded_after_its_task_finished_stays_under_the_step() {
     assert!(!counts(&db, step).0, "the open finding keeps the step open");
 }
 
+/// A late round is shelved by a later *finish*, though: its task reopened and finished again with the
+/// finding still open arrives at a terminal status, and every task of the round is terminal once
+/// more, so the finding goes to the Inbox as any finished task's would.
+#[test]
+fn a_late_round_is_shelved_when_its_reopened_task_finishes_again() {
+    let db = db();
+    let (_, step) = planned(&db, "Reopened");
+    let t = task_under(&db, "task:t", step);
+    set_status(&db, t, TaskStatus::Done);
+    let f = findings(
+        &db,
+        "repos/app/codereviews/reopened",
+        step,
+        &[(1, TaskStatus::Open)],
+        Some(t),
+    );
+    assert_eq!(parent(&db, f[0]), Some(step), "not shelved when recorded");
+    set_status(&db, t, TaskStatus::Open);
+    assert_eq!(parent(&db, f[0]), Some(step), "not shelved by reopening");
+    set_status(&db, t, TaskStatus::Done);
+    assert_eq!(status(&db, t).as_deref(), Some("done"));
+    assert_eq!(
+        parent(&db, f[0]),
+        Some(inbox(&db)),
+        "shelved by the second finish"
+    );
+}
+
 /// A misplaced Open work tree never blocks a task from finishing: the finding stays where it is,
 /// and nothing the attempt wrote survives.
 #[test]

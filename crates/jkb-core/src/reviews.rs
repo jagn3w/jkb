@@ -378,7 +378,6 @@ fn area_of(meta: &item::ItemMeta, tags: &[(String, String)]) -> Option<String> {
     (!file.is_empty() && !file.contains(' ')).then(|| file.to_owned())
 }
 
-/// Snapshot the round `ns` if no recording has yet, returning its id (its recording order).
 /// Whether a finding of this priority is a must-fix: the one threshold the round snapshot, and so
 /// the land gate, and every display of a finding not yet recorded in a round share.
 #[must_use]
@@ -386,6 +385,7 @@ pub fn is_must_fix(priority: Option<i64>) -> bool {
     priority.is_some_and(|p| p <= 1)
 }
 
+/// Snapshot the round `ns` if no recording has yet, returning its id (its recording order).
 fn snapshot_round(
     conn: &Connection,
     ns: &str,
@@ -570,8 +570,11 @@ pub fn is_finding_of(conn: &Connection, task: ItemId, target: ItemId) -> Result<
 /// — and only of a round **every** task recorded against is terminal. A round of a staging branch is
 /// recorded against each task it credits, and its findings are still the open work of the ones not
 /// yet finished; the last of them to finish shelves them. A round recorded after all of them
-/// finished is never shelved: its findings are new work about that step and keep its plan open
-/// until someone triages them (the design's Q4).
+/// finished is not shelved by being recorded, nor by a terminal-to-terminal transition of one of its
+/// tasks (shelving runs only on a transition *into* a terminal status): its findings are new work
+/// about that step and keep its plan open until someone triages them (the design's Q4). Only a
+/// later finish does shelve it — one of its tasks reopened and then finished again, with every
+/// task of the round terminal once more — because that task finished with the findings still open.
 /// A finding someone moved by hand (under a task, or already into an Inbox) is left where it is, and
 /// so is one whose round namespace names no repo this knowledge base knows — a namespace mapped to a
 /// step filed it there, which is the operator's choice. Each move is [`crate::task::move_under`],

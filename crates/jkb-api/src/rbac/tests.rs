@@ -1543,3 +1543,64 @@ fn a_worker_cannot_build_a_triage_step_by_filing_under_it() {
         .unwrap()
         .is_some());
 }
+
+/// An attested subagent not yet bound is refused an **existing** triage step as it is an absent
+/// one, and is left unbound. Its first task-targeted write binds it to what it names, so admitting
+/// `task.add --under step:inbox@<repo>` once the step exists bound it to the step, and every task in
+/// the inbox entered its scope. `role.bind` names the step the same way and is refused too.
+#[test]
+fn an_unbound_subagent_cannot_bind_to_an_existing_triage_step() {
+    let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["app"]);
+    // The operator files under the triage step, so it exists, with a task in it.
+    let inboxed = match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": "filed", "under": "step:inbox@app" }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "implementer", "role": "implementer" }),
+    );
+    let ticket = match ok(
+        &kb.as_token(&container),
+        json!({ "op": "attest.mint", "session": "s1", "agent_id": "ag1",
+                "agent_type": "implementer", "tool_use_id": "tool-1" }),
+    ) {
+        Response::Ticket { token } => token,
+        other => panic!("{other:?}"),
+    };
+    let worker = kb.as_token(&ticket);
+    let unbound = || match ok(&worker, json!({ "op": "role.whoami" })) {
+        Response::WhoAmI { whoami } => assert_eq!(whoami.task, None, "bound to the triage step"),
+        other => panic!("{other:?}"),
+    };
+
+    let e = refused(
+        &worker,
+        json!({ "op": "task.add", "text": "stray", "under": "step:inbox@app",
+                "home": "tasks/repos/t/inbox" }),
+    );
+    assert!(e.message.contains("`step:inbox@app` is not it"), "{e:?}");
+    unbound();
+    let e = refused(
+        &worker,
+        json!({ "op": "role.bind", "uid": "step:inbox@app" }),
+    );
+    assert!(e.message.contains("`step:inbox@app` is not it"), "{e:?}");
+    unbound();
+    // Bound to a task of its own, the inbox's other tasks are outside its reach.
+    let own = add(&kb.op, "its own");
+    ok(&worker, json!({ "op": "role.bind", "uid": own }));
+    refused(
+        &worker,
+        json!({ "op": "task.set", "uid": inboxed, "priority": 1 }),
+    );
+}
