@@ -232,8 +232,12 @@ pub(crate) struct Host<'a> {
 
 /// `jkb doctor`. `backup` and `fix` need `host`: remote mode refuses them before this runs.
 ///
+/// Every section prints, `--backup` and `--fix` included, and only then does an unplanned task (or
+/// a daemon too old to count them) fail the run, so the exit status is a gate and the report is
+/// still the remedy. Doctor's other findings are reported and exit 0.
+///
 /// # Errors
-/// A failed op or host step.
+/// A failed op or host step, or any task unplanned ([`unplanned_check`]).
 pub(crate) fn run(
     kb: &Kb<'_>,
     host: Option<&Host<'_>>,
@@ -281,7 +285,8 @@ pub(crate) fn run(
         }
     }
 
-    for line in unplanned_report(&health) {
+    let (lines, unplanned_failure) = unplanned_check(&health);
+    for line in lines {
         println!("{line}");
     }
 
@@ -313,17 +318,30 @@ pub(crate) fn run(
             None => println!("db location: ok ({})", h.path.display()),
         }
     }
+    // LAST, once every section has printed: the report is the remedy, so it is never cut short.
+    if let Some(failure) = unplanned_failure {
+        anyhow::bail!("{failure}");
+    }
     Ok(())
 }
 
-/// The unplanned-task lines of `jkb doctor`: every open task no execution plan's step reaches, as
-/// many as `kb.health` listed, and how many it left out. Reported, not yet a failure.
-fn unplanned_report(health: &jkb_api::health::Health) -> Vec<String> {
+/// The unplanned-task lines of `jkb doctor` — every open task no execution plan's step reaches, as
+/// many as `kb.health` listed, and how many it left out — and the sentence doctor fails with: `None`
+/// only when the count is known to be zero. A daemon too old to say fails too, as an unreadable
+/// answer is never read as none.
+fn unplanned_check(health: &jkb_api::health::Health) -> (Vec<String>, Option<String>) {
     let (Some(listed), Some(count)) = (&health.unplanned, health.unplanned_count) else {
-        return vec!["unplanned tasks: not reported (the daemon predates the check)".to_owned()];
+        return (
+            vec!["unplanned tasks: not reported (the daemon predates the check)".to_owned()],
+            Some(
+                "the daemon predates the unplanned check, so whether any task is unplanned is \
+                 unknown: restart `jkb serve` from this build"
+                    .to_owned(),
+            ),
+        );
     };
     if count == 0 {
-        return vec!["unplanned tasks: none".to_owned()];
+        return (vec!["unplanned tasks: none".to_owned()], None);
     }
     let mut lines = vec![format!(
         "unplanned tasks: {count} open task(s) under no execution plan's step \
@@ -336,7 +354,11 @@ fn unplanned_report(health: &jkb_api::health::Health) -> Vec<String> {
             count - listed.len()
         ));
     }
-    lines
+    let failure = format!(
+        "{count} unplanned task(s): every open task belongs under a plan step (listed above; \
+         `jkb task move <uid> --under <step>` homes one)"
+    );
+    (lines, Some(failure))
 }
 
 /// The vector-index lines of `jkb doctor`. `swept` is the stale-row count `--fix` removed, when it
@@ -393,7 +415,7 @@ fn vector_report(health: &jkb_api::health::Health, swept: Option<usize>) -> Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::{free, probe_with, unplanned_report, vector_report};
+    use super::{free, probe_with, unplanned_check, vector_report};
     use jkb_api::health::Health;
 
     fn health(vector_tables: usize, stale: usize, unguarded: Option<&[&str]>) -> Health {
@@ -410,11 +432,14 @@ mod tests {
         }
     }
 
-    /// None, some, past the cap, and a daemon too old to say — which is not read as none.
+    /// None, some, past the cap, and a daemon too old to say — which is not read as none. Only a
+    /// count known to be zero passes; every other case fails, naming the count.
     #[test]
     fn unplanned_tasks_are_counted_listed_and_never_assumed_absent() {
+        let unplanned_report = |h: &Health| unplanned_check(h).0;
         let mut h = health(0, 0, Some(&[]));
         assert_eq!(unplanned_report(&h), ["unplanned tasks: none"]);
+        assert_eq!(unplanned_check(&h).1, None, "none unplanned passes");
 
         h.unplanned = Some(vec![jkb_api::health::Unplanned {
             uid: "task:a".to_owned(),
@@ -428,6 +453,10 @@ mod tests {
             "{lines:?}"
         );
         assert_eq!(lines[1], "  task:a  A");
+        let failure = unplanned_check(&h)
+            .1
+            .expect("one unplanned task fails doctor");
+        assert!(failure.starts_with("1 unplanned task(s)"), "{failure}");
 
         h.unplanned_count = Some(3);
         let lines = unplanned_report(&h);
@@ -439,6 +468,8 @@ mod tests {
         h.unplanned = None;
         h.unplanned_count = None;
         assert!(unplanned_report(&h)[0].contains("not reported"));
+        let failure = unplanned_check(&h).1.expect("an old daemon fails doctor");
+        assert!(failure.contains("predates"), "{failure}");
     }
 
     /// A legacy database with no stale rows yet but no GC trigger is NOT reported ok: the row count

@@ -1124,6 +1124,28 @@ pub struct UnplannedList {
     pub count: usize,
     /// Each repo with any, by name, the tasks in no repo last.
     pub repos: Vec<UnplannedRepo>,
+    /// One split per task the request named in `of`, in its order; empty when it named none. An
+    /// asker that named a task and finds no split for it here has not been answered — a daemon
+    /// that predates `of` refuses the field rather than ignoring it, but the asker still reads a
+    /// missing split as *unknown*, never as *nothing unplanned*.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub of: Vec<OwnUnplanned>,
+}
+
+/// One task's unplanned work split from the rest: what `jkb task land` refuses on (`own`) and what
+/// it only warns about (`others`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnUnplanned {
+    /// The task, as the request named it.
+    pub task: String,
+    /// Its **own** unplanned work, most urgent first, every one of them: the task itself, a task in
+    /// its subtree, or a finding `found_in` either ([`jkb_core::design::plan::own_work`]), in any
+    /// repo — work the task's owner can move.
+    pub own: Vec<String>,
+    /// How many other unplanned tasks the asked scope (`repo`, or everything) holds.
+    pub others: usize,
+    /// The first of those, most urgent first, at most the asked limit (and [`MAX_UNPLANNED`]).
+    pub others_first: Vec<String>,
 }
 
 /// `task.unplanned`: the open tasks no plan step reaches ([`jkb_core::design::plan::unplanned`], the
@@ -1131,18 +1153,51 @@ pub struct UnplannedList {
 /// the first `limit` (at most [`MAX_UNPLANNED`]) of each listed. The Design sidebar's read: what
 /// escaped the write-side refusal is shown rather than lost.
 ///
+/// For each task in `of`, the same set is also split into that task's own unplanned work and the
+/// rest of the scope ([`OwnUnplanned`]) — computed **here**, from the one read, so the land gate
+/// and the In Flight row ask one question rather than assembling the split themselves. The
+/// grouped listing is unchanged by `of`.
+///
 /// # Errors
 /// A failed read.
 pub fn unplanned(
     conn: &Connection,
     repo: Option<&str>,
     limit: Option<usize>,
+    of: &[String],
 ) -> Result<UnplannedList, ApiError> {
     let cap = limit.unwrap_or(MAX_UNPLANNED).min(MAX_UNPLANNED);
     let mut groups: std::collections::BTreeMap<(bool, Option<String>), UnplannedRepo> =
         std::collections::BTreeMap::new();
     let mut listed: std::collections::HashMap<String, ItemId> = std::collections::HashMap::new();
-    for t in jkb_core::design::plan::unplanned(conn)? {
+    let all = jkb_core::design::plan::unplanned(conn)?;
+    let mut splits = Vec::with_capacity(of.len());
+    for uid in of {
+        // A task that does not exist gets no split, rather than failing the read for every other
+        // task asked about in it: the asker reads a missing split as unknown, which refuses.
+        let Some(id) = jkb_core::task::resolve_ref(conn, uid)? else {
+            continue;
+        };
+        let own_ids = jkb_core::design::plan::own_work(conn, id)?;
+        let mut split = OwnUnplanned {
+            task: uid.clone(),
+            own: Vec::new(),
+            others: 0,
+            others_first: Vec::new(),
+        };
+        for t in &all {
+            if own_ids.contains(&t.id) {
+                split.own.push(t.uid.clone());
+            } else if repo.is_none_or(|r| t.repo.as_deref() == Some(r)) {
+                split.others += 1;
+                if split.others_first.len() < cap {
+                    split.others_first.push(t.uid.clone());
+                }
+            }
+        }
+        splits.push(split);
+    }
+    for t in all {
         if repo.is_some_and(|r| t.repo.as_deref() != Some(r)) {
             continue;
         }
@@ -1173,7 +1228,10 @@ pub fn unplanned(
     }
     let ids: Vec<ItemId> = listed.values().copied().collect();
     let mut found_in = jkb_core::design::plan::found_in_of(conn, &ids)?;
-    let mut out = UnplannedList::default();
+    let mut out = UnplannedList {
+        of: splits,
+        ..UnplannedList::default()
+    };
     for mut group in groups.into_values() {
         out.count += group.count;
         for t in &mut group.tasks {
@@ -1220,5 +1278,109 @@ mod tests {
             !FileRoots::new(vec![PathBuf::from("relative")]).admits("file:///relative/x"),
             "a relative root admits nothing"
         );
+    }
+
+    /// A task in repo `r`'s inbox, under `parent` when given (else the inbox step), optionally made
+    /// loose — its container removed, as a build before the create guard could leave it.
+    fn task(
+        db: &jkb_core::Db,
+        uid: &str,
+        repo: &str,
+        parent: Option<&str>,
+        loose: bool,
+    ) -> jkb_types::ItemId {
+        use jkb_core::task::{self, NewTask, Under};
+        let (uid, repo, parent) = (uid.to_owned(), repo.to_owned(), parent.map(str::to_owned));
+        db.write_txn("t", move |c, m| {
+            let under = match parent {
+                Some(p) => Under::Parent(jkb_core::item::id_for_uid(c, &p)?.expect("parent")),
+                None => Under::inbox_of(repo.clone()),
+            };
+            let mut spec = NewTask::new(uid, "t", under);
+            spec.home = format!("tasks/repos/{repo}/inbox");
+            let id = task::create(c, m, &spec)?;
+            if loose {
+                if let Some(p) = jkb_core::containment::parent(c, id)? {
+                    jkb_core::edge::unlink(c, m, p, id, jkb_types::EdgeType::ParentOf)?;
+                    jkb_core::containment::uncontain(c, m, id)?;
+                }
+            }
+            Ok(id)
+        })
+        .unwrap()
+    }
+
+    fn found_in(db: &jkb_core::Db, finding: jkb_types::ItemId, task: jkb_types::ItemId) {
+        db.write_txn("t", move |c, m| {
+            jkb_core::edge::link(c, m, finding, task, jkb_types::EdgeType::FoundIn, None)
+                .map(|_| ())
+        })
+        .unwrap();
+    }
+
+    /// `of` splits the unplanned set into each named task's own work — itself, its subtree, a
+    /// finding `found_in` it or its subtask, in any repo — and the rest of the asked repo, which
+    /// another repo's loose task and a planned finding are not part of.
+    #[test]
+    fn of_splits_a_task_s_own_unplanned_work_from_the_rest_of_its_repo() {
+        let db = jkb_core::Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "repos/r")?;
+            jkb_core::ns::ensure(c, m, "repos/s").map(|_| ())
+        })
+        .unwrap();
+        let land = task(&db, "task:land", "r", None, false);
+        let sub = task(&db, "task:sub", "r", Some("task:land"), false);
+        // A finding about the subtask, filed in another repo and under no step: still its own.
+        let finding = task(&db, "task:finding", "s", None, true);
+        found_in(&db, finding, sub);
+        // A finding of the landing task that IS planned is not unplanned at all.
+        let planned = task(&db, "task:planned-finding", "r", None, false);
+        found_in(&db, planned, land);
+        // A loose task with a subtask: both are its own, and both are unplanned.
+        let land2 = task(&db, "task:land2", "r", None, false);
+        let _sub2 = task(&db, "task:sub2", "r", Some("task:land2"), false);
+        db.write_txn("t", move |c, m| {
+            let p = jkb_core::containment::parent(c, land2)?.expect("parent");
+            jkb_core::edge::unlink(c, m, p, land2, jkb_types::EdgeType::ParentOf)?;
+            jkb_core::containment::uncontain(c, m, land2).map(|_| ())
+        })
+        .unwrap();
+        // The rest: one loose task in `r`, one in `s`.
+        let _other = task(&db, "task:other", "r", None, true);
+        let _elsewhere = task(&db, "task:elsewhere", "s", None, true);
+
+        let of = vec!["task:land".to_owned(), "task:land2".to_owned()];
+        let list = db
+            .read_with(move |c| super::unplanned(c, Some("r"), Some(5), &of))
+            .unwrap();
+        assert_eq!(list.of.len(), 2);
+        let split = &list.of[0];
+        assert_eq!(split.task, "task:land");
+        assert_eq!(split.own, ["task:finding"]);
+        let mut rest = split.others_first.clone();
+        rest.sort();
+        assert_eq!(rest, ["task:land2", "task:other", "task:sub2"]);
+        assert_eq!(split.others, 3);
+        let split = &list.of[1];
+        let mut own = split.own.clone();
+        own.sort();
+        assert_eq!(own, ["task:land2", "task:sub2"]);
+        assert_eq!(split.others_first, ["task:other"]);
+        assert_eq!(split.others, 1);
+        // The grouped listing is unchanged by `of`.
+        assert_eq!(list.count, 3, "{list:?}");
+
+        // Without `of`, no split is reported; a task that does not exist gets none.
+        let list = db
+            .read_with(move |c| super::unplanned(c, Some("r"), None, &[]))
+            .unwrap();
+        assert!(list.of.is_empty());
+        let missing = vec!["task:nope".to_owned(), "task:land2".to_owned()];
+        let list = db
+            .read_with(move |c| super::unplanned(c, None, None, &missing))
+            .unwrap();
+        assert_eq!(list.of.len(), 1, "{list:?}");
+        assert_eq!(list.of[0].task, "task:land2");
     }
 }

@@ -7225,3 +7225,320 @@ fn landed_check_asks_for_a_clean_review_of_the_head_and_records_nothing() {
         .failure()
         .stderr(predicate::str::contains("full commit id"));
 }
+
+/// Make `uid` loose — its container and `parent_of` edge removed — as a build from before every
+/// task was filed under a plan step could leave it. Every creator and container writer refuses one
+/// now, so this is the one seam to the state the land gate's unplanned fact exists to catch.
+fn make_loose(db: &Path, uid: &str) {
+    let store = jkb_core::Db::open(db).unwrap();
+    let uid = uid.to_owned();
+    store
+        .write_txn("t", move |c, m| {
+            let id = jkb_core::item::id_for_uid(c, &uid)?.expect("task");
+            let parent = jkb_core::containment::parent(c, id)?.expect("a container");
+            jkb_core::edge::unlink(c, m, parent, id, jkb_types::EdgeType::ParentOf)?;
+            jkb_core::containment::uncontain(c, m, id).map(|_| ())
+        })
+        .unwrap();
+}
+
+/// File `finding` as found in `task`: the `found_in` edge `task.review_file` writes.
+fn found_in(db: &Path, finding: &str, task: &str) {
+    let store = jkb_core::Db::open(db).unwrap();
+    let (finding, task) = (finding.to_owned(), task.to_owned());
+    store
+        .write_txn("t", move |c, m| {
+            let src = jkb_core::item::id_for_uid(c, &finding)?.expect("finding");
+            let dst = jkb_core::item::id_for_uid(c, &task)?.expect("task");
+            jkb_core::edge::link(c, m, src, dst, jkb_types::EdgeType::FoundIn, None).map(|_| ())
+        })
+        .unwrap();
+}
+
+/// A loose task homed in repo `repo` (`tasks/repos/<repo>/inbox`, or `tasks/inbox` for none),
+/// built through the core as a pre-guard build would have left it.
+fn loose_task_in(db: &Path, uid: &str, repo: Option<&str>) {
+    let store = jkb_core::Db::open(db).unwrap();
+    let (owned, repo) = (uid.to_owned(), repo.map(str::to_owned));
+    store
+        .write_txn("t", move |c, m| {
+            use jkb_core::task::{NewTask, Under};
+            let mut spec = NewTask::new(owned, "loose elsewhere", Under::inbox_of("t"));
+            if let Some(r) = &repo {
+                jkb_core::ns::ensure(c, m, &format!("repos/{r}"))?;
+                spec.home = format!("tasks/repos/{r}/inbox");
+            }
+            jkb_core::task::create(c, m, &spec).map(|_| ())
+        })
+        .unwrap();
+    drop(store);
+    make_loose(db, uid);
+}
+
+/// Where the land target and the work branch point, and whether the session checkout is there:
+/// what a refusal must leave exactly as it found.
+fn land_state(f: &Fixture, onto: &str, branch: &str, worktree: &str) -> (String, String, bool) {
+    (
+        git(&f.repo, &["rev-parse", onto]),
+        git(&f.repo, &["rev-parse", branch]),
+        Path::new(worktree).exists(),
+    )
+}
+
+/// The landing task's OWN unplanned work refuses — the task itself and its open subtask, both
+/// under no plan step — before anything moves, and the In Flight row holds it with the same
+/// sentence. Homing the task (which homes its subtree) lets the land go ahead.
+#[test]
+fn a_task_whose_own_work_is_unplanned_does_not_land() {
+    let f = Fixture::new();
+    let uid = f.add_task("parent of a loose subtree");
+    let out = f
+        .jkb_in_t()
+        .args([
+            "--global",
+            "task",
+            "add",
+            "loose child",
+            "--under",
+            &uid,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let child = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let s = f.work(&uid);
+    let (onto, branch, worktree) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        s["branch"].as_str().unwrap().to_owned(),
+        s["worktree"].as_str().unwrap().to_owned(),
+    );
+    commit_in(Path::new(&worktree), "a.txt", "a", "a");
+    make_loose(&f.db, &uid);
+
+    let before = land_state(&f, &onto, &branch, &worktree);
+    let out = f
+        .jkb()
+        .args(["task", "land", &uid, "--no-gate", "--no-review"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("2 task(s) of its own are under no plan step")
+            && stderr.contains(&uid)
+            && stderr.contains(&child)
+            && stderr.contains("jkb task move <uid> --under <step>"),
+        "{stderr}"
+    );
+    assert_eq!(
+        land_state(&f, &onto, &branch, &worktree),
+        before,
+        "a refusal moved nothing"
+    );
+    assert_eq!(f.status_of(&uid), "in_progress");
+
+    let row = &f.staging(&[])[0]["tasks"][0];
+    assert!(
+        row["land_blocked"]
+            .as_str()
+            .is_some_and(|r| r.contains("of its own") && r.contains(&child)),
+        "{row}"
+    );
+
+    f.jkb()
+        .args(["--global", "task", "move", &uid, "--under", "step:inbox@t"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["--global", "task", "set", &child, "--status", "done"])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "land", &uid, "--no-gate", "--no-review"])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&uid), "done");
+}
+
+/// A finding `found_in` the landing task that is under no plan step is the task's own work, and
+/// refuses; a finding left open under a step (where `task.review_file` puts one) does not.
+#[test]
+fn an_unplanned_finding_of_the_task_refuses_and_a_planned_one_does_not() {
+    let f = Fixture::new();
+    let uid = f.add_task("reviewed task with findings");
+    let planned = f.add_task("a concern left open on purpose");
+    found_in(&f.db, &planned, &uid);
+    let loose = f.add_task("a finding a pre-guard build left loose");
+    found_in(&f.db, &loose, &uid);
+    make_loose(&f.db, &loose);
+    let s = f.work(&uid);
+    let (onto, branch, worktree) = (
+        s["onto"].as_str().unwrap().to_owned(),
+        s["branch"].as_str().unwrap().to_owned(),
+        s["worktree"].as_str().unwrap().to_owned(),
+    );
+    commit_in(Path::new(&worktree), "a.txt", "a", "a");
+
+    let before = land_state(&f, &onto, &branch, &worktree);
+    let out = f
+        .jkb()
+        .args(["task", "land", &uid, "--no-gate", "--no-review"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("1 task(s) of its own") && stderr.contains(&loose),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(&planned),
+        "a planned finding is not named: {stderr}"
+    );
+    assert_eq!(
+        land_state(&f, &onto, &branch, &worktree),
+        before,
+        "a refusal moved nothing"
+    );
+
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "move",
+            &loose,
+            "--under",
+            "step:inbox@t",
+        ])
+        .assert()
+        .success();
+    f.jkb()
+        .args(["task", "land", &uid, "--no-gate", "--no-review"])
+        .assert()
+        .success();
+    assert_eq!(f.status_of(&uid), "done");
+}
+
+/// Unplanned tasks in the landing repo that are not the task's own are WARNED about — one
+/// `warning:` line on stderr naming them — and the task lands. A loose task in another repo, or in
+/// none, is not this repo's and is not mentioned. The In Flight row notes the count and is not held
+/// by it.
+#[test]
+fn unrelated_unplanned_tasks_warn_and_the_task_lands() {
+    let f = Fixture::new();
+    let uid = f.add_task("a planned task in a repo with loose ones");
+    loose_task_in(&f.db, "task:loose-in-proj", Some("proj"));
+    loose_task_in(&f.db, "task:loose-in-t", Some("t"));
+    loose_task_in(&f.db, "task:loose-nowhere", None);
+    let s = f.work(&uid);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+
+    let row = &f.staging(&[])[0]["tasks"][0];
+    assert_eq!(
+        row["land_note"], "1 other unplanned task(s) in proj",
+        "{row}"
+    );
+    assert!(
+        !row["land_blocked"]
+            .as_str()
+            .is_some_and(|r| r.contains("unplanned") || r.contains("plan step")),
+        "a note, never a hold: {row}"
+    );
+
+    let out = f
+        .jkb()
+        .args(["task", "land", &uid, "--no-gate", "--no-review"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("warning:") && l.contains("unplanned"))
+        .collect();
+    assert_eq!(
+        warnings,
+        [
+            "warning: 1 unplanned task(s) in proj, not this task's: task:loose-in-proj; list them \
+             with jkb task unplanned --repo proj, home one with jkb task move <uid> --under \
+             step:inbox@proj"
+        ],
+        "{stderr}"
+    );
+    assert!(!stderr.contains("task:loose-in-t") && !stderr.contains("task:loose-nowhere"));
+    assert_eq!(f.status_of(&uid), "done");
+}
+
+/// The same gate in REMOTE mode, through `jkb serve`: the split is one op, so a client of the
+/// daemon refuses on the task's own unplanned work and warns about the rest exactly as the host
+/// does.
+#[test]
+fn the_unplanned_gate_holds_through_the_daemon() {
+    let f = Fixture::new();
+    let uid = f.add_task("landed through the daemon");
+    let loose = f.add_task("its loose finding");
+    found_in(&f.db, &loose, &uid);
+    make_loose(&f.db, &loose);
+    loose_task_in(&f.db, "task:loose-in-proj", Some("proj"));
+    let s = f.work(&uid);
+    commit_in(
+        Path::new(s["worktree"].as_str().unwrap()),
+        "a.txt",
+        "a",
+        "a",
+    );
+    let token = f.home.path().join("daemon/token");
+    let (_serve, url) = Daemon::start(&f.db, &token);
+    let remote = || {
+        let mut cmd = jkb(None);
+        cmd.current_dir(&f.repo)
+            .env("HOME", f.home.path())
+            .env("JKB_REMOTE", &url)
+            .env("JKB_REMOTE_TOKEN_FILE", &token)
+            .env_remove("JKB_DB")
+            .args(["task", "land", &uid, "--no-gate", "--no-review"]);
+        cmd
+    };
+
+    let out = remote().output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("1 task(s) of its own") && stderr.contains(&loose),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .contains("warning: 1 unplanned task(s) in proj, not this task's: task:loose-in-proj"),
+        "the warning is printed whether or not the land goes ahead: {stderr}"
+    );
+
+    f.jkb()
+        .args([
+            "--global",
+            "task",
+            "move",
+            &loose,
+            "--under",
+            "step:inbox@t",
+        ])
+        .assert()
+        .success();
+    let out = remote().output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("warning: 1 unplanned task(s) in proj"),
+        "{stderr}"
+    );
+    assert_eq!(f.status_of(&uid), "done");
+}

@@ -222,6 +222,9 @@ enum Command {
         rebuild: bool,
     },
     /// Health checks, integrity, and backup.
+    ///
+    /// Prints its whole report, then exits non-zero while any open task is under no plan step
+    /// (or when the daemon is too old to say). Its other findings are reported and exit 0.
     Doctor {
         /// Write a consistent copy of the database to this path first (replaced if it exists).
         #[arg(long)]
@@ -3072,6 +3075,7 @@ struct Preflight {
 /// dirty check that used to sit on the other side of the lock closed no window and was simply a
 /// second wording of one rule.
 fn land_preflight(
+    kb: &session_cli::Kb<'_>,
     ctx: &repo::RepoCtx,
     uid: &str,
     facts: &jkb_api::sessions::TaskState,
@@ -3172,6 +3176,22 @@ fn land_preflight(
     // `containment`, which is where the answer lives (D35), so the row, the command and the
     // machine cannot disagree about which parents are held.
     let open_subtasks = facts.open_subtasks;
+    // Unplanned work: this task's own refuses (in `land_blocker`), the rest of the repo is warned
+    // about here — printed whether or not the land then goes ahead, and before anything moves. A
+    // finished task is not asked: `land_blocker`'s terminal arm refuses it first.
+    let unplanned = if state.is_terminal() {
+        None
+    } else {
+        staging::unplanned_facts(
+            kb,
+            &staging::unplanned_repo(&ctx.key),
+            std::slice::from_ref(&facts.uid),
+        )
+        .remove(&facts.uid)
+    };
+    if let Some(warning) = unplanned.as_ref().and_then(staging::UnplannedFact::warning) {
+        eprintln!("warning: {warning}");
+    }
     if let Some(reason) = staging::land_blocker(&staging::LandFacts {
         state,
         open_subtasks,
@@ -3181,6 +3201,7 @@ fn land_preflight(
         branch_exists: work_ref.is_some(),
         target_dirty: target_dirty.as_deref(),
         listing_failed: listing_failed.as_deref(),
+        unplanned: unplanned.as_ref(),
         // The review is enforced a moment later by `review::enforce`, which renders the same
         // verdict at length and is where `--no-review` records a waiver instead of refusing.
         verdict: None,
@@ -3294,7 +3315,7 @@ pub(crate) fn cmd_task_land(
         branch,
         onto,
         ahead,
-    } = land_preflight(&ctx, uid, &facts)?;
+    } = land_preflight(kb, &ctx, uid, &facts)?;
 
     // The review gate (design D38.5), before the graft: a refusal must not have moved a
     // branch first. Concerns and nits do not block — only must-fix findings do. A waiver is
@@ -5084,6 +5105,7 @@ pub(crate) fn cmd_staging_ls(kb: &session_cli::Kb<'_>, all: bool, json: bool) ->
                         "open_must_fix": t.open_must_fix,
                         "review_ok": t.review_ok,
                         "land_blocked": t.land_blocked,
+                        "land_note": t.land_note,
                     })).collect::<Vec<_>>(),
                 })
             })
@@ -5136,6 +5158,9 @@ pub(crate) fn cmd_staging_ls(kb: &session_cli::Kb<'_>, all: bool, json: bool) ->
             // that could not say why a landing would be refused.
             if let Some(reason) = &t.land_blocked {
                 println!("      cannot land: {reason}");
+            }
+            if let Some(note) = &t.land_note {
+                println!("      note: {note}");
             }
         }
     }

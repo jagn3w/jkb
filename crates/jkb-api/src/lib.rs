@@ -1320,6 +1320,12 @@ pub enum Request {
         /// repo's count is its full count.
         #[serde(default)]
         limit: Option<usize>,
+        /// Tasks to split the answer for ([`tasks::OwnUnplanned`]): each one's own unplanned work
+        /// (itself, its subtree, the findings `found_in` it), and the rest of the listed scope.
+        /// What `jkb task land` refuses on and warns about. Left out of the request when empty, so
+        /// an asker that does not split is understood by a daemon that predates the field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        of: Vec<String>,
     },
     /// Any item's details ([`items::show`]).
     #[serde(rename = "item.show")]
@@ -4991,8 +4997,8 @@ impl LocalBackend {
                     })?,
                 }
             }
-            Request::TaskUnplanned { repo, limit } => Response::Unplanned {
-                list: db.read_with(move |c| tasks::unplanned(c, repo.as_deref(), limit))?,
+            Request::TaskUnplanned { repo, limit, of } => Response::Unplanned {
+                list: db.read_with(move |c| tasks::unplanned(c, repo.as_deref(), limit, &of))?,
             },
             Request::TaskStaging { repo, all } => {
                 let (tasks, truncated) = db.read_with(move |c| {

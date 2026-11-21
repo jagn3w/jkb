@@ -871,6 +871,38 @@ pub fn unplanned(conn: &Connection) -> Result<Vec<UnplannedTask>> {
     Ok(rows)
 }
 
+/// A task's **own work**: the task itself, everything contained under it at any depth, and every
+/// item a `found_in` edge files against any of those ([`jkb_types::EdgeType::FoundIn`] — a review
+/// finding found in it or in one of its subtasks), closed under both, so a finding's own subtasks
+/// are its work too. What `jkb task land` refuses to land while any of it is unplanned: work the
+/// lander owns and can move, as against the rest of the repo, which it is only warned about.
+///
+/// One walk down containment and back along `found_in`, with `UNION` so a cycle (which neither
+/// table should hold) ends rather than recursing.
+///
+/// # Errors
+/// A database error.
+pub fn own_work(conn: &Connection, task: ItemId) -> Result<std::collections::HashSet<ItemId>> {
+    let mut stmt = conn.prepare_cached(
+        "WITH RECURSIVE own(id) AS (
+             SELECT ?1
+             UNION
+             SELECT r.child FROM (
+                 SELECT parent_item_id AS parent, child_item_id AS child FROM containment
+                 UNION ALL
+                 SELECT dst_item_id, src_item_id FROM edges WHERE type = ?2
+             ) r JOIN own o ON r.parent = o.id
+         )
+         SELECT id FROM own",
+    )?;
+    let ids = stmt
+        .query_map(params![task.get(), EdgeType::FoundIn.as_str()], |r| {
+            r.get::<_, i64>(0).map(ItemId::new)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
+}
+
 /// The tasks contained under a plan step, at any depth: how many, how many are `done`, and how
 /// many are terminal (`done` or `cancelled`). **The one count** behind both a span's IMPLEMENTED
 /// and a plan's `archived`, so the two cannot disagree about what a step holds — they once did, a

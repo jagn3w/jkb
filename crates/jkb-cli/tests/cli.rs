@@ -1092,6 +1092,64 @@ fn doctor_reports_integrity_and_version() {
     assert!(backup.exists());
 }
 
+/// Make `uid` loose — its container and `parent_of` edge removed — as a build before every task
+/// was filed under a plan step could leave it. The one seam to a loose task: every creator and
+/// container writer now refuses one.
+fn make_loose(db: &Path, uid: &str) {
+    let store = jkb_core::Db::open(db).unwrap();
+    let uid = uid.to_owned();
+    store
+        .write_txn("t", move |c, m| {
+            let id = jkb_core::item::id_for_uid(c, &uid)?.expect("task");
+            let parent = jkb_core::containment::parent(c, id)?.expect("a container");
+            jkb_core::edge::unlink(c, m, parent, id, jkb_types::EdgeType::ParentOf)?;
+            jkb_core::containment::uncontain(c, m, id).map(|_| ())
+        })
+        .unwrap();
+}
+
+/// `jkb doctor` exits non-zero while a task is unplanned — AFTER printing every section, the backup
+/// included, so the report is not cut short — and exits 0 once it is homed.
+#[test]
+fn doctor_fails_on_an_unplanned_task_after_its_whole_report() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let uid = add_task(&db, "a task from before the guard");
+    jkb(&db).args(["doctor"]).assert().success();
+
+    make_loose(&db, &uid);
+    let backup = dir.path().join("backup.db");
+    let out = jkb(&db)
+        .args(["doctor", "--backup", backup.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for section in [
+        "backup written",
+        "unplanned tasks: 1 open task(s)",
+        "task claims:",
+        "vector index:",
+        "db location:",
+    ] {
+        assert!(stdout.contains(section), "{section:?} missing:\n{stdout}");
+    }
+    assert!(stdout.contains(&uid), "{stdout}");
+    assert!(stderr.contains("1 unplanned task(s)"), "{stderr}");
+    assert!(backup.exists(), "the backup is still written");
+
+    jkb(&db)
+        .args(["task", "move", &uid, "--under", "step:inbox@t"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unplanned tasks: none"));
+}
+
 /// Add a task via the CLI and return its minted uid (`--json` emits `{uid}`).
 fn add_task(db: &Path, text: &str) -> String {
     let out = jkb(db)

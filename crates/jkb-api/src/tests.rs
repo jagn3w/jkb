@@ -621,6 +621,7 @@ fn samples() -> Vec<Request> {
         Request::TaskUnplanned {
             repo: None,
             limit: None,
+            of: vec!["u".into()],
         },
         Request::ItemShow {
             uid: "u".into(),

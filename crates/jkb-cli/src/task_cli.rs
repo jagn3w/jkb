@@ -471,7 +471,11 @@ fn claim(ops: &Ops<'_>, uid: &str, owner: Option<String>, acquire: bool) -> Resu
 
 /// `jkb task unplanned`: the `task.unplanned` read, by repo.
 fn unplanned(ops: &Ops<'_>, repo: Option<String>) -> Result<()> {
-    let list = match ops.call(Request::TaskUnplanned { repo, limit: None })? {
+    let list = match ops.call(Request::TaskUnplanned {
+        repo,
+        limit: None,
+        of: Vec::new(),
+    })? {
         Response::Unplanned { list } => list,
         other => return unexpected("task.unplanned", &other),
     };
