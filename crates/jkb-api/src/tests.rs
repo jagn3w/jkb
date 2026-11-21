@@ -2184,7 +2184,7 @@ fn an_attempt_tag_set_replaces_an_earlier_runs_count() {
     use jkb_core::task;
     let db = Db::open_in_memory().unwrap();
     db.write_txn("t", |c, m| {
-        let mut t = task::NewTask::new("task:tried", "tried");
+        let mut t = task::NewTask::new("task:tried", "tried", Under::inbox_of("t"));
         t.home = "tasks/f".into();
         task::create(c, m, &t)?;
         Ok(())

@@ -51,7 +51,7 @@ fn approve(b: &LocalBackend, uid: &str, head: &str) {
             json!({ "op": "task.tag", "uid": uid, "facet_value": tag, "mode": "set" }),
         );
     }
-    let ns = format!("repos/r/codereviews/{head}");
+    let ns = format!("repos/t/codereviews/{head}");
     ok(
         b,
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": ns,
@@ -1316,20 +1316,20 @@ fn a_coordinator_lands_only_a_head_a_reviewer_approved() {
     ok(
         &kb.op,
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
-                "ns": "repos/r/codereviews/m1",
+                "ns": "repos/t/codereviews/m1",
                 "findings": [{ "severity": "must-fix", "summary": "a bug", "file": "x.rs" }] }),
     );
     ok(
         &kb.op,
         json!({ "op": "task.review_record", "repo": "r", "branch": "b", "sha": "abcd",
-                "findings": "repos/r/codereviews/m1" }),
+                "findings": "repos/t/codereviews/m1" }),
     );
     let e = refused(&c, landing("task.landed", Some("abcd")));
     assert!(e.message.contains("must-fix"), "{e:?}");
     // The coordinator closes the finding, as CLOSING FINDINGS has it.
     let finding = match ok(
         &kb.op,
-        json!({ "op": "task.review_findings", "namespaces": ["repos/r/codereviews/m1"] }),
+        json!({ "op": "task.review_findings", "namespaces": ["repos/t/codereviews/m1"] }),
     ) {
         Response::ReviewFindings { findings } => findings.open_must_fix[0].uid.clone(),
         other => panic!("{other:?}"),
