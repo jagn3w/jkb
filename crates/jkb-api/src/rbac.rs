@@ -266,6 +266,7 @@ impl Request {
             | Self::TaskClaims { .. }
             | Self::KbHealth {}
             | Self::TaskStaging { .. }
+            | Self::TaskUnplanned { .. }
             | Self::ItemShow { .. }
             | Self::KbRelated { .. }
             | Self::KbBlobs { .. }
@@ -529,6 +530,7 @@ impl Request {
             | Self::TaskClaims { .. }
             | Self::KbHealth {}
             | Self::TaskStaging { .. }
+            | Self::TaskUnplanned { .. }
             | Self::ItemShow { .. }
             | Self::KbRelated { .. }
             | Self::KbBlobs { .. }

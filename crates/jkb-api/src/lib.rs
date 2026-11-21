@@ -1310,6 +1310,17 @@ pub enum Request {
         #[serde(default)]
         all: bool,
     },
+    /// The open tasks no plan step reaches, by repo ([`tasks::unplanned`]).
+    #[serde(rename = "task.unplanned")]
+    TaskUnplanned {
+        /// Only this repo's.
+        #[serde(default)]
+        repo: Option<String>,
+        /// At most this many tasks listed per repo (at most [`tasks::MAX_UNPLANNED`]); each
+        /// repo's count is its full count.
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// Any item's details ([`items::show`]).
     #[serde(rename = "item.show")]
     ItemShow {
@@ -1913,6 +1924,7 @@ impl Request {
         "task.reclaim",
         "kb.health",
         "task.staging",
+        "task.unplanned",
         "item.show",
         "item.rm",
         "kb.related",
@@ -2066,6 +2078,7 @@ impl Request {
             Self::TaskReclaim { .. } => "task.reclaim",
             Self::KbHealth {} => "kb.health",
             Self::TaskStaging { .. } => "task.staging",
+            Self::TaskUnplanned { .. } => "task.unplanned",
             Self::ItemShow { .. } => "item.show",
             Self::ItemRm { .. } => "item.rm",
             Self::KbRelated { .. } => "kb.related",
@@ -2129,6 +2142,7 @@ impl Request {
             | Self::TaskReviewFindings { .. }
             | Self::TaskClaims { .. }
             | Self::TaskStaging { .. }
+            | Self::TaskUnplanned { .. }
             | Self::ItemShow { .. }
             | Self::KbRelated { .. }
             | Self::KbBlobs { .. }
@@ -2668,6 +2682,12 @@ pub enum Response {
         #[serde(flatten)]
         health: health::Health,
     },
+    /// A `task.unplanned`.
+    Unplanned {
+        /// The tasks, by repo.
+        #[serde(flatten)]
+        list: tasks::UnplannedList,
+    },
     /// A `task.staging`.
     StagingTasks {
         /// The tasks.
@@ -3055,7 +3075,9 @@ impl Response {
             | Self::Versions { truncated, .. }
             | Self::History { truncated, .. } => *truncated,
             Self::GrepHits { answer } => answer.truncated,
-            Self::Created { .. }
+            // Capped per repo, and each repo's count says how many there are in all.
+            Self::Unplanned { .. }
+            | Self::Created { .. }
             | Self::Sent { .. }
             | Self::Messages { .. }
             | Self::Position { .. }
@@ -3207,6 +3229,7 @@ impl Response {
             | Self::SearchHits { .. }
             | Self::Task { .. }
             | Self::StagingTasks { .. }
+            | Self::Unplanned { .. }
             | Self::Related { .. }
             | Self::Blobs { .. }
             | Self::Versions { .. }
@@ -4968,6 +4991,9 @@ impl LocalBackend {
                     })?,
                 }
             }
+            Request::TaskUnplanned { repo, limit } => Response::Unplanned {
+                list: db.read_with(move |c| tasks::unplanned(c, repo.as_deref(), limit))?,
+            },
             Request::TaskStaging { repo, all } => {
                 let (tasks, truncated) = db.read_with(move |c| {
                     let tasks = staging::staging(c, &repo, all, &mut budget)?;

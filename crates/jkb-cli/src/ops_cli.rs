@@ -62,6 +62,7 @@ pub const fn handles(command: &Command) -> bool {
                 | TaskCmd::Show { .. }
                 | TaskCmd::Subtasks { .. }
                 | TaskCmd::Why { .. }
+                | TaskCmd::Unplanned { .. }
                 | TaskCmd::Add { .. }
                 | TaskCmd::Set { .. }
                 | TaskCmd::Edit { .. }
@@ -1094,6 +1095,10 @@ fn task_json(task: &TaskDetail) -> serde_json::Value {
         "unresolved_needs": task.unresolved_needs,
         // Additive: those needs are kept from a tasks.md the task is no longer written into.
         "needs_outside_tasks_file": task.needs_outside_tasks_file,
+        // Additive: the review findings filed about it, and (for a finding) the tasks it was
+        // found in — display provenance, which no gate reads.
+        "findings": task.findings,
+        "found_in": task.found_in,
     })
 }
 
@@ -1174,6 +1179,9 @@ fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
     if let Some(line) = review_line(&task.review) {
         println!("review:    {line}");
     }
+    if let Some(line) = found_in_line(&task.found_in) {
+        println!("found in:  {line}");
+    }
     for line in place_lines(task.place.as_ref()) {
         println!("{line}");
     }
@@ -1219,7 +1227,48 @@ fn print_task(task: &TaskDetail, truncated: bool, json: bool) -> Result<()> {
             println!("this task is held off the ready frontier until they are done");
         }
     }
+    for line in finding_lines(&task.findings) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// `task show`'s `found in:` line: for a review finding, the tasks it was found in.
+fn found_in_line(found_in: &[jkb_core::design::TaskRef]) -> Option<String> {
+    (!found_in.is_empty()).then(|| {
+        found_in
+            .iter()
+            .map(|t| format!("{} ({})", first_line(&t.title), t.uid))
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
+/// `task show`'s `findings:` block: the review findings filed about the task, grouped by round in
+/// the order the answer lists them (recording order). They never hold the task: a finding sits
+/// beside it under its step, linked only by `found_in`.
+fn finding_lines(findings: &[jkb_api::kb::FindingSummary]) -> Vec<String> {
+    if findings.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![String::new(), format!("findings ({}):", findings.len())];
+    let mut round: Option<Option<&str>> = None;
+    for f in findings {
+        if round != Some(f.round.as_deref()) {
+            round = Some(f.round.as_deref());
+            lines.push(format!("  {}:", f.round.as_deref().unwrap_or("(no round)")));
+        }
+        let status = f.status.as_deref().unwrap_or("?");
+        let mut line = format!("    [{status:^12}] {} — {}", f.uid, first_line(&f.title));
+        if f.must_fix {
+            line.push_str(" (must-fix)");
+        }
+        if let Some(step) = f.step_title.as_deref().or(f.step.as_deref()) {
+            let _ = write!(line, " · under {step}");
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -1315,6 +1364,8 @@ mod tests {
                         place: None,
                         unresolved_needs: Vec::new(),
                         needs_outside_tasks_file: false,
+                        findings: Vec::new(),
+                        found_in: Vec::new(),
                     }),
                     truncated: true,
                 },

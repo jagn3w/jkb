@@ -1,5 +1,5 @@
 //! What every Electron smoke shares (D53.2): finding the binary, the skip and where a skip is a
-//! failure, and quitting the app within a bound. smoke.test.mjs and lifecycle-smoke.test.mjs use it;
+//! failure, and quitting the app within a bound. The smokes (smoke, lifecycle, requests, tasks) use it;
 //! smoke-required.test.mjs pins the skip for each of them.
 //
 // The smokes need the Electron binary, which `pnpm install` downloads from GitHub releases —

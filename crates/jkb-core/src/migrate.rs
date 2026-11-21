@@ -1182,4 +1182,58 @@ mod edges_namespaces_autoincrement_tests {
             .expect("the facet is declared");
         assert_eq!(kind, "string");
     }
+
+    /// V034 links every finding of a recorded round to each task that recorded it with a
+    /// `found_in` edge: an edge already present is kept once (IGNORE), a deleted finding and a
+    /// finding that is its own recording task are skipped, and a filing never recorded links
+    /// nothing.
+    #[test]
+    fn v034_links_recorded_findings_to_the_tasks_that_recorded_them() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(33))
+            .run(&mut conn)
+            .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO items (id, uid, kind, content) VALUES
+                 (1, 'task:a', 'task', 'reviewed task A'),
+                 (2, 'task:b', 'task', 'reviewed task B'),
+                 (3, 'task:f1', 'task', 'a must-fix'),
+                 (4, 'task:f2', 'task', 'a nit, already linked'),
+                 (5, 'task:unrecorded', 'task', 'filed, never recorded'),
+                 (6, 'task:c', 'task', 'records a round holding itself');
+             INSERT INTO review_rounds (id, ns, actor, recorded_at) VALUES
+                 (1, 'repos/jkb/codereviews/r1', 'op', '2026-01-01T00:00:00Z'),
+                 (2, 'repos/jkb/codereviews/r2', 'op', '2026-01-02T00:00:00Z');
+             INSERT INTO review_round_findings (round_id, item_id, must_fix) VALUES
+                 (1, 3, 1), (1, 4, 0), (1, 99, 1), (2, 6, 0);
+             INSERT INTO reviews (item_id, kind, ns, sha, actor, txn_id, at) VALUES
+                 (1, 'recorded', 'repos/jkb/codereviews/r1', 'aaa', 'op', 1, 'x'),
+                 (2, 'recorded', 'repos/jkb/codereviews/r1', 'aaa', 'op', 1, 'x'),
+                 (1, 'recorded', 'repos/jkb/codereviews/r1', 'bbb', 'op', 1, 'x'),
+                 (6, 'recorded', 'repos/jkb/codereviews/r2', 'ccc', 'op', 1, 'x'),
+                 (98, 'recorded', 'repos/jkb/codereviews/r1', 'ddd', 'op', 1, 'x'),
+                 (2, 'waived', NULL, 'eee', 'op', 1, 'x');
+             INSERT INTO review_filings (ns, item_id, filed_by) VALUES
+                 ('repos/jkb/codereviews/r3', 5, 'op');
+             INSERT INTO edges (src_item_id, dst_item_id, type) VALUES (4, 1, 'found_in');",
+        )
+        .unwrap();
+
+        super::run(&mut conn).expect("V034 applied");
+
+        let edges: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT src_item_id, dst_item_id FROM edges WHERE type = 'found_in'
+                 ORDER BY src_item_id, dst_item_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(edges, [(3, 1), (3, 2), (4, 1), (4, 2)]);
+    }
 }

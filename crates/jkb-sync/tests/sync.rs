@@ -4942,3 +4942,37 @@ fn a_file_mapped_into_a_retired_design_fails_rather_than_files() {
     let uri = uri_for(&dir.path().join("one.md"));
     assert_eq!(content_for(&db, &format!("{uri}#stale")), None);
 }
+
+/// A review finding's `found_in` edge into a file task is no edge the tasks.md reconcile owns: an
+/// import of the file — re-read and edited — leaves it untouched.
+#[test]
+fn a_tasks_import_leaves_a_findings_found_in_edge_alone() {
+    let (_dir, db, file) = app_repo("## Work\n- [ ] Ship it ^ship\n");
+    sync(&db, "repos/app").unwrap();
+    let t = item_of(&db, &format!("{}#ship", uri_for(&file)));
+    let f = db
+        .write_txn("t", move |conn, meta| {
+            let f = jkb_core::task::create(
+                conn,
+                meta,
+                &jkb_core::task::NewTask::new(
+                    "task:finding",
+                    "a finding",
+                    jkb_core::task::Under::inbox_of("app"),
+                ),
+            )?;
+            jkb_core::reviews::link_findings(conn, meta, t, &[f])?;
+            Ok(f)
+        })
+        .unwrap();
+    let edges = |db: &Db| {
+        db.read(move |c| jkb_core::edge::edges_from(c, f, jkb_types::EdgeType::FoundIn))
+            .unwrap()
+    };
+    assert_eq!(edges(&db), [t]);
+    sync(&db, "repos/app").unwrap();
+    fs::write(&file, "## Work\n- [ ] Ship it now ^ship\n").unwrap();
+    let report = sync(&db, "repos/app").unwrap();
+    assert_eq!(report.count(Outcome::Failed), 0, "{:?}", report.results);
+    assert_eq!(edges(&db), [t], "the import left the edge");
+}

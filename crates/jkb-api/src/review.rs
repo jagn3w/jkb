@@ -322,7 +322,8 @@ pub fn file(
         )));
     }
 
-    let under = finding_under(conn, ask, &root, scope)?;
+    let reviewed = reviewed_task(conn, ask, scope)?;
+    let under = finding_under(conn, &root, reviewed)?;
     let clean = ask.findings.is_empty();
     // The file each finding names, by position — its area, for telling repeated rounds apart.
     let files: Vec<Option<String>> = ask
@@ -380,6 +381,11 @@ pub fn file(
     }
     // What this filing holds, so recording it makes exactly these a task's round (and its scope).
     jkb_core::reviews::record_filing(conn, &root, &ids, filed_by)?;
+    // Each finding names the task it was found in, for display (the clean-review item too, so a
+    // round that found nothing still shows under its task). An unbound filing names none.
+    if let Some(reviewed) = reviewed {
+        jkb_core::reviews::link_findings(conn, meta, reviewed, &ids)?;
+    }
     let step = match ids.first() {
         Some(&id) => match jkb_core::containment::parent(conn, id)? {
             Some(step) => item::get(conn, step)?.map(|m| m.uid).unwrap_or_default(),
@@ -395,8 +401,8 @@ pub fn file(
     })
 }
 
-/// Where a review's findings are filed (`root` is the review's namespace): **the one place** that
-/// decides it, in order:
+/// Where a review's findings are filed (`root` is the review's namespace, `reviewed` the task
+/// [`reviewed_task`] resolved): **the one place** that decides it, in order:
 ///
 /// 1. The reviewed task — the one the caller is held to (`scope`), else the one the ask names
 ///    ([`FileAsk::task`]) — when it is under a plan step: that step, the **nearest above the task**
@@ -412,11 +418,10 @@ pub fn file(
 ///    in a mounted repo" are not things a filing can do.)
 fn finding_under(
     conn: &Connection,
-    ask: &FileAsk,
     root: &str,
-    scope: Option<ItemId>,
+    reviewed: Option<ItemId>,
 ) -> Result<task::Under, ApiError> {
-    if let Some(reviewed) = reviewed_task(conn, ask, scope)? {
+    if let Some(reviewed) = reviewed {
         if let Some(step) = jkb_core::design::plan::step_of(conn, reviewed)? {
             return Ok(task::Under::Parent(step));
         }

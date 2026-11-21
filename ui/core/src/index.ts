@@ -12,6 +12,7 @@ export * from "./design.js";
 export * from "./navigate.js";
 export * from "./threads.js";
 export * from "./plan.js";
+export * from "./unplanned.js";
 export * from "./prompts.js";
 export * from "./workflows.js";
 export * from "./legend.js";

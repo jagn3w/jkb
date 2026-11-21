@@ -779,3 +779,18 @@
 .tree-retired .tree-label:hover {
   background: transparent;
 }
+
+/* A repo's count of open tasks under no plan step (`task.unplanned`). */
+.tree-unplanned {
+  font-size: var(--text-xs);
+  color: var(--ink-muted);
+  border: var(--hairline-width) solid var(--hairline-strong);
+  border-radius: var(--radius);
+  padding: 0 var(--space-1);
+  white-space: nowrap;
+}
+
+.tree-more {
+  font-size: var(--text-xs);
+  padding-left: calc(var(--space-2) + 3 * var(--space-3));
+}

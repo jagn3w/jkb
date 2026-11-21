@@ -15,8 +15,9 @@
 //! reopened task brings its plan back without a write.
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 
-use jkb_types::{ItemId, TaskStatus};
+use jkb_types::{EdgeType, ItemId, TaskStatus};
 
 use super::{design_id, invalid, mint, not_found, span_views, SpanView, KIND, STEP_KIND};
 use crate::store::WriteMeta;
@@ -47,6 +48,47 @@ pub struct PlanTask {
     pub claimed_by: Option<String>,
     /// The workflow strategy it runs (D52): the name it was pinned to, or `default:<name>`.
     pub strategy: String,
+    /// The tasks a review of which filed this one: the destinations of its `found_in` edges
+    /// ([`jkb_types::EdgeType::FoundIn`]), empty for anything but a review finding. Display only —
+    /// the Tasks pane lists a finding under the task it was found in.
+    pub found_in: Vec<TaskRef>,
+}
+
+/// A task named by uid and title.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskRef {
+    /// Its uid.
+    pub uid: String,
+    /// Its title (the first line of its content).
+    pub title: String,
+}
+
+/// The `found_in` destinations of each of `ids` ([`jkb_types::EdgeType::FoundIn`]), as uid and
+/// title, keyed by source: one batched edge read and one batched item read.
+///
+/// # Errors
+/// A database error.
+pub fn found_in_of(
+    conn: &Connection,
+    ids: &[ItemId],
+) -> Result<std::collections::HashMap<ItemId, Vec<TaskRef>>> {
+    let edges = crate::edge::edges_from_many(conn, ids, EdgeType::FoundIn)?;
+    let dsts: Vec<ItemId> = edges.values().flatten().copied().collect();
+    let metas = item::get_many(conn, &dsts)?;
+    Ok(edges
+        .into_iter()
+        .map(|(src, dsts)| {
+            let refs = dsts
+                .iter()
+                .filter_map(|d| metas.get(d))
+                .map(|m| TaskRef {
+                    uid: m.uid.clone(),
+                    title: item::title_of(m),
+                })
+                .collect();
+            (src, refs)
+        })
+        .collect())
 }
 
 /// One step of a plan.
@@ -224,12 +266,27 @@ fn step_items(conn: &Connection, plan: ItemId) -> Result<Vec<(ItemId, String, St
     children_of_kind(conn, plan, STEP_KIND)
 }
 
+/// The tasks under `parent`, depth first in containment order, each with what it was found in.
+fn tasks_under(conn: &Connection, parent: ItemId) -> Result<Vec<PlanTask>> {
+    let mut rows = Vec::new();
+    tasks_below(conn, parent, 0, &mut rows)?;
+    let ids: Vec<ItemId> = rows.iter().map(|(id, _)| *id).collect();
+    let mut found_in = found_in_of(conn, &ids)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, mut t)| {
+            t.found_in = found_in.remove(&id).unwrap_or_default();
+            t
+        })
+        .collect())
+}
+
 /// The tasks under `parent`, depth first in containment order, from depth `depth`.
-fn tasks_under(
+fn tasks_below(
     conn: &Connection,
     parent: ItemId,
     depth: u32,
-    out: &mut Vec<PlanTask>,
+    out: &mut Vec<(ItemId, PlanTask)>,
 ) -> Result<()> {
     // Containment is a tree (one parent per child, and no item contains itself), so this ends; the
     // depth bound only stops a corrupted table from recursing without end.
@@ -253,16 +310,20 @@ fn tasks_under(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, uid, content, status, priority) in rows {
-        out.push(PlanTask {
-            title: item::title_from(&uid, content.as_deref()),
-            claimed_by: claim::holder(conn, id)?,
-            strategy: workflow::current(conn, id)?.source,
-            uid,
-            status,
-            priority,
-            depth,
-        });
-        tasks_under(conn, id, depth + 1, out)?;
+        out.push((
+            id,
+            PlanTask {
+                title: item::title_from(&uid, content.as_deref()),
+                claimed_by: claim::holder(conn, id)?,
+                strategy: workflow::current(conn, id)?.source,
+                uid,
+                status,
+                priority,
+                depth,
+                found_in: Vec::new(),
+            },
+        ));
+        tasks_below(conn, id, depth + 1, out)?;
     }
     Ok(())
 }
@@ -282,8 +343,7 @@ fn view(
     let mut archived = true;
     for (step, step_uid, text) in step_items(conn, plan_item)? {
         archived &= step_tasks(conn, step)?.finished();
-        let mut tasks = Vec::new();
-        tasks_under(conn, step, 0, &mut tasks)?;
+        let tasks = tasks_under(conn, step)?;
         steps.push(StepView {
             spans: spans
                 .iter()
@@ -758,35 +818,57 @@ pub fn mapped_step(conn: &Connection, home: &str) -> Result<Option<ItemId>> {
 /// A task no execution plan's step reaches ([`UNPLANNED_SQL`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnplannedTask {
+    /// Its id.
+    pub id: ItemId,
     /// Its uid.
     pub uid: String,
     /// Its title (the first line of its content).
     pub title: String,
+    /// Its primary placement's namespace, if it has one.
+    pub namespace: Option<String>,
+    /// The repo that namespace is in ([`crate::mount::repo_of_namespace`], the one derivation);
+    /// `None` outside `repos/` and `tasks/repos/`.
+    pub repo: Option<String>,
+    /// Its status (never terminal).
+    pub status: Option<String>,
+    /// Its priority.
+    pub priority: Option<i64>,
 }
 
 /// Every unplanned task ([`UNPLANNED_SQL`]), most urgent first: by priority (none last), then by
-/// age.
+/// age. `kb.health` (`jkb doctor`), `is:unplanned` and the `task.unplanned` read all count this set.
 ///
 /// # Errors
 /// A database error.
 pub fn unplanned(conn: &Connection) -> Result<Vec<UnplannedTask>> {
     let sql = format!(
-        "SELECT i.uid, i.content FROM items i WHERE {UNPLANNED_SQL}
+        "SELECT i.id, i.uid, i.content, i.status, i.priority,
+                (SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
+                  WHERE p.item_id = i.id
+                  ORDER BY (p.role = 'primary') DESC, p.position LIMIT 1)
+           FROM items i WHERE {UNPLANNED_SQL}
           ORDER BY i.priority IS NULL, i.priority, i.id"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
         .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            let uid: String = r.get(1)?;
+            let content: Option<String> = r.get(2)?;
+            let namespace: Option<String> = r.get(5)?;
+            Ok(UnplannedTask {
+                id: ItemId::new(r.get(0)?),
+                title: item::title_from(&uid, content.as_deref()),
+                uid,
+                status: r.get(3)?,
+                priority: r.get(4)?,
+                repo: namespace
+                    .as_deref()
+                    .and_then(crate::mount::repo_of_namespace),
+                namespace,
+            })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows
-        .into_iter()
-        .map(|(uid, content)| UnplannedTask {
-            title: item::title_from(&uid, content.as_deref()),
-            uid,
-        })
-        .collect())
+    Ok(rows)
 }
 
 /// The tasks contained under a plan step, at any depth: how many, how many are `done`, and how
@@ -921,8 +1003,7 @@ pub fn list(conn: &Connection, design: &str, all: bool) -> Result<Plans> {
             plans.push(v);
         }
     }
-    let mut tasks = Vec::new();
-    tasks_under(conn, design_item, 0, &mut tasks)?;
+    let tasks = tasks_under(conn, design_item)?;
     Ok(Plans {
         plans,
         hidden,

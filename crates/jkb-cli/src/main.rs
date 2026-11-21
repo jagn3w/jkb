@@ -1555,6 +1555,14 @@ enum TaskCmd {
         /// The task uid.
         uid: String,
     },
+    /// List the open tasks no plan step reaches, grouped by repo — the set `jkb doctor` counts and
+    /// `is:unplanned` matches. Each escaped the write-side rule that files every task under a step;
+    /// `jkb task move <uid> --under <step>` plans one.
+    Unplanned {
+        /// Only this repo's (`repo=` key, the segment after `repos/`).
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Show or record the pull request that will prove this task's work landed.
     ///
     /// With no number, discovers it from the task's branch and records what it finds. The number
@@ -2749,6 +2757,7 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Show { .. }
         | TaskCmd::Subtasks { .. }
         | TaskCmd::Why { .. }
+        | TaskCmd::Unplanned { .. }
         | TaskCmd::Add { .. }
         | TaskCmd::Set { .. }
         | TaskCmd::Edit { .. }

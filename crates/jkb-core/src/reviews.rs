@@ -23,7 +23,7 @@ use std::collections::{BTreeSet, HashMap};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use jkb_types::{Error as TypeError, ItemId};
+use jkb_types::{EdgeType, Error as TypeError, ItemId};
 
 use crate::query::{Query, Scope};
 use crate::store::WriteMeta;
@@ -92,7 +92,9 @@ pub enum RoundSource<'a> {
 }
 
 /// Record that a review of `task` ran at `sha`, filing its findings under `ns`. Recording the same
-/// round twice is a no-op. The round is snapshotted the first time any task records it.
+/// round twice is a no-op. The round is snapshotted the first time any task records it, and every
+/// finding of the snapshot is linked `found_in` to `task` ([`link_findings`]), so a staging round
+/// recorded against each task it credits shows its findings under each of them.
 ///
 /// # Errors
 /// [`Error::Types`] for an empty or oversized value, a namespace `source` does not allow, or a
@@ -108,7 +110,12 @@ pub fn record(
 ) -> Result<()> {
     check("findings namespace", ns)?;
     check("sha", sha)?;
-    snapshot_round(conn, ns, actor, source)?;
+    let round = snapshot_round(conn, ns, actor, source)?;
+    let findings: Vec<ItemId> = conn
+        .prepare_cached("SELECT item_id FROM review_round_findings WHERE round_id = ?1")?
+        .query_map([round], |r| Ok(ItemId::new(r.get::<_, i64>(0)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    link_findings(conn, meta, task, &findings)?;
     let exists: bool = conn
         .prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM reviews
@@ -167,6 +174,114 @@ fn insert(
     )?
     .execute(params![task.get(), kind, ns, sha, actor, meta.txn_id])?;
     Ok(())
+}
+
+/// Link each of `findings` to the task it was found in, `task`, with a
+/// [`jkb_types::EdgeType::FoundIn`] edge (finding → task): the one seam that writes one, called by
+/// a filing (`task.review_file`) and by a recording ([`record`]), so neither caller has to remember
+/// it. A finding that is `task` itself is skipped (no self-loop), and an edge already present is
+/// left alone, so linking again writes nothing and journals nothing. Each new edge is changelogged
+/// as an `insert` by [`crate::edge::link`], so an undo of the transaction removes it.
+///
+/// **Display only.** No gate reads the edge: the frontier and `is_blocked` follow `depends_on`,
+/// subtasks and step counts follow containment, and the land gate and shelving read the round
+/// snapshot. A finding linked here never holds its task.
+///
+/// # Errors
+/// A database error.
+pub fn link_findings(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    findings: &[ItemId],
+) -> Result<()> {
+    let mut present = conn.prepare_cached(
+        "SELECT EXISTS (SELECT 1 FROM edges
+                        WHERE src_item_id = ?1 AND dst_item_id = ?2 AND type = ?3)",
+    )?;
+    for &finding in findings {
+        if finding == task {
+            continue;
+        }
+        let exists: bool = present.query_row(
+            params![finding.get(), task.get(), EdgeType::FoundIn.as_str()],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            crate::edge::link(conn, meta, finding, task, EdgeType::FoundIn, None)?;
+        }
+    }
+    Ok(())
+}
+
+/// One finding a review of a task filed, as [`findings_of`] answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundFinding {
+    /// The finding.
+    pub id: ItemId,
+    /// The round it belongs to: the namespace it was filed into, else the recorded round whose
+    /// snapshot holds it.
+    pub round: Option<String>,
+    /// Whether that round's snapshot held it as must-fix; `None` when no recorded round holds it.
+    pub must_fix: Option<bool>,
+    /// The recording order of its round, when recorded (`review_rounds.id`): rounds sort by it.
+    pub recorded: Option<i64>,
+}
+
+/// The findings linked `found_in` to `task` ([`link_findings`]), at any status: ordered by their
+/// round's recording order (unrecorded rounds last), then by round name and id. For display only.
+///
+/// # Errors
+/// A database error.
+pub fn findings_of(conn: &Connection, task: ItemId) -> Result<Vec<FoundFinding>> {
+    let mut rows: Vec<FoundFinding> = conn
+        .prepare_cached(
+            "SELECT e.src_item_id,
+                    (SELECT ns FROM review_filings WHERE item_id = e.src_item_id
+                      ORDER BY ns LIMIT 1),
+                    (SELECT r.ns FROM review_round_findings f
+                       JOIN review_rounds r ON r.id = f.round_id
+                      WHERE f.item_id = e.src_item_id ORDER BY r.id LIMIT 1)
+               FROM edges e
+              WHERE e.dst_item_id = ?1 AND e.type = ?2",
+        )?
+        .query_map(params![task.get(), EdgeType::FoundIn.as_str()], |r| {
+            let filed: Option<String> = r.get(1)?;
+            let snapshot: Option<String> = r.get(2)?;
+            Ok(FoundFinding {
+                id: ItemId::new(r.get(0)?),
+                round: filed.or(snapshot),
+                must_fix: None,
+                recorded: None,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut snap = conn.prepare_cached(
+        "SELECT f.must_fix, r.id FROM review_round_findings f
+           JOIN review_rounds r ON r.id = f.round_id
+          WHERE f.item_id = ?1 AND r.ns = ?2",
+    )?;
+    for row in &mut rows {
+        let Some(ns) = &row.round else { continue };
+        if let Some((must_fix, round)) = snap
+            .query_row(params![row.id.get(), ns], |r| {
+                Ok((r.get::<_, bool>(0)?, r.get::<_, i64>(1)?))
+            })
+            .optional()?
+        {
+            row.must_fix = Some(must_fix);
+            row.recorded = Some(round);
+        }
+    }
+    rows.sort_by(|a, b| {
+        (a.recorded.is_none(), a.recorded, &a.round, a.id).cmp(&(
+            b.recorded.is_none(),
+            b.recorded,
+            &b.round,
+            b.id,
+        ))
+    });
+    Ok(rows)
 }
 
 /// Record that `filed_by` filed `items` into the new namespace `ns` (`task.review_file`).

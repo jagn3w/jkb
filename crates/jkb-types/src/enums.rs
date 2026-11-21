@@ -85,6 +85,11 @@ db_enum! {
         References => "references",
         /// Source is a structural parent of the destination.
         ParentOf => "parent_of",
+        /// The source was filed by a review of the destination: a review finding points at
+        /// the task it was found in. Display-only provenance: no gate, frontier, step count or
+        /// sync reconcile follows it, and only the review seam (`reviews::link_findings`) and
+        /// its backfill migration write one.
+        FoundIn => "found_in",
         /// Evidence **for** the destination (observation -> hypothesis). Signed: carries an
         /// optional `weight` (design Dmem.4).
         Supports => "supports",

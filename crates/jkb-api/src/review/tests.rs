@@ -829,3 +829,403 @@ fn the_gate_reads_the_round_not_where_its_findings_sit() {
         "moved, it still blocks"
     );
 }
+
+// ---- `found_in`: each finding names the task it was found in, for display only ----
+
+/// A design in repo `proj` with a one-step plan: `(design uid, step uid)`.
+fn a_design(db: &Db, title: &str) -> (String, String) {
+    let title = title.to_owned();
+    db.write_txn("t", move |c, m| {
+        let d = jkb_core::design::create(c, m, "proj", &title, "Build it.")?.uid;
+        let p = plan::create(c, m, &d, &title, &["one".to_owned()])?;
+        Ok((d, p.steps[0].uid.clone()))
+    })
+    .unwrap()
+}
+
+/// The uids of the tasks `uid` was found in.
+fn found_in_of(db: &Db, uid: &str) -> Vec<String> {
+    let id = id_of(db, uid);
+    db.read(move |c| {
+        let dsts = jkb_core::edge::edges_from(c, id, jkb_types::EdgeType::FoundIn)?;
+        let metas = item::get_many(c, &dsts)?;
+        Ok(dsts.iter().map(|d| metas[d].uid.clone()).collect())
+    })
+    .unwrap()
+}
+
+fn found_in_count(db: &Db) -> i64 {
+    db.read(|c| {
+        Ok(c.query_row(
+            "SELECT count(*) FROM edges WHERE type = 'found_in'",
+            [],
+            |r| r.get(0),
+        )?)
+    })
+    .unwrap()
+}
+
+/// Test 1: a filing links every item it files `found_in` the scoped task, or the task the ask names
+/// when unscoped — the clean-review item too; an unbound filing links nothing; and an undo of the
+/// filing removes the findings with their edges.
+#[test]
+fn a_filing_links_its_findings_to_the_reviewed_task() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&db, &["proj"]);
+    let (_, step_uid) = a_design(&db, "Linked");
+    let t = added_under(&b, "the work", &step_uid);
+    let u = added_under(&b, "other work", &step_uid);
+
+    let scoped = file(&reviewer_of(&db, &t), "repos/proj/codereviews/r1", &three()).unwrap();
+    for f in &scoped.uids {
+        assert_eq!(found_in_of(&db, f), [t.as_str()], "{f}");
+    }
+    let named = file_for(&b, "repos/proj/codereviews/r2", &u, &three()).unwrap();
+    for f in &named.uids {
+        assert_eq!(found_in_of(&db, f), [u.as_str()], "{f}");
+    }
+    let clean = file_for(&b, "repos/proj/codereviews/r3", &u, &json!([])).unwrap();
+    assert!(clean.clean);
+    assert_eq!(
+        found_in_of(&db, &clean.uids[0]),
+        [u.as_str()],
+        "the clean item"
+    );
+
+    let before = found_in_count(&db);
+    let unbound = file(&b, "repos/proj/codereviews/r4", &three()).unwrap();
+    assert_eq!(
+        found_in_count(&db),
+        before,
+        "an unbound filing links nothing"
+    );
+    assert!(found_in_of(&db, &unbound.uids[0]).is_empty());
+
+    let named = file_for(&b, "repos/proj/codereviews/r5", &t, &three()).unwrap();
+    assert_eq!(found_in_count(&db), before + 3);
+    let txn: i64 = db
+        .read(|c| Ok(c.query_row("SELECT max(txn_id) FROM changelog", [], |r| r.get(0))?))
+        .unwrap();
+    db.write_txn("t", move |c, m| jkb_core::undo::undo(c, m, txn))
+        .unwrap();
+    assert_eq!(found_in_count(&db), before, "the undo took the edges");
+    for f in &named.uids {
+        let f = f.clone();
+        assert!(
+            db.read(move |c| item::id_for_uid(c, &f)).unwrap().is_none(),
+            "and the findings"
+        );
+    }
+}
+
+/// Test 3 at the op level, the load-bearing guarantee: a task with an open must-fix and an open nit
+/// linked `found_in` it — filed beside it and not recorded — is on the frontier, unblocked, passes
+/// `task.land_check`, and `task.land` admits it: no open-subtask refusal. The must-fix only refuses
+/// through the round snapshot once recorded, which an unrecorded filing has none of.
+#[test]
+fn open_findings_found_in_a_task_leave_it_landable() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&db, &["proj"]);
+    let (_, step_uid) = a_design(&db, "Landable");
+    let t = added_under(&b, "the work", &step_uid);
+    let filed = file_for(
+        &b,
+        "repos/proj/codereviews/r1",
+        &t,
+        &json!([
+            { "severity": "must-fix", "summary": "breaks" },
+            { "severity": "nit", "summary": "typo" },
+        ]),
+    )
+    .unwrap();
+    for f in &filed.uids {
+        assert_eq!(found_in_of(&db, f), [t.as_str()]);
+        assert_eq!(show(&b, f)["item"]["status"], "open");
+    }
+    let tid = id_of(&db, &t);
+    let (blocked, ready) = db
+        .read(move |c| {
+            Ok((
+                jkb_core::task::is_blocked(c, tid)?,
+                jkb_core::task::ready_ids(c, jkb_core::query::Query::default(), None)?
+                    .contains(&tid),
+            ))
+        })
+        .unwrap();
+    assert!(!blocked, "is_blocked");
+    assert!(ready, "on the frontier");
+    call(
+        &b,
+        json!({ "op": "task.start", "uid": t, "take": { "owner": "host:1" },
+                "place": { "branch": "feat", "repo": "proj", "onto": "batch" } }),
+    )
+    .unwrap();
+    assert!(!facts(&b, &t).open_subtasks, "open_subtasks");
+    assert!(
+        show(&b, &t)["review"]["namespaces"].is_null(),
+        "unrecorded: no round the gate could read"
+    );
+    call(
+        &b,
+        json!({ "op": "task.land_check", "uid": t, "landed": { "branch": "feat", "onto": "batch" } }),
+    )
+    .expect("land_check admits it");
+    let landed = match call(
+        &b,
+        json!({ "op": "task.land", "uid": t, "landed": { "branch": "feat", "onto": "batch" } }),
+    )
+    .unwrap()
+    {
+        Response::Landing { landing } => landing,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(landed.refusal, None, "no open-subtask refusal");
+    assert_eq!(landed.status, "done");
+}
+
+/// The must-fix refusal comes only from the round snapshot: recorded, the round reports its open
+/// must-fix; the `found_in` edge plays no part in it.
+#[test]
+fn the_must_fix_refusal_comes_from_the_recorded_round_not_the_edge() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&db, &["proj"]);
+    let (_, step_uid) = a_design(&db, "Recorded");
+    let t = added_under(&b, "the work", &step_uid);
+    call(
+        &b,
+        json!({ "op": "task.start", "uid": t, "take": { "owner": "host:1" },
+                "place": { "branch": "feat", "repo": "proj", "onto": "batch" } }),
+    )
+    .unwrap();
+    let ns = "repos/proj/codereviews/r1";
+    let scoped = reviewer_of(&db, &t);
+    let filed = file(
+        &scoped,
+        ns,
+        &json!([{ "severity": "must-fix", "summary": "b" }]),
+    )
+    .unwrap();
+    record(&scoped, "feat", ns).unwrap();
+    assert_eq!(findings(&b, ns).open_must_fix.len(), 1);
+    // Dropping the edge changes nothing the gate reads.
+    let fid = id_of(&db, &filed.uids[0]);
+    let tid = id_of(&db, &t);
+    db.write_txn("t", move |c, m| {
+        jkb_core::edge::unlink(c, m, fid, tid, jkb_types::EdgeType::FoundIn)
+    })
+    .unwrap();
+    assert_eq!(findings(&b, ns).open_must_fix.len(), 1);
+}
+
+/// Test 7: `task.show` lists a task's findings by round with their current step and must-fix, and a
+/// finding's page names the task it was found in; `design.plans` carries `found_in`; and an answer
+/// without the fields (an older daemon's) decodes as empty.
+#[test]
+fn task_show_and_design_plans_carry_findings_and_found_in() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&db, &["proj"]);
+    let (design, step_uid) = a_design(&db, "Shown");
+    let t = added_under(&b, "the work", &step_uid);
+    call(
+        &b,
+        json!({ "op": "task.start", "uid": t, "take": { "owner": "host:1" },
+                "place": { "branch": "feat", "repo": "proj", "onto": "batch" } }),
+    )
+    .unwrap();
+    let scoped = reviewer_of(&db, &t);
+    let r1 = file(&scoped, "repos/proj/codereviews/r1", &three()).unwrap();
+    record(&scoped, "feat", "repos/proj/codereviews/r1").unwrap();
+    let r2 = file_for(
+        &b,
+        "repos/proj/codereviews/r2",
+        &t,
+        &json!([{ "severity": "must-fix", "summary": "late" }]),
+    )
+    .unwrap();
+    db.write_txn("t", |c, m| plan::triage_step(c, m, "proj"))
+        .unwrap();
+    call(
+        &b,
+        json!({ "op": "task.move", "uid": r1.uids[0], "under": plan::triage_step_uid("proj") }),
+    )
+    .unwrap();
+
+    let shown = show(&b, &t);
+    let rows = shown["findings"].as_array().unwrap();
+    let got: Vec<(&str, &str, bool, &str)> = rows
+        .iter()
+        .map(|f| {
+            (
+                f["uid"].as_str().unwrap(),
+                f["round"].as_str().unwrap(),
+                f["must_fix"].as_bool().unwrap(),
+                f["step"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let inbox = plan::triage_step_uid("proj");
+    assert_eq!(
+        got,
+        [
+            (
+                r1.uids[0].as_str(),
+                "repos/proj/codereviews/r1",
+                false,
+                inbox.as_str()
+            ),
+            (
+                r1.uids[1].as_str(),
+                "repos/proj/codereviews/r1",
+                false,
+                step_uid.as_str()
+            ),
+            (
+                r1.uids[2].as_str(),
+                "repos/proj/codereviews/r1",
+                true,
+                step_uid.as_str()
+            ),
+            (
+                r2.uids[0].as_str(),
+                "repos/proj/codereviews/r2",
+                true,
+                step_uid.as_str()
+            ),
+        ],
+        "the recorded round first, then the unrecorded one; must-fix by snapshot, else priority"
+    );
+    assert_eq!(rows[0]["step_title"], "Open work \u{203a} Inbox");
+    assert!(shown["found_in"].is_null(), "a task found in nothing");
+    let finding = show(&b, &r1.uids[2]);
+    assert_eq!(finding["found_in"][0]["uid"], t.as_str());
+    assert_eq!(finding["found_in"][0]["title"], "the work");
+
+    let plans = match call(&b, json!({ "op": "design.plans", "uid": design })).unwrap() {
+        Response::DesignPlans { list } => serde_json::to_value(list).unwrap(),
+        other => panic!("{other:?}"),
+    };
+    let tasks = plans["plans"][0]["steps"][0]["tasks"].as_array().unwrap();
+    let of = |uid: &str| tasks.iter().find(|x| x["uid"] == uid).unwrap().clone();
+    assert_eq!(of(&t)["found_in"], json!([]));
+    assert_eq!(of(&r1.uids[2])["found_in"][0]["uid"], t.as_str());
+
+    // An older daemon's answers, without the fields.
+    let mut old = of(&t);
+    old.as_object_mut().unwrap().remove("found_in");
+    let decoded: crate::designs::plans::PlanTask = serde_json::from_value(old).unwrap();
+    assert!(decoded.found_in.is_empty());
+    let mut old = shown.clone();
+    let o = old.as_object_mut().unwrap();
+    o.remove("findings");
+    o.remove("found_in");
+    let decoded: crate::kb::TaskDetail = serde_json::from_value(old).unwrap();
+    assert!(decoded.findings.is_empty() && decoded.found_in.is_empty());
+}
+
+/// A task left under no step, homed at `home`, as a build before the guard could leave one.
+fn loose_at(db: &Db, uid: &str, home: &str) -> ItemId {
+    let (uid, home) = (uid.to_owned(), home.to_owned());
+    db.write_txn("t", move |c, m| {
+        let mut spec = jkb_core::task::NewTask::new(
+            uid,
+            "loose work",
+            jkb_core::task::Under::inbox_of("proj"),
+        );
+        spec.home = home;
+        let id = jkb_core::task::create(c, m, &spec)?;
+        c.execute(
+            "DELETE FROM containment WHERE child_item_id = ?1",
+            [id.get()],
+        )?;
+        c.execute(
+            "DELETE FROM edges WHERE dst_item_id = ?1 AND type = 'parent_of'",
+            [id.get()],
+        )?;
+        Ok(id)
+    })
+    .unwrap()
+}
+
+fn unplanned(b: &LocalBackend, ask: &serde_json::Value) -> crate::tasks::UnplannedList {
+    let mut req = json!({ "op": "task.unplanned" });
+    req.as_object_mut()
+        .unwrap()
+        .extend(ask.as_object().unwrap().clone());
+    match call(b, req).unwrap() {
+        Response::Unplanned { list } => list,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Test 8: `task.unplanned` groups the unplanned set by repo — a task in no repo last, a review
+/// finding homed under `repos/<repo>/codereviews/…` in its repo — counts each repo past its listing
+/// cap, leaves terminal tasks out, and totals what `plan::unplanned` and `kb.health` count.
+#[test]
+fn task_unplanned_groups_the_unplanned_set_by_repo() {
+    let db = Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    crate::test_repo::know(&db, &["proj", "app"]);
+    a_design(&db, "Planned work");
+    for i in 0..3 {
+        loose_at(&db, &format!("task:p{i}"), "tasks/repos/proj/inbox");
+    }
+    loose_at(&db, "task:a0", "repos/app/notes");
+    loose_at(&db, "task:none", "notes/elsewhere");
+    let done = loose_at(&db, "task:finished", "tasks/repos/proj/inbox");
+    db.write_txn("t", move |c, m| {
+        jkb_core::task::set_status(c, m, done, jkb_types::TaskStatus::Done)
+    })
+    .unwrap();
+    let filed = file(
+        &b,
+        "repos/proj/codereviews/r1",
+        &json!([{ "severity": "nit", "summary": "x" }]),
+    )
+    .unwrap();
+    let fid = id_of(&db, &filed.uids[0]);
+    db.write_txn("t", move |c, _| {
+        c.execute(
+            "DELETE FROM containment WHERE child_item_id = ?1",
+            [fid.get()],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+
+    let all = unplanned(&b, &json!({}));
+    let shape: Vec<(Option<&str>, usize, usize)> = all
+        .repos
+        .iter()
+        .map(|r| (r.repo.as_deref(), r.count, r.tasks.len()))
+        .collect();
+    assert_eq!(
+        shape,
+        [(Some("app"), 1, 1), (Some("proj"), 4, 4), (None, 1, 1)]
+    );
+    let proj = &all.repos[1];
+    assert!(proj.tasks.iter().any(|t| t.task.uid == filed.uids[0]
+        && t.namespace
+            .as_deref()
+            .is_some_and(|n| n.starts_with("repos/proj/codereviews/"))));
+    assert!(all
+        .repos
+        .iter()
+        .flat_map(|r| &r.tasks)
+        .all(|t| t.task.uid != "task:finished"));
+    assert_eq!(all.count, 6);
+    assert_eq!(all.count, db.read(plan::unplanned).unwrap().len());
+    let health = match call(&b, json!({ "op": "kb.health" })).unwrap() {
+        Response::Health { health } => health,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(health.unplanned_count, Some(all.count));
+
+    let capped = unplanned(&b, &json!({ "repo": "proj", "limit": 2 }));
+    assert_eq!(capped.count, 4);
+    assert_eq!(capped.repos.len(), 1);
+    assert_eq!((capped.repos[0].count, capped.repos[0].tasks.len()), (4, 2));
+}

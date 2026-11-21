@@ -255,3 +255,148 @@ test("a finished parent of an open subtask stays in the list, muted, so the subt
   assert.deepEqual(visibleTasks(rows, () => true).length, 5);
   assert.deepEqual(visibleTasks([t("X", "done", 0), t("X1", "done", 1), t("X2", "open", 2)], open).map((l) => `${l.task.uid}${l.muted ? "~" : ""}`), ["X~", "X1~", "X2"]);
 });
+
+// ---- review findings under the task they were found in ----------------------------------------
+
+const ref = (uid) => ({ uid, title: `title of ${uid}` });
+const row = (uid, status, depth, foundIn) => ({
+  uid,
+  title: uid,
+  status,
+  priority: null,
+  depth,
+  claimed_by: null,
+  strategy: "default:x",
+  ...(foundIn === undefined ? {} : { found_in: foundIn.map(ref) }),
+});
+const drawn = (lines) =>
+  lines.map((l) => `${l.task.uid}${l.muted ? "~" : ""}${l.findingOf ? `<${l.findingOf}` : ""}${l.from ? `(from ${l.from})` : ""}`);
+
+test("nestFindings: a finding goes right after its origin's subtree, marked, with no depth of its own", async () => {
+  const { nestFindings, visibleTasks } = await import("../dist/index.js");
+  const rows = [row("A", "open", 0), row("A1", "open", 1), row("B", "open", 0), row("F", "open", 0, ["A"])];
+  const lines = nestFindings(visibleTasks(rows, () => true));
+  assert.deepEqual(drawn(lines), ["A", "A1", "F<A", "B"]);
+  assert.deepEqual(
+    lines.map((l) => l.task.depth),
+    [0, 1, 0, 0],
+    "subtask depths are untouched, and the finding keeps its own",
+  );
+});
+
+test("nestFindings: a finding whose origin is elsewhere stays in place, naming its origin", async () => {
+  const { nestFindings, visibleTasks } = await import("../dist/index.js");
+  const rows = [row("A", "open", 0), row("F", "open", 0, ["Z"]), row("B", "open", 0)];
+  assert.deepEqual(drawn(nestFindings(visibleTasks(rows, () => true))), ["A", "F(from title of Z)", "B"]);
+});
+
+test("nestFindings: with two origins in the group, the first listed wins", async () => {
+  const { nestFindings, visibleTasks } = await import("../dist/index.js");
+  const rows = [row("A", "open", 0), row("B", "open", 0), row("F", "open", 0, ["B", "A"]), row("G", "open", 0, ["B"])];
+  assert.deepEqual(drawn(nestFindings(visibleTasks(rows, () => true))), ["A", "F<A", "B", "G<B"]);
+});
+
+test("visibleTasks keeps a finished origin muted for an open finding of it", async () => {
+  const { nestFindings, visibleTasks } = await import("../dist/index.js");
+  const rows = [
+    row("A", "done", 0),
+    row("B", "done", 0),
+    row("F", "open", 0, ["A"]),
+    row("G", "done", 0, ["B"]),
+  ];
+  const open = (t) => t.status !== "done";
+  assert.deepEqual(drawn(nestFindings(visibleTasks(rows, open))), ["A~", "F<A"], "B is dropped: its finding is done too");
+});
+
+test("nestFindings: subtasks keep their depth, and a finding of a subtask follows the subtask's subtree", async () => {
+  const { nestFindings, visibleTasks } = await import("../dist/index.js");
+  const rows = [
+    row("P", "open", 0),
+    row("S", "open", 1),
+    row("S1", "open", 2),
+    row("T", "open", 1),
+    row("F", "open", 0, ["S"]),
+  ];
+  const lines = nestFindings(visibleTasks(rows, () => true));
+  assert.deepEqual(drawn(lines), ["P", "S", "S1", "F<S", "T"]);
+  assert.deepEqual(lines.map((l) => l.task.depth), [0, 1, 2, 0, 1]);
+});
+
+test("nestFindings: two findings of each other move neither, and nothing is lost", async () => {
+  const { nestFindings, visibleTasks } = await import("../dist/index.js");
+  const rows = [row("F", "open", 0, ["G"]), row("G", "open", 0, ["F"]), row("A", "open", 0)];
+  const lines = nestFindings(visibleTasks(rows, () => true));
+  assert.deepEqual(lines.map((l) => l.task.uid).sort(), ["A", "F", "G"]);
+});
+
+test("design.plans and task.show decode found_in and findings, and an older daemon's answer as none", async () => {
+  const { decodePlanList, decodeTaskDetail } = await import("../dist/index.js");
+  const list = (tasks) => ok({ result: "design_plans", list: { uid: "design:d", plans: [], hidden: 0, tasks } });
+  const withRefs = decodePlanList(list([task({ found_in: [{ uid: "task:o", title: "Origin" }] })]));
+  assert.ok(withRefs.ok);
+  assert.deepEqual(withRefs.value.tasks[0].found_in, [{ uid: "task:o", title: "Origin" }]);
+  const old = decodePlanList(list([task()]));
+  assert.ok(old.ok);
+  assert.equal(old.value.tasks[0].found_in, undefined);
+  assert.equal(decodePlanList(list([task({ found_in: [{ uid: 1 }] })])).ok, false);
+
+  const item = { uid: "task:t", status: "open", priority: null, namespace: null, content: "T", tags: [] };
+  const finding = {
+    uid: "task:f",
+    title: "F",
+    status: "open",
+    priority: 1,
+    round: "repos/jkb/codereviews/r1",
+    must_fix: true,
+    step: "step:inbox@jkb",
+    step_title: "Open work › Inbox",
+    design: "design:open-work@jkb",
+  };
+  const shown = decodeTaskDetail(
+    ok({
+      result: "task",
+      task: {
+        item,
+        transitions: [],
+        subtasks: [],
+        review: { namespaces: ["repos/jkb/codereviews/r1"] },
+        findings: [finding],
+        found_in: [{ uid: "task:o", title: "Origin" }],
+      },
+    }),
+  );
+  assert.ok(shown.ok);
+  assert.deepEqual(shown.value.findings, [finding]);
+  assert.deepEqual(shown.value.found_in, [{ uid: "task:o", title: "Origin" }]);
+  assert.deepEqual(shown.value.review_namespaces, ["repos/jkb/codereviews/r1"]);
+  const older = decodeTaskDetail(ok({ result: "task", task: { item, transitions: [], subtasks: [] } }));
+  assert.ok(older.ok);
+  assert.deepEqual([older.value.findings, older.value.found_in, older.value.review_namespaces], [[], [], []]);
+  const bad = decodeTaskDetail(ok({ result: "task", task: { item, transitions: [], findings: [{ uid: "x" }] } }));
+  assert.equal(bad.ok, false);
+});
+
+test("task.unplanned decodes by repo, a missing repo or namespace as null, and is refused malformed", async () => {
+  const { decodeUnplanned, unplannedOps, unplannedOf, inboxStep, planOps } = await import("../dist/index.js");
+  assert.deepEqual(unplannedOps.list(), { op: "task.unplanned" });
+  assert.deepEqual(unplannedOps.list("jkb"), { op: "task.unplanned", repo: "jkb" });
+  assert.deepEqual(planOps.move("task:a", inboxStep("jkb")), { op: "task.move", uid: "task:a", under: "step:inbox@jkb" });
+  const answer = decodeUnplanned(
+    ok({
+      result: "unplanned",
+      count: 3,
+      repos: [
+        { repo: "jkb", count: 2, tasks: [{ task: task(), namespace: "tasks/repos/jkb/inbox" }] },
+        { repo: null, count: 1, tasks: [{ task: task({ uid: "task:b" }) }] },
+      ],
+    }),
+  );
+  assert.ok(answer.ok);
+  assert.equal(answer.value.count, 3);
+  assert.equal(unplannedOf(answer.value, "jkb").count, 2);
+  assert.equal(unplannedOf(answer.value, null).tasks[0].namespace, null);
+  assert.equal(unplannedOf(answer.value, "web"), undefined);
+  assert.equal(decodeUnplanned(ok({ result: "unplanned", count: -1, repos: [] })).ok, false);
+  assert.equal(decodeUnplanned(ok({ result: "unplanned", count: 1, repos: [{ repo: "x", count: 1, tasks: [{ task: {} }] }] })).ok, false);
+  assert.equal(decodeUnplanned(ok({ result: "task", count: 0, repos: [] })).ok, false);
+});

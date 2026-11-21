@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { isTerminal, visibleTasks, type PlanTask } from "@jkb/core";
+import { isTerminal, nestFindings, visibleTasks, type PlanTask, type RepoNode } from "@jkb/core";
 
 import { StrategyPicker, TaskRow } from "./PlansView";
 import { TaskPane } from "./TaskPane";
@@ -17,11 +17,20 @@ export function TasksView({
   selected,
   onSelect,
   onNotice,
+  repo,
+  designs,
+  onMoved,
 }: {
   readonly plans: Plans;
   readonly selected: string | undefined;
   readonly onSelect: (uid: string) => void;
   readonly onNotice: (message: string) => void;
+  /** The design's repo: Move to step's Inbox is this repo's. */
+  readonly repo: string | undefined;
+  /** The repo's designs as the sidebar shows them, for Move to step's design choice. */
+  readonly designs: RepoNode | undefined;
+  /** After a Move to step: what else lists tasks (the sidebar's unplanned counts) is read again. */
+  readonly onMoved: () => void;
 }): React.JSX.Element {
   const [showDone, setShowDone] = useState(false);
   const { listing, live, archived, oneOff, tasks, busy } = plans;
@@ -34,10 +43,10 @@ export function TasksView({
   const shown = (t: PlanTask): boolean => showDone || !isTerminal(t.status);
   const groups = (showDone ? [...live, ...archived] : live).flatMap((plan) =>
     plan.steps
-      .map((step) => ({ key: step.uid, plan: plan.title, step: step.text, lines: visibleTasks(step.tasks, shown) }))
+      .map((step) => ({ key: step.uid, plan: plan.title, step: step.text, lines: nestFindings(visibleTasks(step.tasks, shown)) }))
       .filter((g) => g.lines.length > 0),
   );
-  const loose = visibleTasks(oneOff, shown);
+  const loose = nestFindings(visibleTasks(oneOff, shown));
   const hidden = tasks.length - tasks.filter(shown).length;
 
   return (
@@ -69,8 +78,16 @@ export function TasksView({
                     <span className="muted">{g.plan} ›</span> {g.step}
                   </h3>
                   <ul className="plan-tasks">
-                    {g.lines.map(({ task: t, muted }) => (
-                      <TaskRow key={t.uid} task={t} muted={muted} selected={t.uid === selected} onSelect={onSelect} />
+                    {g.lines.map(({ task: t, muted, findingOf, from }) => (
+                      <TaskRow
+                        key={t.uid}
+                        task={t}
+                        muted={muted}
+                        finding={findingOf}
+                        from={from}
+                        selected={t.uid === selected}
+                        onSelect={onSelect}
+                      />
                     ))}
                   </ul>
                 </div>
@@ -79,8 +96,16 @@ export function TasksView({
                 <div className="task-group">
                   <h3>One-off tasks</h3>
                   <ul className="plan-tasks">
-                    {loose.map(({ task: t, muted }) => (
-                      <TaskRow key={t.uid} task={t} muted={muted} selected={t.uid === selected} onSelect={onSelect} />
+                    {loose.map(({ task: t, muted, findingOf, from }) => (
+                      <TaskRow
+                        key={t.uid}
+                        task={t}
+                        muted={muted}
+                        finding={findingOf}
+                        from={from}
+                        selected={t.uid === selected}
+                        onSelect={onSelect}
+                      />
                     ))}
                   </ul>
                 </div>
@@ -102,6 +127,11 @@ export function TasksView({
           onPlay={(t) => void plans.play("task", t.uid)}
           onChanged={() => void plans.load()}
           onNotice={onNotice}
+          repo={repo}
+          designs={designs}
+          listed={(uid) => tasks.some((t) => t.uid === uid)}
+          onSelect={onSelect}
+          onMoved={onMoved}
         />
       </div>
     </section>

@@ -18,33 +18,50 @@ function StepSpans({ spans }: { readonly spans: ExecPlan["steps"][number]["spans
   );
 }
 
-/** A task in a list: its status, title and claim; choosing it opens it in the Tasks tab. */
+/**
+ * A task in a list: its status, title and claim; choosing it opens it in the Tasks tab. A review
+ * finding drawn under the task it was found in (`nestFindings`) is marked and indented one step by
+ * its class, never by `depth`, so it never reads as a subtask.
+ */
 export function TaskRow({
   task,
   selected,
   onSelect,
   muted = false,
+  finding,
+  from,
 }: {
   readonly task: PlanTask;
   readonly selected: boolean;
   readonly onSelect: (uid: string) => void;
   /** Drawn only as the parent of a row below it (`visibleTasks`). */
   readonly muted?: boolean;
+  /** The uid of the task listed above that this review finding was found in. */
+  readonly finding?: string;
+  /** For a finding whose origin is listed elsewhere: that origin's title. */
+  readonly from?: string;
 }): React.JSX.Element {
   return (
-    <li data-muted={muted || undefined}>
+    <li data-muted={muted || undefined} className={finding !== undefined ? "task-finding" : undefined}>
       <button
         type="button"
         className="plan-task"
         aria-pressed={selected}
         style={{ paddingLeft: `calc(var(--space-2) + ${task.depth} * var(--space-3))` }}
         onClick={() => onSelect(task.uid)}
-        title={task.uid}
+        title={finding !== undefined ? `${task.uid} · a review finding of ${finding}` : task.uid}
+        data-finding-of={finding}
       >
+        {finding !== undefined && (
+          <span className="finding-marker" aria-label="review finding" title="A review finding of the task above">
+            review finding
+          </span>
+        )}
         <span className="task-status" data-status={task.status ?? "unknown"}>
           {task.status ?? "?"}
         </span>
         <span className="task-title">{task.title}</span>
+        {from !== undefined && <span className="task-from muted">from {from}</span>}
         {task.claimed_by !== null && <span className="task-claim">claimed</span>}
       </button>
     </li>

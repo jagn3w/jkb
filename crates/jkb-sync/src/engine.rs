@@ -3383,6 +3383,7 @@ fn edge_owner(e: &SyncEdge) -> (&str, &str) {
         | EdgeType::Answers
         | EdgeType::Spawns
         | EdgeType::DiscoveredFrom
+        | EdgeType::FoundIn
         | EdgeType::MemberOf
         | EdgeType::Tests
         | EdgeType::Verifies

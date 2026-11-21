@@ -618,6 +618,10 @@ fn samples() -> Vec<Request> {
             repo: "r".into(),
             all: false,
         },
+        Request::TaskUnplanned {
+            repo: None,
+            limit: None,
+        },
         Request::ItemShow {
             uid: "u".into(),
             preview: None,
@@ -2018,6 +2022,7 @@ const READS: &[&str] = &[
     "task.review_findings",
     "task.claims",
     "task.staging",
+    "task.unplanned",
     "item.show",
     "kb.related",
     "kb.blobs",
@@ -4031,6 +4036,7 @@ const OP_WORDS: &[(&str, &str)] = &[
     ("task.review_findings", "tasks"),
     ("task.claims", "tasks"),
     ("task.staging", "tasks"),
+    ("task.unplanned", "tasks"),
     ("task.pr_facts", "tasks"),
     ("task.open_in_repo", "tasks"),
     ("repo.gate", "tasks"),

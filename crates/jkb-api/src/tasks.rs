@@ -1093,6 +1093,99 @@ pub fn why(
         .collect())
 }
 
+/// The most unplanned tasks `task.unplanned` lists per repo; each repo's `count` is its full count.
+pub const MAX_UNPLANNED: usize = crate::health::MAX_UNPLANNED;
+
+/// One unplanned task, as `task.unplanned` lists it: in the Tasks pane's own shape, so the app's
+/// `TaskPane` takes it as is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnplannedTask {
+    /// The task (depth 0).
+    pub task: crate::designs::plans::PlanTask,
+    /// Its primary placement's namespace.
+    pub namespace: Option<String>,
+}
+
+/// One repo's unplanned tasks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnplannedRepo {
+    /// The repo (`mount::repo_of_namespace` of the task's namespace); `None` for tasks in no repo.
+    pub repo: Option<String>,
+    /// How many unplanned tasks it has in all.
+    pub count: usize,
+    /// The first of them, most urgent first, at most the asked limit (and [`MAX_UNPLANNED`]).
+    pub tasks: Vec<UnplannedTask>,
+}
+
+/// `task.unplanned`'s answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnplannedList {
+    /// How many unplanned tasks the listed repos hold in all.
+    pub count: usize,
+    /// Each repo with any, by name, the tasks in no repo last.
+    pub repos: Vec<UnplannedRepo>,
+}
+
+/// `task.unplanned`: the open tasks no plan step reaches ([`jkb_core::design::plan::unplanned`], the
+/// set `jkb doctor` and `is:unplanned` count), grouped by repo — of `repo` only, when named — with
+/// the first `limit` (at most [`MAX_UNPLANNED`]) of each listed. The Design sidebar's read: what
+/// escaped the write-side refusal is shown rather than lost.
+///
+/// # Errors
+/// A failed read.
+pub fn unplanned(
+    conn: &Connection,
+    repo: Option<&str>,
+    limit: Option<usize>,
+) -> Result<UnplannedList, ApiError> {
+    let cap = limit.unwrap_or(MAX_UNPLANNED).min(MAX_UNPLANNED);
+    let mut groups: std::collections::BTreeMap<(bool, Option<String>), UnplannedRepo> =
+        std::collections::BTreeMap::new();
+    let mut listed: std::collections::HashMap<String, ItemId> = std::collections::HashMap::new();
+    for t in jkb_core::design::plan::unplanned(conn)? {
+        if repo.is_some_and(|r| t.repo.as_deref() != Some(r)) {
+            continue;
+        }
+        let group = groups
+            .entry((t.repo.is_none(), t.repo.clone()))
+            .or_insert_with(|| UnplannedRepo {
+                repo: t.repo.clone(),
+                count: 0,
+                tasks: Vec::new(),
+            });
+        group.count += 1;
+        if group.tasks.len() < cap {
+            listed.insert(t.uid.clone(), t.id);
+            group.tasks.push(UnplannedTask {
+                task: crate::designs::plans::PlanTask {
+                    claimed_by: claim::holder(conn, t.id)?,
+                    strategy: jkb_core::workflow::store::current(conn, t.id)?.source,
+                    uid: t.uid,
+                    title: t.title,
+                    status: t.status,
+                    priority: t.priority,
+                    depth: 0,
+                    found_in: Vec::new(),
+                },
+                namespace: t.namespace,
+            });
+        }
+    }
+    let ids: Vec<ItemId> = listed.values().copied().collect();
+    let mut found_in = jkb_core::design::plan::found_in_of(conn, &ids)?;
+    let mut out = UnplannedList::default();
+    for mut group in groups.into_values() {
+        out.count += group.count;
+        for t in &mut group.tasks {
+            if let Some(id) = listed.get(&t.task.uid) {
+                t.task.found_in = found_in.remove(id).unwrap_or_default();
+            }
+        }
+        out.repos.push(group);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

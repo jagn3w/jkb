@@ -233,6 +233,9 @@ pub fn add(conn: &Connection, meta: &WriteMeta, unit: &NewUnit) -> Result<ItemId
     for (facet, value) in &unit.tags {
         tag::apply(conn, meta, id, facet, value)?;
     }
+    for (edge_type, _, _) in unit.edges.iter().chain(&unit.reverse_edges) {
+        refuse_review_edge(*edge_type)?;
+    }
     for (edge_type, target_uid, weight) in &unit.edges {
         let target = resolve_uid(conn, target_uid)?;
         edge::link_weighted(conn, meta, id, target, *edge_type, *weight, None)?;
@@ -871,9 +874,24 @@ pub fn link(
     dst_uid: &str,
     weight: Option<f64>,
 ) -> Result<()> {
+    refuse_review_edge(edge_type)?;
     let src = resolve_uid(conn, src_uid)?;
     let dst = resolve_uid(conn, dst_uid)?;
     edge::link_weighted(conn, meta, src, dst, edge_type, weight, None)?;
+    Ok(())
+}
+
+/// Refuse an edge only a review writes: `found_in` says "a review of the destination filed the
+/// source", and stays trustworthy only while its one writer is the review seam
+/// ([`crate::reviews::link_findings`]). No strategy lists it, and an investigation link is not a
+/// review.
+fn refuse_review_edge(edge_type: EdgeType) -> Result<()> {
+    if edge_type == EdgeType::FoundIn {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "`{}` is written only by a review filing or recording (`jkb task review file|record`);              link provenance from investigation work with `discovered_from`",
+            edge_type.as_str()
+        ))));
+    }
     Ok(())
 }
 

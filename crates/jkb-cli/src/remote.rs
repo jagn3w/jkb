@@ -118,6 +118,7 @@ pub const fn support(command: &Command) -> Support {
                 | TaskCmd::Show { .. }
                 | TaskCmd::Subtasks { .. }
                 | TaskCmd::Why { .. }
+                | TaskCmd::Unplanned { .. }
                 // The task-mutate set (tasks S6.2); `jkb_api::tasks` refuses the writes that would
                 // have this host's sync write a file outside the container's view.
                 | TaskCmd::Add { .. }

@@ -56,7 +56,7 @@ use crdt::{Crdt, Piece, PieceKind, Pieces};
 pub use discuss::{discussion, Discussion, Touched, MAX_DISCUSS_UNITS};
 pub use export::{DesignMeta, Exported, Source};
 pub use plan::{
-    Ancestry, Named, PlanTask, PlanView, Plans, StepPlace, StepView, TaskPlace, PLAN_KIND,
+    Ancestry, Named, PlanTask, PlanView, Plans, StepPlace, StepView, TaskPlace, TaskRef, PLAN_KIND,
 };
 pub use prompts::{Launch, PromptRecord, RecordPrompt, Recorded, PROMPT_KIND};
 pub use tree::Split;
@@ -2202,3 +2202,6 @@ mod triage_tests;
 
 #[cfg(test)]
 mod finding_tests;
+
+#[cfg(test)]
+mod found_in_tests;

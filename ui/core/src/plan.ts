@@ -22,6 +22,35 @@ export interface PlanTask {
   readonly claimed_by: string | null;
   /** The workflow strategy it runs: the name it was pinned to, or `default:<name>`. */
   readonly strategy: string;
+  /**
+   * For a review finding, the tasks a review of which filed it (its `found_in` edges); empty or
+   * absent (an older daemon) for anything else. Display only: no gate reads it.
+   */
+  readonly found_in?: readonly TaskRef[];
+}
+
+/** `jkb_core::design::TaskRef`: a task by uid and title. */
+export interface TaskRef {
+  readonly uid: string;
+  readonly title: string;
+}
+
+/** `jkb_api::kb::FindingSummary`: a review finding filed about a task, as `task.show` lists it. */
+export interface FindingSummary {
+  readonly uid: string;
+  readonly title: string;
+  readonly status: string | null;
+  readonly priority: number | null;
+  /** Its review round's namespace. */
+  readonly round: string | null;
+  /** Must-fix as its recorded round held it (else priority 1 or above). */
+  readonly must_fix: boolean;
+  /** The plan step it sits under now, by uid. */
+  readonly step: string | null;
+  /** That step as `<design> › <step>`. */
+  readonly step_title: string | null;
+  /** The design its step belongs to. */
+  readonly design: string | null;
 }
 
 /** `jkb_api::designs::plans::Step`. */
@@ -104,6 +133,12 @@ export interface TaskDetail {
   readonly content: string;
   readonly tags: readonly { readonly facet: string; readonly value: string }[];
   readonly transitions: readonly TaskTransition[];
+  /** Its recorded review rounds' namespaces, in recording order. */
+  readonly review_namespaces: readonly string[];
+  /** The review findings filed about it, by round in recording order. */
+  readonly findings: readonly FindingSummary[];
+  /** For a finding: the tasks it was found in. */
+  readonly found_in: readonly TaskRef[];
 }
 
 // ---- requests ---------------------------------------------------------------------------------
@@ -121,6 +156,8 @@ export const planOps = {
   /** Pin a task to a strategy (the operator's; the app holds the operator's token). */
   pin: (uid: string, strategy: string) => ({ op: "workflow.set", uid, strategy: strategyName(strategy) }),
   show: (uid: string) => ({ op: "task.show", uid }),
+  /** Move a task under a plan step (or a task), e.g. its repo's `step:inbox@<repo>`. */
+  move: (uid: string, under: string) => ({ op: "task.move", uid, under }),
   /**
    * Replace a task's text, or append a note to it. A replace names the text it was made against
    * (`expected`), and jkb refuses it as `stale` when the task's text is no longer that.
@@ -226,14 +263,23 @@ export interface TaskLine {
  * open subtask of a finished task indented under whichever task came before it (review round 1).
  */
 export function visibleTasks(tasks: readonly PlanTask[], shown: (t: PlanTask) => boolean): TaskLine[] {
+  // A finished task a shown finding was found in is kept too, muted, as an ancestor is: the finding
+  // is drawn under it (`nestFindings`), and its origin is part of what it says.
+  const origins = new Set<string>();
+  for (const t of tasks) {
+    if (!shown(t)) continue;
+    const origin = originIn(t, tasks);
+    if (origin !== undefined) origins.add(origin);
+  }
+  const kept = (t: PlanTask): boolean => shown(t) || origins.has(t.uid);
   const out: TaskLine[] = [];
   // Walked from the end: a kept row at depth d needs the nearest earlier row shallower than d.
   let want = Number.POSITIVE_INFINITY;
   for (let i = tasks.length - 1; i >= 0; i -= 1) {
     const t = tasks[i];
     if (t === undefined) continue;
-    if (shown(t)) {
-      out.push({ task: t, muted: false });
+    if (kept(t)) {
+      out.push({ task: t, muted: !shown(t) });
       want = t.depth;
     } else if (want !== Number.POSITIVE_INFINITY && t.depth < want) {
       out.push({ task: t, muted: true });
@@ -241,6 +287,109 @@ export function visibleTasks(tasks: readonly PlanTask[], shown: (t: PlanTask) =>
     }
   }
   return out.reverse();
+}
+
+/** The first of `t`'s `found_in` tasks listed in `among` (other than `t`), by `among`'s order. */
+function originIn(t: PlanTask, among: readonly { readonly uid: string }[]): string | undefined {
+  const named = new Set((t.found_in ?? []).map((r) => r.uid).filter((u) => u !== t.uid));
+  if (named.size === 0) return undefined;
+  return among.find((x) => named.has(x.uid))?.uid;
+}
+
+/** A task row with, for a review finding, where it is drawn from. */
+export type FindingLine = TaskLine & {
+  /** The uid of the task listed in the same group that this finding was found in: drawn under it. */
+  readonly findingOf?: string;
+  /** For a finding whose origin is not in the group: that origin's title, for a "from …" note. */
+  readonly from?: string;
+};
+
+/**
+ * A step group's rows, reordered so each review finding sits right after the task it was found in
+ * (after that task's subtree), marked `findingOf` — never by depth, so it never reads as a subtask.
+ * With two origins in the group the first listed wins. A finding whose origin is elsewhere (another
+ * step or design, or shelved to Open work › Inbox) stays where it is, with `from` naming its origin.
+ * Run on `visibleTasks`' output. Subtask depths are untouched.
+ */
+export function nestFindings(lines: readonly TaskLine[]): FindingLine[] {
+  const tasks = lines.map((l) => l.task);
+  const index = new Map(tasks.map((t, i) => [t.uid, i]));
+  // The block each line heads: it and the lines after it that are deeper (its subtree).
+  const blockEnd = (i: number): number => {
+    const depth = tasks[i]?.depth ?? 0;
+    let j = i + 1;
+    while (j < tasks.length && (tasks[j]?.depth ?? 0) > depth) j += 1;
+    return j;
+  };
+  const originOf = new Map<number, number>();
+  for (let i = 0; i < tasks.length; i += 1) {
+    const t = tasks[i];
+    if (t === undefined) continue;
+    const origin = originIn(t, tasks);
+    const at = origin === undefined ? undefined : index.get(origin);
+    if (at !== undefined) originOf.set(i, at);
+  }
+  // A chain of findings that loops back on itself moves none of its members.
+  for (const start of [...originOf.keys()]) {
+    const seen = new Set<number>([start]);
+    let at = originOf.get(start);
+    while (at !== undefined) {
+      if (seen.has(at)) {
+        for (const s of seen) originOf.delete(s);
+        break;
+      }
+      seen.add(at);
+      at = originOf.get(at);
+    }
+  }
+  // A finding inside a moved block moves with it, so only a block's own head is attached.
+  const attached = new Map<number, number[]>();
+  const heads = new Set<number>();
+  const members = new Set<number>();
+  for (let i = 0; i < tasks.length; i += 1) {
+    if (members.has(i)) continue;
+    const origin = originOf.get(i);
+    if (origin === undefined) continue;
+    const end = blockEnd(i);
+    // An origin inside the finding's own block cannot hold it.
+    if (origin > i && origin < end) continue;
+    heads.add(i);
+    for (let j = i; j < end; j += 1) members.add(j);
+    attached.set(origin, [...(attached.get(origin) ?? []), i]);
+  }
+  const note = (line: TaskLine, k: number): FindingLine => {
+    if (originOf.has(k)) return line;
+    const first = (line.task.found_in ?? []).find((r) => r.uid !== line.task.uid);
+    return first === undefined ? line : { ...line, from: first.title };
+  };
+  const out: FindingLine[] = [];
+  const emitted = new Set<number>();
+  // Lines `from`..`to` in order, each followed (after its own subtree) by the findings found in it.
+  // A finding attached elsewhere is skipped here, with its subtree: it is drawn under its origin.
+  const walk = (from: number, to: number): void => {
+    let k = from;
+    while (k < to) {
+      const sub = blockEnd(k);
+      const line = lines[k];
+      if (line !== undefined && !heads.has(k) && !emitted.has(k)) {
+        emitted.add(k);
+        out.push(note(line, k));
+        walk(k + 1, Math.min(sub, to));
+        for (const f of attached.get(k) ?? []) emitFinding(f, line.task.uid);
+      }
+      k = sub;
+    }
+  };
+  const emitFinding = (i: number, origin: string): void => {
+    const line = lines[i];
+    if (line === undefined || emitted.has(i)) return;
+    emitted.add(i);
+    out.push({ ...line, findingOf: origin });
+    walk(i + 1, blockEnd(i));
+    for (const f of attached.get(i) ?? []) emitFinding(f, line.task.uid);
+  };
+  walk(0, tasks.length);
+  return out;
 }
 
 /** Every task of a plan, in step order. */
@@ -350,7 +499,32 @@ function isPlanTask(v: unknown): v is PlanTask {
     isOptNumber(v["priority"]) &&
     isNumber(v["depth"]) &&
     isOptString(v["claimed_by"]) &&
-    isString(v["strategy"])
+    isString(v["strategy"]) &&
+    (v["found_in"] === undefined || isRefs(v["found_in"]))
+  );
+}
+
+/** `v` as a `PlanTask`, or `undefined` when it is not one (for other decoders of the shape). */
+export function decodePlanTaskValue(v: unknown): PlanTask | undefined {
+  return isPlanTask(v) ? v : undefined;
+}
+
+function isRefs(v: unknown): v is readonly TaskRef[] {
+  return Array.isArray(v) && v.every((r) => isObject(r) && isString(r["uid"]) && isString(r["title"]));
+}
+
+function isFinding(v: unknown): v is FindingSummary {
+  return (
+    isObject(v) &&
+    isString(v["uid"]) &&
+    isString(v["title"]) &&
+    isOptString(v["status"]) &&
+    isOptNumber(v["priority"]) &&
+    isOptString(v["round"]) &&
+    typeof v["must_fix"] === "boolean" &&
+    isOptString(v["step"]) &&
+    isOptString(v["step_title"]) &&
+    isOptString(v["design"])
   );
 }
 
@@ -462,6 +636,11 @@ export function decodeTaskDetail(o: Outcome<OpResponse>): Outcome<TaskDetail> {
   const task = o.value.result === "task" ? o.value["task"] : undefined;
   const item = isObject(task) ? task["item"] : undefined;
   const transitions = isObject(task) ? task["transitions"] : undefined;
+  // Absent from an older daemon's answer, and when empty: none.
+  const findings = isObject(task) ? (task["findings"] ?? []) : undefined;
+  const foundIn = isObject(task) ? (task["found_in"] ?? []) : undefined;
+  const review = isObject(task) ? task["review"] : undefined;
+  const namespaces = isObject(review) ? (review["namespaces"] ?? []) : [];
   if (
     !isObject(item) ||
     !isString(item["uid"]) ||
@@ -472,7 +651,12 @@ export function decodeTaskDetail(o: Outcome<OpResponse>): Outcome<TaskDetail> {
     !Array.isArray(item["tags"]) ||
     !item["tags"].every((t) => isObject(t) && isString(t["facet"]) && isString(t["value"])) ||
     !Array.isArray(transitions) ||
-    !transitions.every(isTransition)
+    !transitions.every(isTransition) ||
+    !Array.isArray(findings) ||
+    !findings.every(isFinding) ||
+    !isRefs(foundIn) ||
+    !Array.isArray(namespaces) ||
+    !namespaces.every(isString)
   ) {
     return failed("internal", "jkb serve did not answer with a well-formed `task`");
   }
@@ -486,6 +670,13 @@ export function decodeTaskDetail(o: Outcome<OpResponse>): Outcome<TaskDetail> {
       content: item["content"] ?? "",
       tags: item["tags"] as TaskDetail["tags"],
       transitions,
+      review_namespaces: namespaces,
+      findings: findings.map((f) => ({
+        ...f,
+        step_title: f.step_title ?? null,
+        design: f.design ?? null,
+      })),
+      found_in: foundIn,
     },
   };
 }

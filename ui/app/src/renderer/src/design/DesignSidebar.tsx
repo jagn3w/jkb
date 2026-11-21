@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 
-import { subtreeReview, type DesignNode, type RepoNode, type ReviewCounts } from "@jkb/core";
+import {
+  NO_REPO_LABEL,
+  subtreeReview,
+  unplannedOf,
+  type DesignNode,
+  type RepoNode,
+  type ReviewCounts,
+  type UnplannedList,
+  type UnplannedRepo,
+} from "@jkb/core";
 
 import { createTargets, defaultTarget, type CreateTarget } from "./create";
 import { sidebarRepos } from "./retire";
@@ -216,6 +225,72 @@ function RetiredFold({
   );
 }
 
+/** What the sidebar has selected that is not a design: an unplanned task of a repo (`null`: in no repo). */
+export interface UnplannedPick {
+  readonly repo: string | null;
+  readonly uid: string;
+}
+
+/**
+ * A repo's unplanned tasks — open, under no plan step — folded until opened, like the Retired fold.
+ * Choosing one opens it in the Tasks pane, where *Move to step* plans it.
+ */
+function UnplannedFold({
+  entry,
+  open,
+  depth,
+  selected,
+  onToggle,
+  onPick,
+}: {
+  readonly entry: UnplannedRepo;
+  readonly open: boolean;
+  readonly depth: number;
+  readonly selected: UnplannedPick | undefined;
+  readonly onToggle: () => void;
+  readonly onPick: (pick: UnplannedPick) => void;
+}): React.JSX.Element {
+  const name = entry.repo ?? NO_REPO_LABEL;
+  return (
+    <li role="treeitem" aria-expanded={open} aria-selected={false} className="tree-unplanned-fold">
+      <div className="tree-row" style={{ paddingLeft: `calc(var(--space-2) + ${depth} * var(--space-3))` }}>
+        <button type="button" className="tree-fold" aria-label={open ? `Fold unplanned tasks of ${name}` : `Unfold unplanned tasks of ${name}`} onClick={onToggle}>
+          {open ? "▾" : "▸"}
+        </button>
+        <span className="tree-label muted">Unplanned ({entry.count})</span>
+      </div>
+      {open && (
+        <ul role="group" aria-label={`Unplanned tasks of ${name}`}>
+          {entry.tasks.map(({ task }) => {
+            const chosen = selected !== undefined && selected.repo === entry.repo && selected.uid === task.uid;
+            return (
+              <li key={task.uid} role="treeitem" aria-selected={chosen}>
+                <div className="tree-row" style={{ paddingLeft: `calc(var(--space-2) + ${depth + 1} * var(--space-3))` }}>
+                  <span className="tree-fold" aria-hidden="true" />
+                  <button
+                    type="button"
+                    className="tree-label tree-unplanned-task"
+                    aria-current={chosen ? "page" : undefined}
+                    title={task.uid}
+                    onClick={() => onPick({ repo: entry.repo, uid: task.uid })}
+                  >
+                    {task.title}
+                  </button>
+                </div>
+              </li>
+            );
+          })}
+          {entry.count > entry.tasks.length && (
+            <li role="treeitem" aria-selected={false} className="muted tree-more">
+              …and {entry.count - entry.tasks.length} more (<code>jkb task unplanned</code>)
+            </li>
+          )}
+        </ul>
+      )}
+    </li>
+  );
+}
+
 /**
  * *New design*: a title, and where it goes — the top level of a repo (first offered: the open
  * design's repo) or under any design. With no designs yet there is no repo to offer, so one is typed.
@@ -314,6 +389,9 @@ export function DesignSidebar({
   onCreate,
   retired,
   onRestore,
+  unplanned,
+  unplannedPick,
+  onPickUnplanned,
 }: {
   readonly tree: readonly RepoNode[] | undefined;
   readonly active: string | undefined;
@@ -329,6 +407,11 @@ export function DesignSidebar({
   readonly retired: ReadonlyMap<string, readonly DesignNode[]>;
   /** Restore a retired design (and those retired under it); a refusal is the tab's notice. */
   readonly onRestore: (uid: string) => Promise<void>;
+  /** The unplanned tasks by repo (`task.unplanned`); `undefined` until read. */
+  readonly unplanned: UnplannedList | undefined;
+  /** The unplanned task open, if one is (instead of a design). */
+  readonly unplannedPick: UnplannedPick | undefined;
+  readonly onPickUnplanned: (pick: UnplannedPick) => void;
 }): React.JSX.Element {
   const [folded, setFolded] = useState<ReadonlySet<string>>(readFolded);
   // Which repos' Retired folds are open: closed until asked, and not remembered.
@@ -341,6 +424,19 @@ export function DesignSidebar({
       return next;
     });
   };
+  // Which repos' Unplanned folds are open (`""` for the tasks in no repo): closed until asked.
+  const [unplannedOpen, setUnplannedOpen] = useState<ReadonlySet<string>>(() => new Set());
+  const toggleUnplanned = (repo: string | null): void => {
+    const key = repo ?? "";
+    setUnplannedOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+  const unplannedRepos = (unplanned?.repos ?? []).flatMap((r) => (r.repo === null ? [] : [r.repo]));
+  const elsewhere = unplannedOf(unplanned, null);
   const [creating, setCreating] = useState(false);
   // The open design is always visible: its repo and every design above it unfold when it opens,
   // however it was opened (*Next*, *Jump to context*), or no row would say which design it is. Once
@@ -393,13 +489,14 @@ export function DesignSidebar({
       )}
       {tree === undefined ? (
         <p className="sidebar-hint muted">{error !== undefined ? `Cannot list designs: ${error}` : "Loading designs…"}</p>
-      ) : tree.length === 0 && retired.size === 0 ? (
+      ) : tree.length === 0 && retired.size === 0 && (unplanned?.count ?? 0) === 0 ? (
         <p className="sidebar-hint muted">No designs yet.</p>
       ) : (
         <ul className="design-tree" role="tree" aria-label="Designs by repo">
-          {sidebarRepos(tree, retired).map((repo) => {
+          {sidebarRepos(tree, retired, unplannedRepos).map((repo) => {
             const r = tree.find((t) => t.repo === repo) ?? { repo, designs: [] };
             const gone = retired.get(repo) ?? [];
+            const loose = unplannedOf(unplanned, repo);
             const key = `repo:${r.repo}`;
             const open = !folded.has(key);
             return (
@@ -414,6 +511,11 @@ export function DesignSidebar({
                     {open ? "▾" : "▸"}
                   </button>
                   <span className="tree-repo-name">{r.repo}</span>
+                  {loose !== undefined && loose.count > 0 && (
+                    <span className="tree-unplanned" title={`${loose.count} open task(s) under no plan step`}>
+                      unplanned {loose.count}
+                    </span>
+                  )}
                   <span className="tree-count muted">{r.designs.length}</span>
                 </div>
                 {open && (
@@ -429,6 +531,16 @@ export function DesignSidebar({
                         onPick={onPick}
                       />
                     ))}
+                    {loose !== undefined && loose.count > 0 && (
+                      <UnplannedFold
+                        entry={loose}
+                        open={unplannedOpen.has(repo)}
+                        depth={1}
+                        selected={unplannedPick}
+                        onToggle={() => toggleUnplanned(repo)}
+                        onPick={onPickUnplanned}
+                      />
+                    )}
                     {gone.length > 0 && (
                       <RetiredFold
                         repo={r.repo}
@@ -443,6 +555,27 @@ export function DesignSidebar({
               </li>
             );
           })}
+          {elsewhere !== undefined && elsewhere.count > 0 && (
+            <li role="treeitem" aria-expanded aria-selected={false}>
+              <div className="tree-row tree-repo">
+                <span className="tree-fold" aria-hidden="true" />
+                <span className="tree-repo-name">{NO_REPO_LABEL}</span>
+                <span className="tree-unplanned" title={`${elsewhere.count} open task(s) in no repo and under no plan step`}>
+                  unplanned {elsewhere.count}
+                </span>
+              </div>
+              <ul role="group">
+                <UnplannedFold
+                  entry={elsewhere}
+                  open={unplannedOpen.has("")}
+                  depth={1}
+                  selected={unplannedPick}
+                  onToggle={() => toggleUnplanned(null)}
+                  onPick={onPickUnplanned}
+                />
+              </ul>
+            </li>
+          )}
         </ul>
       )}
     </nav>
