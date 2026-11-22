@@ -442,7 +442,7 @@ mod tests {
                     meta,
                     &NewItem {
                         uid: uid.to_owned(),
-                        kind: "task".to_owned(),
+                        kind: "note".to_owned(),
                         content: None,
                         content_hash: None,
                         mime: None,

@@ -139,6 +139,9 @@ pub(crate) struct StagedTask {
     /// the CLI's preconditions — a missing worktree and a review namespace holding no
     /// findings at all — so a row read "Landable" for tasks `land` then refused outright.
     pub(crate) land_blocked: Option<String>,
+    /// What `jkb task land` would warn about and land anyway — the rest of the repo's unplanned
+    /// tasks ([`UnplannedFact::note`]). A note, never a hold: the hold is `land_blocked`.
+    pub(crate) land_note: Option<String>,
 }
 
 /// One staging branch and the tasks landing on it.
@@ -201,6 +204,15 @@ pub(crate) fn collect(kb: &Kb<'_>, ctx: &RepoCtx, include_merged: bool) -> Resul
         .is_none()
         .then(|| worktree_listing_refusal(&ctx.root));
     let mut cache = Cache::default();
+    // The land gate's unplanned-work fact for every live task, in ONE read for the whole listing:
+    // the same split `land_preflight` asks for one task. A finished task is not asked — the gate's
+    // terminal arm refuses it before this fact is read.
+    let live: Vec<String> = tasks
+        .iter()
+        .filter(|t| !State::from_status(&t.status).is_terminal())
+        .map(|t| t.uid.clone())
+        .collect();
+    let unplanned = unplanned_facts(kb, &unplanned_repo(&ctx.key), &live);
 
     let mut out = Vec::new();
     for (branch, group) in by_onto {
@@ -244,6 +256,7 @@ pub(crate) fn collect(kb: &Kb<'_>, ctx: &RepoCtx, include_merged: bool) -> Resul
             existing: &existing,
             target_dirty: target_dirty.as_deref(),
             listing_failed: listing_failed.as_deref(),
+            unplanned: &unplanned,
         };
         let mut staged = Vec::new();
         for t in group {
@@ -330,6 +343,8 @@ struct BranchCtx<'a> {
     /// per branch beside `target_dirty` because it is the same silence: `sessions` above was
     /// derived from that listing too, and a row must not read its emptiness as an answer.
     listing_failed: Option<&'a str>,
+    /// Each live task's [`UnplannedFact`], read once for the listing.
+    unplanned: &'a BTreeMap<String, UnplannedFact>,
 }
 
 /// Resolve one task's session, state and review standing.
@@ -346,6 +361,7 @@ fn stage_task(
         existing,
         target_dirty,
         listing_failed,
+        unplanned,
     } = *branch_ctx;
     // Match by worktree rather than by "the task's branch tag": a task that picked up a
     // second `branch=` still resolves to the session that actually exists on disk (D36.2).
@@ -413,6 +429,7 @@ fn stage_task(
     let worktree = sess.map(|s| s.worktree.clone());
     let verdict = review::gate_with(&found, &t.review);
     let review_ok = matches!(verdict, review::GateVerdict::Passed);
+    let unplanned = unplanned.get(&t.uid);
     let land_blocked = land_blocker(&LandFacts {
         state,
         open_subtasks,
@@ -422,6 +439,7 @@ fn stage_task(
         branch_exists: work_ref.is_some(),
         target_dirty,
         listing_failed,
+        unplanned,
         verdict: Some(&verdict),
     });
 
@@ -440,6 +458,7 @@ fn stage_task(
         open_must_fix: found.open_count,
         review_ok,
         land_blocked,
+        land_note: unplanned.and_then(UnplannedFact::note),
     })
 }
 
@@ -572,6 +591,158 @@ pub(crate) fn target_dirty_reason(
     )))
 }
 
+/// The most uids a refusal, warning or note names; each also says how many there are in all.
+const UNPLANNED_NAMED: usize = 5;
+
+/// What the knowledge base says about unplanned work, for one task being landed: its **own**
+/// (refused on) and the rest of its repo (warned about), from one `task.unplanned` read with
+/// `of` — the split is the daemon's, so the land gate and the In Flight row ask one question
+/// rather than each assembling it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnplannedFact {
+    /// The read answered.
+    Read {
+        /// The repo the rest was counted in.
+        repo: String,
+        /// The task's own unplanned work, every one: itself, its subtree, a finding `found_in`
+        /// either.
+        own: Vec<String>,
+        /// How many other unplanned tasks the repo holds.
+        others: usize,
+        /// The first of those.
+        others_first: Vec<String>,
+    },
+    /// The read did not answer — an older daemon that does not know the op or its `of` field, or
+    /// a failed read — or answered without this task. **Not** read as nothing unplanned: like an
+    /// unreadable review, it refuses.
+    Unknown(String),
+}
+
+/// The repo `task.unplanned` counts a checkout's tasks under: its key as a `repos/` namespace,
+/// through [`jkb_core::mount::repo_of_namespace`], the one derivation. A key is one path component
+/// (`gitrepo::key`, the root's file name), so this is the key itself; it is asked rather than
+/// assumed so the two cannot drift.
+pub(crate) fn unplanned_repo(key: &str) -> String {
+    jkb_core::mount::repo_of_namespace(&format!("repos/{key}")).unwrap_or_else(|| key.to_owned())
+}
+
+/// Each of `tasks`' [`UnplannedFact`], from **one** `task.unplanned` read scoped to `repo`. Never
+/// fails: an error answer becomes [`UnplannedFact::Unknown`] for every task, and a task the answer
+/// leaves out is `Unknown` too.
+pub(crate) fn unplanned_facts(
+    kb: &Kb<'_>,
+    repo: &str,
+    tasks: &[String],
+) -> BTreeMap<String, UnplannedFact> {
+    if tasks.is_empty() {
+        return BTreeMap::new();
+    }
+    let answer = kb.call(jkb_api::Request::TaskUnplanned {
+        repo: Some(repo.to_owned()),
+        limit: Some(UNPLANNED_NAMED),
+        of: tasks.to_vec(),
+    });
+    let unknown = |why: &str| {
+        UnplannedFact::Unknown(format!(
+            "Whether it has unplanned work could not be read ({why}), so it does not land until it \
+             can be: `jkb task unplanned` asks the same question."
+        ))
+    };
+    let mut splits = match answer {
+        Ok(jkb_api::Response::Unplanned { list }) => list
+            .of
+            .into_iter()
+            .map(|s| (s.task.clone(), s))
+            .collect::<BTreeMap<_, _>>(),
+        Ok(other) => {
+            let why = match crate::ops_cli::unexpected::<()>("task.unplanned", &other) {
+                Err(e) => format!("{e:#}"),
+                Ok(()) => String::new(),
+            };
+            return tasks.iter().map(|t| (t.clone(), unknown(&why))).collect();
+        }
+        Err(e) => {
+            let why = format!("{e:#}");
+            return tasks.iter().map(|t| (t.clone(), unknown(&why))).collect();
+        }
+    };
+    tasks
+        .iter()
+        .map(|t| {
+            let fact = match splits.remove(t) {
+                Some(s) => UnplannedFact::Read {
+                    repo: repo.to_owned(),
+                    own: s.own,
+                    others: s.others,
+                    others_first: s.others_first,
+                },
+                None => unknown("the answer said nothing about this task"),
+            };
+            (t.clone(), fact)
+        })
+        .collect()
+}
+
+/// Up to [`UNPLANNED_NAMED`] uids, then how many more.
+fn named(first: &[String], total: usize) -> String {
+    let shown: Vec<&str> = first
+        .iter()
+        .take(UNPLANNED_NAMED)
+        .map(String::as_str)
+        .collect();
+    let more = total.saturating_sub(shown.len());
+    if more == 0 {
+        shown.join(", ")
+    } else {
+        format!("{} and {more} more", shown.join(", "))
+    }
+}
+
+impl UnplannedFact {
+    /// Why it does not land: its own work is unplanned, or the read did not answer.
+    pub(crate) fn refusal(&self) -> Option<String> {
+        match self {
+            Self::Unknown(why) => Some(why.clone()),
+            Self::Read { own, repo, .. } if !own.is_empty() => Some(format!(
+                "{} task(s) of its own are under no plan step: {}. Home each with `jkb task move \
+                 <uid> --under <step>` (its plan's step, or `step:inbox@{repo}`); `jkb task \
+                 unplanned` lists them.",
+                own.len(),
+                named(own, own.len())
+            )),
+            Self::Read { .. } => None,
+        }
+    }
+
+    /// The warning `jkb task land` prints, and lands: the rest of the repo has unplanned tasks.
+    pub(crate) fn warning(&self) -> Option<String> {
+        match self {
+            Self::Read {
+                repo,
+                others,
+                others_first,
+                ..
+            } if *others > 0 => Some(format!(
+                "{others} unplanned task(s) in {repo}, not this task's: {}; list them with jkb task \
+                 unplanned --repo {repo}, home one with jkb task move <uid> --under \
+                 step:inbox@{repo}",
+                named(others_first, *others)
+            )),
+            _ => None,
+        }
+    }
+
+    /// The In Flight row's note for the same: a count, never a hold.
+    pub(crate) fn note(&self) -> Option<String> {
+        match self {
+            Self::Read { repo, others, .. } if *others > 0 => {
+                Some(format!("{others} other unplanned task(s) in {repo}"))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The facts a land verdict is computed from. Assembled by the row (`stage_task`) and by the
 /// command (`land_preflight`) from the same git and KB reads.
 pub(crate) struct LandFacts<'a> {
@@ -604,6 +775,10 @@ pub(crate) struct LandFacts<'a> {
     pub(crate) branch_exists: bool,
     /// Why the checkout the graft would happen in cannot take it, if it cannot.
     pub(crate) target_dirty: Option<&'a str>,
+    /// The task's own unplanned work ([`UnplannedFact`]), or `None` when the caller does not ask
+    /// (a finished task, which an earlier arm refuses anyway). Refuses on its own work and on an
+    /// unreadable answer; the rest of the repo is only warned about, by the caller.
+    pub(crate) unplanned: Option<&'a UnplannedFact>,
     /// The review gate's verdict, or `None` when the caller applies the review rule itself.
     ///
     /// `cmd_task_land` passes `None`: it calls `review::enforce` a moment later, which is the
@@ -686,6 +861,13 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
     if facts.commits == 0 {
         return Some("It has no commits that the staging branch does not.".to_owned());
     }
+    // After the session and work-branch facts, before the review. And BEFORE open subtasks: an
+    // unplanned subtask is always open (a terminal task is never unplanned), so below that arm this
+    // refusal could never fire for a subtree, and the lander would be told to finish the leaves
+    // when what needs fixing is that no plan step holds them.
+    if let Some(reason) = facts.unplanned.and_then(UnplannedFact::refusal) {
+        return Some(reason);
+    }
     if facts.open_subtasks {
         return Some(
             "It still has open subtasks — you work the leaves, and the parent lands after them."
@@ -701,7 +883,10 @@ pub(crate) fn land_blocker(facts: &LandFacts<'_>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{land_blocker, target_dirty_reason, worktree_listing_refusal, LandFacts, State};
+    use super::{
+        land_blocker, target_dirty_reason, worktree_listing_refusal, LandFacts, State,
+        UnplannedFact,
+    };
     use jkb_fsm::Fact;
     use jkb_types::TaskStatus;
     use std::collections::BTreeMap;
@@ -768,6 +953,7 @@ mod tests {
             branch_exists: true,
             target_dirty: None,
             listing_failed: None,
+            unplanned: None,
             verdict: None,
         }
     }
@@ -835,5 +1021,127 @@ mod tests {
             land_blocker(&facts(Fact::No)).is_none(),
             "and a checkout PROVEN clean still does — the guard must not refuse everything"
         );
+    }
+
+    fn read(own: &[&str], others: usize, others_first: &[&str]) -> UnplannedFact {
+        UnplannedFact::Read {
+            repo: "proj".to_owned(),
+            own: own.iter().map(|s| (*s).to_owned()).collect(),
+            others,
+            others_first: others_first.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    /// The task's OWN unplanned work refuses, naming every uid and the command that homes one; an
+    /// unreadable answer refuses too. The rest of the repo does not hold the land, and neither does
+    /// a caller that did not ask.
+    #[test]
+    fn own_unplanned_work_or_an_unreadable_answer_refuses_and_the_rest_does_not() {
+        let own = read(&["task:a", "task:b"], 0, &[]);
+        let mut f = facts(Fact::No);
+        f.unplanned = Some(&own);
+        let reason = land_blocker(&f).expect("own unplanned work does not land");
+        assert!(
+            reason.starts_with("2 task(s) of its own")
+                && reason.contains("task:a, task:b")
+                && reason.contains("jkb task move <uid> --under <step>")
+                && reason.contains("step:inbox@proj"),
+            "{reason}"
+        );
+
+        let unknown = UnplannedFact::Unknown("could not be read".to_owned());
+        f.unplanned = Some(&unknown);
+        assert_eq!(
+            land_blocker(&f).as_deref(),
+            Some("could not be read"),
+            "an unreadable answer is not read as nothing unplanned"
+        );
+
+        let others = read(&[], 3, &["task:x"]);
+        f.unplanned = Some(&others);
+        assert_eq!(land_blocker(&f), None, "the rest of the repo is a warning");
+        let warning = others.warning().expect("and it is warned about");
+        assert!(
+            warning.starts_with("3 unplanned task(s) in proj, not this task's: task:x and 2 more")
+                && warning.contains("jkb task unplanned --repo proj")
+                && warning.contains("jkb task move <uid> --under step:inbox@proj"),
+            "{warning}"
+        );
+        assert_eq!(
+            others.note().as_deref(),
+            Some("3 other unplanned task(s) in proj")
+        );
+        assert_eq!(read(&[], 0, &[]).warning(), None);
+        assert_eq!(read(&[], 0, &[]).note(), None);
+
+        f.unplanned = None;
+        assert_eq!(land_blocker(&f), None, "not asked, not refused");
+    }
+
+    /// Ordering: the session and branch refusals come first — an empty branch is reported as
+    /// empty, not as holding unplanned work — and open subtasks after.
+    #[test]
+    fn an_empty_branch_is_refused_before_unplanned_work() {
+        let own = read(&["task:a"], 0, &[]);
+        let mut f = facts(Fact::No);
+        f.unplanned = Some(&own);
+        f.commits = 0;
+        let reason = land_blocker(&f).expect("refused");
+        assert!(reason.contains("no commits"), "{reason}");
+        // And it outranks open subtasks: an unplanned subtree is open, and finishing it is not
+        // the remedy.
+        f.commits = 3;
+        f.open_subtasks = true;
+        let reason = land_blocker(&f).expect("refused");
+        assert!(reason.contains("of its own"), "{reason}");
+    }
+
+    /// A backend answering `task.unplanned` with a fixed outcome.
+    struct Answers(Result<jkb_api::Response, jkb_api::ApiError>);
+
+    impl jkb_api::Backend for Answers {
+        fn call(&self, _: jkb_api::Request) -> Result<jkb_api::Response, jkb_api::ApiError> {
+            self.0.clone()
+        }
+    }
+
+    /// The fact is read from one answer, and an answer that does not say — an older daemon
+    /// refusing the op or its `of` field, or a reply naming no split for the task — is UNKNOWN,
+    /// which refuses, never read as nothing unplanned.
+    #[test]
+    fn an_unreadable_unplanned_answer_is_unknown_never_none() {
+        let ask = |answer| {
+            let backend = Answers(answer);
+            let kb = crate::session_cli::Kb::new(&backend);
+            super::unplanned_facts(&kb, "proj", &["task:l".to_owned()])
+                .remove("task:l")
+                .expect("every asked task has a fact")
+        };
+        let old = ask(Err(jkb_api::ApiError::bad_request(
+            "unknown field `of`, expected `repo` or `limit`",
+        )));
+        assert!(
+            matches!(&old, UnplannedFact::Unknown(why) if why.contains("unknown field")),
+            "{old:?}"
+        );
+        assert!(old.refusal().is_some());
+
+        let silent = ask(Ok(jkb_api::Response::Unplanned {
+            list: jkb_api::tasks::UnplannedList::default(),
+        }));
+        assert!(matches!(silent, UnplannedFact::Unknown(_)), "{silent:?}");
+
+        let answered = ask(Ok(jkb_api::Response::Unplanned {
+            list: jkb_api::tasks::UnplannedList {
+                of: vec![jkb_api::tasks::OwnUnplanned {
+                    task: "task:l".to_owned(),
+                    own: Vec::new(),
+                    others: 2,
+                    others_first: vec!["task:x".to_owned(), "task:y".to_owned()],
+                }],
+                ..jkb_api::tasks::UnplannedList::default()
+            },
+        }));
+        assert_eq!(answered, read(&[], 2, &["task:x", "task:y"]));
     }
 }

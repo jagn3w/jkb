@@ -33,6 +33,10 @@ pub struct PlanTask {
     pub claimed_by: Option<String>,
     /// The workflow strategy it runs: the name it was pinned to, or `default:<name>`.
     pub strategy: String,
+    /// The tasks a review of which filed this one (its `found_in` edges): empty for anything but a
+    /// review finding. Defaulted, so an older daemon's answer decodes as none.
+    #[serde(default)]
+    pub found_in: Vec<design::TaskRef>,
 }
 
 impl From<design::PlanTask> for PlanTask {
@@ -45,6 +49,7 @@ impl From<design::PlanTask> for PlanTask {
             depth: t.depth,
             claimed_by: t.claimed_by,
             strategy: t.strategy,
+            found_in: t.found_in,
         }
     }
 }

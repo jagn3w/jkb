@@ -22,6 +22,15 @@
 //! text against them. STAGED (a `stages` edge to a plan step) and IMPLEMENTED (every staged step has
 //! tasks, all `done`) are read from the graph, never stored.
 
+/// The item kind of a plan step, as a literal: [`STEP_KIND`] is defined from it, and the SQL in
+/// [`plan`] that walks the steps `concat!`s it, so the constant and the queries cannot drift. A
+/// macro because `concat!` takes only literals; defined before `mod plan` so it is in scope there.
+macro_rules! step_kind {
+    () => {
+        "plan_step"
+    };
+}
+
 pub mod crdt;
 mod discuss;
 pub mod export;
@@ -47,7 +56,7 @@ use crdt::{Crdt, Piece, PieceKind, Pieces};
 pub use discuss::{discussion, Discussion, Touched, MAX_DISCUSS_UNITS};
 pub use export::{DesignMeta, Exported, Source};
 pub use plan::{
-    Ancestry, Named, PlanTask, PlanView, Plans, StepPlace, StepView, TaskPlace, PLAN_KIND,
+    Ancestry, Named, PlanTask, PlanView, Plans, StepPlace, StepView, TaskPlace, TaskRef, PLAN_KIND,
 };
 pub use prompts::{Launch, PromptRecord, RecordPrompt, Recorded, PROMPT_KIND};
 pub use tree::Split;
@@ -58,7 +67,7 @@ pub const KIND: &str = "design";
 /// The item kind of a span: the item a design's span is mirrored to, so edges can point at it.
 pub const SPAN_KIND: &str = "design_span";
 /// The item kind of an execution plan's step — what a span is staged into (D53.6).
-pub const STEP_KIND: &str = "plan_step";
+pub const STEP_KIND: &str = step_kind!();
 /// The namespace root designs live under: `designs/<repo>/`.
 pub const ROOT: &str = "designs";
 /// The longest slug prefix carried into a minted design uid.
@@ -454,6 +463,20 @@ pub fn create(
     title: &str,
     body: &str,
 ) -> Result<DesignRow> {
+    let uid = mint(KIND, title.trim())?;
+    create_as(conn, meta, &uid, repo, title, body)
+}
+
+/// [`create`] with the uid given rather than minted: the fixed uid of a repo's Open work design
+/// ([`plan::triage_step`]) goes through the same checks and writes as any other.
+pub(crate) fn create_as(
+    conn: &Connection,
+    meta: &WriteMeta,
+    uid: &str,
+    repo: &str,
+    title: &str,
+    body: &str,
+) -> Result<DesignRow> {
     let title = title.trim();
     if title.is_empty() {
         return Err(invalid("a design needs a title"));
@@ -464,7 +487,7 @@ pub fn create(
         )));
     }
     let path = ns::normalize(&format!("{ROOT}/{repo}"))?;
-    let uid = mint(KIND, title)?;
+    let uid = uid.to_owned();
     let id = item::upsert(
         conn,
         meta,
@@ -623,6 +646,35 @@ fn open_tasks_under(conn: &Connection, design: ItemId) -> Result<Vec<String>> {
     Ok(uids)
 }
 
+/// The namespaces whose metadata maps their new tasks ([`plan::PLAN_STEP_KEY`]) to a plan step
+/// anywhere under `design` — its own plans' or a nested design's — by path.
+fn namespaces_mapped_into(conn: &Connection, design: ItemId) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "WITH RECURSIVE under(id) AS (
+             SELECT child_item_id FROM containment WHERE parent_item_id = ?1
+             UNION
+             SELECT c.child_item_id FROM containment c JOIN under u ON c.parent_item_id = u.id
+         )
+         SELECT n.path FROM namespaces n
+          WHERE json_valid(n.metadata)
+            AND json_extract(n.metadata, '$.' || ?2) IN (
+                SELECT i.uid FROM under u JOIN items i ON i.id = u.id WHERE i.kind = '",
+        step_kind!(),
+        "')
+          ORDER BY n.path",
+    ))?;
+    let paths = stmt
+        .query_map(params![design.get(), plan::PLAN_STEP_KEY], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    Ok(paths)
+}
+
+/// Whether `uid` is a repo's Open work design ([`plan::triage_design_uid`]).
+fn is_triage_design_uid(uid: &str) -> bool {
+    uid.strip_prefix("design:open-work@")
+        .is_some_and(|repo| !repo.is_empty())
+}
+
 /// Retire design `uid` and every design nested under it, in this one transaction, so one `jkb undo`
 /// brings the whole tree back. A retired design leaves [`list`] (and so `jkb design ls`, the Design
 /// tab's tree and `export --all`); nothing else moves — its text, spans, approvals, plans, steps,
@@ -630,14 +682,25 @@ fn open_tasks_under(conn: &Connection, design: ItemId) -> Result<Vec<String>> {
 /// design cat` still reads it. A design is retired, never deleted ([`item::remove`] refuses one).
 ///
 /// Refused while any task under the tree is not `done` or `cancelled`: hiding a design would hide
-/// the work still going on under it. The refusal names those tasks.
+/// the work still going on under it. The refusal names those tasks. Refused too while a namespace
+/// maps its new tasks to a step of the tree ([`plan::map_namespace`]): the next capture there would
+/// be filed in a plan no listing shows. The refusal names each namespace and how to clear it.
 ///
 /// # Errors
-/// An unknown design, one already retired, an open task under the tree, or a database error.
+/// An unknown design, one already retired, a tree holding a repo's Open work design, an open task
+/// under the tree, a namespace mapped to a step of the tree, or a database error.
 pub fn retire(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<DesignRow>> {
     let id = design_id(conn, uid)?;
     if retired_item(conn, id)? {
         return Err(invalid(format!("design {uid} is already retired")));
+    }
+    let mut tree = vec![(id, uid.to_owned())];
+    tree.extend(tree::descendants(conn, id)?);
+    if let Some((_, open_work)) = tree.iter().find(|(_, u)| is_triage_design_uid(u)) {
+        return Err(invalid(format!(
+            "design {open_work} is a repo's Open work, where new tasks with no plan are filed: it \
+             is never retired (the next capture would go under a design no listing shows)"
+        )));
     }
     let open = open_tasks_under(conn, id)?;
     if !open.is_empty() {
@@ -659,8 +722,20 @@ pub fn retire(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<Desi
             open.len()
         )));
     }
-    let mut tree = vec![(id, uid.to_owned())];
-    tree.extend(tree::descendants(conn, id)?);
+    let mapped = namespaces_mapped_into(conn, id)?;
+    if !mapped.is_empty() {
+        let clear = mapped
+            .iter()
+            .map(|path| format!("`jkb ns step {path} --clear`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(invalid(format!(
+            "design {uid} has a step that namespace(s) {} map their new tasks to: retired, the next \
+             capture there would be filed in a plan no listing shows — clear or remap each first \
+             ({clear})",
+            mapped.join(", ")
+        )));
+    }
     let mut out = Vec::with_capacity(tree.len());
     for (design, design_uid) in tree {
         // A child retired on its own before stays as it is: one more write would make undoing this
@@ -2121,3 +2196,12 @@ pub(crate) fn undo_would_lose(conn: &Connection, item: ItemId, txn: i64) -> Resu
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod triage_tests;
+
+#[cfg(test)]
+mod finding_tests;
+
+#[cfg(test)]
+mod found_in_tests;

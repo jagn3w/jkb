@@ -64,7 +64,12 @@ and RBAC: jkb holds every rule the coordinator follows. The swarm has these part
   `systemic_reviewer`); the coordinator cannot fire either exit itself.
 - **Findings.** Whoever verifies a fix closes its finding. When a round comes back clean, the
   coordinator closes the must-fix findings of the group's earlier rounds (`jkb task set <finding>
-  --status done`) before the merge queue. Concerns and nits stay open as backlog.
+  --status done`) before the merge queue. Concerns and nits stay open; jkb moves the ones still open
+  to the repo's Open work › Inbox when the task lands.
+- **Follow-ups.** Workers never file work outside their task. Each reports `FOLLOW-UP` lines, and the
+  coordinator files every one under the step of the task that found it, or the repo's triage step
+  when that task has none. It tags them settled, so the run does not build them. They are listed in
+  the report.
 - **Merge queue.** `scripts/merge-queue.sh` is deterministic, not an agent. It runs the gate on the
   rebased branch, lands it on the feature branch, records the landing, and names its own outcome.
 
@@ -213,4 +218,6 @@ given while the run is going is picked up by its next frontier. Then tell the us
 - **Merge it.** Merge or open a PR from `$INTEG` as with any feature branch.
 - **Clean up.** `git worktree remove .swarm/integration`, then delete the local `swarm-task/*`
   branches. Never push them.
-- **Leftover claims.** If a run crashed and left claims, `jkb doctor --fix` clears them.
+- **Leftover claims.** If a run crashed and left claims, `jkb doctor --fix` clears them. It exits 1
+  whenever any open task is unplanned, after the repair has run: read its `task claims:` lines for
+  whether the claims were cleared, and its `unplanned tasks:` lines for the separate failure.

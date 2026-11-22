@@ -25,6 +25,18 @@ pub struct Flagged {
 /// The most flagged files one answer lists.
 pub const MAX_FLAGGED: usize = 200;
 
+/// A task no execution plan's step reaches ([`jkb_core::design::plan::unplanned`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unplanned {
+    /// Its uid.
+    pub uid: String,
+    /// Its title.
+    pub title: String,
+}
+
+/// The most unplanned tasks one answer lists.
+pub const MAX_UNPLANNED: usize = 200;
+
 /// What `kb.health` found.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Health {
@@ -45,6 +57,14 @@ pub struct Health {
     /// which `jkb doctor` says rather than reading as healthy.
     #[serde(default)]
     pub unguarded_vector_tables: Option<Vec<String>>,
+    /// Open tasks no execution plan's step reaches, the first [`MAX_UNPLANNED`], most urgent first.
+    /// `None` from a daemon too old to report them, which `jkb doctor` says rather than reading as
+    /// none.
+    #[serde(default)]
+    pub unplanned: Option<Vec<Unplanned>>,
+    /// How many unplanned tasks there are in all (`None` as for [`Health::unplanned`]).
+    #[serde(default)]
+    pub unplanned_count: Option<usize>,
 }
 
 /// `kb.health`. Not an agent read: FTS5's integrity check is spelled as an `INSERT`, which the
@@ -82,6 +102,16 @@ pub fn health(conn: &Connection) -> Result<Health, ApiError> {
     };
     let unguarded_vector_tables =
         jkb_index::vector_tables_without_gc_trigger(conn).map_err(|e| index_error(&e))?;
+    let unplanned = jkb_core::design::plan::unplanned(conn)?;
+    let unplanned_count = unplanned.len();
+    let unplanned = unplanned
+        .into_iter()
+        .take(MAX_UNPLANNED)
+        .map(|t| Unplanned {
+            uid: t.uid,
+            title: t.title,
+        })
+        .collect();
     Ok(Health {
         schema_version,
         fts_ok,
@@ -90,6 +120,8 @@ pub fn health(conn: &Connection) -> Result<Health, ApiError> {
         vector_tables,
         stale_vectors,
         unguarded_vector_tables: Some(unguarded_vector_tables),
+        unplanned: Some(unplanned),
+        unplanned_count: Some(unplanned_count),
     })
 }
 
@@ -133,5 +165,48 @@ mod tests {
         assert_eq!((h.vector_tables, h.stale_vectors), (0, 0));
         assert_eq!(h.unguarded_vector_tables, Some(Vec::new()));
         assert_eq!(h.flagged[0].detail.as_deref(), Some("bad"));
+        assert_eq!(h.unplanned, Some(Vec::new()));
+        assert_eq!(h.unplanned_count, Some(0));
+    }
+
+    /// Past [`super::MAX_UNPLANNED`] the list is cut and the count is not.
+    #[test]
+    fn the_unplanned_tasks_are_counted_past_the_listed_ones() {
+        let db = Db::open_in_memory().unwrap();
+        db.write_txn("t", |c, m| {
+            for i in 0..=super::MAX_UNPLANNED {
+                let task = jkb_core::task::NewTask::new(
+                    format!("task:t{i}"),
+                    format!("t{i}"),
+                    jkb_core::task::Under::inbox_of("t"),
+                );
+                let id = jkb_core::task::create(c, m, &task)?;
+                // Loose, as a task from before every task was filed under a step.
+                if let Some(step) = jkb_core::containment::parent(c, id)? {
+                    jkb_core::edge::unlink(c, m, step, id, jkb_types::EdgeType::ParentOf)?;
+                    jkb_core::containment::uncontain(c, m, id)?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        let h = db.read_with(super::health).unwrap();
+        assert_eq!(
+            h.unplanned.as_ref().map(Vec::len),
+            Some(super::MAX_UNPLANNED)
+        );
+        assert_eq!(h.unplanned_count, Some(super::MAX_UNPLANNED + 1));
+        assert_eq!(h.unplanned.unwrap()[0].title, "t0");
+    }
+
+    /// A daemon too old to report unplanned tasks is read as "not reported", never as none.
+    #[test]
+    fn an_older_health_payload_reads_as_not_reported() {
+        let h: super::Health = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "fts_ok": true, "flagged": [], "flagged_count": 0,
+            "vector_tables": 0, "stale_vectors": 0
+        }))
+        .unwrap();
+        assert_eq!((h.unplanned, h.unplanned_count), (None, None));
     }
 }

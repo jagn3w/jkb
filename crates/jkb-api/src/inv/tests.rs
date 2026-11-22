@@ -208,12 +208,20 @@ fn an_evidence_list_is_capped_by_magnitude() {
     let db = Db::open_in_memory().unwrap();
     let cap = crate::items::MAX_RELATED_NODES;
     db.write_txn("t", move |c, m| {
-        let h = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("note:h", "h"))?;
+        let h = jkb_core::task::create(
+            c,
+            m,
+            &jkb_core::task::NewTask::new("note:h", "h", jkb_core::task::Under::inbox_of("t")),
+        )?;
         for i in 0..cap {
             let s = jkb_core::task::create(
                 c,
                 m,
-                &jkb_core::task::NewTask::new(format!("note:s{i}"), "weak"),
+                &jkb_core::task::NewTask::new(
+                    format!("note:s{i}"),
+                    "weak",
+                    jkb_core::task::Under::inbox_of("t"),
+                ),
             )?;
             jkb_core::edge::link_weighted(
                 c,
@@ -225,7 +233,15 @@ fn an_evidence_list_is_capped_by_magnitude() {
                 None,
             )?;
         }
-        let k = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new("note:k", "decisive"))?;
+        let k = jkb_core::task::create(
+            c,
+            m,
+            &jkb_core::task::NewTask::new(
+                "note:k",
+                "decisive",
+                jkb_core::task::Under::inbox_of("t"),
+            ),
+        )?;
         jkb_core::edge::link_weighted(
             c,
             m,

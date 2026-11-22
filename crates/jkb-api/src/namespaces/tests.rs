@@ -1,11 +1,12 @@
 //! Namespaces through the backend, and the file roots a move is held to.
 
+use jkb_core::task::{NewTask, Under};
 use serde_json::json;
 
 use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response};
 
 fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
-    b.call(serde_json::from_value(r).expect("request parses"))
+    b.call(serde_json::from_value(crate::test_repo::in_repo(b, r)).expect("request parses"))
 }
 
 fn list(b: &LocalBackend, scope: Option<&str>) -> Vec<String> {
@@ -76,7 +77,7 @@ fn a_rooted_move_is_bounded() {
     let (db, ..) = crate::tests::mutate_fixture();
     db.write_txn("t", |c, m| {
         for i in 0..=super::MAX_MOVED_ITEMS {
-            let mut t = jkb_core::task::NewTask::new(format!("task:b{i}"), "b");
+            let mut t = NewTask::new(format!("task:b{i}"), "b", Under::inbox_of("t"));
             t.home = "bulk/x".into();
             jkb_core::task::create(c, m, &t)?;
         }
@@ -216,4 +217,53 @@ fn a_rooted_move_is_held_to_the_lines_it_rewrites() {
         json!({ "op": "ns.mv", "from": "scratch", "to": "scratch2" }),
     )
     .unwrap();
+}
+
+/// `ns.step` maps a namespace to a plan step for the tasks homed under it, refuses what is no step,
+/// clears, and answers what the mapping was.
+#[test]
+fn ns_step_maps_a_namespace_to_a_step_and_clears() {
+    let db = jkb_core::Db::open_in_memory().unwrap();
+    let b = LocalBackend::new(db.clone());
+    let step = db
+        .write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "proj/notes")?;
+            let d = jkb_core::design::create(c, m, "t", "Work", "")?.uid;
+            let p = jkb_core::design::plan::create(c, m, &d, "Plan", &["one".to_owned()])?;
+            Ok(p.steps[0].uid.clone())
+        })
+        .unwrap();
+    let mapped = |r: serde_json::Value| match call(&b, r).unwrap() {
+        Response::Mapped { before } => before,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        mapped(json!({ "op": "ns.step", "path": "proj/notes", "step": step })),
+        None
+    );
+    let Response::Added { added } = call(
+        &b,
+        json!({ "op": "task.add", "text": "x", "home": "proj/notes/deep", "cwd": "/nowhere" }),
+    )
+    .unwrap() else {
+        panic!("added")
+    };
+    let parent = db
+        .read(move |c| {
+            let id = jkb_core::item::id_for_uid(c, &added.uid)?.unwrap();
+            let p = jkb_core::containment::parent(c, id)?.unwrap();
+            Ok(jkb_core::item::get(c, p)?.unwrap().uid)
+        })
+        .unwrap();
+    assert_eq!(parent, step, "mapped, it needs no repo");
+    let e = call(
+        &b,
+        json!({ "op": "ns.step", "path": "proj/notes", "step": "design:nope" }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
+    assert_eq!(
+        mapped(json!({ "op": "ns.step", "path": "proj/notes" })),
+        Some(step)
+    );
 }

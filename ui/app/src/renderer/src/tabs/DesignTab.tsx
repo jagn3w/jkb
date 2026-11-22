@@ -12,10 +12,11 @@ import {
   treeOrder,
   unreviewedPassages,
   type Design,
+  type RepoNode,
 } from "@jkb/core";
 
 import { createAndOpen, createDesign, type CreateTarget } from "../design/create";
-import { DesignSidebar } from "../design/DesignSidebar";
+import { DesignSidebar, type UnplannedPick } from "../design/DesignSidebar";
 import { DocumentEditor } from "../design/DocumentEditor";
 import { discussSpec, exclusive } from "../design/discuss";
 import { jumpTo } from "../design/jump";
@@ -26,6 +27,8 @@ import { changeAndReload, listRetired, nestedCount, restoreDesign, retireConfirm
 import { SessionRegistry, type RegistryNotice } from "../design/registry";
 import { ReviewBar } from "../design/ReviewBar";
 import { TasksView } from "../design/TasksView";
+import { UnplannedView } from "../design/UnplannedView";
+import { useUnplanned } from "../design/useUnplanned";
 import { ThreadMargin } from "../design/ThreadMargin";
 import { useSidebarWidth } from "../design/useSidebarWidth";
 import { useThreads } from "../design/useThreads";
@@ -154,6 +157,8 @@ function DesignView({
   onNotice,
   nested,
   onRetire,
+  repoTree,
+  onMoved,
 }: {
   readonly design: Design;
   readonly session: DesignSession | undefined;
@@ -169,6 +174,10 @@ function DesignView({
   readonly nested: number;
   /** Retire it; the daemon's refusal, as it is, or `undefined` once retired. */
   readonly onRetire: () => Promise<string | undefined>;
+  /** Its repo's designs, for the Tasks pane's Move to step. */
+  readonly repoTree: RepoNode | undefined;
+  /** After a task was moved: the sidebar's unplanned counts are read again. */
+  readonly onMoved: () => void;
 }): React.JSX.Element {
   // Arriving by *Next* is a review walk: it lands on the Design view whatever was last shown here,
   // or the passage it reveals would be off screen and `n` dead.
@@ -403,7 +412,15 @@ function DesignView({
           />
         </div>
         <div role="tabpanel" id="view-pane-tasks" aria-labelledby="view-tasks" hidden={view !== "tasks"} className="view-pane">
-          <TasksView plans={plans} selected={task} onSelect={setTask} onNotice={onNotice} />
+          <TasksView
+            plans={plans}
+            selected={task}
+            onSelect={setTask}
+            onNotice={onNotice}
+            repo={repo}
+            designs={repoTree}
+            onMoved={onMoved}
+          />
         </div>
         <div role="tabpanel" id="view-pane-prompts" aria-labelledby="view-prompts" hidden={view !== "prompts"} className="view-pane">
           {repo !== undefined && <PromptsPane design={design} repo={repo} onNotice={onNotice} onCount={setPrompts} />}
@@ -473,7 +490,11 @@ export function DesignTab(): React.JSX.Element {
     };
   }, [load]);
 
+  // An unplanned task chosen in the sidebar is shown in place of a design until a design is picked.
+  const [unplannedPick, setUnplannedPick] = useState<UnplannedPick | undefined>(undefined);
+  const unplanned = useUnplanned();
   const pickDesign = useCallback((next: string): void => {
+    setUnplannedPick(undefined);
     setUid(next);
     remember(LAST_DESIGN_KEY, next);
   }, []);
@@ -504,7 +525,10 @@ export function DesignTab(): React.JSX.Element {
 
   const tree = useMemo(() => (listing.designs === undefined ? undefined : designTree(listing.designs)), [listing.designs]);
   const order = useMemo(() => (tree === undefined ? [] : treeOrder(tree)), [tree]);
-  const design = order.find((d) => d.uid === uid) ?? order[0];
+  const listed = order.find((d) => d.uid === uid) ?? order[0];
+  // With an unplanned task open there is no design on screen, and its session detaches as on any
+  // sidebar switch.
+  const design = unplannedPick === undefined ? listed : undefined;
   const at = design === undefined ? -1 : order.indexOf(design);
   // *Next* past the last passage skips designs with nothing left to review.
   const nextDesign = at >= 0 ? order.slice(at + 1).find(hasUnreviewed) : undefined;
@@ -631,11 +655,18 @@ export function DesignTab(): React.JSX.Element {
         loading={listing.loading}
         error={listing.error}
         onPick={pickDesign}
-        onRefresh={() => void load()}
+        onRefresh={() => {
+          void load();
+          void unplanned.load();
+        }}
         openRepo={repo}
         onCreate={onCreate}
         retired={retiredTree}
         onRestore={onRestore}
+        unplanned={unplanned.list}
+        unplannedError={unplanned.error}
+        unplannedPick={unplannedPick}
+        onPickUnplanned={setUnplannedPick}
       />
       <div className="design-main">
         {notice !== undefined && (
@@ -669,6 +700,20 @@ export function DesignTab(): React.JSX.Element {
             <p className="design-empty">Cannot list designs: {listing.error}</p>
           ) : listing.designs === undefined ? (
             <p className="design-empty muted">Loading designs…</p>
+          ) : unplannedPick !== undefined ? (
+            <UnplannedView
+              list={unplanned.list}
+              repo={unplannedPick.repo}
+              selected={unplannedPick.uid}
+              designs={
+                unplannedPick.repo === null
+                  ? (tree ?? [])
+                  : (tree ?? []).filter((r) => r.repo === unplannedPick.repo)
+              }
+              onSelect={(uid) => setUnplannedPick({ repo: unplannedPick.repo, uid })}
+              onMoved={() => void unplanned.load()}
+              onNotice={setNotice}
+            />
           ) : design === undefined ? (
             <div className="design-empty">
               <p>No designs yet.</p>
@@ -706,6 +751,8 @@ export function DesignTab(): React.JSX.Element {
               onNotice={setNotice}
               nested={tree === undefined ? 0 : nestedCount(tree, design.uid)}
               onRetire={() => onRetire(design.uid)}
+              repoTree={tree?.find((r) => r.repo === repo)}
+              onMoved={() => void unplanned.load()}
             />
           )}
         </div>

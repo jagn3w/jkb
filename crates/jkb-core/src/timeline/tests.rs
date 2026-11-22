@@ -24,7 +24,11 @@ fn db() -> Db {
 fn new_task(db: &Db, uid: &str) -> ItemId {
     let uid = uid.to_owned();
     db.write_txn("test", move |c, m| {
-        create(c, m, &NewTask::new(uid, "a task"))
+        create(
+            c,
+            m,
+            &NewTask::new(uid, "a task", crate::task::Under::inbox_of("t")),
+        )
     })
     .unwrap()
 }

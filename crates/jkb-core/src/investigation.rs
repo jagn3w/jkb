@@ -191,11 +191,22 @@ fn save_bucket_views(conn: &Connection, meta: &WriteMeta, ns_path: &str) -> Resu
 /// **untyped** namespace accepts any kind: the engine does not require an investigation to
 /// be typed before you can record something in it.
 ///
+/// A `task` is never added here: a task is filed under a plan step by `jkb task add`, which can
+/// place it in the investigation too (`+<ns>`), and an investigation's own unit would be a task in
+/// no plan. `task` stays an accepted kind, so a task placed in the namespace that way is welcome.
+///
 /// # Errors
-/// Returns a validation error if the kind is not one the strategy accepts, if an edge names
-/// a uid that does not exist, or if an edge would create a `depends_on` cycle; otherwise a
+/// Returns a validation error for a `task`, if the kind is not one the strategy accepts, if an edge
+/// names a uid that does not exist, or if an edge would create a `depends_on` cycle; otherwise a
 /// database error.
 pub fn add(conn: &Connection, meta: &WriteMeta, unit: &NewUnit) -> Result<ItemId> {
+    if unit.kind == "task" {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "a task is filed with `jkb task add … --under <step> +{}`, which also places it in this \
+             investigation",
+            unit.namespace
+        ))));
+    }
     if let Some((_, strategy)) = nstype::for_namespace(conn, &unit.namespace)? {
         if !strategy.accepts_kind(&unit.kind) {
             return Err(reject_kind(strategy, &unit.kind));
@@ -221,6 +232,9 @@ pub fn add(conn: &Connection, meta: &WriteMeta, unit: &NewUnit) -> Result<ItemId
     placement::place(conn, meta, id, home, PlacementRole::Primary, 0)?;
     for (facet, value) in &unit.tags {
         tag::apply(conn, meta, id, facet, value)?;
+    }
+    for (edge_type, _, _) in unit.edges.iter().chain(&unit.reverse_edges) {
+        refuse_review_edge(*edge_type)?;
     }
     for (edge_type, target_uid, weight) in &unit.edges {
         let target = resolve_uid(conn, target_uid)?;
@@ -860,9 +874,24 @@ pub fn link(
     dst_uid: &str,
     weight: Option<f64>,
 ) -> Result<()> {
+    refuse_review_edge(edge_type)?;
     let src = resolve_uid(conn, src_uid)?;
     let dst = resolve_uid(conn, dst_uid)?;
     edge::link_weighted(conn, meta, src, dst, edge_type, weight, None)?;
+    Ok(())
+}
+
+/// Refuse an edge only a review writes: `found_in` says "a review of the destination filed the
+/// source", and stays trustworthy only while its one writer is the review seam
+/// ([`crate::reviews::link_findings`]). No strategy lists it, and an investigation link is not a
+/// review.
+fn refuse_review_edge(edge_type: EdgeType) -> Result<()> {
+    if edge_type == EdgeType::FoundIn {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "`{}` is written only by a review filing or recording (`jkb task review file|record`); link provenance from investigation work with `discovered_from`",
+            edge_type.as_str()
+        ))));
+    }
     Ok(())
 }
 

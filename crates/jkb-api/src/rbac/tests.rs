@@ -10,7 +10,7 @@ use super::{Caller, OpPermission, Tickets, OP_GRANTS};
 use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response};
 
 fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
-    b.call(serde_json::from_value(r).expect("request parses"))
+    b.call(serde_json::from_value(crate::test_repo::in_repo(b, r)).expect("request parses"))
 }
 
 #[allow(clippy::needless_pass_by_value)] // every call site builds its request inline
@@ -51,7 +51,7 @@ fn approve(b: &LocalBackend, uid: &str, head: &str) {
             json!({ "op": "task.tag", "uid": uid, "facet_value": tag, "mode": "set" }),
         );
     }
-    let ns = format!("repos/r/codereviews/{head}");
+    let ns = format!("repos/t/codereviews/{head}");
     ok(
         b,
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 }, "ns": ns,
@@ -578,6 +578,7 @@ fn rotating_with_keep_keeps_a_live_credential_and_replaces_anything_else() {
 #[test]
 fn a_scoped_caller_adds_only_under_its_task_and_records_only_its_own_review() {
     let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["r"]);
     let a = add(&kb.op, "task a");
     let (_, coord) = grant(&kb.op, "coordinator", Some(&a), "c");
     let c = kb.as_token(&coord);
@@ -980,6 +981,7 @@ fn a_parked_workflow_is_landed_again_only_after_the_operator_reopens_it() {
 #[test]
 fn a_caller_held_to_a_finding_places_nothing_in_its_round() {
     let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["p"]);
     let filed = match ok(
         &kb.op,
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
@@ -1009,6 +1011,7 @@ fn a_caller_held_to_a_finding_places_nothing_in_its_round() {
 #[test]
 fn a_subtask_under_a_round_homes_at_the_callers_own_task() {
     let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["p"]);
     ok(
         &kb.op,
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
@@ -1045,6 +1048,7 @@ fn a_subtask_under_a_round_homes_at_the_callers_own_task() {
 #[test]
 fn an_unrecorded_mounted_round_is_still_a_review_round() {
     let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["p"]);
     let finding = match ok(
         &kb.op,
         json!({ "op": "task.add", "text": "mounted finding !p1",
@@ -1312,20 +1316,20 @@ fn a_coordinator_lands_only_a_head_a_reviewer_approved() {
     ok(
         &kb.op,
         json!({ "op": "task.review_file", "run": { "reviewers": 1, "returned": 1 },
-                "ns": "repos/r/codereviews/m1",
+                "ns": "repos/t/codereviews/m1",
                 "findings": [{ "severity": "must-fix", "summary": "a bug", "file": "x.rs" }] }),
     );
     ok(
         &kb.op,
         json!({ "op": "task.review_record", "repo": "r", "branch": "b", "sha": "abcd",
-                "findings": "repos/r/codereviews/m1" }),
+                "findings": "repos/t/codereviews/m1" }),
     );
     let e = refused(&c, landing("task.landed", Some("abcd")));
     assert!(e.message.contains("must-fix"), "{e:?}");
     // The coordinator closes the finding, as CLOSING FINDINGS has it.
     let finding = match ok(
         &kb.op,
-        json!({ "op": "task.review_findings", "namespaces": ["repos/r/codereviews/m1"] }),
+        json!({ "op": "task.review_findings", "namespaces": ["repos/t/codereviews/m1"] }),
     ) {
         Response::ReviewFindings { findings } => findings.open_must_fix[0].uid.clone(),
         other => panic!("{other:?}"),
@@ -1422,5 +1426,208 @@ fn the_operator_is_not_held_to_a_reviewer() {
     ) {
         Response::Landing { landing } => assert!(landing.moved, "{landing:?}"),
         other => panic!("{other:?}"),
+    }
+}
+
+/// Test 15: a caller held to one task adds under it when it is planned; under its own task left
+/// loose by a build before the guard, the core refusal says to plan that task first.
+#[test]
+fn a_scoped_caller_adds_under_its_planned_task_and_not_under_its_loose_one() {
+    let kb = Kb::new();
+    let planned = add(&kb.op, "planned");
+    let (_, token) = grant(&kb.op, "coordinator", Some(&planned), "c");
+    ok(
+        &kb.as_token(&token),
+        json!({ "op": "task.add", "text": "a subtask", "under": planned }),
+    );
+
+    let loose = add(&kb.op, "loose");
+    let uid = loose.clone();
+    kb.db
+        .write_txn("t", move |c, m| {
+            let id = jkb_core::item::id_for_uid(c, &uid)?.unwrap();
+            let step = jkb_core::containment::parent(c, id)?.unwrap();
+            jkb_core::edge::unlink(c, m, step, id, jkb_types::EdgeType::ParentOf)?;
+            jkb_core::containment::uncontain(c, m, id).map(|_| ())
+        })
+        .unwrap();
+    let (_, token) = grant(&kb.op, "coordinator", Some(&loose), "d");
+    let e = call(
+        &kb.as_token(&token),
+        json!({ "op": "task.add", "text": "a subtask", "under": loose }),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Invalid, "{e:?}");
+    assert!(
+        e.message
+            .contains(&format!("jkb task move {loose} --under <step>")),
+        "{e:?}"
+    );
+}
+
+/// A repo's triage step is never in a worker's scope, whether or not it exists yet: a caller held to
+/// one task, or an attested subagent, is refused `--under step:inbox@<repo>` as it would be under an
+/// existing step outside its task, and no Open work tree is built for it. Without the guard in
+/// `authorize`, the on-demand creation would let a worker build the tree and file into it.
+#[test]
+fn a_worker_cannot_build_a_triage_step_by_filing_under_it() {
+    let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["app"]);
+    let a = add(&kb.op, "task a");
+    let sub = match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": "sub", "under": a }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    // Homed beside its task, so the home is admitted and the step is all that is judged.
+    let stray = json!({ "op": "task.add", "text": "stray", "under": "step:inbox@app",
+                        "home": "tasks/repos/t/inbox" });
+    let absent = || {
+        let found = kb
+            .db
+            .read(|c| jkb_core::item::id_for_uid(c, "design:open-work@app"))
+            .unwrap();
+        assert!(found.is_none(), "a worker built the triage tree");
+    };
+
+    let (_, coord) = grant(&kb.op, "coordinator", Some(&a), "c");
+    let scoped = kb.as_token(&coord);
+    let e = refused(&scoped, stray.clone());
+    assert!(
+        e.message
+            .contains("is scoped to another task, and `step:inbox@app` is not it"),
+        "{e:?}"
+    );
+    absent();
+    // A move under it is held to the scope too, and its refusal rolls back the tree it resolved.
+    let e = refused(
+        &scoped,
+        json!({ "op": "task.move", "uid": sub, "under": "step:inbox@app" }),
+    );
+    assert!(
+        e.message.contains("moves tasks only under that task"),
+        "{e:?}"
+    );
+    absent();
+
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "implementer", "role": "implementer" }),
+    );
+    let ticket = match ok(
+        &kb.as_token(&container),
+        json!({ "op": "attest.mint", "session": "s1", "agent_id": "ag1",
+                "agent_type": "implementer", "tool_use_id": "tool-1" }),
+    ) {
+        Response::Ticket { token } => token,
+        other => panic!("{other:?}"),
+    };
+    let e = refused(&kb.as_token(&ticket), stray);
+    assert!(e.message.contains("`step:inbox@app` is not it"), "{e:?}");
+    absent();
+
+    // The operator reaches the op, and gets the tree.
+    ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": "filed", "under": "step:inbox@app" }),
+    );
+    assert!(kb
+        .db
+        .read(|c| jkb_core::item::id_for_uid(c, "design:open-work@app"))
+        .unwrap()
+        .is_some());
+}
+
+/// An attested subagent not yet bound binds to a task and nothing else. Its first task-targeted write
+/// binds it to what it names, and its scope is then everything contained under that, so a binding to
+/// the triage step, its plan or its design — or to any plan step — put every task beneath in its
+/// scope. Each is refused, by `role.bind` and by `task.add --under`, and the worker is left unbound.
+#[test]
+fn an_unbound_subagent_binds_to_a_task_and_nothing_else() {
+    let kb = Kb::new();
+    crate::test_repo::know(&kb.db, &["app"]);
+    // The operator files under the triage step, so the Open work tree exists, with a task in it.
+    let inboxed = match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": "filed", "under": "step:inbox@app" }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+    // An ordinary design with a plan of one step, and a task under that step.
+    let (design, plan, step) = kb
+        .db
+        .write_txn("t", |c, m| {
+            let d = jkb_core::design::create(c, m, "app", "Real", "Build it.")?.uid;
+            let p = jkb_core::design::plan::create(c, m, &d, "Real", &["one".to_owned()])?;
+            Ok((d, p.uid.clone(), p.steps[0].uid.clone()))
+        })
+        .unwrap();
+    let stepped = match ok(
+        &kb.op,
+        json!({ "op": "task.add", "text": "stepped", "under": step }),
+    ) {
+        Response::Added { added } => added.uid,
+        other => panic!("{other:?}"),
+    };
+
+    let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    ok(
+        &kb.op,
+        json!({ "op": "role.map", "agent_type": "implementer", "role": "implementer" }),
+    );
+    let ticket = match ok(
+        &kb.as_token(&container),
+        json!({ "op": "attest.mint", "session": "s1", "agent_id": "ag1",
+                "agent_type": "implementer", "tool_use_id": "tool-1" }),
+    ) {
+        Response::Ticket { token } => token,
+        other => panic!("{other:?}"),
+    };
+    let worker = kb.as_token(&ticket);
+    let unbound = |what: &str| match ok(&worker, json!({ "op": "role.whoami" })) {
+        Response::WhoAmI { whoami } => assert_eq!(whoami.task, None, "bound to {what}"),
+        other => panic!("{other:?}"),
+    };
+
+    for target in [
+        "step:inbox@app".to_owned(),
+        "plan:open-work@app".to_owned(),
+        "design:open-work@app".to_owned(),
+        step.clone(),
+        plan,
+        design,
+    ] {
+        let e = refused(&worker, json!({ "op": "role.bind", "uid": target }));
+        assert!(
+            e.message.contains("binds to a task only") || e.message.contains("is not it"),
+            "{target}: {e:?}"
+        );
+        unbound(&target);
+        // Homed beside its parent's tasks, so the parent is all that is judged.
+        refused(
+            &worker,
+            json!({ "op": "task.add", "text": "stray", "under": target,
+                    "home": "tasks/repos/t/inbox" }),
+        );
+        unbound(&target);
+    }
+    // Bound to a task of its own, the tasks under those containers are outside its reach.
+    let own = add(&kb.op, "its own");
+    ok(&worker, json!({ "op": "role.bind", "uid": own }));
+    for other in [inboxed, stepped] {
+        refused(
+            &worker,
+            json!({ "op": "task.set", "uid": other, "priority": 1 }),
+        );
     }
 }

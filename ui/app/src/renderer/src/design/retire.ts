@@ -71,9 +71,17 @@ export function retiredByRepo(retired: readonly Design[]): ReadonlyMap<string, r
   return new Map(designTree(retired).map((r) => [r.repo, r.designs]));
 }
 
-/** Every repo the sidebar lists: those with live designs and those with only retired ones, sorted. */
-export function sidebarRepos(tree: readonly RepoNode[], retired: ReadonlyMap<string, readonly DesignNode[]>): string[] {
-  return [...new Set([...tree.map((r) => r.repo), ...retired.keys()])].sort();
+/**
+ * Every repo the sidebar lists: those with live designs, those with only retired ones, and those with
+ * only unplanned tasks (`unplannedRepos`), sorted. Tasks in no repo get their own last row, not one
+ * of these.
+ */
+export function sidebarRepos(
+  tree: readonly RepoNode[],
+  retired: ReadonlyMap<string, readonly DesignNode[]>,
+  unplannedRepos: readonly string[] = [],
+): string[] {
+  return [...new Set([...tree.map((r) => r.repo), ...retired.keys(), ...unplannedRepos])].sort();
 }
 
 /**

@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use jkb_core::query::{Query, Scope};
+use jkb_core::query::Query;
 use jkb_core::Db;
 use jkb_index::{FtsIndexer, KnnPage, VectorIndexer};
 use jkb_types::{Embedder, ItemId};
@@ -308,23 +308,17 @@ fn fts_text(q: &Query) -> Option<&str> {
 /// The structural (scope/tags/predicate) part of `q`, with the ranking terms and
 /// limit stripped, or `None` if `q` imposes no structural restriction (i.e. the
 /// scope is all items — the routes then rank globally without pre-filtering).
+///
+/// Restricted is "anything but the default once the ranking terms are gone", derived from the
+/// [`Query`] itself rather than a hand-kept list of its fields: a list silently dropped every
+/// predicate added after it (`is:claimed`, `phase:`, `-tag:`, `is:unplanned`, …), so a search with
+/// one of them and no scope ranked everything.
 fn scope_query(q: &Query) -> Option<Query> {
-    let restricted = q.kind.is_some()
-        || q.status.is_some()
-        || q.priority.is_some()
-        || q.due.is_some()
-        || !q.tags.is_empty()
-        || q.scope != Scope::All
-        || q.ready
-        || q.blocks.is_some();
-    if !restricted {
-        return None;
-    }
     let mut s = q.clone();
     s.fts = None;
     s.vector = None;
     s.limit = None;
-    Some(s)
+    (s != Query::default()).then_some(s)
 }
 
 /// Rank the vector route: unrestricted KNN, exact scoring in a small scope, or
@@ -530,6 +524,26 @@ fn single_item_context(conn: &Connection, item: ItemId) -> Result<Vec<ContextChu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every predicate restricts a search, including ones added after `scope_query` was written:
+    /// only the ranking terms and the limit leave it unrestricted.
+    #[test]
+    fn every_predicate_restricts_a_search_and_ranking_terms_do_not() {
+        let parse = |dsl: &str| jkb_core::query::parse(dsl).unwrap();
+        assert!(scope_query(&parse("migration")).is_none());
+        assert!(scope_query(&parse(r#"~"near this""#)).is_none());
+        for dsl in [
+            "is:unplanned migration",
+            "-is:unplanned migration",
+            "is:claimed migration",
+            "phase:implement migration",
+            "-tag:size=s migration",
+            "kind:task migration",
+        ] {
+            let scoped = scope_query(&parse(dsl)).unwrap_or_else(|| panic!("{dsl} restricts"));
+            assert!(scoped.fts.is_none() && scoped.limit.is_none(), "{dsl}");
+        }
+    }
 
     /// A constant dim-16 embedder: the vector table only needs its identity and dim here.
     struct Dim16;

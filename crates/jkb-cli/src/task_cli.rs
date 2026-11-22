@@ -102,9 +102,11 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
         TaskCmd::Review { cmd } => {
             let kb = crate::session_cli::Kb::from_ops(ops);
             match cmd {
-                TaskReviewCmd::File { findings, from } => {
-                    crate::review::file_cmd(&kb, &findings, &from, ops.json)
-                }
+                TaskReviewCmd::File {
+                    findings,
+                    from,
+                    task,
+                } => crate::review::file_cmd(&kb, &findings, &from, task, ops.json),
                 TaskReviewCmd::Record {
                     branch,
                     sha,
@@ -301,6 +303,7 @@ pub fn run(ops: &Ops<'_>, cmd: TaskCmd) -> Result<()> {
         TaskCmd::Claim { uid, owner } => claim(ops, &uid, owner, true),
         TaskCmd::Release { uid, owner } => claim(ops, &uid, owner, false),
         TaskCmd::Why { uid } => why(ops, &uid),
+        TaskCmd::Unplanned { repo } => unplanned(ops, repo),
         _ => bail!("internal: a task subcommand the op set does not handle"),
     }
 }
@@ -463,6 +466,46 @@ fn claim(ops: &Ops<'_>, uid: &str, owner: Option<String>, acquire: bool) -> Resu
             (false, false) => println!("{uid} was not claimed by {owner}"),
         }
     }
+    Ok(())
+}
+
+/// `jkb task unplanned`: the `task.unplanned` read, by repo.
+fn unplanned(ops: &Ops<'_>, repo: Option<String>) -> Result<()> {
+    let list = match ops.call(Request::TaskUnplanned {
+        repo,
+        limit: None,
+        of: Vec::new(),
+    })? {
+        Response::Unplanned { list } => list,
+        other => return unexpected("task.unplanned", &other),
+    };
+    if ops.json {
+        println!("{}", serde_json::to_string_pretty(&list)?);
+        return Ok(());
+    }
+    if list.count == 0 {
+        println!("no unplanned tasks: every open task is under a plan step");
+        return Ok(());
+    }
+    println!("{} unplanned task(s):", list.count);
+    for group in &list.repos {
+        let name = group.repo.as_deref().unwrap_or("(in no repo)");
+        if group.tasks.len() < group.count {
+            println!(
+                "\n{name} ({}, the first {} listed):",
+                group.count,
+                group.tasks.len()
+            );
+        } else {
+            println!("\n{name} ({}):", group.count);
+        }
+        for t in &group.tasks {
+            let status = t.task.status.as_deref().unwrap_or("?");
+            let ns = t.namespace.as_deref().unwrap_or("-");
+            println!("  [{status:^12}] {} — {} ({ns})", t.task.uid, t.task.title);
+        }
+    }
+    println!("\nplan one with `jkb task move <uid> --under <step>`");
     Ok(())
 }
 

@@ -7,7 +7,7 @@ use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response, SessionStateIs
 use jkb_core::Db;
 
 fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
-    b.call(serde_json::from_value(r).expect("request parses"))
+    b.call(serde_json::from_value(crate::test_repo::in_repo(b, r)).expect("request parses"))
 }
 
 fn add(b: &LocalBackend, text: &str) -> String {
@@ -890,7 +890,11 @@ fn review_findings_are_bounded() {
     }
     db.write_txn("t", |c, m| {
         for i in 0..=super::MAX_EXAMINED_FINDINGS {
-            let mut t = jkb_core::task::NewTask::new(format!("task:huge-{i}"), format!("t{i}"));
+            let mut t = jkb_core::task::NewTask::new(
+                format!("task:huge-{i}"),
+                format!("t{i}"),
+                jkb_core::task::Under::inbox_of("t"),
+            );
             "reviews/huge".clone_into(&mut t.home);
             jkb_core::task::create(c, m, &t)?;
         }

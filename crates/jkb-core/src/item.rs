@@ -30,9 +30,17 @@ pub struct NewItem {
 /// Insert `item`, or return the id of the existing item with the same
 /// `content_hash` (global dedup). Records a changelog entry on insert.
 ///
+/// Never a task: a task is created by [`crate::task::create`], which files it under a plan step,
+/// and this refuses `kind == "task"` so no creator can write one in no plan.
+///
 /// # Errors
-/// Returns an error if a statement or the changelog append fails.
+/// Returns a validation error for a task, or an error if a statement or the changelog append fails.
 pub fn upsert(conn: &Connection, meta: &WriteMeta, item: &NewItem) -> Result<ItemId> {
+    if item.kind == "task" {
+        return Err(Error::Types(TypeError::Validation(
+            "a task is created by `task::create`, which files it under a plan step".to_owned(),
+        )));
+    }
     if let Some(hash) = item.content_hash.as_deref() {
         let existing: Option<i64> = conn
             .prepare_cached("SELECT id FROM items WHERE content_hash = ?1")?
@@ -1551,7 +1559,7 @@ mod tests {
                     m,
                     &NewItem {
                         uid: "task:n".into(),
-                        kind: "task".into(),
+                        kind: "note".into(),
                         content: Some("n".into()),
                         content_hash: None,
                         mime: None,

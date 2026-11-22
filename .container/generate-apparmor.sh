@@ -96,9 +96,20 @@ DATA = {
     "InnerImports": ["#include <abstractions/base>"],
 }
 
+# METHODS upstream's template calls with arguments, each mirroring its Go namesake. Kept apart from
+# DATA so a field used as a call, or a call used bare, is refused rather than rendered as something.
+def stacked_peer_name(*stacked):    # moby: StackedPeerName
+    # The kernel's canonical stacked label: components sorted by name and deduplicated, joined by
+    # `//&`, so the profile name is not necessarily first ("unconfined//&zzz"). Go's slices.Sort
+    # compares bytes; the names here are ASCII, where Python's str order is the same.
+    return quote_peer_name("//&".join(sorted(set((NAME,) + stacked))))
+
+METHODS = {"StackedPeerName": stacked_peer_name}
+
 # ------------------------------------------------- a faithful evaluator for the subset in use
 # text/template, restricted to what this template contains: {{if X}}, {{range $v := X}}, {{$v}},
-# {{.Field}}, {{end}}, and the {{- / -}} whitespace-trim markers. Deliberately NOT a general
+# {{.Field}}, {{.Method "arg" ...}} (double-quoted string arguments only), {{end}}, and the
+# {{- / -}} whitespace-trim markers. Deliberately NOT a general
 # implementation -- an unrecognised action raises rather than rendering as nothing, because a
 # silently-dropped action is precisely the failure this whole script exists to remove.
 TOKEN = re.compile(r"\{\{(-?)\s*(.*?)\s*(-?)\}\}", re.S)
@@ -142,7 +153,20 @@ def parse(nodes, i=0):
                      f"renderer does not implement; extend it rather than letting it render empty")
     return body, i
 
+CALL = re.compile(r'\.(\w+)((?:\s+"(?:[^"\\]|\\.)*")+)$')
+CALL_ARG = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
 def lookup(expr, scope):
+    call = CALL.match(expr)
+    if call:
+        if call.group(1) not in METHODS:
+            sys.exit(f"template calls .{call.group(1)} with arguments, which this script does not "
+                     f"implement as a method")
+        args = CALL_ARG.findall(call.group(2))
+        if any("\\" in a for a in args):
+            sys.exit(f"template passes an escaped string to .{call.group(1)}; decode Go escapes "
+                     f"before trusting the argument")
+        return METHODS[call.group(1)](*args)
     if expr.startswith("."):
         if expr[1:] not in DATA:
             sys.exit(f"template references {expr}, which this script supplies no value for")
@@ -318,6 +342,10 @@ V = {
     "pivot":  GOOD.replace("  umount,", "  umount,\n  pivot_root,"),
     "action": GOOD.replace("  umount,", '  {{template "partial"}}'),
     "field":  GOOD.replace("{{.Name}}", "{{.Nope}}"),
+    "stacked": GOOD.replace("  umount,", '  umount,\n  signal peer={{.StackedPeerName "unconfined"}},\n'
+                            '  ptrace peer={{.StackedPeerName "aaa" "jkb-dev"}},'),
+    "method": GOOD.replace("  umount,", '  umount,\n  signal peer={{.Nope "unconfined"}},'),
+    "escape": GOOD.replace("  umount,", '  umount,\n  signal peer={{.StackedPeerName "un\\"x"}},'),
 }
 for name, body in V.items():
     with open(os.path.join(d, name + ".go"), "w") as f:
@@ -369,6 +397,20 @@ FIX
     expect "upstream naming pivot_root itself is refused, not doubled" pivot refuse "re-derive the patch"
     expect "an unsupported action is refused, not rendered as nothing" action refuse "does not implement"
     expect "a field this script supplies no value for is refused" field refuse "supplies no value"
+
+    # StackedPeerName mirrors the kernel's canonical stacked label: sorted, deduplicated, `//&`.
+    expect "a StackedPeerName call renders" stacked ok
+    if [ -f "$t/stacked.out" ]; then
+        if grep -qxF -e '  signal peer="jkb-dev//&unconfined",' "$t/stacked.out" \
+            && grep -qxF -e '  ptrace peer="aaa//&jkb-dev",' "$t/stacked.out"; then
+            printf '  \033[32mok\033[0m   the stacked label is sorted and deduplicated, as the kernel writes it\n'
+        else
+            printf '  \033[31mFAIL\033[0m the stacked peers rendered as: %s\n' "$(grep peer= "$t/stacked.out" | tr '\n' ' ')"
+            fails=$((fails+1))
+        fi
+    fi
+    expect "a call to a method this script does not implement is refused" method refuse "does not implement as a method"
+    expect "an escaped string argument is refused, not passed on undecoded" escape refuse "escaped string"
 
     if [ "$fails" -eq 0 ]; then printf '\033[32mgenerate-apparmor self-test passed\033[0m\n'; exit 0; fi
     printf '\033[31mgenerate-apparmor self-test: %s failed\033[0m\n' "$fails"; exit 1

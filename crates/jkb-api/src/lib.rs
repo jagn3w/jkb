@@ -1310,6 +1310,23 @@ pub enum Request {
         #[serde(default)]
         all: bool,
     },
+    /// The open tasks no plan step reaches, by repo ([`tasks::unplanned`]).
+    #[serde(rename = "task.unplanned")]
+    TaskUnplanned {
+        /// Only this repo's.
+        #[serde(default)]
+        repo: Option<String>,
+        /// At most this many tasks listed per repo (at most [`tasks::MAX_UNPLANNED`]); each
+        /// repo's count is its full count.
+        #[serde(default)]
+        limit: Option<usize>,
+        /// Tasks to split the answer for ([`tasks::OwnUnplanned`]): each one's own unplanned work
+        /// (itself, its subtree, the findings `found_in` it), and the rest of the listed scope.
+        /// What `jkb task land` refuses on and warns about. Left out of the request when empty, so
+        /// an asker that does not split is understood by a daemon that predates the field.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        of: Vec<String>,
+    },
     /// Any item's details ([`items::show`]).
     #[serde(rename = "item.show")]
     ItemShow {
@@ -1424,6 +1441,16 @@ pub enum Request {
         from: String,
         /// Its new path.
         to: String,
+    },
+    /// Map a namespace to the plan step a new task homed under it is filed under, or clear the
+    /// mapping ([`jkb_core::design::plan::map_namespace`]).
+    #[serde(rename = "ns.step")]
+    NsStep {
+        /// The namespace: a tasks.md section's, a file's or a mount's.
+        path: String,
+        /// The plan step's uid; `None` clears the mapping.
+        #[serde(default)]
+        step: Option<String>,
     },
     /// The chunks around an item ([`kb::context`]).
     #[serde(rename = "kb.context")]
@@ -1903,6 +1930,7 @@ impl Request {
         "task.reclaim",
         "kb.health",
         "task.staging",
+        "task.unplanned",
         "item.show",
         "item.rm",
         "kb.related",
@@ -1917,6 +1945,7 @@ impl Request {
         "task.close_merged",
         "ns.list",
         "ns.mv",
+        "ns.step",
         "kb.context",
         "view.list",
         "view.run",
@@ -2055,6 +2084,7 @@ impl Request {
             Self::TaskReclaim { .. } => "task.reclaim",
             Self::KbHealth {} => "kb.health",
             Self::TaskStaging { .. } => "task.staging",
+            Self::TaskUnplanned { .. } => "task.unplanned",
             Self::ItemShow { .. } => "item.show",
             Self::ItemRm { .. } => "item.rm",
             Self::KbRelated { .. } => "kb.related",
@@ -2065,6 +2095,7 @@ impl Request {
             Self::KbHistory { .. } => "kb.history",
             Self::NsList { .. } => "ns.list",
             Self::NsMv { .. } => "ns.mv",
+            Self::NsStep { .. } => "ns.step",
             Self::KbContext { .. } => "kb.context",
             Self::ViewList {} => "view.list",
             Self::ViewRun { .. } => "view.run",
@@ -2117,6 +2148,7 @@ impl Request {
             | Self::TaskReviewFindings { .. }
             | Self::TaskClaims { .. }
             | Self::TaskStaging { .. }
+            | Self::TaskUnplanned { .. }
             | Self::ItemShow { .. }
             | Self::KbRelated { .. }
             | Self::KbBlobs { .. }
@@ -2231,6 +2263,7 @@ impl Request {
             | Self::TaskPrAbsent { .. }
             | Self::TaskCloseMerged { .. }
             | Self::NsMv { .. }
+            | Self::NsStep { .. }
             | Self::DesignCreate { .. }
             | Self::DesignMove { .. }
             | Self::DesignSplit { .. }
@@ -2655,6 +2688,12 @@ pub enum Response {
         #[serde(flatten)]
         health: health::Health,
     },
+    /// A `task.unplanned`.
+    Unplanned {
+        /// The tasks, by repo.
+        #[serde(flatten)]
+        list: tasks::UnplannedList,
+    },
     /// A `task.staging`.
     StagingTasks {
         /// The tasks.
@@ -2760,6 +2799,11 @@ pub enum Response {
     Moved {
         /// How many namespaces moved.
         count: usize,
+    },
+    /// An `ns.step`: the step the namespace was mapped to before.
+    Mapped {
+        /// The previous mapping, if any.
+        before: Option<String>,
     },
     /// A `task.close_merged`.
     Closed {
@@ -3037,7 +3081,9 @@ impl Response {
             | Self::Versions { truncated, .. }
             | Self::History { truncated, .. } => *truncated,
             Self::GrepHits { answer } => answer.truncated,
-            Self::Created { .. }
+            // Capped per repo, and each repo's count says how many there are in all.
+            Self::Unplanned { .. }
+            | Self::Created { .. }
             | Self::Sent { .. }
             | Self::Messages { .. }
             | Self::Position { .. }
@@ -3080,6 +3126,7 @@ impl Response {
             | Self::PrFacts { .. }
             | Self::Closed { .. }
             | Self::Moved { .. }
+            | Self::Mapped { .. }
             | Self::Item { .. }
             | Self::ItemRemoved { .. }
             | Self::Blob { .. }
@@ -3188,6 +3235,7 @@ impl Response {
             | Self::SearchHits { .. }
             | Self::Task { .. }
             | Self::StagingTasks { .. }
+            | Self::Unplanned { .. }
             | Self::Related { .. }
             | Self::Blobs { .. }
             | Self::Versions { .. }
@@ -3224,6 +3272,7 @@ impl Response {
             | Self::Views { .. }
             | Self::Namespaces { .. }
             | Self::Moved { .. }
+            | Self::Mapped { .. }
             | Self::Inv { .. }
             | Self::Item { .. }
             | Self::ItemRemoved { .. }
@@ -3557,6 +3606,18 @@ impl LocalBackend {
                         format!(
                             "`{}` refused: {} is already working on another task, and a worker \
                              does not hop",
+                            request.op(),
+                            principal.label
+                        ),
+                    ));
+                }
+                jkb_core::roles::Bound::NotATask => {
+                    return Err(ApiError::with_code(
+                        ErrorCode::Forbidden,
+                        format!(
+                            "`{}` refused: {} binds to a task only, and this names a plan, step, \
+                             design or other item — run `jkb role bind <task uid>` for the task it \
+                             works on",
                             request.op(),
                             principal.label
                         ),
@@ -4948,6 +5009,9 @@ impl LocalBackend {
                     })?,
                 }
             }
+            Request::TaskUnplanned { repo, limit, of } => Response::Unplanned {
+                list: db.read_with(move |c| tasks::unplanned(c, repo.as_deref(), limit, &of))?,
+            },
             Request::TaskStaging { repo, all } => {
                 let (tasks, truncated) = db.read_with(move |c| {
                     let tasks = staging::staging(c, &repo, all, &mut budget)?;
@@ -5098,6 +5162,11 @@ impl LocalBackend {
                     })?,
                 }
             }
+            Request::NsStep { path, step } => Response::Mapped {
+                before: db.write_txn(actor, move |c, m| {
+                    jkb_core::design::plan::map_namespace(c, m, &path, step.as_deref())
+                })?,
+            },
             Request::KbHistory { path, home } => {
                 let server_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                 let (uri, versions, truncated) = db.read_with(move |c| {
@@ -5173,3 +5242,67 @@ fn exec_index(principal: &rbac::Principal, topic: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// The client the tests speak for stands in a checkout of repo `t`, as `jkb` run inside a mounted
+/// repo does: a new task with no `--under` is filed in `t`'s Open work › Inbox, which is what a
+/// task outside any repo cannot be.
+#[cfg(test)]
+pub(crate) mod test_repo {
+    use serde_json::Value;
+
+    /// Where repo `t` is checked out: the `cwd` a request is sent from.
+    pub(crate) const DIR: &str = "/jkb-test/repo-t";
+
+    /// `r`, sent from inside repo `t` when it is a `task.add` naming no `cwd` of its own — with `t`
+    /// mounted in `b`'s database at [`DIR`] for it. A request that names a `cwd` (`/nowhere`, to
+    /// stand outside every repo) is left as it is. Any other repo a request names is unknown until
+    /// a test says otherwise ([`know`]), so a test can meet the refusal of a mistyped repo.
+    pub(crate) fn in_repo(b: &super::LocalBackend, mut r: Value) -> Value {
+        if r.get("op").and_then(Value::as_str) == Some("task.add") && r.get("cwd").is_none() {
+            mount(&b.db);
+            r["cwd"] = Value::from(DIR);
+        }
+        r
+    }
+
+    /// Make each of `repos` one the knowledge base knows, as one with them mounted does: its
+    /// `repos/<repo>` namespace exists. Asked for by each test that files under a repo of its own.
+    pub(crate) fn know(db: &jkb_core::Db, repos: &[&str]) {
+        let repos: Vec<String> = repos.iter().map(|r| (*r).to_owned()).collect();
+        db.write_txn("t", move |c, m| {
+            for repo in &repos {
+                jkb_core::ns::ensure(c, m, &format!("repos/{repo}"))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Mount `repos/t` at [`DIR`] in `db`, once.
+    pub(crate) fn mount(db: &jkb_core::Db) {
+        mount_repo(db, "t", DIR);
+    }
+
+    /// Mount `repos/<repo>` at `dir` in `db`, once: a request sent with `cwd` `dir` stands in it.
+    pub(crate) fn mount_repo(db: &jkb_core::Db, repo: &str, dir: &str) {
+        let (path, uri) = (format!("repos/{repo}"), format!("file://{dir}"));
+        db.write_txn("t", move |c, m| {
+            let ns = jkb_core::ns::ensure(c, m, &path)?;
+            if jkb_core::mount::get(c, ns)?.is_none() {
+                jkb_core::mount::create(
+                    c,
+                    m,
+                    ns,
+                    &uri,
+                    jkb_types::SyncMode::Bidirectional,
+                    "document",
+                    None,
+                    None,
+                    jkb_types::ConflictPolicy::Manual,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+}

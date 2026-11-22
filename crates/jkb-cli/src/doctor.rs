@@ -232,8 +232,12 @@ pub(crate) struct Host<'a> {
 
 /// `jkb doctor`. `backup` and `fix` need `host`: remote mode refuses them before this runs.
 ///
+/// Every section prints, `--backup` and `--fix` included, and only then does an unplanned task (or
+/// a daemon too old to count them) fail the run, so the exit status is a gate and the report is
+/// still the remedy. Doctor's other findings are reported and exit 0.
+///
 /// # Errors
-/// A failed op or host step.
+/// A failed op or host step, or any task unplanned ([`unplanned_check`]).
 pub(crate) fn run(
     kb: &Kb<'_>,
     host: Option<&Host<'_>>,
@@ -281,6 +285,11 @@ pub(crate) fn run(
         }
     }
 
+    let (lines, unplanned_failure) = unplanned_check(&health);
+    for line in lines {
+        println!("{line}");
+    }
+
     report_claims(kb, fix)?;
 
     let swept = match (host, fix) {
@@ -309,7 +318,47 @@ pub(crate) fn run(
             None => println!("db location: ok ({})", h.path.display()),
         }
     }
+    // LAST, once every section has printed: the report is the remedy, so it is never cut short.
+    if let Some(failure) = unplanned_failure {
+        anyhow::bail!("{failure}");
+    }
     Ok(())
+}
+
+/// The unplanned-task lines of `jkb doctor` — every open task no execution plan's step reaches, as
+/// many as `kb.health` listed, and how many it left out — and the sentence doctor fails with: `None`
+/// only when the count is known to be zero. A daemon too old to say fails too, as an unreadable
+/// answer is never read as none.
+fn unplanned_check(health: &jkb_api::health::Health) -> (Vec<String>, Option<String>) {
+    let (Some(listed), Some(count)) = (&health.unplanned, health.unplanned_count) else {
+        return (
+            vec!["unplanned tasks: not reported (the daemon predates the check)".to_owned()],
+            Some(
+                "the daemon predates the unplanned check, so whether any task is unplanned is \
+                 unknown: restart `jkb serve` from this build"
+                    .to_owned(),
+            ),
+        );
+    };
+    if count == 0 {
+        return (vec!["unplanned tasks: none".to_owned()], None);
+    }
+    let mut lines = vec![format!(
+        "unplanned tasks: {count} open task(s) under no execution plan's step \
+         (`jkb task move <uid> --under <step>` homes one)"
+    )];
+    lines.extend(listed.iter().map(|t| format!("  {}  {}", t.uid, t.title)));
+    if count > listed.len() {
+        lines.push(format!(
+            "  … and {} more (`jkb --global query \"kind:task is:unplanned\"` lists them all)",
+            count - listed.len()
+        ));
+    }
+    let failure = format!(
+        "{count} unplanned task(s): every open task belongs under a plan step (listed above; \
+         `jkb task move <uid> --under <step>` homes one)"
+    );
+    (lines, Some(failure))
 }
 
 /// The vector-index lines of `jkb doctor`. `swept` is the stale-row count `--fix` removed, when it
@@ -366,7 +415,7 @@ fn vector_report(health: &jkb_api::health::Health, swept: Option<usize>) -> Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::{free, probe_with, vector_report};
+    use super::{free, probe_with, unplanned_check, vector_report};
     use jkb_api::health::Health;
 
     fn health(vector_tables: usize, stale: usize, unguarded: Option<&[&str]>) -> Health {
@@ -378,7 +427,49 @@ mod tests {
             vector_tables,
             stale_vectors: stale,
             unguarded_vector_tables: unguarded.map(|t| t.iter().map(|s| (*s).to_owned()).collect()),
+            unplanned: Some(Vec::new()),
+            unplanned_count: Some(0),
         }
+    }
+
+    /// None, some, past the cap, and a daemon too old to say — which is not read as none. Only a
+    /// count known to be zero passes; every other case fails, naming the count.
+    #[test]
+    fn unplanned_tasks_are_counted_listed_and_never_assumed_absent() {
+        let unplanned_report = |h: &Health| unplanned_check(h).0;
+        let mut h = health(0, 0, Some(&[]));
+        assert_eq!(unplanned_report(&h), ["unplanned tasks: none"]);
+        assert_eq!(unplanned_check(&h).1, None, "none unplanned passes");
+
+        h.unplanned = Some(vec![jkb_api::health::Unplanned {
+            uid: "task:a".to_owned(),
+            title: "A".to_owned(),
+        }]);
+        h.unplanned_count = Some(1);
+        let lines = unplanned_report(&h);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].starts_with("unplanned tasks: 1 open task(s)"),
+            "{lines:?}"
+        );
+        assert_eq!(lines[1], "  task:a  A");
+        let failure = unplanned_check(&h)
+            .1
+            .expect("one unplanned task fails doctor");
+        assert!(failure.starts_with("1 unplanned task(s)"), "{failure}");
+
+        h.unplanned_count = Some(3);
+        let lines = unplanned_report(&h);
+        assert!(lines[2].starts_with("  … and 2 more"), "{lines:?}");
+        // The hint is unscoped, as `kb.health`'s count is: an ambient-scoped query run from a
+        // mounted repo would list fewer than the count it is offered beside.
+        assert!(lines[2].contains("jkb --global query"), "{lines:?}");
+
+        h.unplanned = None;
+        h.unplanned_count = None;
+        assert!(unplanned_report(&h)[0].contains("not reported"));
+        let failure = unplanned_check(&h).1.expect("an old daemon fails doctor");
+        assert!(failure.contains("predates"), "{failure}");
     }
 
     /// A legacy database with no stale rows yet but no GC trigger is NOT reported ok: the row count
@@ -420,13 +511,12 @@ mod tests {
     }
     use crate::session_cli::Kb;
     use jkb_api::{Backend as _, LocalBackend};
-    use jkb_core::Db;
     use jkb_fsm::Fact;
 
     /// Each owner is probed once, a kept owner never, and only a proven absence is sent to be freed.
     #[test]
     fn owners_are_probed_once_and_only_the_proven_gone_are_freed() {
-        let backend = LocalBackend::new(Db::open_in_memory().unwrap());
+        let backend = LocalBackend::new(crate::known_repo_t_db());
         let mut uids = Vec::new();
         for (text, owner) in [
             ("a", "box:1"),
@@ -438,7 +528,9 @@ mod tests {
             let added = backend
                 .call(
                     serde_json::from_value(serde_json::json!({
-                        "op": "task.add", "text": text, "managed": true
+                        "op": "task.add", "text": text, "managed": true,
+                        // In repo `t`, so it is filed in `t`'s Open work › Inbox.
+                        "home": "tasks/repos/t/inbox"
                     }))
                     .unwrap(),
                 )

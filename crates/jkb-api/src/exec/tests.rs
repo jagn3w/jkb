@@ -11,7 +11,7 @@ use crate::rbac::{Caller, OpPermission, Tickets, OP_GRANTS};
 use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response};
 
 fn call(b: &LocalBackend, r: &Value) -> Result<Response, ApiError> {
-    b.call(serde_json::from_value(r.clone()).expect("request parses"))
+    b.call(serde_json::from_value(crate::test_repo::in_repo(b, r.clone())).expect("request parses"))
 }
 
 fn ok(b: &LocalBackend, r: &Value) -> Response {

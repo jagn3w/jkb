@@ -227,6 +227,7 @@ pub(crate) fn file_cmd(
     kb: &crate::session_cli::Kb<'_>,
     findings_ns: &str,
     from: &std::path::Path,
+    task: Option<String>,
     json: bool,
 ) -> Result<()> {
     use std::io::Read as _;
@@ -282,16 +283,26 @@ pub(crate) fn file_cmd(
         ns: findings_ns.to_owned(),
         run,
         findings,
+        task,
     })?;
     if json {
         println!(
             "{}",
-            serde_json::json!({ "ns": filed.ns, "uids": filed.uids, "clean": filed.clean })
+            serde_json::json!({ "ns": filed.ns, "uids": filed.uids, "clean": filed.clean,
+                                "step": filed.step })
         );
     } else if filed.clean {
-        println!("filed a clean review under {}", filed.ns);
+        println!(
+            "filed a clean review under {}, in plan step {}",
+            filed.ns, filed.step
+        );
     } else {
-        println!("filed {} finding(s) under {}", filed.uids.len(), filed.ns);
+        println!(
+            "filed {} finding(s) under {}, in plan step {}",
+            filed.uids.len(),
+            filed.ns,
+            filed.step
+        );
         for uid in &filed.uids {
             println!("  {uid}");
         }
@@ -449,16 +460,16 @@ mod tests {
         }
     }
 
-    use jkb_core::Db;
-
     /// A task whose reviews outnumber what one query takes is still gated by all of them — asked in
     /// pieces, added up — rather than refused outright, which blocked even `--no-review`.
     #[test]
     fn findings_across_more_reviews_than_one_query_takes_are_added_up() {
-        let db = Db::open_in_memory().unwrap();
+        let db = crate::known_repo_t_db();
         let backend = jkb_api::LocalBackend::new(db.clone());
         let n = jkb_api::sessions::MAX_REVIEW_NAMESPACES + 1;
-        let nss: Vec<String> = (0..n).map(|i| format!("reviews/r{i}")).collect();
+        let nss: Vec<String> = (0..n)
+            .map(|i| format!("repos/t/codereviews/r{i}"))
+            .collect();
         for ns in [&nss[0], &nss[n - 1]] {
             jkb_api::Backend::call(
                 &backend,

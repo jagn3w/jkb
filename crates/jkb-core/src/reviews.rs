@@ -23,7 +23,7 @@ use std::collections::{BTreeSet, HashMap};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use jkb_types::{Error as TypeError, ItemId};
+use jkb_types::{EdgeType, Error as TypeError, ItemId};
 
 use crate::query::{Query, Scope};
 use crate::store::WriteMeta;
@@ -92,7 +92,9 @@ pub enum RoundSource<'a> {
 }
 
 /// Record that a review of `task` ran at `sha`, filing its findings under `ns`. Recording the same
-/// round twice is a no-op. The round is snapshotted the first time any task records it.
+/// round twice is a no-op. The round is snapshotted the first time any task records it, and every
+/// finding of the snapshot is linked `found_in` to `task` ([`link_findings`]), so a staging round
+/// recorded against each task it credits shows its findings under each of them.
 ///
 /// # Errors
 /// [`Error::Types`] for an empty or oversized value, a namespace `source` does not allow, or a
@@ -108,7 +110,12 @@ pub fn record(
 ) -> Result<()> {
     check("findings namespace", ns)?;
     check("sha", sha)?;
-    snapshot_round(conn, ns, actor, source)?;
+    let round = snapshot_round(conn, ns, actor, source)?;
+    let findings: Vec<ItemId> = conn
+        .prepare_cached("SELECT item_id FROM review_round_findings WHERE round_id = ?1")?
+        .query_map([round], |r| Ok(ItemId::new(r.get::<_, i64>(0)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    link_findings(conn, meta, task, &findings)?;
     let exists: bool = conn
         .prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM reviews
@@ -167,6 +174,114 @@ fn insert(
     )?
     .execute(params![task.get(), kind, ns, sha, actor, meta.txn_id])?;
     Ok(())
+}
+
+/// Link each of `findings` to the task it was found in, `task`, with a
+/// [`jkb_types::EdgeType::FoundIn`] edge (finding → task): the one seam that writes one, called by
+/// a filing (`task.review_file`) and by a recording ([`record`]), so neither caller has to remember
+/// it. A finding that is `task` itself is skipped (no self-loop), and an edge already present is
+/// left alone, so linking again writes nothing and journals nothing. Each new edge is changelogged
+/// as an `insert` by [`crate::edge::link`], so an undo of the transaction removes it.
+///
+/// **Display only.** No gate reads the edge: the frontier and `is_blocked` follow `depends_on`,
+/// subtasks and step counts follow containment, and the land gate and shelving read the round
+/// snapshot. A finding linked here never holds its task.
+///
+/// # Errors
+/// A database error.
+pub fn link_findings(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+    findings: &[ItemId],
+) -> Result<()> {
+    let mut present = conn.prepare_cached(
+        "SELECT EXISTS (SELECT 1 FROM edges
+                        WHERE src_item_id = ?1 AND dst_item_id = ?2 AND type = ?3)",
+    )?;
+    for &finding in findings {
+        if finding == task {
+            continue;
+        }
+        let exists: bool = present.query_row(
+            params![finding.get(), task.get(), EdgeType::FoundIn.as_str()],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            crate::edge::link(conn, meta, finding, task, EdgeType::FoundIn, None)?;
+        }
+    }
+    Ok(())
+}
+
+/// One finding a review of a task filed, as [`findings_of`] answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundFinding {
+    /// The finding.
+    pub id: ItemId,
+    /// The round it belongs to: the namespace it was filed into, else the recorded round whose
+    /// snapshot holds it.
+    pub round: Option<String>,
+    /// Whether that round's snapshot held it as must-fix; `None` when no recorded round holds it.
+    pub must_fix: Option<bool>,
+    /// The recording order of its round, when recorded (`review_rounds.id`): rounds sort by it.
+    pub recorded: Option<i64>,
+}
+
+/// The findings linked `found_in` to `task` ([`link_findings`]), at any status: ordered by their
+/// round's recording order (unrecorded rounds last), then by round name and id. For display only.
+///
+/// # Errors
+/// A database error.
+pub fn findings_of(conn: &Connection, task: ItemId) -> Result<Vec<FoundFinding>> {
+    let mut rows: Vec<FoundFinding> = conn
+        .prepare_cached(
+            "SELECT e.src_item_id,
+                    (SELECT ns FROM review_filings WHERE item_id = e.src_item_id
+                      ORDER BY ns LIMIT 1),
+                    (SELECT r.ns FROM review_round_findings f
+                       JOIN review_rounds r ON r.id = f.round_id
+                      WHERE f.item_id = e.src_item_id ORDER BY r.id LIMIT 1)
+               FROM edges e
+              WHERE e.dst_item_id = ?1 AND e.type = ?2",
+        )?
+        .query_map(params![task.get(), EdgeType::FoundIn.as_str()], |r| {
+            let filed: Option<String> = r.get(1)?;
+            let snapshot: Option<String> = r.get(2)?;
+            Ok(FoundFinding {
+                id: ItemId::new(r.get(0)?),
+                round: filed.or(snapshot),
+                must_fix: None,
+                recorded: None,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut snap = conn.prepare_cached(
+        "SELECT f.must_fix, r.id FROM review_round_findings f
+           JOIN review_rounds r ON r.id = f.round_id
+          WHERE f.item_id = ?1 AND r.ns = ?2",
+    )?;
+    for row in &mut rows {
+        let Some(ns) = &row.round else { continue };
+        if let Some((must_fix, round)) = snap
+            .query_row(params![row.id.get(), ns], |r| {
+                Ok((r.get::<_, bool>(0)?, r.get::<_, i64>(1)?))
+            })
+            .optional()?
+        {
+            row.must_fix = Some(must_fix);
+            row.recorded = Some(round);
+        }
+    }
+    rows.sort_by(|a, b| {
+        (a.recorded.is_none(), a.recorded, &a.round, a.id).cmp(&(
+            b.recorded.is_none(),
+            b.recorded,
+            &b.round,
+            b.id,
+        ))
+    });
+    Ok(rows)
 }
 
 /// Record that `filed_by` filed `items` into the new namespace `ns` (`task.review_file`).
@@ -263,6 +378,13 @@ fn area_of(meta: &item::ItemMeta, tags: &[(String, String)]) -> Option<String> {
     (!file.is_empty() && !file.contains(' ')).then(|| file.to_owned())
 }
 
+/// Whether a finding of this priority is a must-fix: the one threshold the round snapshot, and so
+/// the land gate, and every display of a finding not yet recorded in a round share.
+#[must_use]
+pub fn is_must_fix(priority: Option<i64>) -> bool {
+    priority.is_some_and(|p| p <= 1)
+}
+
 /// Snapshot the round `ns` if no recording has yet, returning its id (its recording order).
 fn snapshot_round(
     conn: &Connection,
@@ -332,7 +454,7 @@ fn snapshot_round(
         let Some(m) = metas.get(item_id) else {
             continue;
         };
-        let must_fix = m.priority.is_some_and(|p| p <= 1);
+        let must_fix = is_must_fix(m.priority);
         let area = area_of(m, tags.get(item_id).map_or(&[][..], Vec::as_slice));
         stmt.execute(params![id, item_id.get(), must_fix, area])?;
     }
@@ -435,6 +557,97 @@ pub fn is_finding_of(conn: &Connection, task: ItemId, target: ItemId) -> Result<
         .query_row(params![task.get(), target.get()], |r| r.get(0))?)
 }
 
+/// Move the still-open findings of `task`'s recorded rounds that sit directly under a plan step to
+/// their repo's Open work › Inbox: what a task reaching a terminal status does
+/// ([`crate::transition::perform`] calls this), so a nit left open on purpose — or a finding about
+/// work that was abandoned — does not keep the reviewed task's plan from archiving, and stays
+/// visible for triage. In the callee because the operator's own `task set --status done`, a pull
+/// request observed merged, and a cancel all finish a task, and a rule each had to remember would be
+/// forgotten by one.
+///
+/// Which findings: those of `task`'s *recorded* rounds, read from the round snapshot like
+/// [`is_finding_of`], that are open tasks contained directly by a plan step other than a triage step
+/// — and only of a round **every** task recorded against is terminal. A round of a staging branch is
+/// recorded against each task it credits, and its findings are still the open work of the ones not
+/// yet finished; the last of them to finish shelves them. A round recorded after all of them
+/// finished is not shelved by being recorded, nor by a terminal-to-terminal transition of one of its
+/// tasks (shelving runs only on a transition *into* a terminal status): its findings are new work
+/// about that step and keep its plan open until someone triages them (the design's Q4). Only a
+/// later finish does shelve it — one of its tasks reopened and then finished again, with every
+/// task of the round terminal once more — because that task finished with the findings still open.
+/// A finding someone moved by hand (under a task, or already into an Inbox) is left where it is, and
+/// so is one whose round namespace names no repo this knowledge base knows — a namespace mapped to a
+/// step filed it there, which is the operator's choice. Each move is [`crate::task::move_under`],
+/// changelogged, so an undo of the transaction that finished the task puts them back. Answers the
+/// findings it moved.
+///
+/// **Never fails a transition over where a finding goes**: when a repo's Open work tree is not
+/// where it should be ([`crate::design::plan::triage_step`] refuses it), or a move is refused, that
+/// finding is left where it is and the writes made trying are rolled back to a savepoint. Every way
+/// a task finishes runs through here, and a misplaced Inbox must not stop a landing.
+///
+/// # Errors
+/// A database error.
+pub fn shelve_open_findings(
+    conn: &Connection,
+    meta: &WriteMeta,
+    task: ItemId,
+) -> Result<Vec<ItemId>> {
+    let open: Vec<(i64, String, String)> = conn
+        .prepare_cached(concat!(
+            "SELECT f.item_id, r.ns, p.uid FROM reviews v
+               JOIN review_rounds r ON r.ns = v.ns
+               JOIN review_round_findings f ON f.round_id = r.id
+               JOIN items i ON i.id = f.item_id
+               JOIN containment c ON c.child_item_id = i.id
+               JOIN items p ON p.id = c.parent_item_id
+              WHERE v.item_id = ?1 AND v.kind = 'recorded'
+                AND i.kind = 'task' AND p.kind = ?2 AND ",
+            jkb_types::sql_not_terminal!("i.status"),
+            " AND NOT EXISTS (
+                 SELECT 1 FROM reviews o JOIN items t ON t.id = o.item_id
+                  WHERE o.ns = r.ns AND o.kind = 'recorded' AND ",
+            jkb_types::sql_not_terminal!("t.status"),
+            ") ORDER BY r.id, f.item_id"
+        ))?
+        .query_map(params![task.get(), crate::design::STEP_KIND], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut moved = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (finding, ns, step) in open {
+        if !seen.insert(finding) || crate::design::plan::is_triage_step_uid(&step) {
+            continue;
+        }
+        let Some(repo) = crate::mount::repo_of_namespace(&ns) else {
+            continue;
+        };
+        if !crate::design::plan::knows_repo(conn, &repo)? {
+            continue;
+        }
+        let finding = ItemId::new(finding);
+        conn.execute_batch("SAVEPOINT shelve_finding")?;
+        let shelved = crate::design::plan::triage_step(conn, meta, &repo)
+            .and_then(|inbox| crate::task::move_under(conn, meta, finding, inbox));
+        match shelved {
+            Ok(m) => {
+                conn.execute_batch("RELEASE shelve_finding")?;
+                if let crate::task::Moved::Moved { .. } = m {
+                    moved.push(finding);
+                }
+            }
+            Err(e) => {
+                conn.execute_batch("ROLLBACK TO shelve_finding; RELEASE shelve_finding")?;
+                if !matches!(e, Error::Types(TypeError::Validation(_))) {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    Ok(moved)
+}
+
 /// `task`'s review state.
 ///
 /// # Errors
@@ -501,7 +714,13 @@ mod tests {
     fn rounds_accumulate_in_order_and_the_newest_head_is_the_reviewed_one() {
         let db = Db::open_in_memory().unwrap();
         let id = db
-            .write_txn("t", |c, m| create(c, m, &NewTask::new("task:r", "R")))
+            .write_txn("t", |c, m| {
+                create(
+                    c,
+                    m,
+                    &NewTask::new("task:r", "R", crate::task::Under::inbox_of("t")),
+                )
+            })
             .unwrap();
         db.write_txn("t", move |c, m| {
             record(

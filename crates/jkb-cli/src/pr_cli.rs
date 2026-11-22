@@ -781,7 +781,9 @@ mod tests {
     fn started(b: &LocalBackend, title: &str, branch: &str) -> String {
         let uid = match op(
             b,
-            serde_json::json!({ "op": "task.add", "text": title, "managed": true }),
+            serde_json::json!({ "op": "task.add", "text": title, "managed": true,
+                                // In repo `t`, so it is filed in `t`'s Open work › Inbox.
+                                "home": "tasks/repos/t/inbox" }),
         ) {
             Response::Added { added } => added.uid,
             other => panic!("{other:?}"),
@@ -813,7 +815,7 @@ mod tests {
     /// flight with no pull request is the common case. Then a pull request found closes the task.
     #[test]
     fn close_merged_asks_gh_about_a_branch_with_no_pull_request_once_per_remote_tip() {
-        let db = jkb_core::Db::open_in_memory().unwrap();
+        let db = crate::known_repo_t_db();
         let b = Counting {
             inner: LocalBackend::new(db),
             ops: RefCell::new(Vec::new()),
@@ -865,7 +867,7 @@ mod tests {
     /// is a move, and so is the first push of a branch that had none.
     #[test]
     fn a_tracking_ref_that_appears_or_vanishes_asks_again() {
-        let db = jkb_core::Db::open_in_memory().unwrap();
+        let db = crate::known_repo_t_db();
         let b = Counting {
             inner: LocalBackend::new(db),
             ops: RefCell::new(Vec::new()),
@@ -891,7 +893,7 @@ mod tests {
     /// refuse it.
     #[test]
     fn close_merged_writes_only_where_a_merge_is_proven() {
-        let db = jkb_core::Db::open_in_memory().unwrap();
+        let db = crate::known_repo_t_db();
         let b = Counting {
             inner: LocalBackend::new(db),
             ops: RefCell::new(Vec::new()),
@@ -949,7 +951,7 @@ mod tests {
     /// old one, at the same remote tip, does not stand for it.
     #[test]
     fn a_none_for_the_old_branch_does_not_stand_for_a_re_worked_task() {
-        let db = jkb_core::Db::open_in_memory().unwrap();
+        let db = crate::known_repo_t_db();
         let b = Counting {
             inner: LocalBackend::new(db),
             ops: RefCell::new(Vec::new()),
@@ -979,7 +981,7 @@ mod tests {
     /// run, as it was before any were kept — a key no push can move would hold for ever.
     #[test]
     fn without_a_readable_remote_tip_gh_is_asked_every_run() {
-        let db = jkb_core::Db::open_in_memory().unwrap();
+        let db = crate::known_repo_t_db();
         let b = Counting {
             inner: LocalBackend::new(db),
             ops: RefCell::new(Vec::new()),

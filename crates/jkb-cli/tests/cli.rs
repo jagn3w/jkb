@@ -57,6 +57,46 @@ fn db_path(dir: &TempDir) -> std::path::PathBuf {
     dir.path().join("jkb.db")
 }
 
+/// Map the `tasks` mount at `ns` — in no repo, so its tasks have no Open work › Inbox — to a plan
+/// step of its own (`jkb ns step`), as a real one outside `repos/` must be before its tasks import.
+fn map_mount(db: &Path, ns: &str) {
+    let step = a_step(db);
+    jkb(db).args(["ns", "step", ns, &step]).assert().success();
+}
+
+/// A new plan step in repo `t`, by uid.
+fn a_step(db: &Path) -> String {
+    let json = |args: &[&str]| -> serde_json::Value {
+        let out = jkb(db).arg("--json").args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let design = json(&["design", "create", "Mapped", "--repo", "t"])["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let plan = json(&[
+        "design", "plan", "create", &design, "Work", "--step", "work",
+    ]);
+    plan["steps"][0]["uid"].as_str().unwrap().to_owned()
+}
+
+/// A checkout of repo `t` beside `db`, mounted at `repos/t` in it on first use: where a test adds a
+/// task naming no step, so it is filed in `t`'s Open work › Inbox — outside every repo it would be
+/// refused.
+fn repo_t(db: &Path) -> std::path::PathBuf {
+    let stem = db.file_stem().unwrap().to_string_lossy().into_owned();
+    let dir = db.with_file_name(format!("{stem}-repo-t"));
+    if !dir.exists() {
+        std::fs::create_dir(&dir).unwrap();
+        jkb(db)
+            .args(["mount", "create", "repos/t", dir.to_str().unwrap()])
+            .assert()
+            .success();
+    }
+    dir
+}
+
 #[test]
 fn ingest_then_query_lists_the_document() {
     let dir = TempDir::new().unwrap();
@@ -83,6 +123,7 @@ fn task_add_and_next() {
     let db = db_path(&dir);
 
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "write the docs", "!p1"])
         .assert()
         .success()
@@ -99,7 +140,11 @@ fn task_add_and_next() {
 fn task_next_json_is_an_array() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
-    jkb(&db).args(["task", "add", "a task"]).assert().success();
+    jkb(&db)
+        .current_dir(repo_t(&db))
+        .args(["task", "add", "a task"])
+        .assert()
+        .success();
 
     jkb(&db)
         .args(["--global", "--json", "task", "next"])
@@ -117,6 +162,7 @@ fn task_show_prints_the_full_untruncated_body() {
     let body = "this task body is deliberately much longer than the eighty character \
                 snippet that listings show so we can prove show returns the whole thing";
     let out = jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["--json", "task", "add", body])
         .output()
         .unwrap();
@@ -158,6 +204,7 @@ fn view_save_list_and_run() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "review pr"])
         .assert()
         .success();
@@ -259,6 +306,7 @@ fn task_edit_appends_a_body_to_a_file_backed_task_but_refuses_a_blank_line() {
         ])
         .assert()
         .success();
+    map_mount(&db, "work");
     jkb(&db).args(["sync", "work"]).assert().success();
 
     // The file-backed uid is the only `file://…` string in the JSON frontier.
@@ -320,6 +368,7 @@ fn task_edit_appends_a_body_to_a_file_backed_task_but_refuses_a_blank_line() {
 
     // The guard is specific to file-backed tasks: a managed task still appends fine.
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "managed task"])
         .assert()
         .success();
@@ -363,6 +412,7 @@ fn a_needs_word_in_a_file_backed_tasks_text_is_refused_and_a_parked_one_holds_it
         ])
         .assert()
         .success();
+    map_mount(&db, "work");
     jkb(&db)
         .args(["sync", "work"])
         .assert()
@@ -468,6 +518,7 @@ fn two_tasks_files(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf, st
             .args(["--serializer", "tasks"])
             .assert()
             .success();
+        map_mount(&db, name);
         jkb(&db).args(["sync", name]).assert().success();
     }
     (db, pfile, ofile)
@@ -560,6 +611,7 @@ fn a_parked_needs_resolves_when_the_named_task_is_bound_into_its_file() {
     let (db, pfile, _) = two_tasks_files(&dir);
     let ship = format!("file://{}#ship", pfile.display());
     let later = jkb(&db)
+        .current_dir(repo_t(&db))
         .args([
             "--json",
             "task",
@@ -665,6 +717,7 @@ fn a_parked_needs_that_would_close_a_cycle_stays_parked_and_the_file_still_syncs
             .args(["--serializer", "tasks"])
             .assert()
             .success();
+        map_mount(&db, name);
         sync_ok(&db, name);
     }
     let fix = format!("file://{}#fix", pfile.display());
@@ -752,6 +805,7 @@ fn a_parked_needs_closing_a_cycle_through_another_file_stays_parked() {
     let fix = format!("file://{}#fix", pfile.display());
     let ghost = format!("file://{}#ghost", ofile.display());
     let out = jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["--json", "task", "add", "Between"])
         .output()
         .unwrap();
@@ -918,6 +972,7 @@ fn a_file_parent_replaces_an_outside_container_with_its_edge() {
     let (db, _pfile, ofile) = two_tasks_files(&dir);
     let outside = add_task(&db, "Outside");
     let out = jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["--json", "task", "add", "Kid", "+oth/tasks.md/x", "--sync"])
         .args(["--under", &outside])
         .output()
@@ -987,7 +1042,10 @@ fn a_file_parent_replaces_an_outside_container_with_its_edge() {
 fn ns_ls_shows_created_namespaces() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
+    // A repo the knowledge base knows, as a mount of it would make it.
+    jkb(&db).args(["ns", "mk", "repos/app"]).assert().success();
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "x", "+repos/app"])
         .assert()
         .success();
@@ -1004,6 +1062,7 @@ fn undo_reverts_the_last_change() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "throwaway"])
         .assert()
         .success();
@@ -1033,9 +1092,68 @@ fn doctor_reports_integrity_and_version() {
     assert!(backup.exists());
 }
 
+/// Make `uid` loose — its container and `parent_of` edge removed — as a build before every task
+/// was filed under a plan step could leave it. The one seam to a loose task: every creator and
+/// container writer now refuses one.
+fn make_loose(db: &Path, uid: &str) {
+    let store = jkb_core::Db::open(db).unwrap();
+    let uid = uid.to_owned();
+    store
+        .write_txn("t", move |c, m| {
+            let id = jkb_core::item::id_for_uid(c, &uid)?.expect("task");
+            let parent = jkb_core::containment::parent(c, id)?.expect("a container");
+            jkb_core::edge::unlink(c, m, parent, id, jkb_types::EdgeType::ParentOf)?;
+            jkb_core::containment::uncontain(c, m, id).map(|_| ())
+        })
+        .unwrap();
+}
+
+/// `jkb doctor` exits non-zero while a task is unplanned — AFTER printing every section, the backup
+/// included, so the report is not cut short — and exits 0 once it is homed.
+#[test]
+fn doctor_fails_on_an_unplanned_task_after_its_whole_report() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let uid = add_task(&db, "a task from before the guard");
+    jkb(&db).args(["doctor"]).assert().success();
+
+    make_loose(&db, &uid);
+    let backup = dir.path().join("backup.db");
+    let out = jkb(&db)
+        .args(["doctor", "--backup", backup.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for section in [
+        "backup written",
+        "unplanned tasks: 1 open task(s)",
+        "task claims:",
+        "vector index:",
+        "db location:",
+    ] {
+        assert!(stdout.contains(section), "{section:?} missing:\n{stdout}");
+    }
+    assert!(stdout.contains(&uid), "{stdout}");
+    assert!(stderr.contains("1 unplanned task(s)"), "{stderr}");
+    assert!(backup.exists(), "the backup is still written");
+
+    jkb(&db)
+        .args(["task", "move", &uid, "--under", "step:inbox@t"])
+        .assert()
+        .success();
+    jkb(&db)
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unplanned tasks: none"));
+}
+
 /// Add a task via the CLI and return its minted uid (`--json` emits `{uid}`).
 fn add_task(db: &Path, text: &str) -> String {
     let out = jkb(db)
+        .current_dir(repo_t(db))
         .args(["--json", "task", "add", text])
         .output()
         .unwrap();
@@ -1405,6 +1523,7 @@ fn task_add_explicit_placement_sets_home() {
     let db = db_path(&dir);
 
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "explicit home task", "+projects/alpha"])
         .assert()
         .success();
@@ -1427,9 +1546,24 @@ fn task_add_backlog_outside_repo_errors() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
 
-    // No ambient repo and stdin is not a TTY → the global fallback is declined → error.
+    // No ambient repo and no step: refused before the backlog question, saying how to name a step.
     jkb(&db)
         .args(["task", "add", "orphan backlog", "--backlog"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("outside a mounted repo"))
+        .stderr(predicate::str::contains("--under <step>"));
+    // With a step, the question is reached; stdin is not a TTY → the global fallback is declined.
+    let step = a_step(&db);
+    jkb(&db)
+        .args([
+            "task",
+            "add",
+            "orphan backlog",
+            "--backlog",
+            "--under",
+            &step,
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("--backlog needs an ambient repo"));
@@ -1515,11 +1649,14 @@ fn task_next_scopes_to_the_repo_task_tree() {
     std::fs::create_dir(&repo).unwrap();
     mount_repo(&db, "repos/proj", &repo);
 
-    // A purely-global task and a repo-scoped task.
+    // A purely-global task — added outside every repo, so it names its step and is homed at
+    // `tasks/inbox` — and a repo-scoped task.
+    let step = a_step(&db);
     jkb(&db)
-        .args(["task", "add", "global only task"])
+        .args(["task", "add", "global only task", "--under", &step])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("at tasks/inbox"));
     jkb(&db)
         .current_dir(&repo)
         .args(["task", "add", "repo scoped task"])
@@ -1541,8 +1678,10 @@ fn task_unplace_removes_mirror_but_keeps_the_home() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
 
-    // Add a task (homes at tasks/inbox) and mirror it under proj/mirror.
+    // Add a task (homed at tasks/repos/t/inbox, mirrored at tasks/inbox) and mirror it under
+    // proj/mirror too.
     let out = jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "unplace target"])
         .output()
         .unwrap();
@@ -1560,7 +1699,7 @@ fn task_unplace_removes_mirror_but_keeps_the_home() {
         .success()
         .stdout(predicate::str::contains("unplace target"));
 
-    // Unplace the mirror: it goes, the tasks/inbox home stays.
+    // Unplace the proj/mirror mirror: it goes, the home and its tasks/inbox mirror stay.
     jkb(&db)
         .args(["task", "unplace", &uid, "proj/mirror"])
         .assert()
@@ -1595,9 +1734,11 @@ fn task_add_infers_synced_binding_under_a_tasks_mount() {
         ])
         .assert()
         .success();
+    map_mount(&db, "tasks/proj/.backlog");
 
     // Homed under the tasks mount → a synced file binding is inferred (D26.5).
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "synced task", "+tasks/proj/.backlog"])
         .assert()
         .success()
@@ -1626,6 +1767,7 @@ fn task_add_stays_managed_without_a_tasks_mount_and_sync_errors() {
 
     // No tasks mount over the home → inference keeps it managed (no synced hint).
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "plain managed", "+proj/x"])
         .assert()
         .success()
@@ -1633,6 +1775,7 @@ fn task_add_stays_managed_without_a_tasks_mount_and_sync_errors() {
 
     // --sync with no tasks mount over the home is an error.
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "needs sync", "+proj/x", "--sync"])
         .assert()
         .failure()
@@ -1646,10 +1789,12 @@ fn ls_lists_children_and_hides_terminal_tasks() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "alpha task", "+proj/x"])
         .assert()
         .success();
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "beta task", "+proj/x"])
         .assert()
         .success();
@@ -1673,6 +1818,7 @@ fn ls_lists_children_and_hides_terminal_tasks() {
 
     // A completed task is hidden by default, revealed with --all.
     let out = jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "gamma task", "+proj/y"])
         .output()
         .unwrap();
@@ -1703,7 +1849,11 @@ fn item_show_bounds_the_preview() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let long = "x".repeat(500);
-    let out = jkb(&db).args(["task", "add", &long]).output().unwrap();
+    let out = jkb(&db)
+        .current_dir(repo_t(&db))
+        .args(["task", "add", &long])
+        .output()
+        .unwrap();
     let uid = String::from_utf8(out.stdout)
         .unwrap()
         .split_whitespace()
@@ -1739,6 +1889,7 @@ fn item_edit_holds_a_tasks_md_item_to_the_task_edit_rule() {
         .assert()
         .success();
     let out = jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["--json", "task", "add", "filed +repos/proj"])
         .output()
         .unwrap();
@@ -1767,6 +1918,7 @@ fn item_edit_replaces_content() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let out = jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "before edit"])
         .output()
         .unwrap();
@@ -1794,14 +1946,17 @@ fn ls_sorts_namespaces_first_then_tasks_by_priority() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "low pri", "+proj", "!p3"])
         .assert()
         .success();
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "high pri", "+proj", "!p1"])
         .assert()
         .success();
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "child ns task", "+proj/sub"])
         .assert()
         .success();
@@ -1821,10 +1976,12 @@ fn query_count_reports_the_number_of_matches() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "one", "+proj"])
         .assert()
         .success();
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "two", "+proj"])
         .assert()
         .success();
@@ -1872,6 +2029,7 @@ fn ns_rm_refuses_nonempty_and_removes_empty() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let out = jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "tmp task", "+proj/tmp"])
         .output()
         .unwrap();
@@ -1906,8 +2064,11 @@ fn ns_rm_refuses_nonempty_and_removes_empty() {
 fn task_mirror_symlinks_repo_tasks_under_tasks() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
+    // A repo the knowledge base knows, as a mount of it would make it.
+    jkb(&db).args(["ns", "mk", "repos/jkb"]).assert().success();
     // A task homed outside tasks/ (repo content) is auto-mirrored under tasks/ on create.
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "repo task", "+repos/jkb/openspec/x"])
         .assert()
         .success();
@@ -1924,6 +2085,7 @@ fn task_mirror_symlinks_repo_tasks_under_tasks() {
         .stdout(predicate::str::contains("repo task"));
     // A tasks/-homed task isn't mirrored; `task mirror` finds nothing new.
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "inbox task", "+tasks/jkb/.backlog"])
         .assert()
         .success();
@@ -1973,10 +2135,12 @@ fn grep_is_literal_scoped_and_exit_coded() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "buy a 6-inch pipe", "+proj/hw"])
         .assert()
         .success();
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "write the DESIGN doc", "+proj/docs"])
         .assert()
         .success();
@@ -2021,10 +2185,12 @@ fn ls_long_and_recursive() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "alpha task", "+proj/a"])
         .assert()
         .success();
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "beta task", "+proj/b"])
         .assert()
         .success();
@@ -2048,6 +2214,7 @@ fn cat_prints_raw_body() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "cat me", "+proj/x"])
         .assert()
         .success();
@@ -2072,10 +2239,12 @@ fn tree_find_recent_stat_guide() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "alpha task", "+proj/a"])
         .assert()
         .success();
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "beta task", "+proj/b"])
         .assert()
         .success();
@@ -2141,6 +2310,7 @@ fn find_guards_unscoped_and_tree_bounds_depth() {
     let db = db_path(&dir);
     // A deep chain a/b/c/d/e/f so the default tree depth elides the bottom.
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "deep", "+a/b/c/d/e/f"])
         .assert()
         .success();
@@ -2396,6 +2566,7 @@ fn item_rm_is_guarded_and_undoable() {
 
     // A plain note, placed and tagged, is removable.
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "scratch note", "+notes/tmp"])
         .assert()
         .success();
@@ -2577,6 +2748,7 @@ fn the_inv_surface_refuses_cross_strategy_and_task_misuse() {
 
     // `inv resolve` refuses a task and points at the right command.
     let out = jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["--json", "task", "add", "an ordinary task"])
         .output()
         .unwrap();
@@ -2735,6 +2907,7 @@ fn doctor_backup_captures_state_before_fix_repairs_it() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["--global", "task", "add", "orphaned work"])
         .assert()
         .success();
@@ -2796,6 +2969,7 @@ fn history_finds_a_deleted_file_by_relative_path() {
         .args(["--serializer", "tasks"])
         .assert()
         .success();
+    map_mount(&db, "docs/m");
     jkb(&db).args(["sync", "docs/m"]).assert().success();
     std::fs::remove_file(backing.join("tasks.md")).unwrap();
 
@@ -2836,6 +3010,7 @@ fn blob_archive_recovers_a_previous_version_of_a_synced_file() {
         ])
         .assert()
         .success();
+    map_mount(&db, "work");
     jkb(&db).args(["sync", "work"]).assert().success();
 
     // Someone clobbers the file and it settles, so the disk no longer has the line.
@@ -2981,6 +3156,7 @@ fn a_namespace_contract_is_enforced_on_write_and_contracts_are_not_investigation
 
     // A task in the tasks tree is exactly what the contract allows.
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "a real task", "+tasks/jkb"])
         .assert()
         .success();
@@ -3019,10 +3195,11 @@ fn a_contract_may_type_several_namespaces_and_relocates_nothing() {
 
     // Task homing is unmoved: `tasks/` is the root because the layout reserves it.
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "still in the reserved root"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("at tasks/inbox"));
+        .stdout(predicate::str::contains("at tasks/repos/t/inbox"));
 
     // Both still enforce their contract where they are.
     let note = dir.path().join("n.md");
@@ -3081,14 +3258,18 @@ fn ns_type_show_distinguishes_a_missing_namespace_from_an_untyped_one() {
 fn ls_reports_subtree_leaves_broken_down_by_kind() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
+    // A repo the knowledge base knows, as a mount of it would make it.
+    jkb(&db).args(["ns", "mk", "repos/jkb"]).assert().success();
     let note = dir.path().join("n.md");
     std::fs::write(&note, "a document, not a task").unwrap();
 
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "one", "+repos/jkb/notes"])
         .assert()
         .success();
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "two", "+repos/jkb/notes"])
         .assert()
         .success();
@@ -3140,6 +3321,7 @@ fn ls_labels_a_namespaces_own_type_but_not_an_inherited_one() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "one", "+tasks/jkb/inbox"])
         .assert()
         .success();
@@ -3318,6 +3500,7 @@ fn a_parent_with_open_subtasks_is_not_on_the_frontier() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "big feature"])
         .assert()
         .success();
@@ -3330,6 +3513,7 @@ fn a_parent_with_open_subtasks_is_not_on_the_frontier() {
 
     for child in ["part one", "part two"] {
         jkb(&db)
+            .current_dir(repo_t(&db))
             .args(["task", "add", child, "--under", &parent])
             .assert()
             .success();
@@ -3403,6 +3587,7 @@ fn ls_marks_a_parent_expandable_and_task_subtasks_lists_its_children() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "big feature"])
         .assert()
         .success();
@@ -3414,6 +3599,7 @@ fn ls_marks_a_parent_expandable_and_task_subtasks_lists_its_children() {
     let parent = v[0]["uid"].as_str().unwrap().to_owned();
     for child in ["part one", "part two"] {
         jkb(&db)
+            .current_dir(repo_t(&db))
             .args(["task", "add", child, "--under", &parent])
             .assert()
             .success();
@@ -3479,6 +3665,7 @@ fn ls_lists_any_container_and_a_subtask_is_never_listed_twice() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "big feature"])
         .assert()
         .success();
@@ -3490,6 +3677,7 @@ fn ls_lists_any_container_and_a_subtask_is_never_listed_twice() {
     let parent = v[0]["uid"].as_str().unwrap().to_owned();
     for child in ["part one", "part two"] {
         jkb(&db)
+            .current_dir(repo_t(&db))
             .args(["task", "add", child, "--under", &parent])
             .assert()
             .success();
@@ -3529,6 +3717,7 @@ fn ls_lists_any_container_and_a_subtask_is_never_listed_twice() {
     // in a different namespace is listed under its parent and nowhere else. It lives inside
     // the parent; the namespace placement serves scoping and search, not listing.
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "elsewhere", "--under", &parent, "+other/ns"])
         .assert()
         .success();
@@ -3578,6 +3767,7 @@ fn re_running_mount_create_preserves_unnamed_properties() {
         .assert()
         .success()
         .stdout(predicate::str::contains("include=**/tasks.md"));
+    map_mount(&db, "docs/m");
 
     // Change ONLY the policy. The glob and serializer must survive.
     jkb(&db)
@@ -3630,6 +3820,7 @@ fn sync_keeps_two_tasks_files_in_one_directory_apart() {
         .args(["--serializer", "tasks", "--include", "**/*.md"])
         .assert()
         .success();
+    map_mount(&db, "docs/m");
 
     jkb(&db)
         .args(["sync", "docs/m"])
@@ -4649,7 +4840,17 @@ fn the_read_set_answers_through_the_daemon_exactly_as_on_the_host() {
     let parent = parent["uid"].as_str().unwrap().to_owned();
     host_ok(&["task", "add", "child", "--under", &parent], &host_repo);
     host_ok(&["task", "add", "sibling needle !p2"], &host_repo);
-    host_ok(&["task", "add", "outside the repo"], &root);
+    // Outside the repo, a task names its step: here the repo's own Inbox, made by the adds above.
+    host_ok(
+        &[
+            "task",
+            "add",
+            "outside the repo",
+            "--under",
+            "step:inbox@proj",
+        ],
+        &root,
+    );
     host_ok(
         &["inv", "new", "debugging", "bug", "--goal", "it crashes"],
         &host_repo,
@@ -4858,7 +5059,7 @@ fn the_task_writes_go_through_the_daemon_and_stop_at_the_container_s_view() {
         v["uid"].as_str().unwrap().to_owned()
     };
     let outside = uid_of(&ok(
-        host(&["--json", "task", "add", "a note +docs/notes"], &root),
+        host(&["--json", "task", "add", "a note +docs/notes"], &host_repo),
         "host add outside",
     ));
     let dep = uid_of(&ok(
@@ -5278,12 +5479,16 @@ fn the_mcp_server_serves_its_tools_through_the_daemon() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("host.db");
     let token = tmp.path().join("daemon/token");
+    // Started in a checkout of a mounted repo, as Claude Code starts it, so a task it creates is
+    // filed in that repo's Open work › Inbox.
+    let repo = repo_t(&db);
     let (serve, url) = Daemon::start(&db, &token);
     let client_home = tmp.path().join("container-home");
     std::fs::create_dir_all(&client_home).unwrap();
 
     let mut child = jkb_bare()
         .arg("mcp")
+        .current_dir(&repo)
         .env("JKB_REMOTE", &url)
         .env("JKB_REMOTE_TOKEN_FILE", &token)
         .env("HOME", &client_home)
@@ -5961,14 +6166,27 @@ fn task_show_names_the_step_plan_and_design_a_task_sits_under() {
             )));
     }
 
-    let loose = uid_of(json(&["task", "add", "Loose", "end", "--managed"]));
-    assert!(json(&["task", "show", &loose])["place"].is_null());
+    // A task added with no step is no longer loose: it is in its repo's Open work › Inbox.
+    let out = jkb(&db)
+        .current_dir(repo_t(&db))
+        .args(["--json", "task", "add", "Loose", "end", "--managed"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let inboxed = uid_of(serde_json::from_slice(&out.stdout).unwrap());
+    let place = json(&["task", "show", &inboxed])["place"].clone();
+    assert_eq!(place["step"]["uid"], "step:inbox@t", "{place}");
+    assert_eq!(place["design"]["uid"], "design:open-work@t", "{place}");
     jkb(&db)
-        .args(["task", "show", &loose])
+        .args(["task", "show", &inboxed])
         .assert()
         .success()
-        .stdout(predicate::str::contains("plan:").not())
-        .stdout(predicate::str::contains("design:").not());
+        .stdout(predicate::str::contains(
+            "plan:      Open work · step 1. Inbox (step:inbox@t)",
+        ))
+        .stdout(predicate::str::contains(
+            "design:    Open work (design:open-work@t)",
+        ));
 
     // Remote mode: the same answer crosses the daemon's wire, from the op and not a client read.
     let token = dir.path().join("daemon/token");
@@ -6513,6 +6731,7 @@ fn an_edit_with_a_stale_expected_base_is_refused_and_writes_nothing() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     let out = jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["--json", "task", "add", "Build it"])
         .output()
         .unwrap();
@@ -6615,7 +6834,7 @@ fn task_move_reparents_under_a_step_refuses_a_plan_and_undoes() {
         .args(["task", "move", &child, "--under", &plan_uid])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("holds no tasks"));
+        .stderr(predicate::str::contains("under no plan step"));
     assert!(lists(&step, &child));
 
     jkb(&db).args(["undo"]).assert().success();
@@ -6669,6 +6888,7 @@ fn ls_of_a_path_that_names_nothing_fails_rather_than_listing_empty() {
     let dir = TempDir::new().unwrap();
     let db = db_path(&dir);
     jkb(&db)
+        .current_dir(repo_t(&db))
         .args(["task", "add", "alpha task", "+proj/x"])
         .assert()
         .success();
@@ -6740,4 +6960,162 @@ fn writing_bytes_into_a_closed_pipe_ends_quietly() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// `jkb task add --help` says when a task with no `--under` is refused: only when no mapping, no
+/// repo its home names and no repo you are in gives a step — not whenever you are outside a repo.
+#[test]
+fn task_add_help_says_when_a_task_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let out = jkb(&db_path(&dir))
+        .args(["task", "add", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8(out.stdout).unwrap();
+    assert!(help.contains("the repo its home names"), "{help}");
+    assert!(
+        help.contains("refused only when none of these gives a step"),
+        "{help}"
+    );
+}
+
+/// A mistyped repo in a home, from inside a mounted repo, is refused — and leaves neither the
+/// mistyped `repos/<repo>` namespace nor an Open work tree for it behind.
+#[test]
+fn task_add_homed_in_an_unknown_repo_is_refused_and_builds_nothing() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    jkb(&db)
+        .current_dir(repo_t(&db))
+        .args(["task", "add", "x +repos/jbk/notes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("repo `jbk`"));
+    jkb(&db)
+        .args(["--global", "query", "kind:design"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("open-work@jbk").not());
+    jkb(&db)
+        .args(["ns", "ls", "repos"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("jbk").not());
+}
+
+/// `jkb task review file --task <uid>` files the findings under that task's plan step, and says which
+/// step; without it, an unbound filing goes to the repo's Open work › Inbox.
+#[test]
+fn review_file_names_the_step_its_findings_went_under() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = repo_t(&db);
+    let step = a_step(&db);
+    let out = jkb(&db)
+        .current_dir(&repo)
+        .args(["--json", "task", "add", "reviewed work", "--under", &step])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let task = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["uid"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let result = dir.path().join("result.json");
+    std::fs::write(
+        &result,
+        r#"{"reviewers":1,"returned":1,"findings":[{"severity":"nit","summary":"a nit"}]}"#,
+    )
+    .unwrap();
+    let from = result.to_str().unwrap();
+    let out = jkb(&db)
+        .args([
+            "--json",
+            "task",
+            "review",
+            "file",
+            "--findings",
+            "repos/t/codereviews/r1",
+        ])
+        .args(["--from", from, "--task", &task])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let filed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(filed["step"], step.as_str(), "{filed}");
+    jkb(&db)
+        .args([
+            "task",
+            "review",
+            "file",
+            "--findings",
+            "repos/t/codereviews/r2",
+        ])
+        .args(["--from", from])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in plan step step:inbox@t"));
+}
+
+/// The review coordinator's step 3 is run exactly as it is printed: rendered with the vars
+/// `/review` passes, its filing command taken from the text and run from inside a mounted repo on a
+/// database where nothing was filed there yet. It files the pre-existing finding in the repo's
+/// triage step, homed in its backlog — the text a coordinator is told to run works.
+#[test]
+fn the_review_coordinators_filing_command_files_in_the_repos_triage_step() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let repo = repo_t(&db);
+    let repo_s = repo.to_str().unwrap();
+    let out = jkb(&db)
+        .args(["workflow", "agent", "show", "review-coordinator"])
+        .args(["--var", &format!("repo={repo_s}")])
+        .args(["--var", "range_desc=main...HEAD"])
+        .args(["--var", "stat_cmd=git diff --stat main...HEAD"])
+        .args(["--var", "diff_cmd=git diff main...HEAD"])
+        .args(["--var", "findings_ns=repos/t/codereviews/20261108-000000-b"])
+        .args(["--var", "focus_block="])
+        .args(["--var", "triage_step=step:inbox@t"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let prompt = String::from_utf8(out.stdout).unwrap();
+    let line = prompt
+        .lines()
+        .find(|l| l.contains("jkb task add"))
+        .unwrap_or_else(|| panic!("no filing command in step 3:\n{prompt}"))
+        .trim();
+    let command = line
+        .strip_prefix(&format!("cd {repo_s} && jkb "))
+        .unwrap_or_else(|| panic!("step 3 files from the repository: {line}"));
+    // The flags as printed, then the quoted task line with its placeholders filled.
+    let (flags, quoted) = command.split_once('"').unwrap();
+    assert!(
+        quoted.starts_with("<summary> — <file>:<line> !p<"),
+        "{quoted}"
+    );
+    let flags: Vec<&str> = flags.split_whitespace().collect();
+    assert_eq!(
+        flags,
+        ["task", "add", "--backlog", "--under", "step:inbox@t"],
+        "{line}"
+    );
+    let filed = jkb(&db)
+        .current_dir(&repo)
+        .arg("--json")
+        .args(&flags)
+        .arg("A stale comment — src/lib.rs:12 !p3")
+        .output()
+        .unwrap();
+    assert!(filed.status.success(), "{filed:?}");
+    let filed: serde_json::Value = serde_json::from_slice(&filed.stdout).unwrap();
+    assert_eq!(filed["home"], "tasks/repos/t/.backlog", "{filed}");
+    let uid = filed["uid"].as_str().unwrap();
+    let shown = jkb(&db)
+        .args(["--json", "task", "show", uid])
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{shown:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["place"]["step"]["uid"], "step:inbox@t", "{shown}");
 }

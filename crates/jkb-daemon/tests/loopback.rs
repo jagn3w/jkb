@@ -27,6 +27,11 @@ impl Fixture {
     fn with(tune: impl FnOnce(&mut ServeConfig)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path().join("jkb.db")).unwrap();
+        // The repo `t` the requests' homes name is one this knowledge base knows.
+        db.write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+        })
+        .unwrap();
         let token = dir.path().join("daemon/token");
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut cfg = ServeConfig::new(addr, token.clone());
@@ -252,6 +257,11 @@ fn a_wrong_or_missing_token_is_unauthorized_and_a_rotated_one_is_picked_up() {
 fn an_unspecified_address_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("jkb.db")).unwrap();
+    // The repo `t` the requests' homes name is one this knowledge base knows.
+    db.write_txn("t", |c, m| {
+        jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+    })
+    .unwrap();
     for addr in ["0.0.0.0:0", "[::]:0"] {
         let err = spawn(
             db.clone(),
@@ -270,6 +280,11 @@ fn an_unspecified_address_is_refused() {
 fn a_port_held_by_another_process_is_named_with_how_to_find_it() {
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(dir.path().join("jkb.db")).unwrap();
+    // The repo `t` the requests' homes name is one this knowledge base knows.
+    db.write_txn("t", |c, m| {
+        jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+    })
+    .unwrap();
     let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = holder.local_addr().unwrap();
     let token = dir.path().join("daemon/token");
@@ -750,6 +765,11 @@ fn a_daemon_whose_database_will_not_open_answers_why_and_recovers_when_it_does()
     let dir = tempfile::tempdir().unwrap();
     let token = dir.path().join("daemon/token");
     let db = Db::open(dir.path().join("jkb.db")).unwrap();
+    // The repo `t` the requests' homes name is one this knowledge base knows.
+    db.write_txn("t", |c, m| {
+        jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+    })
+    .unwrap();
     let fixed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let opener: jkb_daemon::server::Opener = {
@@ -1361,9 +1381,11 @@ fn a_role_token_and_a_ticket_are_served_as_their_principal_over_http() {
     let call = |b: &RemoteBackend, r: serde_json::Value| {
         b.call(serde_json::from_value(r).expect("request parses"))
     };
-    let Response::Added { added } =
-        call(&op, json!({ "op": "task.add", "text": "the work" })).unwrap()
-    else {
+    let Response::Added { added } = call(
+        &op,
+        json!({ "op": "task.add", "text": "the work", "home": "tasks/repos/t/inbox" }),
+    )
+    .unwrap() else {
         panic!("added")
     };
     let uid = added.uid;
@@ -1569,7 +1591,7 @@ fn tasks(f: &Fixture) -> i64 {
 fn a_keyed_write_sent_twice_is_applied_once_and_answered_alike() {
     let f = Fixture::new();
     let token = root_token(&f);
-    let add = json!({ "op": "task.add", "text": "once" });
+    let add = json!({ "op": "task.add", "text": "once", "home": "tasks/repos/t/inbox" });
     let first = post(&f, &token, Some("k1"), &add);
     assert_eq!(first.0, 200, "{first:?}");
     assert_eq!(post(&f, &token, Some("k1"), &add), first, "replayed");
@@ -1579,7 +1601,7 @@ fn a_keyed_write_sent_twice_is_applied_once_and_answered_alike() {
         &f,
         &token,
         Some("k1"),
-        &json!({ "op": "task.add", "text": "other" }),
+        &json!({ "op": "task.add", "text": "other", "home": "tasks/repos/t/inbox" }),
     );
     assert_eq!(other.0, 400, "{other:?}");
     assert!(other.1.contains("different request"), "{other:?}");
@@ -1600,7 +1622,7 @@ fn a_keyed_write_sent_twice_is_applied_once_and_answered_alike() {
 fn a_request_to_v1_op_runs_every_time_key_or_not() {
     let f = Fixture::new();
     let token = root_token(&f);
-    let add = json!({ "op": "task.add", "text": "twice" });
+    let add = json!({ "op": "task.add", "text": "twice", "home": "tasks/repos/t/inbox" });
     for key in [None, Some("k")] {
         let before = tasks(&f);
         let a = post_at(&f, "/v1/op", &token, key, &add);
@@ -1619,7 +1641,7 @@ fn the_keyed_route_needs_a_key_and_refuses_a_long_poll() {
     topic_and_group(&f.client());
     let token = root_token(&f);
     let keyed = jkb_daemon::server::KEYED_PATH;
-    let add = json!({ "op": "task.add", "text": "t" });
+    let add = json!({ "op": "task.add", "text": "t", "home": "tasks/repos/t/inbox" });
     let missing = post_at(&f, keyed, &token, None, &add);
     assert_eq!(missing.0, 400, "{missing:?}");
     assert!(
@@ -1668,7 +1690,7 @@ fn a_resend_while_the_original_runs_waits_for_its_answer() {
             .unwrap();
         });
         held.recv().unwrap();
-        let add = json!({ "op": "task.add", "text": "once" });
+        let add = json!({ "op": "task.add", "text": "once", "home": "tasks/repos/t/inbox" });
         let answers = std::thread::scope(|s| {
             let first = s.spawn(|| post(f, &token, Some("k"), &add));
             wait_until(|| handle.keyed_in_progress() == 1);
@@ -1737,7 +1759,7 @@ fn another_caller_s_key_is_not_answered_from_mine() {
 /// runs its request again.
 #[test]
 fn expired_and_evicted_keys_run_again() {
-    let add = json!({ "op": "task.add", "text": "t" });
+    let add = json!({ "op": "task.add", "text": "t", "home": "tasks/repos/t/inbox" });
     let f = Fixture::with(|cfg| cfg.idempotency_ttl = Duration::from_millis(300));
     let token = root_token(&f);
     post(&f, &token, Some("k"), &add);
@@ -1801,7 +1823,7 @@ fn a_keyed_request_refused_before_it_ran_is_not_recorded() {
 fn an_answer_too_large_to_record_is_not_replayed_and_not_rerun() {
     let f = Fixture::with(|cfg| cfg.idempotency_max_answer = 10);
     let token = root_token(&f);
-    let add = json!({ "op": "task.add", "text": "t" });
+    let add = json!({ "op": "task.add", "text": "t", "home": "tasks/repos/t/inbox" });
     let first = post(&f, &token, Some("k"), &add);
     assert_eq!(first.0, 200, "{first:?}");
     let resent = post(&f, &token, Some("k"), &add);

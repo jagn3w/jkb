@@ -770,23 +770,19 @@ mod tests {
         db.write_txn("t", |conn, meta| {
             let deep = ensure(conn, meta, "tasks/jkb/openspec")?;
             let leaf = ensure(conn, meta, "tasks/jkb/openspec/changes")?;
-            let new = |uid: &str| NewItem {
-                uid: uid.to_owned(),
-                kind: "task".to_owned(),
-                content: None,
-                content_hash: None,
-                mime: None,
-            };
+            // Homed at `tasks/inbox` by `task::create`; placed where the test counts below.
+            let new =
+                |uid: &str| crate::task::NewTask::new(uid, uid, crate::task::Under::inbox_of("t"));
             // `a` lives (via a mirror) under a descendant, and is *also* placed on an
             // ancestor in the same subtree — it must be counted once, not twice.
-            let a = upsert(conn, meta, &new("task:a"))?;
+            let a = crate::task::create(conn, meta, &new("task:a"))?;
             placement::place(conn, meta, a, leaf, PlacementRole::Reference, 0)?;
             placement::place(conn, meta, a, deep, PlacementRole::Reference, 0)?;
             // `b` is a second, distinct leaf under the descendant.
-            let b = upsert(conn, meta, &new("task:b"))?;
+            let b = crate::task::create(conn, meta, &new("task:b"))?;
             placement::place(conn, meta, b, leaf, PlacementRole::Reference, 0)?;
             // `c` is done — hidden unless terminal items are included.
-            let c = upsert(conn, meta, &new("task:c"))?;
+            let c = crate::task::create(conn, meta, &new("task:c"))?;
             placement::place(conn, meta, c, leaf, PlacementRole::Reference, 0)?;
             conn.execute("UPDATE items SET status = 'done' WHERE id = ?1", [c.get()])?;
             Ok(())
@@ -819,18 +815,14 @@ mod tests {
             let a_leaf = ensure(conn, meta, "tasks/jkb/a/deep")?;
             let b_leaf = ensure(conn, meta, "tasks/other/b")?;
             ensure(conn, meta, "tasks/empty")?; // a child with no placements at all
-            let new = |uid: &str| NewItem {
-                uid: uid.to_owned(),
-                kind: "task".to_owned(),
-                content: None,
-                content_hash: None,
-                mime: None,
-            };
-            let x = upsert(conn, meta, &new("task:x"))?;
+                                                // Homed at `tasks/inbox` by `task::create`; placed where the test counts below.
+            let new =
+                |uid: &str| crate::task::NewTask::new(uid, uid, crate::task::Under::inbox_of("t"));
+            let x = crate::task::create(conn, meta, &new("task:x"))?;
             placement::place(conn, meta, x, a_leaf, PlacementRole::Reference, 0)?;
-            let y = upsert(conn, meta, &new("task:y"))?;
+            let y = crate::task::create(conn, meta, &new("task:y"))?;
             placement::place(conn, meta, y, b_leaf, PlacementRole::Reference, 0)?;
-            let z = upsert(conn, meta, &new("task:z"))?;
+            let z = crate::task::create(conn, meta, &new("task:z"))?;
             placement::place(conn, meta, z, b_leaf, PlacementRole::Reference, 0)?;
             conn.execute("UPDATE items SET status = 'done' WHERE id = ?1", [z.get()])?;
             Ok(())
@@ -882,6 +874,18 @@ mod tests {
                 ("doc:c", "document"),
                 ("note:d", "note"),
             ] {
+                if kind == "task" {
+                    // A task is created by `task::create`, homed here (it is filed under the Open
+                    // work inbox of the repo the home names).
+                    let mut task = crate::task::NewTask::new(
+                        uid,
+                        uid,
+                        crate::task::Under::Default { ambient_repo: None },
+                    );
+                    task.home = "repos/jkb/notes".to_owned();
+                    crate::task::create(conn, meta, &task)?;
+                    continue;
+                }
                 let id = upsert(
                     conn,
                     meta,
@@ -954,19 +958,15 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let item = db
             .write_txn("t", |conn, meta| {
-                let leaf = ensure(conn, meta, "tasks/mono/backend")?;
-                let item = upsert(
-                    conn,
-                    meta,
-                    &NewItem {
-                        uid: "task:1".to_owned(),
-                        kind: "task".to_owned(),
-                        content: None,
-                        content_hash: None,
-                        mime: None,
-                    },
-                )?;
-                placement::place(conn, meta, item, leaf, PlacementRole::Primary, 0)?;
+                let item = {
+                    let mut t = crate::task::NewTask::new(
+                        "task:1",
+                        "task:1",
+                        crate::task::Under::inbox_of("t"),
+                    );
+                    t.home = "tasks/mono/backend".to_owned();
+                    crate::task::create(conn, meta, &t)?
+                };
                 Ok(item)
             })
             .unwrap();

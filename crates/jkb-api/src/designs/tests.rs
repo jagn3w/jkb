@@ -11,7 +11,7 @@ use crate::rbac::{Caller, Tickets};
 use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response};
 
 fn call(b: &LocalBackend, r: Value) -> Result<Response, ApiError> {
-    b.call(serde_json::from_value(r).expect("request parses"))
+    b.call(serde_json::from_value(crate::test_repo::in_repo(b, r)).expect("request parses"))
 }
 
 #[allow(clippy::needless_pass_by_value)] // every call site builds its request inline

@@ -1651,11 +1651,16 @@ mod tests {
         use std::io::Write as _;
         let dir = tempfile::tempdir().unwrap();
         let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        // The repo `t` the requests' homes name is one this knowledge base knows.
+        db.write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+        })
+        .unwrap();
         let token_path = dir.path().join("token");
         let cfg = super::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token_path.clone());
         let handle = super::spawn(db.clone(), &cfg).unwrap();
         let token = crate::token::read(&token_path).unwrap();
-        let body = serde_json::json!({ "op": "task.add", "text": format!("{SLOW_TEXT} hung-up") })
+        let body = serde_json::json!({ "op": "task.add", "text": format!("{SLOW_TEXT} hung-up"), "home": "tasks/repos/t/inbox" })
             .to_string();
         let mut raw = std::net::TcpStream::connect(handle.addr).unwrap();
         write!(
@@ -1822,6 +1827,11 @@ mod tests {
     fn a_permit_outlives_a_cancelled_request_until_its_call_returns() {
         let dir = tempfile::tempdir().unwrap();
         let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        // The repo `t` the requests' homes name is one this knowledge base knows.
+        db.write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+        })
+        .unwrap();
         let backend = backend_for(&db, 1024 * 1024);
         let reads = backend.reads().clone();
         let (held, holding) = std::sync::mpsc::channel();
@@ -1897,6 +1907,11 @@ mod tests {
     fn the_daemon_s_reads_are_served_apart_from_its_writes() {
         let dir = tempfile::tempdir().unwrap();
         let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        // The repo `t` the requests' homes name is one this knowledge base knows.
+        db.write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+        })
+        .unwrap();
         let backend = backend_for(&db, 1024);
         let refused = backend
             .reads()
@@ -1915,6 +1930,11 @@ mod tests {
         use std::sync::atomic::Ordering;
         let dir = tempfile::tempdir().unwrap();
         let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        // The repo `t` the requests' homes name is one this knowledge base knows.
+        db.write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+        })
+        .unwrap();
         let token_path = dir.path().join("token");
         let cfg = super::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token_path.clone());
         let handle = super::spawn(db, &cfg).unwrap();
@@ -1925,7 +1945,7 @@ mod tests {
                 .bearer_auth(&token)
                 .header("content-type", "application/json")
                 .header("idempotency-key", "k")
-                .body(serde_json::json!({ "op": "task.add", "text": PANIC_TEXT }).to_string())
+                .body(serde_json::json!({ "op": "task.add", "text": PANIC_TEXT , "home": "tasks/repos/t/inbox" }).to_string())
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
                 .unwrap()
@@ -1946,6 +1966,11 @@ mod tests {
     fn a_waiter_on_an_original_that_started_and_failed_is_told_it_may_have_applied() {
         let dir = tempfile::tempdir().unwrap();
         let db = jkb_core::Db::open(dir.path().join("jkb.db")).unwrap();
+        // The repo `t` the requests' homes name is one this knowledge base knows.
+        db.write_txn("t", |c, m| {
+            jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+        })
+        .unwrap();
         let token_path = dir.path().join("token");
         let cfg = super::ServeConfig::new("127.0.0.1:0".parse().unwrap(), token_path.clone());
         let handle = super::spawn(db, &cfg).unwrap();
@@ -1957,7 +1982,7 @@ mod tests {
                 .bearer_auth(&token)
                 .header("content-type", "application/json")
                 .header("idempotency-key", "k")
-                .body(serde_json::json!({ "op": "task.add", "text": text }).to_string())
+                .body(serde_json::json!({ "op": "task.add", "text": text , "home": "tasks/repos/t/inbox" }).to_string())
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
                 .unwrap();

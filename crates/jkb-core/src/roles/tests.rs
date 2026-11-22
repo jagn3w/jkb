@@ -13,8 +13,16 @@ use jkb_types::Error as TypeError;
 fn tasks(db: &Db) -> (ItemId, ItemId) {
     db.write_txn("test", |c, m| {
         Ok((
-            create(c, m, &NewTask::new("task:a", "A"))?,
-            create(c, m, &NewTask::new("task:b", "B"))?,
+            create(
+                c,
+                m,
+                &NewTask::new("task:a", "A", crate::task::Under::inbox_of("t")),
+            )?,
+            create(
+                c,
+                m,
+                &NewTask::new("task:b", "B", crate::task::Under::inbox_of("t")),
+            )?,
         ))
     })
     .unwrap()
@@ -218,18 +226,56 @@ fn an_attested_agent_binds_to_its_first_task_and_cannot_hop() {
     assert_eq!(db.read(|c| agent_binding(c, "s1", "ag1")).unwrap(), Some(a));
 }
 
+/// A binding is a worker's scope, so it is to a task only: a design, plan or plan step — each a
+/// container of tasks — is refused, and nothing is bound.
+#[test]
+fn an_attested_agent_binds_to_nothing_but_a_task() {
+    let db = Db::open_in_memory().unwrap();
+    let (a, _) = tasks(&db);
+    let containers = db
+        .write_txn("test", |c, m| {
+            let d = crate::design::create(c, m, "app", "D", "Body.")?.uid;
+            let p = crate::design::plan::create(c, m, &d, "P", &["one".to_owned()])?;
+            let mut out = Vec::new();
+            for uid in [&d, &p.uid, &p.steps[0].uid] {
+                out.push(crate::item::id_for_uid(c, uid)?.unwrap());
+            }
+            Ok(out)
+        })
+        .unwrap();
+    for id in containers {
+        let got = db
+            .write_txn("test", move |c, m| bind_agent(c, m, "s1", "ag1", id))
+            .unwrap();
+        assert_eq!(got, Bound::NotATask);
+        assert_eq!(db.read(|c| agent_binding(c, "s1", "ag1")).unwrap(), None);
+    }
+    let first = db
+        .write_txn("test", move |c, m| bind_agent(c, m, "s1", "ag1", a))
+        .unwrap();
+    assert_eq!(first, Bound::Now(a), "a refused bind decided nothing");
+}
+
 #[test]
 fn scope_reaches_subtasks_and_the_task_s_own_findings_and_nothing_else() {
     let db = Db::open_in_memory().unwrap();
     let (a, b) = tasks(&db);
     let (sub, finding, stray) = db
         .write_txn("test", move |c, m| {
-            let sub = create(c, m, &NewTask::new("task:a1", "A1"))?;
+            let sub = create(
+                c,
+                m,
+                &NewTask::new("task:a1", "A1", crate::task::Under::inbox_of("t")),
+            )?;
             crate::task::add_subtask(c, m, a, sub)?;
-            let mut f = NewTask::new("task:f", "a finding");
+            let mut f = NewTask::new("task:f", "a finding", crate::task::Under::inbox_of("t"));
             f.home = "reviews/a-1/must-fix".into();
             let finding = create(c, m, &f)?;
-            let mut s = NewTask::new("task:s", "someone else's finding");
+            let mut s = NewTask::new(
+                "task:s",
+                "someone else's finding",
+                crate::task::Under::inbox_of("t"),
+            );
             s.home = "reviews/a-10/must-fix".into();
             let stray = create(c, m, &s)?;
             crate::reviews::record(

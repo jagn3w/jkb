@@ -140,8 +140,8 @@ mod tests {
         // applications unreusable ids; V030 records each vector's provenance (content_rev,
         // chunked_rev, vector_sources); V031 run requests (exec_requests, exec_output); V032 a
         // strategy definition's description (workflow_strategies.describe); V033 tags every review
-        // finding `finding=review`.
-        assert_eq!(user_version, 33);
+        // finding `finding=review`; V034 links each recorded finding `found_in` its task.
+        assert_eq!(user_version, 34);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -309,8 +309,8 @@ mod tests {
         // applications unreusable ids; V030 records each vector's provenance (content_rev,
         // chunked_rev, vector_sources); V031 run requests (exec_requests, exec_output); V032 a
         // strategy definition's description (workflow_strategies.describe); V033 tags every review
-        // finding `finding=review`.
-        assert_eq!(user_version, 33);
+        // finding `finding=review`; V034 links each recorded finding `found_in` its task.
+        assert_eq!(user_version, 34);
         assert_eq!(
             crate::supported_schema_version(),
             user_version,

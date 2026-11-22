@@ -177,6 +177,11 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
 - **Writes go through the single writer-actor**; core is synchronous, async only
   at the edges (ollama HTTP, file-watching, MCP).
 - **Indexes are derived** — anything in an index must be rebuildable from the VFS.
+- **Every task you file names its plan step.** `jkb task add … --under <step>`: use the step of the
+  work that surfaced it (`jkb task show <uid>` prints `plan:` with the step uid), or else this repo's
+  triage step, `step:inbox@jkb`, which the operator triages. It is not a parking place.
+  `--backlog` sets the home, not the step, so it goes with `--under <step>`. Workers never file:
+  they report `FOLLOW-UP` lines to their coordinator.
 - **Tests:** unit + integration + `proptest` for load-bearing invariants.
 - **Self-review before the reviewer, and reach high confidence first.** `/review` costs one to
   four agents per round. Run its step 0 — did every edit land, does each comment match its code, can each guard fire, who else implements this
@@ -224,8 +229,8 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
 - **Migrations:** add `V00N__<name>.sql` under `crates/jkb-core/src/migrations/`
   (refinery embeds them at compile time). Virtual tables (vec0/FTS5) are
   **additive** — never `ALTER` a populated one. `rusqlite` is pinned **once** in
-  `[workspace.dependencies]` (0.39, `bundled`) and every SQLite-touching crate uses
-  `rusqlite = { workspace = true }`; 0.39 matches refinery **0.9.2** so they share one
+  `[workspace.dependencies]` (0.41, `bundled`) and every SQLite-touching crate uses
+  `rusqlite = { workspace = true }`; 0.41 matches refinery **0.10** so they share one
   `libsqlite3-sys`. Don't add a per-crate version — desyncing reintroduces the
   `links = "sqlite3"` conflict.
 - **Lints gotchas:** `clippy::doc_markdown` fires on bare code identifiers and

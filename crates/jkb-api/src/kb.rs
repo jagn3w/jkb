@@ -445,6 +445,34 @@ pub struct SubtaskSummary {
     pub status: Option<String>,
 }
 
+/// A review finding filed about a task (linked to it `found_in`), as `task.show` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingSummary {
+    /// Its uid.
+    pub uid: String,
+    /// Its label (as [`SubtaskSummary::title`]).
+    pub title: String,
+    /// Its status.
+    pub status: Option<String>,
+    /// Its priority.
+    pub priority: Option<i64>,
+    /// The review round it belongs to: the namespace it was filed into, else the recorded round
+    /// whose snapshot holds it.
+    pub round: Option<String>,
+    /// Must-fix: as its recorded round's snapshot held it, else (not yet recorded) priority 1 or
+    /// above.
+    pub must_fix: bool,
+    /// The uid of the plan step it sits under now — a shelved one names its repo's Open work ›
+    /// Inbox.
+    pub step: Option<String>,
+    /// That step, as `<design title> › <step text>`, for display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_title: Option<String>,
+    /// The uid of the design its step belongs to, so a client can open it there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design: Option<String>,
+}
+
 /// An item a task sits under, as `task.show` names it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaceRef {
@@ -539,6 +567,14 @@ pub struct TaskDetail {
     /// daemon's answer.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_outside_tasks_file: bool,
+    /// The review findings filed about it (the sources of `found_in` edges into it), at any status,
+    /// by round in recording order. Absent when none, and from an older daemon's answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<FindingSummary>,
+    /// For a review finding: the tasks it was found in (its `found_in` edges). Absent when none,
+    /// and from an older daemon's answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub found_in: Vec<design::TaskRef>,
 }
 
 fn not_found(what: impl Into<String>) -> ApiError {
@@ -1323,9 +1359,10 @@ impl Embedder for NoEmbedder {
     }
 }
 
-/// `task.show`: a task (or any item a task reference names) in full, with its recent transitions and
-/// its subtasks — as many as fit `budget`. The task itself is shown whatever its size and is not
-/// charged, so `truncated` means exactly that subtasks were dropped.
+/// `task.show`: a task (or any item a task reference names) in full, with its recent transitions, its
+/// subtasks, the review findings filed about it and the tasks it was found in — the lists as many as
+/// fit `budget`, charged in that order. The task itself is shown whatever its size and is not
+/// charged, so `truncated` means exactly that list entries were dropped.
 ///
 /// # Errors
 /// [`ErrorCode::NotFound`] when the reference names no item; else a failed read.
@@ -1374,6 +1411,8 @@ pub fn task_show(
         place: design::plan::ancestry_of(conn, id)?.map(TaskPlacement::from),
         unresolved_needs: item::unresolved_needs(conn, id)?,
         needs_outside_tasks_file: false,
+        findings: Vec::new(),
+        found_in: Vec::new(),
     };
     detail.needs_outside_tasks_file = !detail.unresolved_needs.is_empty()
         && binding::serializer_for(conn, id)?.as_deref() != Some("tasks");
@@ -1391,7 +1430,72 @@ pub fn task_show(
         detail.subtasks.push(summary);
         true
     })?;
+    findings_into(conn, id, &mut detail, budget)?;
     Ok(detail)
+}
+
+/// `task.show`'s review provenance, charged to `budget` after the subtasks: the findings filed about
+/// task `id` (the sources of `found_in` edges into it) and the tasks it was found in.
+fn findings_into(
+    conn: &Connection,
+    id: ItemId,
+    detail: &mut TaskDetail,
+    budget: &mut Budget,
+) -> jkb_core::Result<()> {
+    if budget.exhausted() {
+        return Ok(());
+    }
+    let found = jkb_core::reviews::findings_of(conn, id)?;
+    let ids: Vec<ItemId> = found.iter().map(|f| f.id).collect();
+    let metas = item::get_many(conn, &ids)?;
+    for f in found {
+        let Some(m) = metas.get(&f.id) else { continue };
+        let ancestry = design::plan::ancestry_of(conn, f.id)?;
+        let (step, step_title, in_design) = match ancestry {
+            Some(design::plan::Ancestry {
+                step: Some(s),
+                design,
+                ..
+            }) => (
+                Some(s.step.uid.clone()),
+                Some(format!(
+                    "{} \u{203a} {}",
+                    item::title_from(&design.uid, Some(&design.text)),
+                    item::title_from(&s.step.uid, Some(&s.step.text))
+                )),
+                Some(design.uid),
+            ),
+            Some(a) => (None, None, Some(a.design.uid)),
+            None => (None, None, None),
+        };
+        let summary = FindingSummary {
+            title: label(&m.uid, m.content.as_deref()),
+            uid: m.uid.clone(),
+            status: m.status.clone(),
+            priority: m.priority,
+            round: f.round,
+            must_fix: f
+                .must_fix
+                .unwrap_or_else(|| jkb_core::reviews::is_must_fix(m.priority)),
+            step,
+            step_title,
+            design: in_design,
+        };
+        if !budget.take(&summary) {
+            return Ok(());
+        }
+        detail.findings.push(summary);
+    }
+    for t in design::plan::found_in_of(conn, &[id])?
+        .remove(&id)
+        .unwrap_or_default()
+    {
+        if !budget.take(&t) {
+            break;
+        }
+        detail.found_in.push(t);
+    }
+    Ok(())
 }
 
 /// `task.subtasks`: a task's contained children, shaped like `kb.ls` children, as many as fit
@@ -1442,6 +1546,8 @@ mod tests {
             place: None,
             unresolved_needs: Vec::new(),
             needs_outside_tasks_file: false,
+            findings: Vec::new(),
+            found_in: Vec::new(),
         };
         let sent = serde_json::to_value(&detail).unwrap();
         assert!(sent.get("place").is_none(), "{sent}");

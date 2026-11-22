@@ -4044,6 +4044,7 @@ mod tests {
                     &task::NewTask::from_quick_add(
                         "task:status-undo",
                         task::parse_quick_add("a task")?,
+                        crate::task::Under::inbox_of("t"),
                     ),
                 )
             })

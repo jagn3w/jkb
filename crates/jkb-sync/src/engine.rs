@@ -21,6 +21,7 @@ use globset::{Glob, GlobMatcher};
 use serde_json::json;
 use walkdir::WalkDir;
 
+use jkb_core::design::plan;
 use jkb_core::item::NewItem;
 use jkb_core::{
     binding, blob, containment, edge, item, mount, ns, placement, sync_state, tag, task, Db,
@@ -2243,17 +2244,21 @@ fn apply_doc(
     let mut declared_mirrors: HashMap<ItemId, HashSet<NamespaceId>> = HashMap::new();
     for it in &doc.items {
         let uri = item_uri(bare_uri, &it.local_id);
-        let home = it
+        let (home, home_path) = it
             .section
             .as_ref()
-            .and_then(|s| section_ns.get(s).copied())
-            .unwrap_or(file_ns);
+            .and_then(|s| {
+                section_ns
+                    .get(s)
+                    .map(|&id| (id, format!("{file_ns_path}/{s}")))
+            })
+            .unwrap_or_else(|| (file_ns, file_ns_path.clone()));
         let id = match existing.get(&it.local_id) {
             Some(&id) => {
                 update_item(conn, meta, id, it, home)?;
                 id
             }
-            None => create_item(conn, meta, ctx, it, &uri, home)?,
+            None => create_item(conn, meta, ctx, it, &uri, (home, &home_path), &file_ns_path)?,
         };
         let declared = declared_mirrors.entry(id).or_default();
         for m in &it.mirrors {
@@ -2297,7 +2302,7 @@ fn apply_doc(
     }
 
     // Pass 2 — reconcile edges now that every local_id resolves to an item.
-    let parked = reconcile_edges(conn, meta, doc, &resolved, &existing)?;
+    let parked = reconcile_edges(conn, meta, doc, &resolved, &existing, &file_ns_path)?;
     let mut doc = doc.clone();
     park_cycle_closing_needs(conn, meta, &mut doc, &resolved, &parked)?;
 
@@ -2472,16 +2477,22 @@ fn retire_undeclared_sections(
     Ok(())
 }
 
-/// Create a new item for a [`SyncItem`], placing it under its home namespace and
-/// binding it to `uri`. `content_hash` is left `None` so two identical-title tasks do
+/// Create a new item for a [`SyncItem`], placing it under its home namespace (`home`, with its
+/// path) and binding it to `uri`. `content_hash` is left `None` so two identical-title tasks do
 /// not dedup-collapse into one item (their `local_id`/uri is the real identity).
+///
+/// A task goes through [`task::create`], the one creator of a task, filed under the default step for
+/// its home ([`plan::step_for_home`]): a step its section or file is mapped to, else the Open work ›
+/// Inbox of the repo the file is in. An indented line is moved under its file parent afterwards, by
+/// [`reconcile_containment`]. A file in no repo with no mapping is refused, naming how to map it.
 fn create_item(
     conn: &Connection,
     meta: &WriteMeta,
     ctx: &Ctx,
     it: &SyncItem,
     uri: &str,
-    home: NamespaceId,
+    (home, home_path): (NamespaceId, &str),
+    file_ns_path: &str,
 ) -> Result<ItemId> {
     // A line deleted from the file is detached, not deleted (design D25) — and it keeps its
     // file-derived uid. Re-adding that same line mints the same uid, so a plain insert hits
@@ -2489,6 +2500,9 @@ fn create_item(
     // and the better semantics: deleting a line and putting it back restores the same item,
     // with its edges, tags and history intact, rather than a stranger wearing its name.
     let existing = item::id_for_uid(conn, uri)?;
+    if existing.is_none() && it.kind == "task" {
+        return create_task(conn, meta, ctx, it, uri, (home, home_path), file_ns_path);
+    }
     let id = match existing {
         Some(id) => id,
         None => item::upsert(
@@ -2528,6 +2542,78 @@ fn create_item(
     // eventually not have.
     tag::reconcile_tags(conn, meta, id, &it.tags)?;
     Ok(id)
+}
+
+/// [`create_item`] for a new task: [`task::create`] writes the row, its home, its binding (before
+/// any status, so [`set_task_columns`]' status write is the file's), and its step; the position in
+/// the home, the tags and the columns follow as for any line.
+fn create_task(
+    conn: &Connection,
+    meta: &WriteMeta,
+    ctx: &Ctx,
+    it: &SyncItem,
+    uri: &str,
+    (home, home_path): (NamespaceId, &str),
+    file_ns_path: &str,
+) -> Result<ItemId> {
+    check_has_step(conn, home_path, file_ns_path)?;
+    let mut spec = task::NewTask::new(
+        uri,
+        it.content.clone(),
+        task::Under::Default { ambient_repo: None },
+    );
+    home_path.clone_into(&mut spec.home);
+    uri.clone_into(&mut spec.binding);
+    let id = task::create(conn, meta, &spec)?;
+    binding::set(
+        conn,
+        meta,
+        id,
+        uri,
+        Some(sync_mode_of(&ctx.sync_mode)),
+        None,
+    )?;
+    task::set_primary_home(conn, meta, id, home, it.position)?;
+    set_task_columns(conn, meta, id, it)?;
+    tag::reconcile_tags(conn, meta, id, &it.tags)?;
+    Ok(id)
+}
+
+/// The step a file task homed at `home` goes to by default ([`plan::step_for_home`]), or `None`
+/// when its home names no repo and is mapped to no step.
+fn default_step(conn: &Connection, meta: &WriteMeta, home: &str) -> Result<Option<ItemId>> {
+    #[cfg(test)]
+    step_probe::LOOKUPS.with(|n| n.set(n.get() + 1));
+    if mount::repo_of_namespace(home).is_none() && plan::mapped_step(conn, home)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(plan::step_for_home(conn, meta, home, None)?))
+}
+
+/// How many default-step lookups ran, on this (the writer's) thread: what proves a pass looks each
+/// home up once.
+#[cfg(test)]
+mod step_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static LOOKUPS: Cell<usize> = const { Cell::new(0) };
+    }
+}
+
+/// Refuse a file task homed at `home_path` that no step could be found for — no mapping at or above
+/// its namespace, and no repo — with the refusal every new task gets, plus how to map the file.
+fn check_has_step(conn: &Connection, home_path: &str, file_ns_path: &str) -> Result<()> {
+    if mount::repo_of_namespace(home_path).is_none()
+        && plan::mapped_step(conn, home_path)?.is_none()
+    {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "{} — or map this file's tasks to a step: `jkb ns mk {file_ns_path}`, then `jkb ns step \
+             {file_ns_path} <step>`",
+            plan::NO_REPO
+        ))));
+    }
+    Ok(())
 }
 
 /// Update an existing item to match a [`SyncItem`]: content, task columns, tags, and
@@ -2606,6 +2692,7 @@ fn reconcile_edges(
     doc: &SyncDoc,
     resolved: &HashMap<String, ItemId>,
     existing: &HashMap<String, ItemId>,
+    file_ns_path: &str,
 ) -> Result<Vec<(String, String)>> {
     // The file's items in file order, so which of two cycle-closing needs is parked does not
     // depend on a hash map's order.
@@ -2666,7 +2753,7 @@ fn reconcile_edges(
             edge::link(conn, meta, src, dst, kind, None)?;
         }
     }
-    reconcile_containment(conn, meta, doc, resolved, &ids, &file)?;
+    reconcile_containment(conn, meta, doc, resolved, &ids, &file, file_ns_path)?;
     Ok(parked)
 }
 
@@ -2712,6 +2799,14 @@ impl FileEdges {
 /// for that task, since a task has one container; then [`task::set_container`] replaces it and
 /// unlinks its `parent_of` edge too, the one outside edge an import removes (the file declared a
 /// different parent, so the edge contradicts it), which [`FileEdges::owns`] does not otherwise own.
+///
+/// **Every parent is planned before its child is contained**, because a task's container must be a
+/// plan step or a task under one ([`task::set_container`]): (a) the rows the file no longer declares
+/// go; (b) each file task with no declared file parent, whose container is none, unplanned, or a
+/// repo's Open work › Inbox, goes to its default step ([`plan::step_for_home`]) — a planned container
+/// outside the file stays, since that is a task someone moved by hand ([`plan::homes_tasks`]); (c)
+/// declared children go under their file parents in file order, a parent's line before its
+/// children's.
 fn reconcile_containment(
     conn: &Connection,
     meta: &WriteMeta,
@@ -2719,6 +2814,7 @@ fn reconcile_containment(
     resolved: &HashMap<String, ItemId>,
     ids: &[ItemId],
     file: &FileEdges,
+    file_ns_path: &str,
 ) -> Result<()> {
     let order: HashMap<ItemId, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
     let mut declared: HashMap<ItemId, ItemId> = HashMap::new();
@@ -2744,6 +2840,46 @@ fn reconcile_containment(
             }
         }
     }
+    // (b) Top-level tasks to their default step, in file order. The step is looked up once per
+    // home in a pass: a file's lines share a handful of sections, and every save of a settled file
+    // would otherwise repeat the whole lookup for each line only to find it where it already is.
+    let mut defaults: HashMap<String, Option<ItemId>> = HashMap::new();
+    for &child in ids {
+        if declared.contains_key(&child) || item_kind(conn, child)?.as_deref() != Some("task") {
+            continue;
+        }
+        let cur = containment::parent(conn, child)?;
+        let planned = match cur {
+            Some(cur) => plan::homes_tasks(conn, cur)?,
+            None => false,
+        };
+        let in_triage = match cur {
+            Some(cur) => item::get(conn, cur)?.is_some_and(|m| plan::is_triage_step_uid(&m.uid)),
+            None => false,
+        };
+        if planned && !in_triage {
+            continue; // moved by hand to a real step
+        }
+        let home = item::primary_namespace(conn, child)?.unwrap_or_else(|| file_ns_path.to_owned());
+        let step = if let Some(step) = defaults.get(&home) {
+            *step
+        } else {
+            let step = default_step(conn, meta, &home)?;
+            defaults.insert(home.clone(), step);
+            step
+        };
+        let Some(step) = step else {
+            if planned {
+                continue; // in an Inbox, and its home names no step to move it to
+            }
+            check_has_step(conn, &home, file_ns_path)?;
+            continue;
+        };
+        if cur != Some(step) {
+            task::add_subtask(conn, meta, step, child)?;
+        }
+    }
+    // (c) Declared children under their file parents.
     let mut children: Vec<(ItemId, ItemId)> = declared.into_iter().collect();
     children.sort_unstable_by_key(|&(c, _)| order.get(&c).copied());
     let mut next_position: HashMap<ItemId, i64> = HashMap::new();
@@ -3247,6 +3383,7 @@ fn edge_owner(e: &SyncEdge) -> (&str, &str) {
         | EdgeType::Answers
         | EdgeType::Spawns
         | EdgeType::DiscoveredFrom
+        | EdgeType::FoundIn
         | EdgeType::MemberOf
         | EdgeType::Tests
         | EdgeType::Verifies
@@ -3647,7 +3784,7 @@ mod edge_ownership {
 #[cfg(test)]
 mod archive_skip {
     use super::archive_probe::ARCHIVE_WRITES;
-    use super::sync;
+    use super::{plan, sync};
     use jkb_core::{blob, ns, Db};
     use jkb_types::{ConflictPolicy, SyncMode};
 
@@ -3684,7 +3821,11 @@ mod archive_skip {
                 Some("**/*.md"),
                 None,
                 ConflictPolicy::KbWins,
-            )
+            )?;
+            // In no repo: its tasks are filed under a step it is mapped to.
+            plan::triage_step(conn, meta, "t")?;
+            plan::map_namespace(conn, meta, "docs/plan", Some(&plan::triage_step_uid("t")))?;
+            Ok(())
         })
         .unwrap();
         sync(&db, "docs/plan").unwrap();
@@ -3732,5 +3873,52 @@ mod archive_skip {
         sync(&db, "docs/plan").unwrap();
         assert_eq!(archive_writes(), before + 1, "new bytes must be archived");
         assert!(archived(&db, edited.as_bytes()));
+    }
+}
+
+#[cfg(test)]
+mod default_step_memo {
+    use super::step_probe::LOOKUPS;
+    use super::sync;
+    use jkb_core::{ns, Db};
+    use jkb_types::{ConflictPolicy, SyncMode};
+
+    /// A pass looks up each home's default step once, not once per line: a settled file of many
+    /// top-level lines in one section costs one lookup per save.
+    #[test]
+    fn a_pass_looks_up_each_homes_step_once() {
+        let dir =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+        let path = dir.path().join("tasks.md");
+        let lines: String = (0..20).fold(String::new(), |mut s, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(s, "- [ ] line {i} ^l{i}");
+            s
+        });
+        std::fs::write(&path, format!("## Work\n{lines}")).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let backing = format!("file://{}", dir.path().to_string_lossy());
+        db.write_txn("t", move |conn, meta| {
+            let ns_id = ns::ensure(conn, meta, "repos/app")?;
+            jkb_core::mount::create(
+                conn,
+                meta,
+                ns_id,
+                &backing,
+                SyncMode::Bidirectional,
+                "tasks",
+                Some("**/*.md"),
+                None,
+                ConflictPolicy::Manual,
+            )
+        })
+        .unwrap();
+        // The writer thread holds the probe; read it there.
+        let lookups = |db: &Db| db.read(|_| Ok(LOOKUPS.with(std::cell::Cell::get))).unwrap();
+        sync(&db, "repos/app").unwrap();
+        let before = lookups(&db);
+        std::fs::write(&path, format!("## Work\n{lines}- [ ] one more ^more\n")).unwrap();
+        sync(&db, "repos/app").unwrap();
+        assert_eq!(lookups(&db) - before, 1, "one home, one lookup");
     }
 }

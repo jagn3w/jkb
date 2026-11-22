@@ -6,7 +6,7 @@ use crate::{ApiError, Backend, ErrorCode, LocalBackend, Response};
 use jkb_core::Db;
 
 fn call(b: &LocalBackend, r: serde_json::Value) -> Result<Response, ApiError> {
-    b.call(serde_json::from_value(r).expect("request parses"))
+    b.call(serde_json::from_value(crate::test_repo::in_repo(b, r)).expect("request parses"))
 }
 
 fn add(b: &LocalBackend, text: &str) -> String {
@@ -155,7 +155,11 @@ fn the_claims_are_paged() {
     db.write_txn("t", |c, m| {
         for i in 0..=super::CLAIMS_PAGE {
             let uid = format!("task:t{i}");
-            let id = jkb_core::task::create(c, m, &jkb_core::task::NewTask::new(&uid, "t"))?;
+            let id = jkb_core::task::create(
+                c,
+                m,
+                &jkb_core::task::NewTask::new(&uid, "t", jkb_core::task::Under::inbox_of("t")),
+            )?;
             jkb_core::claim::claim(c, m, id, "box:1")?;
         }
         Ok(())

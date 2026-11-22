@@ -143,6 +143,11 @@ pub struct Query {
     /// `is:claimed` / `is:unclaimed` — filter on live agent claims (design D27.1).
     /// `None` means "either".
     pub claimed: Option<bool>,
+    /// `is:unplanned` (`Some(true)`) — a non-terminal task no execution plan's step contains at
+    /// any depth ([`crate::design::plan::UNPLANNED_SQL`]); `-is:unplanned` (`Some(false)`) — its
+    /// exact complement, so `kind:task status:open -is:unplanned` is the planned open work.
+    /// `None` means "either".
+    pub unplanned: Option<bool>,
     /// `blocks:<uid>` — items that block the item with this uid.
     pub blocks: Option<String>,
     /// The bare/quoted words for FTS `match`, as typed: [`Query::evaluate`] quotes each word
@@ -365,7 +370,7 @@ impl Query {
     }
 
     /// Predicates over the edge graph and claim state: `is:ready`, `is:frontier`,
-    /// `is:tombstone`, `is:claimed`/`is:unclaimed`, `blocks:`.
+    /// `is:tombstone`, `is:claimed`/`is:unclaimed`, `is:unplanned`/`-is:unplanned`, `blocks:`.
     fn push_graph_clauses(&self, clauses: &mut Vec<String>, params: &mut Vec<Value>) {
         if self.ready {
             // A task is ready if its own status is non-terminal and every `depends_on`
@@ -437,6 +442,16 @@ impl Query {
                   ))"
                 .to_owned(),
             );
+        }
+        if let Some(unplanned) = self.unplanned {
+            // The walk a plan's `archived` uses, from every step; it binds no parameter, so it
+            // cannot shift the anonymous `?` bindings around it.
+            let sql = crate::design::plan::UNPLANNED_SQL;
+            clauses.push(if unplanned {
+                sql.to_owned()
+            } else {
+                format!("NOT {sql}")
+            });
         }
         if let Some(claimed) = self.claimed {
             clauses.push(if claimed {

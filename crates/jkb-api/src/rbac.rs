@@ -266,6 +266,7 @@ impl Request {
             | Self::TaskClaims { .. }
             | Self::KbHealth {}
             | Self::TaskStaging { .. }
+            | Self::TaskUnplanned { .. }
             | Self::ItemShow { .. }
             | Self::KbRelated { .. }
             | Self::KbBlobs { .. }
@@ -388,6 +389,7 @@ impl Request {
             | Self::LeaseBreak { .. }
             | Self::ItemRm { .. }
             | Self::NsMv { .. }
+            | Self::NsStep { .. }
             | Self::MqCompact { .. }
             | Self::RoleMap { .. }
             | Self::RoleRotateContainer { .. }
@@ -463,6 +465,7 @@ impl Request {
             | Self::RemovalDrop { .. }
             | Self::TaskReclaim { .. }
             | Self::NsMv { .. }
+            | Self::NsStep { .. }
             | Self::MqCompact { .. }
             | Self::RoleMap { .. }
             | Self::RoleRotateContainer { .. }
@@ -527,6 +530,7 @@ impl Request {
             | Self::TaskClaims { .. }
             | Self::KbHealth {}
             | Self::TaskStaging { .. }
+            | Self::TaskUnplanned { .. }
             | Self::ItemShow { .. }
             | Self::KbRelated { .. }
             | Self::KbBlobs { .. }
@@ -1003,6 +1007,14 @@ pub enum Admit {
     },
 }
 
+/// The refusal of a caller held to one task whose op names `reference`, outside that task.
+fn out_of_scope(op: &str, label: &str, reference: &str) -> ApiError {
+    forbidden(format!(
+        "`{op}` refused: {label} is scoped to another task, and `{reference}` is not it, one of its \
+         subtasks, or one of its findings"
+    ))
+}
+
 fn deny(no: &Refusal, op: &str) -> ApiError {
     forbidden(format!("`{op}` refused: {no}"))
 }
@@ -1133,6 +1145,18 @@ pub fn authorize(
         Ok(r) => r,
         Err(admit) => return Ok(admit),
     };
+    // A repo's triage step is never in a worker's scope, whether it exists or the op would create it
+    // on demand (`plan::resolve_parent_ref`). Judged here, by the name, before anything resolves,
+    // because the paths below disagree about it: a scoped caller is refused an existing one by
+    // `in_scope`, but an attested subagent not yet bound would be admitted and **bound to the
+    // step** (`BindThenRun` — `roles::bind_agent` binds whatever item it is given), putting every
+    // task in the inbox in its scope. A step is only ever named by its uid (`task::resolve_ref`
+    // looks a reference with a `:` up as one), so the name is the whole test.
+    if jkb_core::design::plan::is_triage_step_uid(reference)
+        && (principal.scope.is_some() || principal.attested_agent().is_some())
+    {
+        return Err(out_of_scope(op, &principal.label, reference));
+    }
     let Some(target) = task::resolve_ref(conn, reference)? else {
         // Nothing to scope against; the op itself answers `not_found`.
         return Ok(Admit::Run);
@@ -1143,11 +1167,7 @@ pub fn authorize(
     match (principal.scope, principal.attested_agent()) {
         (Some(scope), _) => {
             if !roles::in_scope(conn, scope, target)? {
-                return Err(forbidden(format!(
-                    "`{op}` refused: {} is scoped to another task, and `{reference}` is not it, one \
-                     of its subtasks, or one of its findings",
-                    principal.label
-                )));
+                return Err(out_of_scope(op, &principal.label, reference));
             }
             Ok(Admit::Run)
         }

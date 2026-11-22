@@ -64,7 +64,8 @@ findings_ns="repos/$repo/codereviews/$(date +%Y%m%d-%H%M%S)-$(printf '%s' "$bran
 ```sh
 jkb workflow agent show review-coordinator --var repo="$(git rev-parse --show-toplevel)" \
   --var range_desc="<the range, or 'the working tree'>" --var stat_cmd="<stat_cmd>" \
-  --var diff_cmd="<diff_cmd>" --var findings_ns="$findings_ns" --var focus_block="<focus_block>"
+  --var diff_cmd="<diff_cmd>" --var findings_ns="$findings_ns" --var focus_block="<focus_block>" \
+  --var triage_step="step:inbox@$repo"
 ```
 
 Follow what it prints. It tells you how to fill the reviewers' prompts, when to split, and how
@@ -74,8 +75,9 @@ to file the pre-existing findings yourself.
 
 Relay the report:
 - **Findings for this change:** grouped by severity, each as `file:line` · summary.
-- **Pre-existing findings:** each with its backlog uid. If any of them is a must-fix, say so in a
-  sentence. The branch can land over it, and somebody should still know it is there.
+- **Pre-existing findings:** each with the uid it was filed as, under `step:inbox@$repo` (Open work ›
+  Inbox, for the operator to triage). If any of them is a must-fix, say so in a sentence. The
+  branch can land over it, and somebody should still know it is there.
 - **Where the findings are:** `$findings_ns`, which you can browse under `tasks/<repo>/codereviews/…`.
 - **Whether the branch can land:** it can when no must-fix finding for this change is open
   (`jkb task land <uid>`). Otherwise, name what blocks it.

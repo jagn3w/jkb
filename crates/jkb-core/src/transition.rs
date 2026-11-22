@@ -103,6 +103,13 @@ pub fn perform(
         if *to == TaskStatus::Done && matches!(event, TaskEvent::Land | TaskEvent::ObservedLanded) {
             crate::workflow::store::follow_landing(conn, meta, task)?;
         }
+        // A finished task's still-open review findings leave its plan step for the repo's Inbox:
+        // here, because every way a task finishes comes through this function. Only on arriving
+        // at a terminal status, so a re-run (a terminal self-loop) never re-shelves a finding
+        // someone moved back since.
+        if to.is_terminal() && !from.is_terminal() {
+            crate::reviews::shelve_open_findings(conn, meta, task)?;
+        }
     }
     Ok(outcome)
 }
@@ -808,7 +815,11 @@ mod tests {
 
     fn a_task(db: &Db) -> jkb_types::ItemId {
         db.write_txn("test", |conn, meta| {
-            create(conn, meta, &NewTask::new("task:t", "T"))
+            create(
+                conn,
+                meta,
+                &NewTask::new("task:t", "T", crate::task::Under::inbox_of("t")),
+            )
         })
         .expect("create")
     }
@@ -943,7 +954,11 @@ mod tests {
     fn make_task(db: &Db, uid: &str) -> jkb_types::ItemId {
         let uid = uid.to_owned();
         db.write_txn("t", move |conn, meta| {
-            create(conn, meta, &NewTask::new(uid, "T"))
+            create(
+                conn,
+                meta,
+                &NewTask::new(uid, "T", crate::task::Under::inbox_of("t")),
+            )
         })
         .expect("create")
     }

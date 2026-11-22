@@ -271,9 +271,47 @@ pub fn ambient_namespace(conn: &Connection, fs_path: &Path) -> Result<Option<Str
     Ok(covering(conn, fs_path, None)?.map(|(ns_path, _)| ns_path))
 }
 
+/// The repo a namespace is in: the segment after `repos/`, in `repos/<R>/…` or in the task form
+/// `tasks/repos/<R>/…`; `None` for a namespace outside both. **The one derivation** — the CLI's
+/// ambient repo, `jkb design`'s repo and the triage step a new task falls back to
+/// ([`crate::design::plan::step_for_home`]) all ask it.
+#[must_use]
+pub fn repo_of_namespace(namespace: &str) -> Option<String> {
+    let rest = namespace
+        .strip_prefix("repos/")
+        .or_else(|| namespace.strip_prefix("tasks/repos/"))?;
+    rest.split('/')
+        .next()
+        .filter(|r| !r.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ambient_namespace, create, get};
+    use super::{ambient_namespace, create, get, repo_of_namespace};
+
+    #[test]
+    fn only_a_namespace_under_repos_names_a_repo() {
+        for (ns, repo) in [
+            ("repos/jkb", "jkb"),
+            ("repos/jkb/crates", "jkb"),
+            ("tasks/repos/jkb/inbox", "jkb"),
+            ("tasks/repos/jkb", "jkb"),
+        ] {
+            assert_eq!(repo_of_namespace(ns).as_deref(), Some(repo), "{ns}");
+        }
+        for none in [
+            "references/papers",
+            "repos/",
+            "repos",
+            "jkb",
+            "tasks/inbox",
+            "tasks/jkb/inbox",
+            "tasks/repos/",
+        ] {
+            assert_eq!(repo_of_namespace(none), None, "{none}");
+        }
+    }
     use crate::{ns, Db};
     use jkb_types::{ConflictPolicy, SyncMode};
     use std::path::Path;

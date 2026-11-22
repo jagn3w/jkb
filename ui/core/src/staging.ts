@@ -56,6 +56,12 @@ export interface StagedTask {
    * go ahead. Rendered, never re-derived — see {@link landBlocker}.
    */
   readonly land_blocked: string | null;
+  /**
+   * What `jkb task land` would warn about and land anyway: the rest of the repo's unplanned tasks,
+   * as a count. A note, never a hold — the hold is {@link StagedTask.land_blocked}. Absent from a
+   * CLI that predates it.
+   */
+  readonly land_note?: string | null;
 }
 
 /** One staging branch and the tasks landing on it. */
@@ -94,6 +100,7 @@ export function formatTaskSummary(t: StagedTask): string {
   // label from properly reviewed rows for reasons that have nothing to do with the review.
   else if (t.reviewed && t.review_ok) parts.push("reviewed");
   if (t.review_waived) parts.push("review waived");
+  if (t.land_note) parts.push(t.land_note);
   return parts.join(" · ");
 }
 

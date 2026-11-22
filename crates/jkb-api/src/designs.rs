@@ -402,8 +402,8 @@ pub fn create(
 /// each of them as it lists now.
 ///
 /// # Errors
-/// The engine's refusal: an unknown or already retired design, or a task under it not yet done or
-/// cancelled (named).
+/// The engine's refusal: an unknown or already retired design, a task under it not yet done or
+/// cancelled (named), or a namespace mapped to one of its steps (named, with how to clear it).
 pub fn retire(conn: &Connection, meta: &WriteMeta, uid: &str) -> Result<Vec<Design>, ApiError> {
     Ok(design::retire(conn, meta, uid)?
         .into_iter()

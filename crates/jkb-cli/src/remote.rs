@@ -110,7 +110,7 @@ pub const fn support(command: &Command) -> Support {
         // Every tool an op; a file or URL is read here and only its text sent (design-s6-4.md K).
         | Command::Mcp
         | Command::Ns {
-            cmd: NsCmd::Ls { .. } | NsCmd::Mv { .. },
+            cmd: NsCmd::Ls { .. } | NsCmd::Mv { .. } | NsCmd::Step { .. },
         }
         | Command::Task {
             cmd:
@@ -118,6 +118,7 @@ pub const fn support(command: &Command) -> Support {
                 | TaskCmd::Show { .. }
                 | TaskCmd::Subtasks { .. }
                 | TaskCmd::Why { .. }
+                | TaskCmd::Unplanned { .. }
                 // The task-mutate set (tasks S6.2); `jkb_api::tasks` refuses the writes that would
                 // have this host's sync write a file outside the container's view.
                 | TaskCmd::Add { .. }

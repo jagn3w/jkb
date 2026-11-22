@@ -114,7 +114,9 @@ enum Command {
         /// Query DSL terms, e.g. `kind:task is:ready ns:tasks/**`. `phase:<p>[,<p>…]` matches a
         /// task's workflow phase (`design`, `design_review`, `implement`, `review`,
         /// `systemic_review`, `landable`, `landed`, `cancelled`; no workflow yet is `design`), and
-        /// `-phase:…` excludes those phases.
+        /// `-phase:…` excludes those phases. `is:unplanned` is every open task no execution plan's
+        /// step reaches, and `-is:unplanned` its complement. A term that starts with `-` reads as a
+        /// flag, so put the terms after `--`: `jkb query -- kind:task -is:unplanned`.
         #[arg(required = true, num_args = 1..)]
         terms: Vec<String>,
         /// Maximum number of results.
@@ -220,6 +222,9 @@ enum Command {
         rebuild: bool,
     },
     /// Health checks, integrity, and backup.
+    ///
+    /// Prints its whole report, then exits non-zero while any open task is under no plan step
+    /// (or when the daemon is too old to say). Its other findings are reported and exit 0.
     Doctor {
         /// Write a consistent copy of the database to this path first (replaced if it exists).
         #[arg(long)]
@@ -491,7 +496,8 @@ enum DesignCmd {
     },
     /// Retire a design and every design nested under it (operator): it leaves `ls`, the Design
     /// tab and `export --all`, and keeps its text, spans, plans and threads. Refused while a task
-    /// under it is not done or cancelled. `jkb design restore` or `jkb undo` takes it back.
+    /// under it is not done or cancelled, or while a namespace maps its new tasks to one of its
+    /// steps (`jkb ns step <path> --clear`). `jkb design restore` or `jkb undo` takes it back.
     Retire {
         /// The design.
         uid: String,
@@ -1149,6 +1155,19 @@ enum NsCmd {
     Mv { from: String, to: String },
     /// Remove an empty namespace (no child namespaces or item placements).
     Rm { path: String },
+    /// Map a namespace — a tasks.md section's, a file's or a mount's — to the plan step a new task
+    /// homed there with no `--under` is filed under (else its repo's Open work › Inbox). A synced
+    /// file's top-level tasks still in that Inbox move to the mapped step on its next import.
+    Step {
+        /// The namespace path.
+        path: String,
+        /// The plan step's uid (`jkb design plan ls <design>` lists them).
+        #[arg(required_unless_present = "clear")]
+        step: Option<String>,
+        /// Remove the mapping.
+        #[arg(long, conflicts_with = "step")]
+        clear: bool,
+    },
     /// Show or set a namespace's type. A type states what may live in the namespace
     /// (enforced on every write) and, for an investigation strategy, the verbs that
     /// drive it. Inherited by the whole subtree. With no `<type>`, shows the current one.
@@ -1178,12 +1197,18 @@ enum TagCmd {
 #[derive(Subcommand)]
 enum TaskCmd {
     /// Quick-add a task: `"text" !p1 @2026-07-15 +ns #facet=value ^dep-uid`.
+    ///
+    /// Every new task is filed under a plan step: the one `--under` names; else the step its home
+    /// namespace is mapped to (`jkb ns step`); else the Open work › Inbox of the repo its home names
+    /// (`repos/<repo>/…`); else that of the repo you are in. It is refused only when none of these
+    /// gives a step.
     Add {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
         /// Home the task in the ambient mount's backlog (`tasks/<mount>/.backlog`, e.g.
         /// `tasks/repos/jkb/.backlog`)
-        /// instead of its inbox. Outside a repo, confirms a global `tasks/.backlog`.
+        /// instead of its inbox; filed in the same Open work › Inbox step. Outside a repo (with
+        /// `--under`), confirms a global `tasks/.backlog`.
         #[arg(long)]
         backlog: bool,
         /// Force a synced file binding into the home's `tasks` mount (errors if none).
@@ -1192,9 +1217,10 @@ enum TaskCmd {
         /// Force a `managed:` (KB-only) binding, overriding mount inference.
         #[arg(long)]
         managed: bool,
-        /// Make this a subtask of `<uid>`: the parent leaves the ready frontier until every
-        /// subtask is terminal, so a task too big for one branch is split into the pieces
-        /// that get worked. Defaults the new task's home to the parent's.
+        /// File it under `<uid>`: a plan step, or a task under one (`jkb design plan ls <design>`
+        /// lists the steps). Under a task it is a subtask: the parent leaves the ready frontier
+        /// until every subtask is terminal, so a task too big for one branch is split into the
+        /// pieces that get worked. Defaults the new task's home to the parent's.
         #[arg(long)]
         under: Option<String>,
         /// Home the task in this namespace, taken **verbatim**.
@@ -1288,7 +1314,9 @@ enum TaskCmd {
     /// Move an existing task under another parent: a task, or an execution plan's step.
     ///
     /// Replaces its parent (one transaction; `jkb undo` restores the old one) and leaves its
-    /// placements and binding alone. A task bound to a synced file is refused — edit the file.
+    /// placements and binding alone. The new parent must be a plan step or a task under one. A
+    /// synced file's line moves only from a top-level line to a parent outside its file — to
+    /// re-indent it, edit the file.
     Move {
         /// The task uid.
         uid: String,
@@ -1530,6 +1558,14 @@ enum TaskCmd {
         /// The task uid.
         uid: String,
     },
+    /// List the open tasks no plan step reaches, grouped by repo — the set `jkb doctor` counts and
+    /// `is:unplanned` matches. Each escaped the write-side rule that files every task under a step;
+    /// `jkb task move <uid> --under <step>` plans one.
+    Unplanned {
+        /// Only this repo's (`repo=` key, the segment after `repos/`).
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Show or record the pull request that will prove this task's work landed.
     ///
     /// With no number, discovers it from the task's branch and records what it finds. The number
@@ -1549,6 +1585,10 @@ enum TaskReviewCmd {
     /// (`must-fix` blocks landing). Reads the reviewer workflow's result — a JSON object with a
     /// `findings` array of `{severity, summary, file, line, scenario, fix}` — from a file, or from
     /// stdin with `-`.
+    ///
+    /// The findings are filed under the reviewed task's plan step, beside it: the task this caller
+    /// is bound to, else the one `--task` names, else (neither, or a task under no step) the repo's
+    /// Open work › Inbox.
     File {
         /// The namespace to file them under, e.g. `repos/<repo>/codereviews/<folder>`. Must be new.
         #[arg(long)]
@@ -1556,6 +1596,10 @@ enum TaskReviewCmd {
         /// The workflow's result, as JSON (`-` for stdin).
         #[arg(long)]
         from: PathBuf,
+        /// The task this review is of, when this caller is bound to none: its findings go under that
+        /// task's plan step. A caller bound to a task files for that task only.
+        #[arg(long)]
+        task: Option<String>,
     },
     /// Record a review against a branch: tags every task working that branch with the
     /// reviewed SHA and the findings namespace, and moves `in_progress` to `needs_review`.
@@ -2182,7 +2226,7 @@ fn cmd_guide() {
 /// The item's primary (home) namespace path, if placed.
 fn cmd_ns(db: &Db, cmd: NsCmd, json: bool) -> Result<()> {
     match cmd {
-        NsCmd::Ls { .. } | NsCmd::Mv { .. } => {
+        NsCmd::Ls { .. } | NsCmd::Mv { .. } | NsCmd::Step { .. } => {
             anyhow::bail!("internal: an ns verb served as an op missed ops_cli's dispatch")
         }
         NsCmd::Mk { paths } => {
@@ -2716,6 +2760,7 @@ fn cmd_task(db: &Db, db_path: &Path, cmd: TaskCmd, json: bool) -> Result<()> {
         | TaskCmd::Show { .. }
         | TaskCmd::Subtasks { .. }
         | TaskCmd::Why { .. }
+        | TaskCmd::Unplanned { .. }
         | TaskCmd::Add { .. }
         | TaskCmd::Set { .. }
         | TaskCmd::Edit { .. }
@@ -3030,6 +3075,7 @@ struct Preflight {
 /// dirty check that used to sit on the other side of the lock closed no window and was simply a
 /// second wording of one rule.
 fn land_preflight(
+    kb: &session_cli::Kb<'_>,
     ctx: &repo::RepoCtx,
     uid: &str,
     facts: &jkb_api::sessions::TaskState,
@@ -3130,6 +3176,22 @@ fn land_preflight(
     // `containment`, which is where the answer lives (D35), so the row, the command and the
     // machine cannot disagree about which parents are held.
     let open_subtasks = facts.open_subtasks;
+    // Unplanned work: this task's own refuses (in `land_blocker`), the rest of the repo is warned
+    // about here — printed whether or not the land then goes ahead, and before anything moves. A
+    // finished task is not asked: `land_blocker`'s terminal arm refuses it first.
+    let unplanned = if state.is_terminal() {
+        None
+    } else {
+        staging::unplanned_facts(
+            kb,
+            &staging::unplanned_repo(&ctx.key),
+            std::slice::from_ref(&facts.uid),
+        )
+        .remove(&facts.uid)
+    };
+    if let Some(warning) = unplanned.as_ref().and_then(staging::UnplannedFact::warning) {
+        eprintln!("warning: {warning}");
+    }
     if let Some(reason) = staging::land_blocker(&staging::LandFacts {
         state,
         open_subtasks,
@@ -3139,6 +3201,7 @@ fn land_preflight(
         branch_exists: work_ref.is_some(),
         target_dirty: target_dirty.as_deref(),
         listing_failed: listing_failed.as_deref(),
+        unplanned: unplanned.as_ref(),
         // The review is enforced a moment later by `review::enforce`, which renders the same
         // verdict at length and is where `--no-review` records a waiver instead of refusing.
         verdict: None,
@@ -3252,7 +3315,7 @@ pub(crate) fn cmd_task_land(
         branch,
         onto,
         ahead,
-    } = land_preflight(&ctx, uid, &facts)?;
+    } = land_preflight(kb, &ctx, uid, &facts)?;
 
     // The review gate (design D38.5), before the graft: a refusal must not have moved a
     // branch first. Concerns and nits do not block — only must-fix findings do. A waiver is
@@ -5042,6 +5105,7 @@ pub(crate) fn cmd_staging_ls(kb: &session_cli::Kb<'_>, all: bool, json: bool) ->
                         "open_must_fix": t.open_must_fix,
                         "review_ok": t.review_ok,
                         "land_blocked": t.land_blocked,
+                        "land_note": t.land_note,
                     })).collect::<Vec<_>>(),
                 })
             })
@@ -5095,6 +5159,9 @@ pub(crate) fn cmd_staging_ls(kb: &session_cli::Kb<'_>, all: bool, json: bool) ->
             if let Some(reason) = &t.land_blocked {
                 println!("      cannot land: {reason}");
             }
+            if let Some(note) = &t.land_note {
+                println!("      note: {note}");
+            }
         }
     }
     Ok(())
@@ -5107,6 +5174,18 @@ fn truncate(s: &str, n: usize) -> String {
     }
     let head: String = s.chars().take(n.saturating_sub(1)).collect();
     format!("{head}…")
+}
+
+/// An in-memory database that knows repo `t` — its `repos/t` namespace exists, as a mount of it would
+/// make — for the tests that add tasks homed in `t`.
+#[cfg(test)]
+pub(crate) fn known_repo_t_db() -> jkb_core::Db {
+    let db = jkb_core::Db::open_in_memory().unwrap();
+    db.write_txn("t", |c, m| {
+        jkb_core::ns::ensure(c, m, "repos/t").map(|_| ())
+    })
+    .unwrap();
+    db
 }
 
 #[cfg(test)]
