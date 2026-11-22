@@ -229,8 +229,8 @@ and the MCP server. See `openspec/changes/jkb-v1-foundation/design.md`.
 - **Migrations:** add `V00N__<name>.sql` under `crates/jkb-core/src/migrations/`
   (refinery embeds them at compile time). Virtual tables (vec0/FTS5) are
   **additive** — never `ALTER` a populated one. `rusqlite` is pinned **once** in
-  `[workspace.dependencies]` (0.39, `bundled`) and every SQLite-touching crate uses
-  `rusqlite = { workspace = true }`; 0.39 matches refinery **0.9.2** so they share one
+  `[workspace.dependencies]` (0.41, `bundled`) and every SQLite-touching crate uses
+  `rusqlite = { workspace = true }`; 0.41 matches refinery **0.10** so they share one
   `libsqlite3-sys`. Don't add a per-crate version — desyncing reintroduces the
   `links = "sqlite3"` conflict.
 - **Lints gotchas:** `clippy::doc_markdown` fires on bare code identifiers and

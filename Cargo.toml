@@ -35,9 +35,9 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 # Pinned once here so every crate shares ONE `libsqlite3-sys` (bundled). Desyncing
 # the version across crates reintroduces the `links = "sqlite3"` conflict, so all
-# SQLite-touching crates use `rusqlite = { workspace = true }`. Kept at 0.39 to match
-# refinery 0.9.2's libsqlite3-sys (jkb-core).
-rusqlite = { version = "0.39", features = ["bundled"] }
+# SQLite-touching crates use `rusqlite = { workspace = true }`. Kept in step with
+# refinery's rusqlite range (jkb-core). 0.41 bundles SQLite 3.54 (RUSTSEC-2026-0459).
+rusqlite = { version = "0.41", features = ["bundled"] }
 # HTTP client. jkb-embed talks to the local ollama server; jkb-ingest reuses it
 # for URL fetching. Kept TLS-free here (embed only hits http://localhost); crates
 # that need https opt into a TLS feature (see tasks.md 7.3).

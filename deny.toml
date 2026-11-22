@@ -29,6 +29,20 @@ ignore = [
     # still depends on it, so there is no upgrade path and no known exploit. Revisit when
     # yrs moves to `compact_str`/`smol_str` (the advisory's suggested alternatives).
     "RUSTSEC-2026-0215",
+    # `chrono` is unmaintained (not a vulnerability; no release fixes it). `rmcp` and
+    # `schemars` depend on it, and `jkb-daemon` uses it only to format the RFC 3339 stamp on
+    # `jkb serve`'s log lines. Revisit when rmcp and schemars move to `jiff` or `time`, and
+    # move the daemon's stamp at the same time.
+    "RUSTSEC-2026-0543",
+    # rmcp's OAuth client checks host strings, not resolved addresses (fixed in 3.7.0).
+    # jkb builds rmcp with only `server` and `transport-io` (crates/jkb-mcp/Cargo.toml):
+    # the OAuth client is behind the `auth` feature and is not compiled in, as the lockfile's
+    # rmcp entry shows (no `oauth2` or `reqwest` dependency). Revisit on the move to rmcp 3.
+    "RUSTSEC-2026-0457",
+    # rmcp's Streamable HTTP clients buffer response bodies without a limit (fixed in
+    # 3.9.0). Both affected clients are behind `transport-streamable-http-client-*` features
+    # jkb does not enable; `jkb mcp` is a stdio server. Revisit on the move to rmcp 3.
+    "RUSTSEC-2026-0462",
 ]
 
 [licenses]
