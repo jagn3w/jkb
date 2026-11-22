@@ -2,7 +2,7 @@
 #
 # GENERATED FILE -- DO NOT EDIT. Run .container/generate-apparmor.sh to refresh it.
 # Source: https://raw.githubusercontent.com/moby/profiles/main/apparmor/template.go
-# upstream-sha256: 7da15d81aa5c507f5002b844fdc49a969904681447a2cc29222bd6cbe797163b
+# upstream-sha256: 3e10fd44140c527b01c70fb0e79b05c1f9a128b9b31a59c9627b497b8dfba475
 #
 # This is Docker's own `docker-default` with ONE CHANGE, at the single site marked PATCHED below:
 # the mount family is opened up. `deny mount,` becomes `mount,`, and `pivot_root,` is added --
@@ -73,16 +73,6 @@ profile "jkb-dev" flags=(attach_disconnected,mediate_deleted) {
   capability,
   file,
   umount,
-  # Host (privileged) processes may send signals to container processes.
-  signal (receive) peer=unconfined,
-  # runc may send signals to container processes (for "docker stop").
-  signal (receive) peer=runc,
-  # crun may send signals to container processes (for "docker stop" when used with crun OCI runtime).
-  signal (receive) peer=crun,
-  # dockerd may send signals to container processes (for "docker kill").
-  signal (receive) peer=unconfined,
-  # Container processes may send signals amongst themselves.
-  signal (send,receive) peer="jkb-dev",
 
   deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
   # deny write to files not in /proc/<number>/** or /proc/sys/**
@@ -111,7 +101,23 @@ profile "jkb-dev" flags=(attach_disconnected,mediate_deleted) {
   deny /sys/devices/virtual/powercap/** rwklx,
   deny /sys/kernel/security/** rwklx,
 
-  # allow processes within the container to trace each other,
-  # provided all other LSM and yama setting allow it.
+  # Host (privileged) processes may send signals to container processes.
+  signal (receive) peer=unconfined,
+  # runc may send signals to container processes (for "docker stop").
+  signal (receive) peer=runc,
+  # crun may send signals to container processes (for "docker stop").
+  signal (receive) peer=crun,
+  # dockerd may send signals to container processes (for "docker kill").
+  signal (receive) peer=unconfined,
+  # Container processes may send signals amongst themselves.
+  signal (send,receive) peer="jkb-dev",
+  # With kernel.apparmor_restrict_unprivileged_unconfined=1, an unprivileged
+  # profile change is converted to stacking, producing a stacked label such
+  # as "<name>//&unconfined".
+  # Allow signals to peers with this stacked label as well.
+  signal (send,receive) peer="jkb-dev//&unconfined",
+  # allow processes within the container to trace each other, provided all other LSM and yama settings allow it.
   ptrace (trace,tracedby,read,readby) peer="jkb-dev",
+  # Same stacked-label peer as the signal rule above.
+  ptrace (trace,tracedby,read,readby) peer="jkb-dev//&unconfined",
 }
