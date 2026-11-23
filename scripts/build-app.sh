@@ -91,12 +91,10 @@ app_clone_check "$repo_root" || die "refusing to build: $repo_root is not exactl
 commit="$(_git -C "$repo_root" rev-parse HEAD)"
 
 # --- build --------------------------------------------------------------------------------------
-# A GUI app (the update) and the post-merge hook both start this with a short PATH. pnpm lives under
-# PNPM_HOME, which shells export only interactively (check.sh does the same); Homebrew's node and
-# pnpm are in /opt/homebrew/bin or /usr/local/bin.
-export PNPM_HOME="${PNPM_HOME:-$HOME/Library/pnpm}"
-export PATH="$PNPM_HOME:$HOME/.local/share/pnpm:/opt/homebrew/bin:/usr/local/bin:$PATH"
-command -v pnpm >/dev/null 2>&1 || die "pnpm not found (install it, or set PNPM_HOME)"
+# A GUI app (the update) and the post-merge hook both start this with a short PATH: lib.sh's
+# pnpm_onto_path finds pnpm. Homebrew's prefixes stay on PATH for a node that pnpm's home lacks.
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+pnpm_onto_path || die "pnpm not found (install it, or set PNPM_HOME)"
 
 echo "==> building Code Factory at ${commit:0:12} (origin/main) in $repo_root"
 cd "$repo_root/ui"

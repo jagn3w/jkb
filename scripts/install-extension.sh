@@ -15,18 +15,9 @@ while [ $# -gt 0 ]; do
 done
 
 # --- locate pnpm (installed via the standalone installer; not always on a bare PATH) ---
-if ! command -v pnpm >/dev/null 2>&1; then
-  for d in "$HOME/Library/pnpm" "$HOME/.local/share/pnpm"; do
-    for candidate in "$d/bin/pnpm" "$d/pnpm"; do
-      if [ -x "$candidate" ]; then
-        export PNPM_HOME="$d"
-        export PATH="$(dirname "$candidate"):$PATH"
-        break 2
-      fi
-    done
-  done
-fi
-command -v pnpm >/dev/null 2>&1 || {
+# shellcheck source=scripts/lib.sh
+. "$repo_root/scripts/lib.sh"
+pnpm_onto_path || {
   echo "error: pnpm not found. Install it (pnpm only, never npm): https://pnpm.io/installation" >&2
   exit 1
 }

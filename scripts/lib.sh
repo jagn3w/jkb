@@ -2269,6 +2269,37 @@ app_scrub_env() {
     done
 }
 
+# pnpm_onto_path — put pnpm on PATH, for the scripts a GUI app, a hook or a non-interactive shell
+# starts (build-app.sh, check.sh, install-extension.sh): pnpm lives under PNPM_HOME, which ~/.zshrc
+# exports only for interactive shells. 0 when pnpm is then on PATH, 1 when it is nowhere.
+# Its home has two layouts: pnpm's current standalone installer puts the binary (and the node that
+# `pnpm env use` installs) in PNPM_HOME/bin, older ones in PNPM_HOME itself. build-app.sh looked only
+# in the second, check.sh only in the first, so Code Factory's update stopped at "pnpm not found" on
+# a machine where check.sh found it. One lookup, both layouts, every caller.
+# Order: a PNPM_HOME the caller set wins over PATH (the tests point it at a stub pnpm, and CI has a
+# real one on PATH); then PATH; then the default homes and Homebrew's prefixes.
+pnpm_onto_path() {
+    local home dir
+    for home in ${PNPM_HOME:+"$PNPM_HOME"}; do
+        for dir in "$home/bin" "$home"; do
+            if [ -x "$dir/pnpm" ]; then export PATH="$dir:$PATH"; return 0; fi
+        done
+    done
+    if command -v pnpm >/dev/null 2>&1; then return 0; fi
+    for home in "$HOME/Library/pnpm" "$HOME/.local/share/pnpm"; do
+        for dir in "$home/bin" "$home"; do
+            if [ -x "$dir/pnpm" ]; then
+                export PNPM_HOME="$home" PATH="$dir:$PATH"
+                return 0
+            fi
+        done
+    done
+    for dir in /opt/homebrew/bin /usr/local/bin; do
+        if [ -x "$dir/pnpm" ]; then export PATH="$dir:$PATH"; return 0; fi
+    done
+    return 1
+}
+
 # app_executable <uname -s> <dest> — the program a running copy of the app installed at <dest> is:
 # what `ps` shows for it, and what the app compares its own executable with (ui/core/src/update.ts,
 # `installedExecutable`, names the same two).

@@ -30,9 +30,11 @@ product_exe="$(app_executable "$os" "$product")"
 # `run build` leaves app/out/ as electron-vite would, and `run package` leaves a packaged app holding
 # $STUB_ID, out/commit (electron-builder packs out/**), and an executable at the platform's place
 # that, when run, appends "ran" to $STUB_RAN.
+# It sits at PNPM_HOME/bin/pnpm, where pnpm's current installer puts it: build-app.sh once looked only
+# in PNPM_HOME itself, and Code Factory's update stopped at "pnpm not found" (lib.sh's pnpm_onto_path).
 stub="$work/stub"
-mkdir -p "$stub"
-cat >"$stub/pnpm" <<EOF
+mkdir -p "$stub/bin"
+cat >"$stub/bin/pnpm" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >>"$stub/log"
 printf 'GIT_DIR=%s GIT_INDEX_FILE=%s ELECTRON_RUN_AS_NODE=%s\n' "\${GIT_DIR:-}" "\${GIT_INDEX_FILE:-}" "\${ELECTRON_RUN_AS_NODE:-}" >>"$stub/env"
@@ -47,7 +49,7 @@ case "\$*" in
 esac
 exit 0
 EOF
-chmod +x "$stub/pnpm"
+chmod +x "$stub/bin/pnpm"
 
 # fixture <name> — sets $seed (where main is authored), $origin (bare), $checkout (a clone of origin
 # on a feature branch with a commit main does not have), $app_home. main carries the real
