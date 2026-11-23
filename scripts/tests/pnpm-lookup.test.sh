@@ -102,7 +102,22 @@ case7() {
         || fail "callers" "missing:${missing:- none}; own lookup: ${own:-none}"
 }
 
+# build-app.sh adds Homebrew's prefixes for node, and only after the lookup: added before it, a
+# Homebrew pnpm counts as "on PATH" and wins over ~/Library/pnpm/bin (the first review of this fix).
+case8() {
+    local f="$repo_root/scripts/build-app.sh" lookup brew
+    lookup="$(grep -n '^[^#]*pnpm_onto_path' "$f" | head -1 | cut -d: -f1)"
+    brew="$(grep -n '^[^#]*PATH=.*/opt/homebrew/bin' "$f" | head -1 | cut -d: -f1)"
+    if [ -z "$lookup" ] || [ -z "$brew" ]; then
+        fail "build-app order" "lookup line '${lookup:-none}', Homebrew PATH line '${brew:-none}'"
+    elif [ "$brew" -gt "$lookup" ]; then
+        ok "build-app.sh puts Homebrew on PATH after the lookup"
+    else
+        fail "build-app order" "Homebrew is put on PATH at line $brew, before the lookup at line $lookup"
+    fi
+}
+
 echo "==> scripts/lib.sh::pnpm_onto_path"
-run_cases case1 case2 case3 case4 case5 case6 case7
+run_cases case1 case2 case3 case4 case5 case6 case7 case8
 
 finish

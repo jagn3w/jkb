@@ -92,9 +92,11 @@ commit="$(_git -C "$repo_root" rev-parse HEAD)"
 
 # --- build --------------------------------------------------------------------------------------
 # A GUI app (the update) and the post-merge hook both start this with a short PATH: lib.sh's
-# pnpm_onto_path finds pnpm. Homebrew's prefixes stay on PATH for a node that pnpm's home lacks.
-export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+# pnpm_onto_path finds pnpm. Homebrew's prefixes go on PATH only AFTER it, for a node that pnpm's
+# home lacks: before it, a Homebrew pnpm would count as "already on PATH" and win over pnpm's home
+# (and the node `pnpm env use` put beside it).
 pnpm_onto_path || die "pnpm not found (install it, or set PNPM_HOME)"
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
 
 echo "==> building Code Factory at ${commit:0:12} (origin/main) in $repo_root"
 cd "$repo_root/ui"
