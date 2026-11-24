@@ -501,6 +501,16 @@ an esbuild platform error and nothing pointing at the container. One shared muta
 two writers with incompatible requirements; the copy removes the sharing rather than adding a rule
 both sides have to remember.
 
+Reading that directory is a different matter, and is allowed. `ui/pnpm-workspace.yaml` sets
+`supportedArchitectures` so a host install links Linux's esbuild beside the host's own, on the host's
+CPU (the container runs on it), and the container can then run the `ui/` tests that bundle with
+esbuild against the host's `node_modules` without writing to it. Before that, a macOS install left
+only `@esbuild/darwin-arm64` there and every such test failed in the container. It does not make the
+directory writable from both sides — node-pty compiles in place and Electron downloads one
+platform's binary — so builds still copy `ui/` out. Measured with pnpm 11.17 from the Linux side
+(`os: [current, darwin]` linked both `@esbuild/linux-arm64` and `@esbuild/darwin-arm64` under every
+esbuild version, and `app/test/plan.test.mjs` passed; with the Linux package unlinked it failed).
+
 It is **fatal** on failure, like the `jkb` install, and for the same reason: the binary and the
 panel are the two things that make this a jkb container rather than a generic one. `verify.sh`
 appends its id to the declared list and asserts it like any other; `check-config.sh` pins the
