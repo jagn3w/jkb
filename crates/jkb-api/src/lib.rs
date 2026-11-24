@@ -49,6 +49,18 @@ pub mod tasks;
 pub mod timeline;
 pub mod workflows;
 
+/// This crate's directory, read at run time from the `CARGO_MANIFEST_DIR` that `cargo test` sets.
+///
+/// Not the compile-time `env!` form: the build directory is shared across checkouts, so a test
+/// binary compiled in one worktree is reused by another, and a baked path keeps naming the first
+/// one — after that worktree is deleted, every test reading a repo file through it fails `NotFound`.
+#[cfg(test)]
+pub(crate) fn manifest_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo test sets CARGO_MANIFEST_DIR"),
+    )
+}
+
 /// One operation. Serialized with an `"op"` tag, e.g. `{"op":"mq.send","topic":"t",…}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", deny_unknown_fields)]

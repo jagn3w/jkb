@@ -53,6 +53,15 @@ fn jkb_bare() -> Command {
     cmd
 }
 
+/// This crate's directory, read at run time from the `CARGO_MANIFEST_DIR` that `cargo test` sets
+/// rather than baked in by `env!`: the build directory is shared across checkouts, so a baked
+/// path names whichever worktree compiled the binary, and that worktree may since be deleted.
+fn manifest_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo test sets CARGO_MANIFEST_DIR"),
+    )
+}
+
 fn db_path(dir: &TempDir) -> std::path::PathBuf {
     dir.path().join("jkb.db")
 }
@@ -6397,7 +6406,7 @@ fn workflow_agent_copy_set_show_and_export() {
     // Export into a copy of the packaged file: that entry moves to its next version.
     let file = dir.path().join("agents.json");
     std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../jkb-core/src/workflow/agents.json"),
+        manifest_dir().join("../jkb-core/src/workflow/agents.json"),
         &file,
     )
     .unwrap();

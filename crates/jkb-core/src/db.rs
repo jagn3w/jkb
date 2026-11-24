@@ -224,7 +224,7 @@ mod tests {
                 }
             }
         }
-        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let crates = crate::manifest_dir().join("..");
         let mut files = Vec::new();
         walk(&crates, &mut files);
         assert!(
@@ -233,7 +233,7 @@ mod tests {
             files.len()
         );
 
-        let this = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db.rs");
+        let this = crate::manifest_dir().join("src/db.rs");
         let this = std::fs::canonicalize(this).unwrap();
 
         // db.rs is exempt from the scan below only because its one file open is guarded — so that

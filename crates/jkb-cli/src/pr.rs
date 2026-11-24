@@ -487,7 +487,7 @@ mod live {
     #[test]
     #[ignore = "needs `gh` authenticated against a repo with a merged pull request"]
     fn live_a_merged_pull_request_reads_as_merged() {
-        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo = &crate::manifest_dir();
         // Discovery by head branch, then a lookup by number — the two calls in the order the
         // commands make them. A branch nobody ever opened a pull request for is `None`, which is
         // an answer, not a failure.

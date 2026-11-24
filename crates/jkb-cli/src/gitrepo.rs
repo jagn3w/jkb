@@ -4193,12 +4193,12 @@ mod tests {
     ///    defaulting to silence.
     #[test]
     fn no_spawn_in_the_crate_resolves_a_repository_unscrubbed() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = &crate::manifest_dir();
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         // The CRATE ROOT, so the claim "every .rs under the crate" is true — a `build.rs` git
         // spawn was outside a `src/` + `tests/` walk while the doc said coverage was complete.
         // `target/` is skipped: it holds generated sources that are not ours to classify.
-        let mut stack = vec![root.to_path_buf()];
+        let mut stack = vec![root.clone()];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
