@@ -232,12 +232,13 @@ pub(crate) struct Host<'a> {
 
 /// `jkb doctor`. `backup` and `fix` need `host`: remote mode refuses them before this runs.
 ///
-/// Every section prints, `--backup` and `--fix` included, and only then does an unplanned task (or
-/// a daemon too old to count them) fail the run, so the exit status is a gate and the report is
-/// still the remedy. Doctor's other findings are reported and exit 0.
+/// Every section prints, `--backup` and `--fix` included, and only then does a finding fail the run
+/// ([`failures`]: FTS integrity failed, sync files flagged, stale vector rows `--fix` did not sweep,
+/// or a task unplanned), so the exit status is a gate and the report is still the remedy. Orphaned
+/// claims, sessions and a missing GC trigger are reported and do not fail it.
 ///
 /// # Errors
-/// A failed op or host step, or any task unplanned ([`unplanned_check`]).
+/// A failed op or host step, or any finding [`failures`] names.
 pub(crate) fn run(
     kb: &Kb<'_>,
     host: Option<&Host<'_>>,
@@ -285,7 +286,7 @@ pub(crate) fn run(
         }
     }
 
-    let (lines, unplanned_failure) = unplanned_check(&health);
+    let (lines, _) = unplanned_check(&health);
     for line in lines {
         println!("{line}");
     }
@@ -319,10 +320,37 @@ pub(crate) fn run(
         }
     }
     // LAST, once every section has printed: the report is the remedy, so it is never cut short.
-    if let Some(failure) = unplanned_failure {
-        anyhow::bail!("{failure}");
-    }
+    let failed = failures(&health, swept);
+    anyhow::ensure!(failed.is_empty(), "{}", failed.join("; "));
     Ok(())
+}
+
+/// Every finding that fails `jkb doctor`, each as the sentence it fails with; empty when the run
+/// passes. One list, so a finding the report prints cannot be left out of the exit status by a
+/// second, separate check.
+///
+/// `swept` is the stale-row count `--fix` removed, when it ran: rows it removed are no longer a
+/// finding, as the vector report says.
+fn failures(health: &jkb_api::health::Health, swept: Option<usize>) -> Vec<String> {
+    let mut out = Vec::new();
+    if !health.fts_ok {
+        out.push("the full-text index failed its integrity check".to_owned());
+    }
+    if health.flagged_count > 0 {
+        out.push(format!(
+            "{} sync file(s) need attention (listed above)",
+            health.flagged_count
+        ));
+    }
+    if swept.is_none() && health.stale_vectors > 0 {
+        out.push(format!(
+            "{} stale vector row(s): `jkb index --sweep` (or `jkb doctor --fix`) on the host \
+             removes them",
+            health.stale_vectors
+        ));
+    }
+    out.extend(unplanned_check(health).1);
+    out
 }
 
 /// The unplanned-task lines of `jkb doctor` — every open task no execution plan's step reaches, as
@@ -415,7 +443,7 @@ fn vector_report(health: &jkb_api::health::Health, swept: Option<usize>) -> Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::{free, probe_with, unplanned_check, vector_report};
+    use super::{failures, free, probe_with, unplanned_check, vector_report};
     use jkb_api::health::Health;
 
     fn health(vector_tables: usize, stale: usize, unguarded: Option<&[&str]>) -> Health {
@@ -470,6 +498,49 @@ mod tests {
         assert!(unplanned_report(&h)[0].contains("not reported"));
         let failure = unplanned_check(&h).1.expect("an old daemon fails doctor");
         assert!(failure.contains("predates"), "{failure}");
+    }
+
+    /// Each fault the report prints fails the run, every one of them named at once; a healthy
+    /// database, an unguarded table with nothing stale yet, and stale rows `--fix` swept all pass.
+    #[test]
+    fn every_fault_the_report_prints_fails_doctor() {
+        assert!(failures(&health(1, 0, Some(&[])), None).is_empty());
+        assert!(
+            failures(&health(1, 0, Some(&["vec_items_16"])), None).is_empty(),
+            "a missing trigger is reported, not failed"
+        );
+
+        let mut h = health(1, 0, Some(&[]));
+        h.fts_ok = false;
+        let f = failures(&h, None);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].contains("full-text index failed"), "{f:?}");
+
+        let mut h = health(1, 0, Some(&[]));
+        h.flagged_count = 2;
+        let f = failures(&h, None);
+        assert_eq!(f, ["2 sync file(s) need attention (listed above)"]);
+
+        let f = failures(&health(1, 3, Some(&[])), None);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].starts_with("3 stale vector row(s)"), "{f:?}");
+        assert!(
+            failures(&health(1, 3, Some(&[])), Some(3)).is_empty(),
+            "rows `--fix` swept are no longer a finding"
+        );
+
+        // All at once, unplanned included, in the report's order.
+        let mut h = health(1, 3, Some(&[]));
+        h.fts_ok = false;
+        h.flagged_count = 1;
+        h.unplanned_count = Some(1);
+        h.unplanned = Some(Vec::new());
+        let f = failures(&h, None);
+        assert_eq!(f.len(), 4, "{f:?}");
+        assert!(f[0].contains("full-text"), "{f:?}");
+        assert!(f[1].contains("sync file"), "{f:?}");
+        assert!(f[2].contains("stale vector"), "{f:?}");
+        assert!(f[3].contains("unplanned"), "{f:?}");
     }
 
     /// A legacy database with no stale rows yet but no GC trigger is NOT reported ok: the row count

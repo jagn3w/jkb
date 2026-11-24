@@ -1159,6 +1159,56 @@ fn doctor_fails_on_an_unplanned_task_after_its_whole_report() {
         .stdout(predicate::str::contains("unplanned tasks: none"));
 }
 
+/// A sync file needing attention fails `jkb doctor` too, after the whole report, and it passes once
+/// the file is fixed: the exit status gates every finding the report prints as a fault, not only
+/// unplanned tasks.
+#[test]
+fn doctor_fails_on_a_flagged_sync_file_after_its_whole_report() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let proj = dir.path().canonicalize().unwrap().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let file = proj.join("tasks.md");
+    std::fs::write(&file, "## Backend\n- [ ] one ^one\n").unwrap();
+    jkb(&db)
+        .args(["mount", "create", "work", proj.to_str().unwrap()])
+        .args(["--serializer", "tasks"])
+        .assert()
+        .success();
+    map_mount(&db, "work");
+    sync_ok(&db, "work");
+    jkb(&db).args(["doctor"]).assert().success();
+
+    // Two tasks claiming one `^id` quarantines the file: flagged, its last good tasks kept.
+    std::fs::write(&file, "## Backend\n- [ ] one ^dup\n- [ ] two ^dup\n").unwrap();
+    let (ok, out) = sync_run(&db, "work");
+    assert!(!ok && out.contains("1 quarantined"), "{out}");
+
+    let out = jkb(&db).args(["doctor"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for section in [
+        "sync journal: 1 file(s) need attention",
+        "unplanned tasks: none",
+        "task claims:",
+        "vector index:",
+        "db location:",
+    ] {
+        assert!(stdout.contains(section), "{section:?} missing:\n{stdout}");
+    }
+    assert!(stderr.contains("1 sync file(s) need attention"), "{stderr}");
+    assert!(!stderr.contains("unplanned"), "{stderr}");
+
+    std::fs::write(&file, "## Backend\n- [ ] one ^one\n").unwrap();
+    sync_ok(&db, "work");
+    jkb(&db)
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sync journal: ok"));
+}
+
 /// Add a task via the CLI and return its minted uid (`--json` emits `{uid}`).
 fn add_task(db: &Path, text: &str) -> String {
     let out = jkb(db)
