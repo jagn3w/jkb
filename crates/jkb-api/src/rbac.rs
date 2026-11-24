@@ -1146,12 +1146,14 @@ pub fn authorize(
         Err(admit) => return Ok(admit),
     };
     // A repo's triage step is never in a worker's scope, whether it exists or the op would create it
-    // on demand (`plan::resolve_parent_ref`). Judged here, by the name, before anything resolves,
-    // because the paths below disagree about it: a scoped caller is refused an existing one by
-    // `in_scope`, but an attested subagent not yet bound would be admitted and **bound to the
-    // step** (`BindThenRun` — `roles::bind_agent` binds whatever item it is given), putting every
-    // task in the inbox in its scope. A step is only ever named by its uid (`task::resolve_ref`
-    // looks a reference with a `:` up as one), so the name is the whole test.
+    // on demand (`plan::resolve_parent_ref`). An EXISTING one is already refused below: a scoped
+    // caller by `in_scope`, and an attested subagent not yet bound by `roles::bind_agent`, which
+    // binds only a task (`Bound::NotATask` for a plan step). What only this guard catches is an
+    // ABSENT one: `task::resolve_ref` finds nothing, the op would run unbound and create the step
+    // on demand, and the worker would have filed into the operator's inbox. Judged here, by the
+    // name, before anything resolves, so both cases get one refusal. A step is only ever named by
+    // its uid (`task::resolve_ref` looks a reference with a `:` up as one), so the name is the
+    // whole test.
     if jkb_core::design::plan::is_triage_step_uid(reference)
         && (principal.scope.is_some() || principal.attested_agent().is_some())
     {

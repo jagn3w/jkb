@@ -102,11 +102,11 @@ pub fn health(conn: &Connection) -> Result<Health, ApiError> {
     };
     let unguarded_vector_tables =
         jkb_index::vector_tables_without_gc_trigger(conn).map_err(|e| index_error(&e))?;
-    let unplanned = jkb_core::design::plan::unplanned(conn)?;
-    let unplanned_count = unplanned.len();
-    let unplanned = unplanned
+    // The total is counted, and only the listed page is read: a KB with thousands of open
+    // findings would otherwise read and title every one of them on the writer thread to keep 200.
+    let unplanned_count = jkb_core::design::plan::unplanned_count(conn)?;
+    let unplanned = jkb_core::design::plan::unplanned_first(conn, Some(MAX_UNPLANNED))?
         .into_iter()
-        .take(MAX_UNPLANNED)
         .map(|t| Unplanned {
             uid: t.uid,
             title: t.title,

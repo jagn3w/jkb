@@ -3736,3 +3736,38 @@ fn the_step_kind_literal_is_the_step_kind() {
     assert_eq!(STEP_KIND, step_kind!());
     assert_eq!(STEP_KIND, "plan_step");
 }
+
+/// `unplanned_first` reads a prefix of `unplanned`, in its order, and `unplanned_count` counts the
+/// whole set without reading it: `kb.health` lists the page and reports the count, so the two must
+/// agree with the full read for any cap, including one past the end and zero.
+#[test]
+fn unplanned_page_and_count_agree_with_the_full_read() {
+    let db = db();
+    for i in 0..5 {
+        loose_task(&db, &format!("task:loose-{i}"), "tasks/repos/x/inbox");
+    }
+    let all: Vec<String> = db
+        .read(plan::unplanned)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.uid)
+        .collect();
+    assert_eq!(all.len(), 5);
+    assert_eq!(db.read(plan::unplanned_count).unwrap(), 5);
+    for cap in [0, 2, 5, 9] {
+        let page: Vec<String> = db
+            .read(move |c| plan::unplanned_first(c, Some(cap)))
+            .unwrap()
+            .into_iter()
+            .map(|t| t.uid)
+            .collect();
+        assert_eq!(page, all[..cap.min(all.len())], "cap {cap}");
+    }
+    let uncapped: Vec<String> = db
+        .read(|c| plan::unplanned_first(c, None))
+        .unwrap()
+        .into_iter()
+        .map(|t| t.uid)
+        .collect();
+    assert_eq!(uncapped, all);
+}

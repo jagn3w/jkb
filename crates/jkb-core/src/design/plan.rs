@@ -842,17 +842,31 @@ pub struct UnplannedTask {
 /// # Errors
 /// A database error.
 pub fn unplanned(conn: &Connection) -> Result<Vec<UnplannedTask>> {
+    unplanned_first(conn, None)
+}
+
+/// The first `limit` of [`unplanned`], in its order, reading only those rows (`None`: all of
+/// them). A caller that lists a capped page — `kb.health` — takes the page here and the total from
+/// [`unplanned_count`], rather than reading and titling every unplanned task's content to keep a
+/// few hundred.
+///
+/// # Errors
+/// A database error.
+pub fn unplanned_first(conn: &Connection, limit: Option<usize>) -> Result<Vec<UnplannedTask>> {
     let sql = format!(
         "SELECT i.id, i.uid, i.content, i.status, i.priority,
                 (SELECT n.path FROM placements p JOIN namespaces n ON n.id = p.namespace_id
                   WHERE p.item_id = i.id
                   ORDER BY (p.role = 'primary') DESC, p.position LIMIT 1)
            FROM items i WHERE {UNPLANNED_SQL}
-          ORDER BY i.priority IS NULL, i.priority, i.id"
+          ORDER BY i.priority IS NULL, i.priority, i.id
+          LIMIT ?1"
     );
+    // SQLite reads a negative LIMIT as no limit.
+    let limit = limit.map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map([limit], |r| {
             let uid: String = r.get(1)?;
             let content: Option<String> = r.get(2)?;
             let namespace: Option<String> = r.get(5)?;
@@ -870,6 +884,16 @@ pub fn unplanned(conn: &Connection) -> Result<Vec<UnplannedTask>> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// How many tasks [`unplanned`] would return, counted without reading them.
+///
+/// # Errors
+/// A database error.
+pub fn unplanned_count(conn: &Connection) -> Result<usize> {
+    let sql = format!("SELECT COUNT(*) FROM items i WHERE {UNPLANNED_SQL}");
+    let n: i64 = conn.prepare_cached(&sql)?.query_row([], |r| r.get(0))?;
+    Ok(usize::try_from(n).unwrap_or(0))
 }
 
 /// A task's **own work**: the task itself, everything contained under it at any depth, and every
