@@ -217,7 +217,8 @@ case_parity() {
     local r rb pre want got i n bad=""; r="$(mkrepo parity)"
     printf 'one\n' >"$r/g"; git -C "$r" add g; git -C "$r" commit -qm "g"
     git -C "$r" checkout -qb feat
-    echo a >>"$r/f"; git -C "$r" commit -qam "edit one"
+    # An author date before 1973, which commit-tree refuses as a bare epoch (review round 1).
+    echo a >>"$r/f"; GIT_AUTHOR_DATE="@86400 +0000" git -C "$r" commit -qam "edit one"
     git -C "$r" commit -q --allow-empty -m "started empty"
     echo same >"$r/dup"; git -C "$r" add dup; git -C "$r" commit -qm "dup, which the base gets too"
     printf 'one\nX\n' >"$r/g"; git -C "$r" commit -qam "X, a patch the base carries"
@@ -310,6 +311,47 @@ case_untracked_collision() {
     else
         ok "the untracked file is untouched, and the stall names it"
     fi
+}
+
+# ...INCLUDING A PATH THE BRANCH ADDS BY A RENAME. Porcelain diff reports a `git mv` as R, not A, so
+# a filter on A never listed it and the untracked file was overwritten (review round 1).
+case_untracked_rename_collision() {
+    local r; r="$(mkrepo untracked-rename)"
+    echo old >"$r/old"; git -C "$r" add old; git -C "$r" commit -qm old
+    git -C "$r" checkout -qb feat; git -C "$r" mv old new; git -C "$r" commit -qm "rename old to new"
+    git -C "$r" checkout -q trunk; echo mine >"$r/new"
+    check "an untracked file at a path the branch renames into stalls, and the base never moves" "$r" 3 still 0
+    [ "$(cat "$r/new")" = mine ] \
+        && ok "the untracked file at the rename's target is untouched" \
+        || fail "queue: untracked rename collision" "the untracked new was overwritten: $(cat "$r/new")"
+}
+
+# ...AND AN UNTRACKED FILE WHERE THE GRAFT PUTS A DIRECTORY. The branch adds `d/x`; reset would
+# replace an untracked file `d` with the directory (review round 1). A TRACKED `d` that the branch
+# replaces is reset's to replace, and must not stall.
+case_untracked_prefix_collision() {
+    local r; r="$(mkrepo untracked-prefix)"
+    git -C "$r" checkout -qb feat; mkdir -p "$r/d/e"; echo x >"$r/d/e/x"; git -C "$r" add d
+    git -C "$r" commit -qm "add d/e/x"
+    git -C "$r" checkout -q trunk; mkdir -p "$r/d"; echo mine >"$r/d/e"
+    check "an untracked file where the graft puts a directory stalls, and the base never moves" "$r" 3 still 0
+    [ -f "$r/d/e" ] && [ "$(cat "$r/d/e")" = mine ] \
+        && ok "the untracked file in the directory's place is untouched" \
+        || fail "queue: untracked prefix collision" "the untracked d/e was replaced"
+    r="$(mkrepo tracked-prefix)"
+    echo was-a-file >"$r/d"; git -C "$r" add d; git -C "$r" commit -qm "d is a file"
+    git -C "$r" checkout -qb feat; git -C "$r" rm -q d; mkdir "$r/d"; echo x >"$r/d/x"
+    git -C "$r" add d; git -C "$r" commit -qm "d becomes a directory"
+    git -C "$r" checkout -q trunk
+    check "a tracked file the branch turns into a directory is not mistaken for a collision" "$r" 0 moved 1
+    # ...and an untracked DIRECTORY at a path the graft adds as a file is a collision too.
+    r="$(mkrepo untracked-dir)"
+    git -C "$r" checkout -qb feat; echo x >"$r/n"; git -C "$r" add n; git -C "$r" commit -qm "add n"
+    git -C "$r" checkout -q trunk; mkdir "$r/n"; echo mine >"$r/n/keep"
+    check "an untracked directory at a path the graft adds as a file stalls" "$r" 3 still 0
+    [ "$(cat "$r/n/keep" 2>/dev/null)" = mine ] \
+        && ok "the untracked directory in the file's place is untouched" \
+        || fail "queue: untracked dir collision" "the untracked n/keep was lost"
 }
 
 # THE AUTHOR IS KEPT, THE COMMITTER IS THE QUEUE: what rebase did, and what `git blame` relies on.
@@ -543,6 +585,7 @@ case_signalled() {   # killed mid-gate by any signal: never `landed`, and the ba
 
 run_cases case_signalled case_land case_unapproved case_moved_after_approval case_red_gate case_red_suite case_nothing_ahead case_empty_work \
           case_conflict case_phantom case_parity case_parity_ff case_dirty_tracked case_untracked_collision \
+          case_untracked_rename_collision case_untracked_prefix_collision \
           case_multi_author case_base_unswitchable \
           case_already_landed case_wedged case_already_merged \
           case_tag_like_branch case_tag_like_ancestor_branch case_tag_like_base \

@@ -171,6 +171,8 @@ _graft() {
         # The author is read off the commit object's own `author` line -- `NAME <EMAIL> SECONDS TZ`,
         # where git forbids `<` and `>` in the name -- rather than through `git log`'s formatting,
         # which config (mailmap, `log.showSignature`) can reach.
+        # The date goes in as `@SECONDS TZ`: bare, commit-tree refuses an epoch before 1973 as an
+        # unparseable date (measured, review round 1).
         raw="$(git cat-file commit "$c" 2>&1)" || { sed -n 1p <<<"$raw"; return 3; }
         author="$(sed -n '1,/^$/s/^author //p' <<<"$raw")"
         # The MESSAGE is piped straight from the object, never through a variable: `$( )` strips
@@ -178,7 +180,7 @@ _graft() {
         out="$(git cat-file commit "$c" | sed '1,/^$/d' \
             | GIT_AUTHOR_NAME="${author%% <*}" \
               GIT_AUTHOR_EMAIL="$(sed 's/^[^<]*<\([^>]*\)>.*$/\1/' <<<"$author")" \
-              GIT_AUTHOR_DATE="${author##*> }" \
+              GIT_AUTHOR_DATE="@${author##*> }" \
               git commit-tree "$tree" -p "$tip" -F - 2>&1)" || { sed -n 1p <<<"$out"; return 3; }
         tip="$out"
     done
@@ -426,12 +428,21 @@ if ! git diff-index --quiet HEAD -- 2>/dev/null; then
   echo "error: the queue's worktree has tracked changes ($(git diff-index --name-only HEAD -- 2>/dev/null | sed -n 1p)); it must be clean before $BRANCH can be grafted"
   finish 3
 fi
-# ...AND NO UNTRACKED FILE IN THE WAY. `reset --hard` overwrites an untracked file at a path the
-# graft adds, where checkout refused. A path absent from $PRE's tree that already exists on disk
-# is exactly that file, so this is a filesystem test and asks git nothing more. The list is read
-# into a variable first, not through a process substitution, which would discard git's refusal and
-# leave an empty list that passes; `-z` so a name is never C-quoted.
-if ! _added="$(git diff --name-only -z --diff-filter=A "$PRE" "$GRAFT" | tr '\0' '\n')"; then
+# ...AND NO UNTRACKED FILE IN THE WAY. `reset --hard` overwrites an untracked file where checkout
+# refused, in two places. At a path the graft ADDS: absent from $PRE's tree, so anything on disk
+# there is untracked, a directory included. And at a LEADING
+# COMPONENT of one: a branch adding `d/x` turns an untracked FILE `d` into a directory, deleting
+# it. A component that exists, is not a directory or is a symlink, and is not tracked in $PRE (a
+# tracked `d` is reset's to replace) is that file.
+#
+# PLUMBING, RENAMES OFF. This was porcelain `git diff --diff-filter=A`, which detects renames, so a
+# path the branch added by `git mv` was status R and never listed: measured, an untracked `new`
+# under a branch renaming `old` to `new` was overwritten and the queue landed (review round 1).
+# `diff-tree` never detects renames unless asked, and `--no-renames` says so anyway.
+#
+# The list is read into a variable first, not through a process substitution, which would discard
+# git's refusal and leave an empty list that passes; `-z` so a name is never C-quoted.
+if ! _added="$(git diff-tree -r -z --no-renames --name-only --diff-filter=A "$PRE" "$GRAFT" | tr '\0' '\n')"; then
   echo "error: could not list the paths the graft of $BRANCH adds"
   finish 3
 fi
@@ -441,6 +452,17 @@ while IFS= read -r _path; do
     echo "error: the queue's worktree has an untracked $_path, which grafting $BRANCH would overwrite; move it out of the way"
     finish 3
   fi
+  _prefix=""
+  _rest="$_path"
+  while [ "${_rest#*/}" != "$_rest" ]; do
+    _prefix="${_prefix:+$_prefix/}${_rest%%/*}"
+    _rest="${_rest#*/}"
+    if { [ -L "$_prefix" ] || { [ -e "$_prefix" ] && [ ! -d "$_prefix" ]; }; } \
+       && ! git cat-file -e "$PRE:$_prefix" 2>/dev/null; then
+      echo "error: the queue's worktree has an untracked $_prefix where grafting $BRANCH puts a directory ($_path), which would delete it; move it out of the way"
+      finish 3
+    fi
+  done
 done <<<"$_added"
 # Detached at the current commit first (writes no files), so the reset moves HEAD and not $BASE.
 # HOOKS OFF on the reset: it runs none today, and the flag matches the fast-forward's below.
