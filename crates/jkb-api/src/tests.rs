@@ -114,6 +114,7 @@ fn samples() -> Vec<Request> {
             pid: "1".into(),
             instance: "h".into(),
             cwd: String::new(),
+            inbox: None,
         },
         Request::SessionEnded {
             session: "s".into(),
@@ -711,6 +712,10 @@ fn samples() -> Vec<Request> {
             id: "exec-1".into(),
             after: None,
             max: 10,
+        },
+        Request::ExecInboxTake {
+            session: "s".into(),
+            agent_id: None,
         },
         Request::ExecBegin {
             id: "exec-1".into(),
@@ -3589,6 +3594,7 @@ fn a_session_list_cursor_is_opaque() {
             pid: "1".into(),
             instance: "h".into(),
             cwd: String::new(),
+            inbox: None,
         })
         .unwrap();
     }
@@ -4070,6 +4076,7 @@ const OP_WORDS: &[(&str, &str)] = &[
     ("exec.status", "run requests"),
     ("exec.list", "run requests"),
     ("exec.follow", "run requests"),
+    ("exec.inbox.take", "hand a session the results"),
     ("task.add", "add tasks"),
     ("task.set", "fields"),
     ("task.edit", "text"),

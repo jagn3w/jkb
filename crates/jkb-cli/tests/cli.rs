@@ -5895,6 +5895,66 @@ fn the_attestation_hook_puts_a_ticket_on_a_jkb_command_and_takes_it_back() {
         "hook_event_name": "SubagentStop", "session_id": "sess-1", "agent_id": "ag-7",
     }));
     assert!(!whoami(&sub).status.success(), "released at SubagentStop");
+
+    // A run request the session filed and stopped waiting for: the operator's answer reaches the
+    // session as context on its next tool call — any tool — once, and never on the one after.
+    let filed = pre("t3", None, "jkb exec request --no-wait");
+    let ticket = filed
+        .split_once("JKB_ATTEST=")
+        .unwrap()
+        .1
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let out = assert_cmd::Command::from_std(jkb_bare())
+        .env("HOME", dir.path())
+        .env("JKB_REMOTE", &url)
+        .env("JKB_ATTEST", &ticket)
+        .env_remove("JKB_DB")
+        .args([
+            "exec",
+            "request",
+            "--no-wait",
+            "--target",
+            "container",
+            "--dir",
+        ])
+        .arg(&work)
+        .args(["--reason", "land it", "--", "make", "land"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!("you will be told when {id} ends")),
+        "{out:?}"
+    );
+    let read = || {
+        hook(serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "sess-1", "tool_use_id": "t4",
+            "tool_name": "Read", "tool_input": { "file_path": "/x" },
+        }))
+    };
+    assert_eq!(read(), "", "nothing has happened to it yet");
+    jkb(&db)
+        .args(["exec", "decline", &id, "--note", "ask for make check"])
+        .assert()
+        .success();
+    let said: serde_json::Value = serde_json::from_str(&read()).unwrap();
+    let context = said["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        context.starts_with(&format!(
+            "[jkb run request] {id} declined: ask for make check: land it"
+        )),
+        "{context}"
+    );
+    assert_eq!(said["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    assert_eq!(read(), "", "delivered once");
 }
 
 /// A quote beginning with `-` (a Markdown list item) is a value, not a flag, in every quote option

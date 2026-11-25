@@ -248,6 +248,10 @@ pub struct Requester {
     pub session: String,
     /// The subagent type, when a subagent asked.
     pub agent_type: Option<String>,
+    /// The in-process subagent that asked, as its ticket names it; `None` for the main agent. Kept on
+    /// the request's delivery row ([`crate::exec_delivery`]), so its result goes back to the agent that
+    /// asked — and read back as NULL once a fold joined two agents' requests.
+    pub agent_id: Option<String>,
     /// The role it holds.
     pub role: String,
     /// The task it holds, if it is bound to one.
@@ -387,6 +391,27 @@ pub struct Output {
     pub chunks: i64,
     /// Where the full output is.
     pub log_path: Option<String>,
+    /// The output's `warning:` lines, at most [`warnings::MAX_WARNINGS`], each at most
+    /// [`warnings::MAX_WARNING_BYTES`].
+    pub warnings: Vec<String>,
+    /// How many more warning lines there were.
+    pub warnings_dropped: i64,
+    /// The bytes that reached jkb as chunks.
+    pub streamed_bytes: i64,
+}
+
+impl Output {
+    /// Whether less than all of the output reached jkb to be scanned: chunks were streamed but fewer
+    /// bytes than the run produced (the runner wrote the rest to its log only), or nothing was streamed
+    /// and the tail is less than all of it.
+    #[must_use]
+    pub const fn partial(&self) -> bool {
+        if self.chunks > 0 {
+            self.total_bytes > self.streamed_bytes
+        } else {
+            self.truncated
+        }
+    }
 }
 
 /// Which rows [`list`] returns.
@@ -442,6 +467,9 @@ impl Requester {
         check_text("session", &self.session, MAX_NAME_BYTES, false)?;
         if let Some(t) = &self.agent_type {
             check_text("agent type", t, MAX_NAME_BYTES, false)?;
+        }
+        if let Some(a) = &self.agent_id {
+            check_text("agent id", a, MAX_NAME_BYTES, false)?;
         }
         check_text("role", &self.role, MAX_NAME_BYTES, false)
     }
@@ -508,7 +536,8 @@ impl Ask {
 const COLUMNS: &str =
     "id, created_at, expires_at, session, agent_type, role, task_id, target, dir, \
                        dir_side, argv, reason, pin_head, pin_changes, timeout_ms, state, \
-                       refuse_reason, note, runner, started_at, ended_at, exit_status, outcome";
+                       refuse_reason, note, runner, started_at, ended_at, exit_status, outcome, \
+                       (SELECT d.agent_id FROM exec_delivery d WHERE d.request_id = exec_requests.id)";
 
 fn corrupt(id: i64, what: &str, value: &str) -> crate::Error {
     QueueError::Corrupt(format!(
@@ -542,6 +571,7 @@ fn row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         ended_at: r.get(20)?,
         exit_status: r.get(21)?,
         outcome: r.get(22)?,
+        agent_id: r.get(23)?,
     })
 }
 
@@ -570,6 +600,7 @@ struct RawRow {
     ended_at: Option<i64>,
     exit_status: Option<i64>,
     outcome: Option<String>,
+    agent_id: Option<String>,
 }
 
 impl RawRow {
@@ -604,6 +635,7 @@ impl RawRow {
             requester: Requester {
                 session: self.session,
                 agent_type: self.agent_type,
+                agent_id: self.agent_id,
                 role: self.role,
                 task: self.task_id.map(ItemId::new),
             },
@@ -816,8 +848,9 @@ fn moved(
 }
 
 /// Expire every pending request whose `expires_at` has passed, returning their ids. Called at the
-/// start of every function here that takes `meta`, so no path sees a request it should not.
-fn settle(conn: &Connection, meta: &WriteMeta, now: i64) -> Result<Vec<i64>> {
+/// start of every function here that takes `meta`, so no path sees a request it should not — and by
+/// [`crate::exec_delivery::take_for_hook`], so a result is never held back for want of an exec op.
+pub(crate) fn settle(conn: &Connection, meta: &WriteMeta, now: i64) -> Result<Vec<i64>> {
     let due: Vec<i64> = conn
         .prepare_cached(
             "SELECT id FROM exec_requests WHERE state = 'pending' AND expires_at <= ?1 ORDER BY id",
@@ -860,6 +893,7 @@ fn settle(conn: &Connection, meta: &WriteMeta, now: i64) -> Result<Vec<i64>> {
             &[&id, &now, &note],
             now,
         )? {
+            close_warnings(conn, id)?;
             publish(conn, meta, id, "exec.end", end_payload(&row), now, false)?;
         }
     }
@@ -940,6 +974,9 @@ pub fn request(
             ..TopicSpec::default()
         };
         mq::topic_create_reserved(conn, meta, &topic(id), &spec, now)?;
+        // Its delivery row, in the request's own transaction: every request has one, so no deliverer
+        // can find a result it does not know how to hand back.
+        crate::exec_delivery::create(conn, id, requester.agent_id.as_deref())?;
         let row = must_get(conn, id)?;
         // Every way of asking notifies, because it is done here, in the request's own transaction.
         crate::notify::post_direct(
@@ -978,6 +1015,9 @@ pub fn request(
         .ok_or_else(|| {
             validation("the request collided with no pending request it could fold into")
         })?;
+    // Asked again by another agent of the session: the result now goes to the session, not to one of
+    // the two agents.
+    crate::exec_delivery::fold(conn, id, requester.agent_id.as_deref())?;
     Ok(Requested {
         row: must_get(conn, id)?,
         folded: true,
@@ -1142,6 +1182,7 @@ pub fn output(
              ON CONFLICT(request_id) DO UPDATE SET chunks = chunks + 1 RETURNING chunks - 1",
         )?
         .query_row([id], |r| r.get(0))?;
+    warnings::collect(conn, id, chunk, false, chunk.len())?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
     let seq = publish(
         conn,
@@ -1182,6 +1223,19 @@ fn store_output(conn: &Connection, id: i64, done: &Finished<'_>, tail_len: i64) 
         done.log_path
     ])?;
     Ok(())
+}
+
+/// The end of `id`'s output, for its warning lines: the unfinished last line counts now, and a run that
+/// streamed no chunk has its stored tail scanned instead — so every way a run ends collects them.
+fn close_warnings(conn: &Connection, id: i64) -> Result<()> {
+    let Some(out) = output_of(conn, id)? else {
+        return Ok(());
+    };
+    if out.chunks == 0 {
+        warnings::collect(conn, id, &out.tail, true, 0)
+    } else {
+        warnings::collect(conn, id, &[], true, 0)
+    }
 }
 
 /// Refuse anyone but the runner of a running request.
@@ -1259,6 +1313,7 @@ pub fn finish(
         )?
         .ok_or_else(|| stale(format!("{} changed under its finish", row.wire_id())))?;
         store_output(conn, id, done, tail_len)?;
+        close_warnings(conn, id)?;
         publish(
             conn,
             meta,
@@ -1301,6 +1356,7 @@ pub fn finish(
     )?
     .ok_or_else(|| not_pending(&row, "finish"))?;
     store_output(conn, id, done, tail_len)?;
+    close_warnings(conn, id)?;
     publish(
         conn,
         meta,
@@ -1335,21 +1391,35 @@ pub fn status(
 /// # Errors
 /// A database error.
 pub fn output_of(conn: &Connection, id: i64) -> Result<Option<Output>> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT tail, total_bytes, truncated, chunks, log_path FROM exec_output \
-             WHERE request_id = ?1",
-        )?
-        .query_row([id], |r| {
-            Ok(Output {
+    conn.prepare_cached(
+        "SELECT tail, total_bytes, truncated, chunks, log_path, warnings, warnings_dropped, \
+                    streamed_bytes FROM exec_output WHERE request_id = ?1",
+    )?
+    .query_row([id], |r| {
+        Ok((
+            Output {
                 tail: r.get(0)?,
                 total_bytes: r.get(1)?,
                 truncated: r.get(2)?,
                 chunks: r.get(3)?,
                 log_path: r.get(4)?,
-            })
-        })
-        .optional()?)
+                warnings: Vec::new(),
+                warnings_dropped: r.get(6)?,
+                streamed_bytes: r.get(7)?,
+            },
+            r.get::<_, String>(5)?,
+        ))
+    })
+    .optional()?
+    .map(|(mut out, warnings)| {
+        out.warnings = serde_json::from_str(&warnings).map_err(|e| {
+            crate::Error::from(QueueError::Corrupt(format!(
+                "exec request {id}'s warnings are not a list of strings: {e}"
+            )))
+        })?;
+        Ok::<_, crate::Error>(out)
+    })
+    .transpose()
 }
 
 /// A page of requests after id `after`, oldest first — or, with [`Filter::newest_first`], below id
@@ -1562,6 +1632,11 @@ pub fn index_ack(
 ) -> Result<i64> {
     mq::ack_reserved(conn, meta, INDEX_TOPIC, group, seq, now)
 }
+
+mod text;
+pub mod warnings;
+
+pub use text::{delivery_text, escape, DELIVERY_TEXT_MAX_BYTES, NOT_AN_INSTRUCTION};
 
 #[cfg(test)]
 mod tests;

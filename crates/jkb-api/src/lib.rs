@@ -215,6 +215,12 @@ pub enum Request {
         /// The session's working directory.
         #[serde(default)]
         cwd: String,
+        /// This process's inbox, from the hook's environment — honoured only from the harness (the
+        /// operator or the container's credential) or the session's own ticket, so no session can
+        /// point another's results at a socket it controls. A start without one keeps the inbox the
+        /// process already registered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inbox: Option<Inbox>,
     },
     /// A Claude Code session ended, as its own process reported: that process's hold ends. The session
     /// stays live while another process holds it.
@@ -576,6 +582,19 @@ pub enum Request {
         after: Option<i64>,
         /// At most this many (at most 256).
         max: usize,
+    },
+    /// Hand over every run-request result due for one agent of a session, through the attest hook
+    /// ([`jkb_core::exec_delivery::take_for_hook`]): each is marked delivered, and its message
+    /// returned, so a session hears its result on its next tool call, prompt or start. Also lists the
+    /// session's still-open requests. The dev container's credential's, and the operator's, alone.
+    #[serde(rename = "exec.inbox.take")]
+    ExecInboxTake {
+        /// The Claude Code session.
+        session: String,
+        /// The subagent the hook event came from; absent for the main agent, which is handed its own
+        /// results and those of subagents that have stopped.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
     },
     /// Start running a pending request — the operator's runner (`jkb_core::exec::begin`).
     ///
@@ -1545,6 +1564,27 @@ pub struct NotifySession {
     pub state: String,
 }
 
+/// A `claude` process's inbox, as `session.started` carries it: the socket and token from the hook's
+/// `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Inbox {
+    /// The socket's absolute path.
+    pub socket: String,
+    /// The token that authenticates a post to it.
+    pub token: String,
+}
+
+/// Never the token: a `Debug` of a request lands in logs.
+impl std::fmt::Debug for Inbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inbox")
+            .field("socket", &self.socket)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
 /// One process's hold on a Claude Code session, as `session.list` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeSession {
@@ -1570,6 +1610,9 @@ pub struct ClaudeSession {
     /// Why it ended (`gone` when a sweep proved it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<String>,
+    /// Whether this process registered its inbox socket. Never the token, which no listing carries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inbox: bool,
 }
 
 impl From<jkb_core::claude_session::HolderRow> for ClaudeSession {
@@ -1584,6 +1627,7 @@ impl From<jkb_core::claude_session::HolderRow> for ClaudeSession {
             seen_at: r.seen_at,
             ended_at: r.ended_at,
             end_reason: r.end_reason,
+            inbox: r.has_inbox,
         }
     }
 }
@@ -1860,6 +1904,7 @@ impl Request {
         "exec.status",
         "exec.list",
         "exec.follow",
+        "exec.inbox.take",
         "exec.begin",
         "exec.decline",
         "exec.refuse",
@@ -2120,6 +2165,7 @@ impl Request {
             Self::ExecStatus { .. } => "exec.status",
             Self::ExecList { .. } => "exec.list",
             Self::ExecFollow { .. } => "exec.follow",
+            Self::ExecInboxTake { .. } => "exec.inbox.take",
             Self::ExecBegin { .. } => "exec.begin",
             Self::ExecDecline { .. } => "exec.decline",
             Self::ExecRefuse { .. } => "exec.refuse",
@@ -2301,6 +2347,9 @@ impl Request {
             | Self::ExecRequest(_)
             | Self::ExecStatus { .. }
             | Self::ExecList { .. }
+            // A read first, and a write only when something is due — on the writer, since it may
+            // write, and the hook that sends it must not wait behind a long read.
+            | Self::ExecInboxTake { .. }
             | Self::ExecBegin { .. }
             | Self::ExecDecline { .. }
             | Self::ExecRefuse { .. }
@@ -2611,6 +2660,13 @@ pub enum Response {
         /// Continue after this.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next: Option<i64>,
+    },
+    /// An `exec.inbox.take`.
+    ExecInboxTaken {
+        /// One message per result handed over, oldest first ([`jkb_core::exec::delivery_text`]).
+        lines: Vec<String>,
+        /// The session's requests still pending or running.
+        open: Vec<exec::OpenRequest>,
     },
     /// An `exec.output`.
     ExecOutputSent {
@@ -3191,6 +3247,7 @@ impl Response {
             | Self::ExecRequest { .. }
             | Self::ExecBegun { .. }
             | Self::ExecRequests { .. }
+            | Self::ExecInboxTaken { .. }
             | Self::ExecOutputSent { .. } => false,
         }
     }
@@ -3219,6 +3276,9 @@ impl Response {
             | Self::ExecBegun { .. }
             | Self::ExecRequests { .. }
             | Self::ExecOutputSent { .. } => true,
+            // A take that handed something over settled expiries first, which announces them; one that
+            // found nothing — every tool call of every idle session — wrote nothing.
+            Self::ExecInboxTaken { lines, .. } => !lines.is_empty(),
             Self::Notified { sent, .. } => *sent > 0,
             // Every stored design update is announced on `design/<uid>` (D53.4).
             Self::DesignWritten { written } => written.seq.is_some(),
@@ -3953,14 +4013,28 @@ impl LocalBackend {
                 pid,
                 instance,
                 cwd,
+                inbox,
             } => {
+                // Honoured only from whoever may vouch for the session; a malformed one is dropped, not
+                // a refused start — a lost start is what leaves a running session recorded as ended.
+                let inbox = inbox
+                    .filter(|_| exec::vouches_for_end(principal, &session))
+                    .and_then(|i| claude_session::Inbox::new(&i.socket, &i.token).ok());
                 let was = db.write_txn(actor, move |c, m| {
                     let process = claude_session::Process {
                         session: &session,
                         pid: &pid,
                         instance: &instance,
                     };
-                    claude_session::started(c, m, &process, &cwd, &source, now)
+                    claude_session::started_with_inbox(
+                        c,
+                        m,
+                        &process,
+                        &cwd,
+                        &source,
+                        inbox.as_ref(),
+                        now,
+                    )
                 })?;
                 Response::SessionStart {
                     was: was.as_str().to_owned(),
@@ -4368,6 +4442,9 @@ impl LocalBackend {
                     now,
                 )?;
                 Response::ExecRequests { requests, next }
+            }
+            Request::ExecInboxTake { session, agent_id } => {
+                exec::inbox_take(db, actor, &session, agent_id, now)?
             }
             Request::ExecFollow { id, after, max } => Response::Messages {
                 messages: exec::follow(db, principal, &id, after.unwrap_or(0), max, now)?
@@ -4993,12 +5070,24 @@ impl LocalBackend {
                 session,
                 agent_id,
                 tool_use_id,
-            } => Response::TicketsReleased {
-                count: match &self.tickets {
-                    Some(t) => t.release(&session, agent_id.as_deref(), tool_use_id.as_deref())?,
-                    None => 0,
-                },
-            },
+            } => {
+                // A subagent's stop, in the same op: its undelivered run-request results become the
+                // session's to hear, at once.
+                if let (Some(agent), None) = (&agent_id, &tool_use_id) {
+                    let (s, a) = (session.clone(), agent.clone());
+                    db.write_txn(actor, move |c, _| {
+                        jkb_core::exec_delivery::agent_gone(c, &s, &a, now)
+                    })?;
+                }
+                Response::TicketsReleased {
+                    count: match &self.tickets {
+                        Some(t) => {
+                            t.release(&session, agent_id.as_deref(), tool_use_id.as_deref())?
+                        }
+                        None => 0,
+                    },
+                }
+            }
             Request::TaskClaims { after } => {
                 let (claims, next) = db.read_with(move |c| claims::claims(c, after))?;
                 Response::Claims { claims, next }

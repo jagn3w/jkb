@@ -26,6 +26,7 @@ fn who(session: &str) -> Requester {
     Requester {
         session: session.to_owned(),
         agent_type: Some("implementer".to_owned()),
+        agent_id: None,
         role: "implementer".to_owned(),
         task: None,
     }
@@ -1255,4 +1256,222 @@ fn a_list_reads_newest_first_down_from_its_cursor() {
         ids[..5].iter().rev().copied().collect::<Vec<_>>()
     );
     assert_eq!(more, None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Warning lines and the result message
+// ---------------------------------------------------------------------------------------------
+
+fn running(db: &Db, argv: &str) -> i64 {
+    let id = req(db, &who("s1"), &ask(&[argv], None), T0).row.id;
+    assert!(matches!(
+        try_begin(db, id, None, "app", T0 + 1).unwrap(),
+        Begun::Running(_)
+    ));
+    id
+}
+
+fn chunk(db: &Db, id: i64, bytes: &[u8]) {
+    let bytes = bytes.to_vec();
+    db.write_txn("t", move |c, m| output(c, m, id, "app", &bytes, T0 + 2))
+        .unwrap();
+}
+
+fn end_with(db: &Db, id: i64, tail: &[u8], total: i64) -> super::Output {
+    let tail = tail.to_vec();
+    db.write_txn("t", move |c, m| {
+        finish(
+            c,
+            m,
+            id,
+            &Finished {
+                runner: "app",
+                outcome: Outcome::Exited,
+                exit_status: Some(0),
+                tail: &tail,
+                total_bytes: total,
+                log_path: Some("/logs/exec.log"),
+            },
+            T0 + 3,
+        )
+    })
+    .unwrap();
+    db.read(move |c| output_of(c, id)).unwrap().unwrap()
+}
+
+#[test]
+fn warnings_are_collected_from_the_chunks_as_they_arrive() {
+    let db = Db::open_in_memory().unwrap();
+    let id = running(&db, "land");
+    chunk(&db, id, b"compiling\nwarn");
+    chunk(&db, id, b"ing: 2 tasks are unplanned\n");
+    // Pushed far out of the tail by later output, the early warning is still kept.
+    let filler = vec![b'.'; MAX_CHUNK_BYTES];
+    for _ in 0..7 {
+        chunk(&db, id, &filler);
+    }
+    chunk(
+        &db,
+        id,
+        b"\n\x1b[33mwarning:\x1b[0m late\nwarning: no newline",
+    );
+    let total = i64::try_from(MAX_CHUNK_BYTES * 7).unwrap() + 120;
+    let out = end_with(&db, id, b"tail without warnings", total);
+    assert_eq!(
+        out.warnings,
+        vec![
+            "warning: 2 tasks are unplanned".to_owned(),
+            "warning:\u{1b}[0m late".to_owned(),
+            "warning: no newline".to_owned(),
+        ]
+    );
+    assert_eq!(out.warnings_dropped, 0);
+    assert!(
+        out.partial(),
+        "fewer bytes were streamed than the run produced"
+    );
+}
+
+#[test]
+fn the_tail_is_scanned_when_no_chunk_was_streamed() {
+    let db = Db::open_in_memory().unwrap();
+    let id = running(&db, "quiet");
+    let out = end_with(&db, id, b"ok\nwarning: from the tail\n", 26);
+    assert_eq!(out.warnings, vec!["warning: from the tail".to_owned()]);
+    assert!(!out.partial());
+    let cut = running(&db, "loud");
+    let out = end_with(&db, cut, b"warning: seen\n", 1_000_000);
+    assert!(out.partial(), "a tail shorter than the output");
+}
+
+#[test]
+fn past_fifty_warnings_the_rest_are_counted() {
+    let db = Db::open_in_memory().unwrap();
+    let id = running(&db, "noisy");
+    let mut text = Vec::new();
+    for n in 0..73 {
+        text.extend_from_slice(format!("warning: {n}\n").as_bytes());
+    }
+    chunk(&db, id, &text);
+    let out = end_with(&db, id, b"", i64::try_from(text.len()).unwrap());
+    assert_eq!(out.warnings.len(), super::warnings::MAX_WARNINGS);
+    assert_eq!(out.warnings[49], "warning: 49");
+    assert_eq!(out.warnings_dropped, 23);
+    assert!(!out.partial());
+}
+
+fn delivery() -> crate::exec_delivery::Delivery {
+    crate::exec_delivery::Delivery::default()
+}
+
+#[test]
+fn the_message_says_what_became_of_the_request() {
+    let db = Db::open_in_memory().unwrap();
+    let id = running(&db, "land");
+    chunk(&db, id, b"warning: 2 tasks are unplanned\n");
+    let out = end_with(&db, id, b"", 31);
+    let r = row(&db, id);
+    assert_eq!(
+        super::delivery_text(&r, Some(&out), &delivery()),
+        format!(
+            "[jkb run request] exec-{id} finished exit 0: run the gate the sandbox cannot\n\
+             filed by implementer · argv: land · log: /logs/exec.log\n\
+             warning: 2 tasks are unplanned\n\
+             {}",
+            super::NOT_AN_INSTRUCTION
+        )
+    );
+    let sub = crate::exec_delivery::Delivery {
+        agent_id: Some("a1b2".into()),
+        ..delivery()
+    };
+    assert!(
+        super::delivery_text(&r, Some(&out), &sub).contains("filed by implementer (a1b2) · argv")
+    );
+    let mut main = r.clone();
+    main.requester.agent_type = None;
+    assert!(super::delivery_text(&main, None, &delivery()).contains("filed by the main agent ·"));
+
+    let words = |f: &dyn Fn(&mut super::ExecRow)| {
+        let mut x = r.clone();
+        f(&mut x);
+        let text = super::delivery_text(&x, None, &delivery());
+        text.lines().next().unwrap().to_owned()
+    };
+    let head = format!("[jkb run request] exec-{id}");
+    let why = ": run the gate the sandbox cannot";
+    assert_eq!(
+        words(&|x| {
+            x.outcome = Some(Outcome::Signalled);
+            x.exit_status = Some(9);
+        }),
+        format!("{head} finished signal 9{why}")
+    );
+    assert_eq!(
+        words(&|x| x.outcome = Some(Outcome::TimedOut)),
+        format!("{head} timed out{why}")
+    );
+    assert_eq!(
+        words(&|x| x.outcome = Some(Outcome::Interrupted)),
+        format!("{head} interrupted{why}")
+    );
+    assert_eq!(
+        words(&|x| {
+            x.state = ExecState::Declined;
+            x.note = Some("ask for the gate\nonly".into());
+        }),
+        format!("{head} declined: ask for the gate\\u{{000a}}only{why}")
+    );
+    for (reason, said) in [
+        (RefuseReason::TreeChanged, "tree changed"),
+        (RefuseReason::AuditRefused, "audit refused"),
+        (RefuseReason::DirGone, "directory gone"),
+    ] {
+        assert_eq!(
+            words(&|x| {
+                x.state = ExecState::Refused;
+                x.refuse_reason = Some(reason);
+            }),
+            format!("{head} refused: {said}{why}")
+        );
+    }
+    assert_eq!(
+        words(&|x| {
+            x.state = ExecState::Expired;
+            x.note = Some("expired: nobody answered it in two hours".into());
+        }),
+        format!("{head} expired: unanswered for two hours{why}")
+    );
+    assert_eq!(
+        words(&|x| {
+            x.state = ExecState::Expired;
+            x.note = Some("expired: the requesting session ended".into());
+        }),
+        format!("{head} expired: your session ended{why}")
+    );
+}
+
+#[test]
+fn the_message_escapes_what_a_program_printed_and_stays_under_its_cap() {
+    let db = Db::open_in_memory().unwrap();
+    let id = running(&db, "x");
+    let mut text = b"warning: \x1b]0;title\x07 \xe2\x80\xae evil\n".to_vec();
+    for n in 0..49 {
+        text.extend_from_slice(format!("warning: {n} {}\n", "w".repeat(900)).as_bytes());
+    }
+    chunk(&db, id, &text);
+    let out = end_with(&db, id, b"", i64::try_from(text.len()).unwrap() + 10);
+    let msg = super::delivery_text(&row(&db, id), Some(&out), &delivery());
+    assert!(msg.len() <= super::DELIVERY_TEXT_MAX_BYTES, "{}", msg.len());
+    assert!(msg.contains("warning: \\u{001b}]0;title\\u{0007} \\u{202e} evil"));
+    assert!(!msg.contains('\u{1b}') && !msg.contains('\u{202e}'));
+    assert!(msg.ends_with(super::NOT_AN_INSTRUCTION));
+    let closing = msg.lines().rev().nth(1).unwrap();
+    assert!(
+        closing.starts_with("(+") && closing.contains("more warning lines; output reached jkb only in part; more warnings may be in /logs/exec.log)"),
+        "{closing}"
+    );
+    let shown = msg.lines().filter(|l| l.starts_with("warning:")).count();
+    let more: usize = closing[2..closing.find(' ').unwrap()].parse().unwrap();
+    assert_eq!(shown + more, 50, "every warning is shown or counted");
 }

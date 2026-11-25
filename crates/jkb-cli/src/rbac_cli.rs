@@ -180,9 +180,11 @@ pub enum WorkflowCmd {
 
 #[derive(Subcommand)]
 pub enum AttestCmd {
-    /// The Claude Code hook: read a `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SubagentStop` or
-    /// `SessionEnd` payload on stdin, mint or release the tool call's ticket, and on `PreToolUse` put it
-    /// on the command. Always exits 0; failures go to `~/.jkb/logs/attest-hook.log`.
+    /// The Claude Code hook: read a `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+    /// `UserPromptSubmit`, `SessionStart`, `SubagentStop` or `SessionEnd` payload on stdin, mint or
+    /// release the tool call's ticket (on `PreToolUse` putting it on the command), register the
+    /// session's inbox at its start, and hand the session the results of run requests it filed as
+    /// context. Always exits 0; failures go to `~/.jkb/logs/attest-hook.log`.
     Hook,
 }
 
@@ -1147,10 +1149,9 @@ pub fn attest(cmd: &AttestCmd) {
             return;
         }
     };
-    let s = |k: &str| p[k].as_str().map(str::to_owned);
-    let Some(session) = s("session_id") else {
+    if p["session_id"].as_str().is_none() {
         return;
-    };
+    }
     let backend = match remote::client(&remote::daemon_url(), Purpose::Hook) {
         Ok(b) => b,
         Err(e) => {
@@ -1158,15 +1159,160 @@ pub fn attest(cmd: &AttestCmd) {
             return;
         }
     };
-    let request = match s("hook_event_name").as_deref() {
-        Some("PreToolUse") => {
+    let is_start = p["hook_event_name"].as_str() == Some("SessionStart");
+    let instance = if is_start {
+        crate::notify::instance()
+    } else {
+        String::new()
+    };
+    let env = HookEnv {
+        forced_ask: std::env::var("JKB_ATTEST_DECISION").as_deref() == Ok("ask"),
+        inbox: if is_start {
+            crate::notify::inbox_from_env()
+        } else {
+            None
+        },
+        owner: if is_start {
+            crate::notify::owner_in(&instance, attest_owner)
+        } else {
+            String::new()
+        },
+        instance,
+    };
+    let (out, failures) = attest_event(&backend, &p, &env);
+    for f in failures {
+        log_failure(&f);
+    }
+    if let Some(out) = out {
+        println!("{out}");
+    }
+}
+
+/// What the attest hook reads from outside its payload, resolved at the edge so [`attest_event`] is a
+/// function of its arguments.
+#[derive(Debug, Default)]
+struct HookEnv {
+    /// `JKB_ATTEST_DECISION=ask`.
+    forced_ask: bool,
+    /// At `SessionStart`: the process's inbox, from the environment.
+    inbox: Option<jkb_api::Inbox>,
+    /// At `SessionStart`: the `claude` process, or empty when it could not be trusted.
+    owner: String,
+    /// At `SessionStart`: where `owner` means something.
+    instance: String,
+}
+
+/// The `claude` process the managed hook was started by, if that is what its parent is. Claude Code
+/// starts a hook's command directly (measured for the notification shim, whose `$PPID` is `claude`),
+/// so this process's parent is the session's process — unless a shell sits between, which would exit
+/// with this hook and make the registry row read as provably dead. A parent that is a shell, or one
+/// that cannot be read, names no process: the start is then not sent from here at all, because a
+/// pid-less row would keep the session from ever reading as ended.
+fn attest_owner() -> String {
+    if let Ok(o) = std::env::var("JKB_HOOK_OWNER") {
+        return crate::notify::owner_from(
+            o.trim(),
+            std::os::unix::process::parent_id(),
+            std::process::id(),
+        );
+    }
+    let parent = std::os::unix::process::parent_id();
+    let Ok(comm) = std::fs::read_to_string(format!("/proc/{parent}/comm")) else {
+        return String::new();
+    };
+    if is_shell(comm.trim()) || parent <= 1 {
+        return String::new();
+    }
+    parent.to_string()
+}
+
+/// Whether a process named `comm` is a shell — a short-lived process between Claude Code and a hook.
+fn is_shell(comm: &str) -> bool {
+    matches!(
+        comm,
+        "sh" | "bash" | "dash" | "zsh" | "ash" | "ksh" | "mksh" | "fish" | "busybox" | "env"
+    )
+}
+
+/// The line `SessionStart` adds after the open requests it lists.
+const OPEN_REMINDER: &str = "You will be told when these end; `jkb exec status --wait <id>` \
+                             re-attaches in the foreground if you need to wait.";
+
+/// The hook output that puts `context` into the model's context at `event`.
+fn context_output(event: &str, context: &str) -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": context,
+        }
+    })
+}
+
+/// One `exec.inbox.take`: the messages of the results it handed over and, with `open`, the reminder
+/// of what is still open — `None` when there is nothing to say.
+fn take(
+    backend: &dyn Backend,
+    session: &str,
+    agent_id: Option<String>,
+    open: bool,
+    failures: &mut Vec<String>,
+) -> Option<String> {
+    let (lines, still_open) = match backend.call(Request::ExecInboxTake {
+        session: session.to_owned(),
+        agent_id,
+    }) {
+        Ok(Response::ExecInboxTaken { lines, open }) => (lines, open),
+        Ok(other) => {
+            failures.push(format!("exec.inbox.take: unexpected {other:?}"));
+            return None;
+        }
+        Err(e) => {
+            failures.push(format!("exec.inbox.take: {}", e.message));
+            return None;
+        }
+    };
+    let mut parts = lines;
+    if open && !still_open.is_empty() {
+        let mut block = String::from("Your run requests still open:\n");
+        for o in &still_open {
+            block.push_str(&o.line());
+            block.push('\n');
+        }
+        block.push_str(OPEN_REMINDER);
+        parts.push(block);
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// One hook event: what to print, and the failures to log.
+///
+/// * `PreToolUse` (Bash): mint the call's ticket and put it on the command.
+/// * `PostToolUse`/`PostToolUseFailure`, for any tool: hand over the results due for the agent that
+///   made the call (`exec.inbox.take`), as `additionalContext`; and release the call's ticket, for a
+///   Bash call this hook ticketed.
+/// * `UserPromptSubmit`: the same take — how an idle session hears a result, on the next prompt.
+/// * `SessionStart`: register the process and its inbox (`session.started`, through the one builder
+///   the notification hook uses too), then the take; after a compaction or a resume, also the requests
+///   still open, so a session that lost its memory of them is told.
+/// * `SubagentStop`: release the subagent's tickets — which also makes its undelivered results the
+///   session's to hear.
+/// * `SessionEnd`: release the session's tickets.
+fn attest_event(backend: &dyn Backend, p: &Value, env: &HookEnv) -> (Option<Value>, Vec<String>) {
+    let mut failures = Vec::new();
+    let s = |k: &str| p[k].as_str().map(str::to_owned);
+    let Some(session) = s("session_id") else {
+        return (None, failures);
+    };
+    let event = s("hook_event_name").unwrap_or_default();
+    let request = match event.as_str() {
+        "PreToolUse" => {
             let command = p["tool_input"]["command"].as_str().unwrap_or_default();
             let class = attestation(command);
             if s("tool_name").as_deref() != Some("Bash") || class == Attestation::Skip {
-                return;
+                return (None, failures);
             }
             let Some(tool_use_id) = s("tool_use_id") else {
-                return;
+                return (None, failures);
             };
             let token = match backend.call(Request::AttestMint {
                 session,
@@ -1176,51 +1322,79 @@ pub fn attest(cmd: &AttestCmd) {
             }) {
                 Ok(Response::Ticket { token }) => token,
                 Ok(other) => {
-                    log_failure(&format!("attest.mint: unexpected {other:?}"));
-                    return;
+                    failures.push(format!("attest.mint: unexpected {other:?}"));
+                    return (None, failures);
                 }
                 Err(e) => {
-                    log_failure(&format!("attest.mint: {}", e.message));
-                    return;
+                    failures.push(format!("attest.mint: {}", e.message));
+                    return (None, failures);
                 }
             };
             let mut input = p["tool_input"].clone();
             input["command"] = json!(format!("export {}={token}; {command}", remote::ATTEST_VAR));
-            let forced_ask = std::env::var("JKB_ATTEST_DECISION").as_deref() == Ok("ask");
-            println!("{}", pre_tool_use(class, forced_ask, &input));
-            return;
+            return (Some(pre_tool_use(class, env.forced_ask, &input)), failures);
         }
-        // Only a call this hook ticketed has anything to release: asking the daemon after every
-        // `ls` put it on every Bash call's path.
-        Some("PostToolUse" | "PostToolUseFailure") => {
+        "PostToolUse" | "PostToolUseFailure" => {
+            let said = take(backend, &session, s("agent_id"), false, &mut failures);
+            // Only a call this hook ticketed has anything to release: asking the daemon after every
+            // `ls` put it on every Bash call's path.
             let command = p["tool_input"]["command"].as_str().unwrap_or_default();
-            if attestation(command) == Attestation::Skip {
-                return;
+            if s("tool_name").as_deref() == Some("Bash")
+                && attestation(command) != Attestation::Skip
+            {
+                if let Err(e) = backend.call(Request::AttestRelease {
+                    session,
+                    agent_id: None,
+                    tool_use_id: s("tool_use_id"),
+                }) {
+                    failures.push(format!("attest.release: {}", e.message));
+                }
             }
-            Request::AttestRelease {
-                session,
-                agent_id: None,
-                tool_use_id: s("tool_use_id"),
-            }
+            // `PostToolUseFailure` takes its context under its own event name.
+            return (said.map(|c| context_output(&event, &c)), failures);
         }
-        Some("SubagentStop") => match s("agent_id") {
+        "UserPromptSubmit" => {
+            let said = take(backend, &session, None, false, &mut failures);
+            return (said.map(|c| context_output(&event, &c)), failures);
+        }
+        "SessionStart" => {
+            // Registered only with a process it can name: a pid-less row would keep the session from
+            // ever reading as ended, and the notification hook, where there is one, registers it too.
+            if !env.owner.is_empty() && !env.instance.is_empty() {
+                if let Some(start) = crate::notify::session_start_request(
+                    p,
+                    &env.owner,
+                    &env.instance,
+                    env.inbox.clone(),
+                ) {
+                    if let Err(e) = backend.call(start) {
+                        failures.push(format!("session.started: {}", e.message));
+                    }
+                }
+            }
+            let open = matches!(s("source").as_deref(), Some("compact" | "resume"));
+            let said = take(backend, &session, None, open, &mut failures);
+            return (said.map(|c| context_output(&event, &c)), failures);
+        }
+        "SubagentStop" => match s("agent_id") {
             Some(agent) => Request::AttestRelease {
                 session,
                 agent_id: Some(agent),
                 tool_use_id: None,
             },
-            None => return,
+            None => return (None, failures),
         },
-        Some("SessionEnd") => Request::AttestRelease {
+        "SessionEnd" => Request::AttestRelease {
             session,
             agent_id: None,
             tool_use_id: None,
         },
-        _ => return,
+        _ => return (None, failures),
     };
     if let Err(e) = backend.call(request) {
-        log_failure(&format!("attest.release: {}", e.message));
+        failures.push(format!("attest.release: {}", e.message));
     }
+    (None, failures)
 }
 
 #[cfg(test)]
@@ -2031,5 +2205,206 @@ mod tests {
         ] {
             assert!(!runs_jkb(no), "{no}");
         }
+    }
+
+    /// A daemon that records every request, and hands `lines` and `open` to each `exec.inbox.take`.
+    struct Recorder {
+        sent: RefCell<Vec<Request>>,
+        lines: Vec<String>,
+        open: Vec<jkb_api::exec::OpenRequest>,
+    }
+
+    impl Recorder {
+        fn new(lines: &[&str]) -> Self {
+            Self {
+                sent: RefCell::new(Vec::new()),
+                lines: lines.iter().map(|l| (*l).to_owned()).collect(),
+                open: Vec::new(),
+            }
+        }
+
+        fn ops(&self) -> Vec<&'static str> {
+            self.sent.borrow().iter().map(Request::op).collect()
+        }
+    }
+
+    impl Backend for Recorder {
+        fn call(&self, request: Request) -> Result<Response, ApiError> {
+            let answer = match &request {
+                Request::ExecInboxTake { .. } => Response::ExecInboxTaken {
+                    lines: self.lines.clone(),
+                    open: self.open.clone(),
+                },
+                Request::AttestRelease { .. } => Response::TicketsReleased { count: 1 },
+                Request::SessionStarted { .. } => Response::SessionStart {
+                    was: "unknown".to_owned(),
+                },
+                other => panic!("unexpected request {other:?}"),
+            };
+            self.sent.borrow_mut().push(request);
+            Ok(answer)
+        }
+    }
+
+    fn event(b: &Recorder, payload: &Value, env: &super::HookEnv) -> Option<Value> {
+        let (out, failures) = super::attest_event(b, payload, env);
+        assert!(failures.is_empty(), "{failures:?}");
+        out
+    }
+
+    fn context(out: &Value, event: &str) -> String {
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], event);
+        out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_post_tool_use_of_any_tool_takes_and_says_what_it_took() {
+        let b = Recorder::new(&["[jkb run request] exec-1 finished exit 0", "second"]);
+        let read = json!({
+            "hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Read",
+            "agent_id": "ag1", "tool_input": { "file_path": "/x" }
+        });
+        let out = event(&b, &read, &super::HookEnv::default()).unwrap();
+        assert_eq!(
+            context(&out, "PostToolUse"),
+            "[jkb run request] exec-1 finished exit 0\n\nsecond"
+        );
+        assert_eq!(
+            b.ops(),
+            vec!["exec.inbox.take"],
+            "a Read has no ticket to release"
+        );
+        {
+            let sent = b.sent.borrow();
+            let Request::ExecInboxTake { session, agent_id } = &sent[0] else {
+                panic!()
+            };
+            assert_eq!((session.as_str(), agent_id.as_deref()), ("s1", Some("ag1")));
+        }
+
+        let failed = json!({
+            "hook_event_name": "PostToolUseFailure", "session_id": "s1", "tool_name": "Edit"
+        });
+        let out = event(&b, &failed, &super::HookEnv::default()).unwrap();
+        context(&out, "PostToolUseFailure");
+    }
+
+    #[test]
+    fn with_nothing_due_the_hook_prints_nothing() {
+        let b = Recorder::new(&[]);
+        for name in ["PostToolUse", "UserPromptSubmit", "SessionStart"] {
+            let p = json!({ "hook_event_name": name, "session_id": "s1", "tool_name": "Read" });
+            assert_eq!(event(&b, &p, &super::HookEnv::default()), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_ticketed_bash_post_tool_use_takes_and_releases() {
+        let b = Recorder::new(&[]);
+        let p = json!({
+            "hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Bash",
+            "tool_use_id": "tu1", "tool_input": { "command": "jkb task show x" }
+        });
+        assert_eq!(event(&b, &p, &super::HookEnv::default()), None);
+        assert_eq!(b.ops(), vec!["exec.inbox.take", "attest.release"]);
+        let Request::AttestRelease { tool_use_id, .. } = &b.sent.borrow()[1] else {
+            panic!()
+        };
+        assert_eq!(tool_use_id.as_deref(), Some("tu1"));
+    }
+
+    #[test]
+    fn a_session_start_registers_the_inbox_and_after_a_compaction_lists_what_is_open() {
+        let mut b = Recorder::new(&["result"]);
+        b.open = vec![jkb_api::exec::OpenRequest {
+            id: "exec-12".into(),
+            state: "running".into(),
+            agent_type: Some("implementer".into()),
+            reason: "land it".into(),
+        }];
+        let env = super::HookEnv {
+            inbox: Some(jkb_api::Inbox {
+                socket: "/tmp/cc-socks/1.sock".into(),
+                token: "tok".into(),
+            }),
+            owner: "77".into(),
+            instance: "h#b/ns".into(),
+            ..super::HookEnv::default()
+        };
+        let p = json!({
+            "hook_event_name": "SessionStart", "session_id": "s1", "source": "compact", "cwd": "/w"
+        });
+        let out = event(&b, &p, &env).unwrap();
+        assert_eq!(b.ops(), vec!["session.started", "exec.inbox.take"]);
+        let Request::SessionStarted {
+            pid, inbox, source, ..
+        } = &b.sent.borrow()[0]
+        else {
+            panic!()
+        };
+        assert_eq!((pid.as_str(), source.as_str()), ("77", "compact"));
+        assert_eq!(inbox.as_ref().unwrap().socket, "/tmp/cc-socks/1.sock");
+        let said = context(&out, "SessionStart");
+        assert!(
+            said.starts_with("result\n\nYour run requests still open:\n"),
+            "{said}"
+        );
+        assert!(said.contains(r#"exec-12 running, filed by implementer: "land it""#));
+        assert!(said.ends_with(super::OPEN_REMINDER));
+
+        // A startup lists nothing open; a parent it cannot name registers nothing.
+        let b = Recorder::new(&[]);
+        let p =
+            json!({ "hook_event_name": "SessionStart", "session_id": "s1", "source": "startup" });
+        let env = super::HookEnv {
+            owner: String::new(),
+            instance: "h#b/ns".into(),
+            ..super::HookEnv::default()
+        };
+        assert_eq!(event(&b, &p, &env), None);
+        assert_eq!(b.ops(), vec!["exec.inbox.take"]);
+    }
+
+    #[test]
+    fn a_user_prompt_takes_for_the_main_agent() {
+        let b = Recorder::new(&["result"]);
+        let p =
+            json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1", "prompt": "hi" });
+        let out = event(&b, &p, &super::HookEnv::default()).unwrap();
+        assert_eq!(context(&out, "UserPromptSubmit"), "result");
+        let Request::ExecInboxTake { agent_id, .. } = &b.sent.borrow()[0] else {
+            panic!()
+        };
+        assert_eq!(*agent_id, None);
+    }
+
+    #[test]
+    fn a_subagent_stop_releases_with_its_agent_id() {
+        let b = Recorder::new(&["never said here"]);
+        let p = json!({ "hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": "ag1" });
+        assert_eq!(event(&b, &p, &super::HookEnv::default()), None);
+        let Request::AttestRelease {
+            agent_id,
+            tool_use_id,
+            ..
+        } = &b.sent.borrow()[0]
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (agent_id.as_deref(), tool_use_id.as_deref()),
+            (Some("ag1"), None)
+        );
+    }
+
+    #[test]
+    fn only_a_shell_parent_is_refused_as_the_owner() {
+        for shell in ["sh", "bash", "dash", "zsh"] {
+            assert!(super::is_shell(shell));
+        }
+        assert!(!super::is_shell("claude"));
     }
 }

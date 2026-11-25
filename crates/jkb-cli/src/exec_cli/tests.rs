@@ -21,6 +21,7 @@ fn requested(db: &Db, argv: &str) -> (i64, ExecView) {
                 &Requester {
                     session: "s1".into(),
                     agent_type: None,
+                    agent_id: None,
                     role: "coordinator".into(),
                     task: None,
                 },
@@ -609,4 +610,75 @@ fn a_patch_printed_to_a_terminal_is_escaped() {
         "+ok\n\\u{001b}[1A\\u{001b}[2K\trm\\u{202e}x\\u{0085}\\u{007f}"
     );
     assert_eq!(escape_for_terminal("plain é 漢\n"), "plain é 漢\n");
+}
+
+fn status_waited(db: &Db, id: i64, json: bool) -> (i32, String, String) {
+    let b = LocalBackend::new(db.clone());
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = super::status_wait(&b, &exec::wire_id(id), json, &mut out, &mut err).unwrap();
+    (
+        code,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+#[test]
+fn status_wait_re_attaches_and_ends_with_the_result_message() {
+    let db = Db::open_in_memory().unwrap();
+    let (id, _) = requested(&db, "land");
+    let runner = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            ran(
+                &db,
+                id,
+                &[b"building\n", b"warning: 1 task is unplanned\n"],
+                Outcome::Exited,
+                Some(4),
+            );
+        })
+    };
+    let (code, out, err) = status_waited(&db, id, false);
+    runner.join().unwrap();
+    assert_eq!(code, 4);
+    assert_eq!(out, "building\nwarning: 1 task is unplanned\n");
+    let text = err.split("\n\n").last().unwrap().trim_end();
+    assert!(
+        text.starts_with(&format!("[jkb run request] exec-{id} finished exit 4")),
+        "{err}"
+    );
+    assert!(text.contains("\nwarning: 1 task is unplanned\n"), "{text}");
+    assert!(text.ends_with(jkb_core::exec::NOT_AN_INSTRUCTION));
+
+    // An ended request: its tail again, and the same message; and it was never marked delivered.
+    let (code, out, _) = status_waited(&db, id, false);
+    assert_eq!(
+        (code, out.as_str()),
+        (4, "building\nwarning: 1 task is unplanned\n")
+    );
+    let d = db
+        .read(move |c| jkb_core::exec_delivery::get(c, id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.state, jkb_core::exec_delivery::DeliveryState::Waiting);
+}
+
+#[test]
+fn status_wait_with_json_prints_only_the_final_view() {
+    let db = Db::open_in_memory().unwrap();
+    let (id, _) = requested(&db, "make");
+    db.write_txn("t", move |c, m| {
+        exec::decline(c, m, id, "no", jkb_core::mq::now_ms())
+    })
+    .unwrap();
+    let (code, out, _) = status_waited(&db, id, true);
+    assert_eq!(code, super::EXIT_DECLINED);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["state"], "declined");
+    assert!(v["delivery_text"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("exec-{id} declined: no")));
 }

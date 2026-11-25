@@ -203,7 +203,7 @@ fn the_packaged_templates_are_what_the_coordinators_fill() {
         assert_eq!(get(c).def.role, Role::Coordinator, "{c}");
     }
     // `/task-swarm` fills the swarm's coordinator, the designer budget included.
-    assert_eq!(get("swarm-coordinator").version, 7);
+    assert_eq!(get("swarm-coordinator").version, 8);
     assert_eq!(
         placeholders(&get("swarm-coordinator").def.template).unwrap(),
         [
@@ -1906,4 +1906,19 @@ fn setup_maps_every_subagent_type_to_its_templates_role() {
             "scripts/setup.sh does not clear the bare `{bare}` (cleared: {cleared:?})"
         );
     }
+}
+
+/// The swarm's coordinator relays a run request's `warning:` lines in its report: the result reaches
+/// the session as a message, and only the report reaches the operator.
+#[test]
+fn the_swarm_coordinator_relays_run_request_warnings() {
+    let agents = packaged().unwrap();
+    let coord = &agents
+        .iter()
+        .find(|a| a.name == "swarm-coordinator")
+        .unwrap()
+        .def
+        .template;
+    assert!(coord.contains("[jkb run request] exec-N"), "{coord}");
+    assert!(coord.contains("`WARNINGS:` (or `WARNINGS: none`)"));
 }

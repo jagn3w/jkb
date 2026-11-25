@@ -151,7 +151,8 @@ impl OpPermission {
             Self::DesignApprove => "Approve a part of a design, when it names this reviewer.",
             Self::Grant => "Hand out and revoke role grants, of the roles it may grant.",
             Self::Attest => {
-                "Vouch for which agent made a tool call: the dev container's credential alone."
+                "Vouch for which agent made a tool call, and hand a session the results of the run \
+                 requests it filed: the dev container's credential alone."
             }
             Self::ExecRequest => "Ask the operator to run one command.",
             Self::Admin => {
@@ -377,7 +378,12 @@ impl Request {
             | Self::DesignTarget { .. }
             | Self::DesignSources { .. } => OpPermission::Design,
             Self::DesignApprove { .. } => OpPermission::DesignApprove,
-            Self::AttestMint { .. } | Self::AttestRelease { .. } => OpPermission::Attest,
+            // Handing a session its results reads their messages and marks them delivered: the
+            // harness's job, as attesting is, so a session cannot swallow another's — or its own
+            // subagent's — before they are heard.
+            Self::AttestMint { .. } | Self::AttestRelease { .. } | Self::ExecInboxTake { .. } => {
+                OpPermission::Attest
+            }
             // Threads are started and resolved by the operator, who alone approves a selection.
             Self::DesignThreadStart { .. }
             | Self::DesignThreadResolve { .. }
@@ -511,6 +517,7 @@ impl Request {
             | Self::RoleRevoke { .. }
             | Self::AttestMint { .. }
             | Self::AttestRelease { .. }
+            | Self::ExecInboxTake { .. }
             // Reads, and the hooks' own records.
             | Self::KbAmbient { .. }
             | Self::KbQuery { .. }

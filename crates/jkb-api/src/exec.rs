@@ -18,6 +18,7 @@
 
 use base64::Engine as _;
 use jkb_core::exec::{self, Ask, ExecRow, ExecState, ExecTarget, Outcome, RefuseReason, TreePin};
+use jkb_core::exec_delivery as delivery;
 use jkb_core::Db;
 use jkb_rbac::Role as _;
 use rusqlite::OptionalExtension as _;
@@ -155,6 +156,42 @@ pub struct ExecView {
     /// Its stored output — on `exec.status` only, once it ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputView>,
+    /// The message reporting its result, as the push and the hook deliver it
+    /// ([`jkb_core::exec::delivery_text`]) — on `exec.status` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_text: Option<String>,
+}
+
+/// A request still pending or running, as `exec.inbox.take` lists it for a session reminded of what
+/// it filed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenRequest {
+    /// `exec-<n>`.
+    pub id: String,
+    /// `pending` or `running`.
+    pub state: String,
+    /// The requesting subagent's type, if a subagent asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// The requester's sentence.
+    pub reason: String,
+}
+
+impl OpenRequest {
+    /// The reminder line: `exec-12 running, filed by implementer: "<reason>"`, escaped.
+    #[must_use]
+    pub fn line(&self) -> String {
+        format!(
+            "{} {}, filed by {}: \"{}\"",
+            self.id,
+            self.state,
+            exec::escape(
+                self.agent_type.as_deref().unwrap_or("the main agent"),
+                false
+            ),
+            exec::escape(&self.reason, false)
+        )
+    }
 }
 
 fn invalid(why: impl Into<String>) -> ApiError {
@@ -246,6 +283,7 @@ pub fn requester(principal: &Principal) -> Result<exec::Requester, ApiError> {
     Ok(exec::Requester {
         session: t.session.clone(),
         agent_type: t.agent_type.clone(),
+        agent_id: t.agent_id.clone(),
         role: role.name().to_owned(),
         task: principal.scope,
     })
@@ -322,6 +360,7 @@ pub fn view(conn: &rusqlite::Connection, row: ExecRow) -> Result<ExecView, ApiEr
         exit_status: row.exit_status,
         outcome: row.outcome.map(|o| o.as_str().to_owned()),
         output: None,
+        delivery_text: None,
     })
 }
 
@@ -347,7 +386,10 @@ pub fn status(
         if reader.as_ref().is_some_and(|s| *s != row.requester.session) {
             return Err(not_found(&wire));
         }
+        let delivery = delivery::get(c, n)?.unwrap_or_default();
+        let text = exec::delivery_text(&row, out.as_ref(), &delivery);
         let mut v = view(c, row)?;
+        v.delivery_text = Some(text);
         v.output = out.map(|o| OutputView {
             tail_b64: base64::engine::general_purpose::STANDARD.encode(&o.tail),
             total_bytes: o.total_bytes,
@@ -416,6 +458,48 @@ pub fn follow(
         }
         Ok(exec::follow(c, n, after, max, now)?)
     })
+}
+
+/// `exec.inbox.take`: hand `session`'s `agent_id` every result due for it, and list the session's open
+/// requests. A plain read first, so the common case — nothing due, on every tool call of every
+/// session — opens no write transaction; the take itself in one transaction. All of it on `db`, the
+/// writer's connection: the hook has a second, and must not wait behind a long read on the reader.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for a malformed session; a database error.
+pub fn inbox_take(
+    db: &Db,
+    actor: &str,
+    session: &str,
+    agent_id: Option<String>,
+    now: i64,
+) -> Result<crate::Response, ApiError> {
+    if !jkb_types::is_session_id(session) {
+        return Err(invalid(format!("{session:?} is not a session id")));
+    }
+    let (s, a) = (session.to_owned(), agent_id.clone());
+    let any = db.read(move |c| delivery::any_for_hook(c, &s, a.as_deref(), now))?;
+    let lines = if any {
+        let (s, a) = (session.to_owned(), agent_id);
+        db.write_txn(actor, move |c, m| {
+            let taken = delivery::take_for_hook(c, m, &s, a.as_deref(), now)?;
+            Ok(taken.iter().map(delivery::Taken::text).collect())
+        })?
+    } else {
+        Vec::new()
+    };
+    let s = session.to_owned();
+    let open = db
+        .read(move |c| delivery::open(c, &s))?
+        .into_iter()
+        .map(|r| OpenRequest {
+            id: r.wire_id(),
+            state: r.state.as_str().to_owned(),
+            agent_type: r.requester.agent_type,
+            reason: r.ask.reason,
+        })
+        .collect();
+    Ok(crate::Response::ExecInboxTaken { lines, open })
 }
 
 /// Whether an end reported for `session` by `principal` may expire that session's pending run

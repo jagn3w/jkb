@@ -1554,6 +1554,30 @@ if [ -z "${JKB_SETUP_MARKER:-}" ]; then
 elif [ -f "$JKB_SETUP_MARKER" ] && [ ! -x /usr/local/lib/jkb-hook/jkb ]; then
     bad "setup finished but /usr/local/lib/jkb-hook/jkb is missing — the harness hooks have nothing to run (run: sudo -n /usr/local/bin/pin-jkb-hook.sh)"
 fi
+# THE POSTURE IN FORCE delivers a run request's result (check-config.sh pins the repo's copy; this
+# reads what Claude Code loaded): the attest hook on every tool call's PostToolUse/PostToolUseFailure,
+# on UserPromptSubmit and SessionStart, and `crossSessionInbound: accept`. An image built before them
+# leaves results unheard until the operator relays them.
+rr_managed=/etc/claude-code/managed-settings.json
+if [ ! -f "$rr_managed" ] || ! command -v jq >/dev/null 2>&1; then
+    bad "cannot read $rr_managed with jq, so whether run-request results reach their session is unchecked"
+else
+    rr_bad=""
+    for rr_ev in PostToolUse PostToolUseFailure; do
+        rr_m="$(jq -r --arg e "$rr_ev" '.hooks[$e][]? | select([.hooks[]?.command] | index("/usr/local/lib/jkb-hook/jkb attest hook")) | .matcher // ""' "$rr_managed" 2>/dev/null)"
+        [ "$rr_m" = ".*" ] || rr_bad="$rr_bad $rr_ev(matcher [$rr_m])"
+    done
+    for rr_ev in UserPromptSubmit SessionStart; do
+        jq -e --arg e "$rr_ev" '[.hooks[$e][]?.hooks[]?.command] | index("/usr/local/lib/jkb-hook/jkb attest hook")' "$rr_managed" >/dev/null 2>&1 \
+            || rr_bad="$rr_bad $rr_ev(no attest hook)"
+    done
+    [ "$(jq -r '.crossSessionInbound // ""' "$rr_managed" 2>/dev/null)" = accept ] || rr_bad="$rr_bad crossSessionInbound"
+    if [ -z "$rr_bad" ]; then
+        ok "the managed attest hook hands sessions their run-request results on every tool call, prompt and start"
+    else
+        bad "run-request results would go unheard — $rr_managed:$rr_bad (rebuild the image)"
+    fi
+fi
 
 #     `sudo -n -l` failing and `sudo -n -l` listing nothing are different facts, and collapsing
 #     them reported the friendliest one: sudo missing, PAM broken or sudoers unparseable all

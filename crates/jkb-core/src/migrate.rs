@@ -1236,4 +1236,54 @@ mod edges_namespaces_autoincrement_tests {
             .unwrap();
         assert_eq!(edges, [(3, 1), (3, 2), (4, 1), (4, 2)]);
     }
+
+    /// V035 counts every request made before it as delivered (`backfill`), so an upgrade does not
+    /// flood sessions with old results; a request made after it starts `waiting`.
+    #[test]
+    fn v035_backfills_existing_requests_as_delivered() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(34))
+            .run(&mut conn)
+            .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO exec_requests (id, created_at, expires_at, session, role, target, dir,
+                 dir_side, argv, reason, timeout_ms, state, ended_at, note)
+             VALUES (1, 10, 20, 's', 'implementer', 'host', '/w', 'host', '[\"a\"]', '', 1000,
+                     'declined', 15, 'no'),
+                    (2, 11, 21, 's', 'implementer', 'host', '/w', 'host', '[\"b\"]', '', 1000,
+                     'pending', NULL, NULL);
+             INSERT INTO exec_output (request_id) VALUES (1);",
+        )
+        .unwrap();
+
+        super::run(&mut conn).expect("V035 applied");
+
+        let rows: Vec<(i64, String, String, i64)> = conn
+            .prepare(
+                "SELECT request_id, state, via, delivered_at FROM exec_delivery ORDER BY request_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (1, "delivered".to_owned(), "backfill".to_owned(), 15),
+                (2, "delivered".to_owned(), "backfill".to_owned(), 11)
+            ]
+        );
+        let (warnings, carry): (String, Vec<u8>) = conn
+            .query_row(
+                "SELECT warnings, warn_carry FROM exec_output WHERE request_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((warnings.as_str(), carry.len()), ("[]", 0));
+    }
 }

@@ -508,3 +508,206 @@ fn the_request_index_is_read_by_the_operator_alone() {
         other => panic!("{other:?}"),
     }
 }
+
+fn take(b: &LocalBackend, session: &str, agent: Option<&str>) -> (Vec<String>, Vec<String>) {
+    match ok(
+        b,
+        &json!({ "op": "exec.inbox.take", "session": session, "agent_id": agent }),
+    ) {
+        Response::ExecInboxTaken { lines, open } => (
+            lines,
+            open.iter().map(crate::exec::OpenRequest::line).collect(),
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn run_to_end(kb: &Kb, id: &str, chunk: &[u8]) {
+    use base64::Engine as _;
+    ok(
+        &kb.op,
+        &json!({ "op": "exec.begin", "id": id, "runner": "app",
+                        "recomputed_pin": { "head": "ab".repeat(20), "changes": "cd".repeat(32) } }),
+    );
+    let b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
+    ok(
+        &kb.op,
+        &json!({ "op": "exec.output", "id": id, "runner": "app", "chunk_b64": b64 }),
+    );
+    ok(
+        &kb.op,
+        &json!({ "op": "exec.finish", "id": id, "runner": "app", "outcome": "exited",
+                        "exit_status": 0, "total_bytes": chunk.len() }),
+    );
+}
+
+/// The hook's take is the harness's: the container credential and the operator hand a session its
+/// results; a ticket — even the session's own — or another grant cannot, so no tool call can swallow a
+/// result before it is heard.
+#[test]
+fn the_inbox_take_is_the_harness_s_alone() {
+    let kb = Kb::new();
+    let take_op = json!({ "op": "exec.inbox.take", "session": "s1" });
+    assert_eq!(
+        code(&kb.ticket("s1", None, "t1"), &take_op),
+        ErrorCode::Forbidden
+    );
+    assert_eq!(
+        code(
+            &kb.ticket("s1", Some(("a1", "implementer")), "t2"),
+            &take_op
+        ),
+        ErrorCode::Forbidden
+    );
+    let other_grant = match ok(
+        &kb.op,
+        &json!({ "op": "role.grant", "role": "coordinator", "agent": "someone" }),
+    ) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        code(&kb.as_token(&other_grant), &take_op),
+        ErrorCode::Forbidden
+    );
+    take(&kb.as_token(&kb.container), "s1", None);
+    take(&kb.op, "s1", None);
+    assert_eq!(
+        code(
+            &kb.op,
+            &json!({ "op": "exec.inbox.take", "session": "not a session" })
+        ),
+        ErrorCode::Invalid
+    );
+    assert_eq!(
+        crate::Request::ExecInboxTake {
+            session: "s".into(),
+            agent_id: None
+        }
+        .permission(),
+        OpPermission::Attest
+    );
+}
+
+/// A session hears its result once: the first take hands over the message, with the warning the run
+/// printed; the next finds nothing. A subagent's result waits for that subagent, until it stops.
+#[test]
+fn a_result_reaches_the_agent_that_filed_it_once() {
+    let kb = Kb::new();
+    let hook = kb.as_token(&kb.container);
+    let (main_req, _) = requested(ok(&kb.ticket("s1", None, "t1"), &ask(&["land"])));
+    let (sub_req, _) = requested(ok(
+        &kb.ticket("s1", Some(("a1", "implementer")), "t2"),
+        &ask(&["check"]),
+    ));
+    let (lines, open) = take(&hook, "s1", None);
+    assert!(lines.is_empty());
+    assert_eq!(open.len(), 2, "{open:?}");
+    assert!(open[1].contains("running") || open[1].contains("pending"));
+
+    run_to_end(&kb, &main_req.id, b"warning: 1 task is unplanned\nok\n");
+    run_to_end(&kb, &sub_req.id, b"done\n");
+
+    let (lines, open) = take(&hook, "s1", None);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with(&format!(
+        "[jkb run request] {} finished exit 0",
+        main_req.id
+    )));
+    assert!(
+        lines[0].contains("\nwarning: 1 task is unplanned\n"),
+        "{}",
+        lines[0]
+    );
+    assert!(open.is_empty());
+    assert!(take(&hook, "s1", None).0.is_empty(), "delivered once");
+    assert!(take(&hook, "s2", None).0.is_empty(), "another session's");
+
+    let (lines, _) = take(&hook, "s1", Some("a1"));
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("filed by implementer (a1)"),
+        "{}",
+        lines[0]
+    );
+
+    // A subagent that stops before its next tool call: its result becomes the main agent's.
+    let (later, _) = requested(ok(
+        &kb.ticket("s1", Some(("a2", "implementer")), "t3"),
+        &ask(&["again"]),
+    ));
+    run_to_end(&kb, &later.id, b"x\n");
+    assert!(take(&hook, "s1", None).0.is_empty());
+    ok(
+        &hook,
+        &json!({ "op": "attest.release", "session": "s1", "agent_id": "a2" }),
+    );
+    assert_eq!(take(&hook, "s1", None).0.len(), 1);
+
+    // `exec.status` carries the same message, and reading it delivers nothing.
+    let v = view(ok(
+        &kb.op,
+        &json!({ "op": "exec.status", "id": main_req.id }),
+    ));
+    assert!(v
+        .delivery_text
+        .unwrap()
+        .contains("warning: 1 task is unplanned"));
+}
+
+/// An inbox is honoured only from whoever may vouch for the session — never from another session's
+/// ticket — and no listing carries its token.
+#[test]
+fn an_inbox_is_set_only_by_the_harness_or_the_session_and_never_listed() {
+    let kb = Kb::new();
+    let start = |session: &str, pid: &str| {
+        json!({ "op": "session.started", "session": session, "source": "startup",
+                "pid": pid, "instance": "h#b/ns",
+                "inbox": { "socket": "/tmp/cc-socks/9.sock", "token": "sekrit-token" } })
+    };
+    ok(&kb.ticket("s2", None, "t1"), &start("s1", "10"));
+    ok(&kb.ticket("s1", None, "t2"), &start("s1", "11"));
+    ok(&kb.as_token(&kb.container), &start("s3", "12"));
+    let rows = match ok(&kb.op, &json!({ "op": "session.list", "all": true })) {
+        Response::ClaudeSessions { sessions, .. } => sessions,
+        other => panic!("{other:?}"),
+    };
+    let has = |s: &str, pid: &str| {
+        rows.iter()
+            .find(|r| r.session == s && r.pid == pid)
+            .unwrap()
+            .inbox
+    };
+    assert!(
+        !has("s1", "10"),
+        "another session's ticket cannot point s1's results anywhere"
+    );
+    assert!(has("s1", "11"));
+    assert!(has("s3", "12"));
+    let listed = serde_json::to_string(&rows).unwrap();
+    assert!(!listed.contains("sekrit"), "{listed}");
+    let targets = kb
+        .db
+        .read(|c| jkb_core::claude_session::inbox_targets(c, "s1", "h#b"))
+        .unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].inbox.token(), "sekrit-token");
+    // A malformed inbox is dropped, and the start still recorded.
+    ok(
+        &kb.op,
+        &json!({ "op": "session.started", "session": "s4", "source": "startup", "pid": "13",
+                 "instance": "h", "inbox": { "socket": "relative", "token": "t" } }),
+    );
+    assert_eq!(
+        kb.db
+            .read(|c| jkb_core::claude_session::holders(c, "s4"))
+            .unwrap()
+            .iter()
+            .map(|h| h.has_inbox)
+            .collect::<Vec<_>>(),
+        vec![false]
+    );
+    // A request's debug form never shows the token.
+    let r: crate::Request = serde_json::from_value(start("s1", "1")).unwrap();
+    assert!(!format!("{r:?}").contains("sekrit"));
+}
