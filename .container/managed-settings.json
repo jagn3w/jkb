@@ -27,6 +27,9 @@
     "PostToolUseFailure": [
       { "matcher": ".*", "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] }
     ],
+    "PermissionDenied": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] }
+    ],
     "UserPromptSubmit": [
       { "hooks": [{ "type": "command", "command": "/usr/local/lib/jkb-hook/jkb attest hook", "timeout": 10 }] }
     ],

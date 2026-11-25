@@ -14,7 +14,9 @@
 //!
 //! **Tickets live in memory** ([`Tickets`]), in the daemon that minted them: they are per tool call,
 //! gone at `PostToolUse`, `SubagentStop` or `SessionEnd`, and a daemon restart dropping them costs
-//! one re-run command.
+//! one re-run command. A call the harness denied has its ticket **parked** ([`Tickets::park`]):
+//! dead until the same agent retries the same command, which gets it back, so the retried line is
+//! the very text the operator granted.
 
 use std::collections::HashMap;
 
@@ -382,6 +384,7 @@ impl Request {
             // harness's job, as attesting is, so a session cannot swallow another's — or its own
             // subagent's — before they are heard.
             Self::AttestMint { .. }
+            | Self::AttestPark { .. }
             | Self::AttestRelease { .. }
             | Self::ExecInboxTake { .. }
             | Self::ExecInboxAck { .. } => OpPermission::Attest,
@@ -517,6 +520,7 @@ impl Request {
             | Self::TaskReviewRecord(_)
             | Self::RoleRevoke { .. }
             | Self::AttestMint { .. }
+            | Self::AttestPark { .. }
             | Self::AttestRelease { .. }
             | Self::ExecInboxTake { .. }
             | Self::ExecInboxAck { .. }
@@ -667,6 +671,9 @@ pub struct Ticket {
     pub tool_use_id: String,
     /// The grant that minted it — the container credential.
     pub minted_by: i64,
+    /// The blake3 hex of the command it was minted for, as the hook normalized it — what a parked
+    /// ticket is handed back by ([`Tickets::mint`]). `None` from a hook that sends none.
+    pub command_digest: Option<String>,
     minted_at: Instant,
 }
 
@@ -678,7 +685,7 @@ pub const MAX_LIVE_TICKETS: usize = 4096;
 /// The most tickets one session holds live at once.
 pub const MAX_SESSION_TICKETS: usize = 256;
 
-/// The daemon's live tickets, by token.
+/// The daemon's live tickets, by token, and the parked ones ([`Tickets::park`]).
 #[derive(Debug, Default)]
 pub struct Tickets {
     live: Mutex<Live>,
@@ -690,30 +697,82 @@ pub struct Tickets {
 /// One attested subagent's lock ([`Tickets::agent_lock`]).
 pub type AgentLock = Arc<Mutex<()>>;
 
+/// How long a parked ticket waits for its retry ([`Tickets::park`]) — long enough for the operator
+/// to reach `/permissions` and approve the denied line. A parked ticket authorizes nothing, so a
+/// longer wait keeps only a dead credential around longer.
+pub const PARKED_BACKSTOP: Duration = Duration::from_hours(1);
+
+/// The most parked tickets one session holds; parking another evicts that session's oldest.
+pub const MAX_SESSION_PARKED: usize = 32;
+
+/// The most parked tickets daemon-wide; parking another evicts the oldest. A park frees a live slot,
+/// so without this a credential holder that mints and denies could grow the parked set without end.
+pub const MAX_PARKED: usize = MAX_LIVE_TICKETS;
+
 /// The tickets, and the order they expire in. Tickets are minted with a monotonic clock and all live
 /// for the same [`TICKET_BACKSTOP`], so mint order **is** expiry order: expiring is popping from the
-/// front, never a scan of every ticket on every lookup.
+/// front, never a scan of every ticket on every lookup. The parked set is kept the same way, in park
+/// order, for [`PARKED_BACKSTOP`].
+///
+/// A queue entry is only a claim that its token MAY be due: a token released, parked or rebound since
+/// keeps its old entry, so an entry removes its token only when the ticket still carries that
+/// entry's instant. Without that check a rebound ticket ([`Tickets::mint`]) would expire at the
+/// deadline of the call it was first minted for.
 #[derive(Debug, Default)]
 struct Live {
     by_token: HashMap<String, Ticket>,
     expiry: std::collections::VecDeque<(Instant, String)>,
+    /// Parked tickets, by token, with when they were parked.
+    parked: HashMap<String, (Ticket, Instant)>,
+    parked_expiry: std::collections::VecDeque<(Instant, String)>,
 }
 
 impl Live {
-    fn expire(&mut self) {
+    fn expire(&mut self, now: Instant) {
         while let Some((at, _)) = self.expiry.front() {
-            if at.elapsed() < TICKET_BACKSTOP {
+            if now.saturating_duration_since(*at) < TICKET_BACKSTOP {
                 break;
             }
-            if let Some((_, token)) = self.expiry.pop_front() {
-                self.by_token.remove(&token);
+            if let Some((at, token)) = self.expiry.pop_front() {
+                if self.by_token.get(&token).is_some_and(|t| t.minted_at == at) {
+                    self.by_token.remove(&token);
+                }
+            }
+        }
+        while let Some((at, _)) = self.parked_expiry.front() {
+            if now.saturating_duration_since(*at) < PARKED_BACKSTOP {
+                break;
+            }
+            if let Some((at, token)) = self.parked_expiry.pop_front() {
+                if self.parked.get(&token).is_some_and(|(_, p)| *p == at) {
+                    self.parked.remove(&token);
+                }
             }
         }
         // A released ticket's queue entry outlives it; drop those once they are most of the queue,
         // so the queue stays proportional to the live set.
         if self.expiry.len() > 2 * self.by_token.len() + 64 {
             let by_token = &self.by_token;
-            self.expiry.retain(|(_, t)| by_token.contains_key(t));
+            self.expiry
+                .retain(|(at, t)| by_token.get(t).is_some_and(|x| x.minted_at == *at));
+        }
+        if self.parked_expiry.len() > 2 * self.parked.len() + 64 {
+            let parked = &self.parked;
+            self.parked_expiry
+                .retain(|(at, t)| parked.get(t).is_some_and(|(_, p)| p == at));
+        }
+    }
+
+    /// Drop the oldest parked ticket: of `session` when given, else daemon-wide.
+    fn evict_oldest_parked(&mut self, session: Option<&str>) {
+        let oldest = self
+            .parked
+            .iter()
+            .filter(|(_, (t, _))| session.is_none_or(|s| t.session == s))
+            .min_by_key(|(_, (_, at))| *at)
+            .map(|(token, _)| token.clone());
+        if let Some(token) = oldest {
+            self.parked.remove(&token);
         }
     }
 }
@@ -725,13 +784,17 @@ impl Tickets {
             .map_err(|_| ApiError::with_code(ErrorCode::Internal, "ticket store poisoned"))
     }
 
-    /// The live ticket `token` names. An expired one is dropped on sight.
+    /// The live ticket `token` names. An expired one is dropped on sight; a parked one is not live.
     ///
     /// # Errors
     /// [`ErrorCode::Internal`] for a poisoned store.
     pub fn get(&self, token: &str) -> Result<Option<Ticket>, ApiError> {
+        self.get_at(token, Instant::now())
+    }
+
+    fn get_at(&self, token: &str, now: Instant) -> Result<Option<Ticket>, ApiError> {
         let mut live = self.lock()?;
-        live.expire();
+        live.expire(now);
         Ok(live.by_token.get(token).cloned())
     }
 
@@ -783,13 +846,15 @@ impl Tickets {
         self.agents.lock().map_or(0, |a| a.len())
     }
 
+    /// Mint `t`, live from `t.minted_at`. A ticket parked for the same session, agent, agent type and
+    /// command digest is handed back instead of a fresh one, rebound to `t`'s tool call: the retry of
+    /// a denied line then carries the very text the operator granted. Only a parked ticket is ever
+    /// reused, so two identical calls in flight each hold their own; and a ticket with no digest
+    /// (an older hook) never matches one.
     fn mint(&self, t: Ticket) -> Result<String, ApiError> {
-        let token = format!(
-            "{TICKET_PREFIX}{}",
-            roles::fresh_token().map_err(ApiError::from)?
-        );
+        let now = t.minted_at;
         let mut live = self.lock()?;
-        live.expire();
+        live.expire(now);
         let busy = |why: String| ApiError::with_code(ErrorCode::Busy, why);
         if live.by_token.len() >= MAX_LIVE_TICKETS {
             return Err(busy(format!(
@@ -809,13 +874,78 @@ impl Tickets {
                 t.session
             )));
         }
-        live.expiry.push_back((t.minted_at, token.clone()));
+        // The most recently parked match: the line the operator most likely just granted.
+        let parked = t.command_digest.as_ref().and_then(|digest| {
+            live.parked
+                .iter()
+                .filter(|(_, (p, _))| {
+                    p.session == t.session
+                        && p.agent_id == t.agent_id
+                        && p.agent_type == t.agent_type
+                        && p.command_digest.as_ref() == Some(digest)
+                })
+                .max_by_key(|(_, (_, at))| *at)
+                .map(|(token, _)| token.clone())
+        });
+        let token = match parked {
+            Some(token) => {
+                live.parked.remove(&token);
+                token
+            }
+            None => format!(
+                "{TICKET_PREFIX}{}",
+                roles::fresh_token().map_err(ApiError::from)?
+            ),
+        };
+        live.expiry.push_back((now, token.clone()));
         live.by_token.insert(token.clone(), t);
         Ok(token)
     }
 
-    /// Release tickets: the one for `tool_use_id` when given; else every ticket of `agent_id` in
-    /// `session` when given; else every ticket of `session`. Returns how many.
+    /// Park the live ticket of `session`'s tool call `tool_use_id`: the harness denied that call, so
+    /// it will never be presented, but its retry should carry the same text ([`Tickets::mint`]). A
+    /// parked ticket authenticates nothing — the denial quoted its token into the model's transcript,
+    /// and live it would have stayed usable until [`TICKET_BACKSTOP`]. Returns how many were parked.
+    ///
+    /// # Errors
+    /// [`ErrorCode::Internal`] for a poisoned store.
+    pub fn park(&self, session: &str, tool_use_id: &str) -> Result<usize, ApiError> {
+        self.park_at(session, tool_use_id, Instant::now())
+    }
+
+    fn park_at(&self, session: &str, tool_use_id: &str, now: Instant) -> Result<usize, ApiError> {
+        let mut live = self.lock()?;
+        live.expire(now);
+        let tokens: Vec<String> = live
+            .by_token
+            .iter()
+            .filter(|(_, t)| t.session == session && t.tool_use_id == tool_use_id)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in &tokens {
+            let Some(ticket) = live.by_token.remove(token) else {
+                continue;
+            };
+            while live
+                .parked
+                .values()
+                .filter(|(p, _)| p.session == session)
+                .count()
+                >= MAX_SESSION_PARKED
+            {
+                live.evict_oldest_parked(Some(session));
+            }
+            while live.parked.len() >= MAX_PARKED {
+                live.evict_oldest_parked(None);
+            }
+            live.parked_expiry.push_back((now, token.clone()));
+            live.parked.insert(token.clone(), (ticket, now));
+        }
+        Ok(tokens.len())
+    }
+
+    /// Release tickets, live or parked: the one for `tool_use_id` when given; else every ticket of
+    /// `agent_id` in `session` when given; else every ticket of `session`. Returns how many.
     ///
     /// # Errors
     /// [`ErrorCode::Internal`] for a poisoned store.
@@ -825,18 +955,19 @@ impl Tickets {
         agent_id: Option<&str>,
         tool_use_id: Option<&str>,
     ) -> Result<usize, ApiError> {
-        let mut live = self.lock()?;
-        let before = live.by_token.len();
-        live.by_token.retain(|_, t| {
-            let hit = t.session == session
+        let hit = |t: &Ticket| {
+            t.session == session
                 && match (tool_use_id, agent_id) {
                     (Some(tool), _) => t.tool_use_id == tool,
                     (None, Some(agent)) => t.agent_id.as_deref() == Some(agent),
                     (None, None) => true,
-                };
-            !hit
-        });
-        let released = before - live.by_token.len();
+                }
+        };
+        let mut live = self.lock()?;
+        let before = live.by_token.len() + live.parked.len();
+        live.by_token.retain(|_, t| !hit(t));
+        live.parked.retain(|_, (t, _)| !hit(t));
+        let released = before - live.by_token.len() - live.parked.len();
         drop(live);
         // A subagent that stopped, or a session that ended, needs no lock any more.
         if tool_use_id.is_none() {
@@ -1754,11 +1885,20 @@ pub fn define(
     Ok(wf::define(conn, meta, name, describe, &spec)?)
 }
 
-/// `attest.mint`: a ticket for one tool call, carrying what the harness reported. Only the container
-/// credential gets here ([`authorize`]).
+/// Whether `v` is a well-formed identifier the harness reported: a session, agent, type or tool call.
+fn attestation_field(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 128
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+/// `attest.mint`: a ticket for one tool call, carrying what the harness reported and the digest of
+/// the command it is for. Only the container credential gets here ([`authorize`]).
 ///
 /// # Errors
-/// [`ErrorCode::Invalid`] for malformed identifiers.
+/// [`ErrorCode::Invalid`] for malformed identifiers, or a digest that is not 64 lowercase hex
+/// characters.
 pub fn mint_ticket(
     tickets: &Tickets,
     principal: &Principal,
@@ -1766,19 +1906,19 @@ pub fn mint_ticket(
     agent_id: Option<&str>,
     agent_type: Option<&str>,
     tool_use_id: &str,
+    command_digest: Option<&str>,
 ) -> Result<String, ApiError> {
-    let ok = |v: &str| {
-        !v.is_empty()
-            && v.len() <= 128
-            && v.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
-    };
     for v in [Some(session), agent_id, agent_type, Some(tool_use_id)]
         .into_iter()
         .flatten()
     {
-        if !ok(v) {
+        if !attestation_field(v) {
             return Err(invalid(format!("a malformed attestation field `{v}`")));
+        }
+    }
+    if let Some(d) = command_digest {
+        if !is_digest(d) {
+            return Err(invalid(format!("a malformed command digest `{d}`")));
         }
     }
     let PrincipalKind::Grant(g) = &principal.kind else {
@@ -1790,8 +1930,36 @@ pub fn mint_ticket(
         agent_type: agent_type.map(str::to_owned),
         tool_use_id: tool_use_id.to_owned(),
         minted_by: g.id,
+        command_digest: command_digest.map(str::to_owned),
         minted_at: Instant::now(),
     })
+}
+
+/// Whether `d` is a blake3 hex digest as the hook spells one: 64 lowercase hex characters.
+fn is_digest(d: &str) -> bool {
+    d.len() == 64 && d.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `attest.park`: park the ticket of a tool call the harness denied ([`Tickets::park`]). Only the
+/// container credential gets here ([`authorize`]).
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for malformed identifiers.
+pub fn park_ticket(
+    tickets: &Tickets,
+    principal: &Principal,
+    session: &str,
+    tool_use_id: &str,
+) -> Result<usize, ApiError> {
+    for v in [session, tool_use_id] {
+        if !attestation_field(v) {
+            return Err(invalid(format!("a malformed attestation field `{v}`")));
+        }
+    }
+    let PrincipalKind::Grant(_) = &principal.kind else {
+        return Err(forbidden("only the container credential parks tickets"));
+    };
+    tickets.park(session, tool_use_id)
 }
 
 /// A backend's shared ticket store, for the daemon to hand every per-request backend.

@@ -1317,6 +1317,21 @@ pub enum Request {
         agent_type: Option<String>,
         /// The tool call.
         tool_use_id: String,
+        /// The blake3 hex of the command the ticket is for, as the hook normalized it: a ticket
+        /// parked with the same agent and digest is handed back instead of a fresh one
+        /// ([`rbac::Tickets::park`]). An older hook sends none, and is never handed one back.
+        #[serde(default)]
+        command_digest: Option<String>,
+    },
+    /// Park the ticket of a tool call the harness denied: it authenticates nothing until the same
+    /// agent's retry of the same command mints it back ([`rbac::Tickets::park`]). Answered with
+    /// [`Response::TicketsReleased`], counting the tickets parked.
+    #[serde(rename = "attest.park")]
+    AttestPark {
+        /// The session.
+        session: String,
+        /// The denied tool call.
+        tool_use_id: String,
     },
     /// Release tickets: one tool call's, one subagent's, or a whole session's ([`rbac::Tickets::release`]).
     #[serde(rename = "attest.release")]
@@ -1997,6 +2012,7 @@ impl Request {
         "timeline.plan",
         "design.compact",
         "attest.mint",
+        "attest.park",
         "attest.release",
         "task.claims",
         "task.reclaim",
@@ -2151,6 +2167,7 @@ impl Request {
             Self::DesignRetire { .. } => "design.retire",
             Self::DesignRestore { .. } => "design.restore",
             Self::AttestMint { .. } => "attest.mint",
+            Self::AttestPark { .. } => "attest.park",
             Self::AttestRelease { .. } => "attest.release",
             Self::TaskClaims { .. } => "task.claims",
             Self::TaskReclaim { .. } => "task.reclaim",
@@ -2327,6 +2344,7 @@ impl Request {
             | Self::WorkflowAgentSet { .. }
             // In memory, and a subagent's release also marks its run-request results due: the writer.
             | Self::AttestMint { .. }
+            | Self::AttestPark { .. }
             | Self::AttestRelease { .. }
             | Self::TaskReclaim { .. }
             // FTS5's integrity check is an `INSERT`, which the `query_only` reader refuses.
@@ -2998,9 +3016,9 @@ pub enum Response {
         /// The ticket.
         token: String,
     },
-    /// An `attest.release`.
+    /// An `attest.release`, or an `attest.park`.
     TicketsReleased {
-        /// How many.
+        /// How many were released (or parked).
         count: usize,
     },
     /// A `design.list`.
@@ -5081,6 +5099,7 @@ impl LocalBackend {
                 agent_id,
                 tool_use_id,
                 agent_type,
+                command_digest,
             } => {
                 let tickets = self.tickets.as_ref().ok_or_else(|| {
                     ApiError::with_code(
@@ -5096,7 +5115,22 @@ impl LocalBackend {
                         agent_id.as_deref(),
                         agent_type.as_deref(),
                         &tool_use_id,
+                        command_digest.as_deref(),
                     )?,
+                }
+            }
+            Request::AttestPark {
+                session,
+                tool_use_id,
+            } => {
+                let tickets = self.tickets.as_ref().ok_or_else(|| {
+                    ApiError::with_code(
+                        ErrorCode::Unsupported,
+                        "attestation tickets are parked by jkb serve, not an in-process backend",
+                    )
+                })?;
+                Response::TicketsReleased {
+                    count: rbac::park_ticket(tickets, principal, &session, &tool_use_id)?,
                 }
             }
             Request::AttestRelease {

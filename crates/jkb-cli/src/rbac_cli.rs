@@ -181,10 +181,10 @@ pub enum WorkflowCmd {
 #[derive(Subcommand)]
 pub enum AttestCmd {
     /// The Claude Code hook: read a `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
-    /// `UserPromptSubmit`, `SessionStart`, `SubagentStop` or `SessionEnd` payload on stdin, mint or
-    /// release the tool call's ticket (on `PreToolUse` putting it on the command), register the
-    /// session's inbox at its start, and hand the session the results of run requests it filed as
-    /// context. Always exits 0; failures go to `~/.jkb/logs/attest-hook.log`.
+    /// `PermissionDenied`, `UserPromptSubmit`, `SessionStart`, `SubagentStop` or `SessionEnd` payload
+    /// on stdin, mint, park or release the tool call's ticket (on `PreToolUse` putting it on the
+    /// command), register the session's inbox at its start, and hand the session the results of run
+    /// requests it filed as context. Always exits 0; failures go to `~/.jkb/logs/attest-hook.log`.
     Hook,
 }
 
@@ -881,9 +881,11 @@ enum Attestation {
     /// something besides `jkb` and the `HARMLESS` commands, one the lexer cannot model, or one whose
     /// `jkb` does work RBAC cannot judge -- reads a file the caller names, runs a command the caller
     /// wrote ([`remote::beyond_rbac`]) -- or is refused by jkb's own parser. The hook
-    /// returns no `permissionDecision`, so the session's own rules judge the call against the command
-    /// as the model wrote it -- approving the line would approve the rest of it too, past whatever
-    /// rule the person set for that.
+    /// returns no `permissionDecision`, so the session's own rules judge the call -- against the
+    /// REWRITTEN line, `export JKB_ATTEST=t_…; <the command>` (read from Claude Code 2.1.317), which
+    /// is why a denied line's ticket is parked and handed back to its retry ([`strip_own_prefix`]).
+    /// Approving the line would approve the rest of it too, past whatever rule the person set for
+    /// that.
     ///
     /// There is no third, forcing answer. The hook used to put `ask` on several classes -- first on
     /// everything that was not one plain invocation, later on `task land`/`task gate`, on lines it
@@ -1112,7 +1114,11 @@ fn beyond_rbac(words: &[String]) -> bool {
 /// secret (measured — each Bash tool call runs in its own PID namespace, so no other call can read
 /// this one's `/proc/*/environ`, which is why the ticket cannot instead be left in a file for a
 /// sibling call to steal). Only the DECISION is conditional, and for [`Attestation::Defer`] there
-/// is none: the session's own rules judge the call, as they did before this hook existed.
+/// is none: the session's own rules judge the call, as they did before this hook existed -- but they
+/// judge the rewritten `input`, ticket and all, not the command as the model wrote it (Claude Code
+/// 2.1.317 hands a hook's `updatedInput` to its permission check). So the text a denial's grant
+/// names is stable only because a denied call's ticket is parked and its retry gets it back
+/// ([`attest_event`]).
 ///
 /// `JKB_ATTEST_DECISION=ask` forces the prompt on every ticketed line without a rebuild — the
 /// hook binary is pinned and root-owned, so a rollback that needs one is not a rollback.
@@ -1131,6 +1137,38 @@ fn pre_tool_use(class: Attestation, forced_ask: bool, input: &Value) -> Value {
         out["permissionDecision"] = json!(d);
     }
     json!({ "hookSpecificOutput": out })
+}
+
+/// `command` without the hook's own ticket prefix: one leading `export JKB_ATTEST=t_<token>; `, byte
+/// for byte as [`attest_event`] writes it, the token being ASCII alphanumerics, `_` and `-`. A retry
+/// can come back spelled either way -- the command the model first wrote, or the rewritten text a
+/// denial's grant quoted -- and both must digest, classify and rewrite the same, so the retried line
+/// is byte-identical to the granted one. The value is ignored, never trusted, never sent: the hook's
+/// own export replaces it, and sets the same variable first. Anything not exactly that shape (no
+/// space, `;rm`, a `$`, another variable, the export later in the line) is left as it is, and
+/// classifies as it always did.
+fn strip_own_prefix(command: &str) -> &str {
+    let Some(rest) = command
+        .strip_prefix("export ")
+        .and_then(|r| r.strip_prefix(remote::ATTEST_VAR))
+        .and_then(|r| r.strip_prefix('='))
+        .and_then(|r| r.strip_prefix(jkb_api::rbac::TICKET_PREFIX))
+    else {
+        return command;
+    };
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return command;
+    }
+    rest[end..].strip_prefix("; ").unwrap_or(command)
+}
+
+/// The digest `attest.mint` is sent for `command` (already [`strip_own_prefix`]ed): what a parked
+/// ticket is handed back by.
+fn command_digest(command: &str) -> String {
+    blake3::hash(command.as_bytes()).to_hex().to_string()
 }
 
 /// `jkb attest hook`. Never fails: every failure is logged, and the tool call proceeds without a
@@ -1324,6 +1362,63 @@ fn take(
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
+/// `PreToolUse` (Bash): mint the call's ticket and put it on the command — the parked ticket of a
+/// denied identical call, when the daemon holds one ([`strip_own_prefix`]).
+fn ticket_the_call(
+    backend: &dyn Backend,
+    p: &Value,
+    session: String,
+    env: &HookEnv,
+    failures: &mut Vec<String>,
+) -> Option<Value> {
+    let s = |k: &str| p[k].as_str().map(str::to_owned);
+    let command = strip_own_prefix(p["tool_input"]["command"].as_str().unwrap_or_default());
+    let class = attestation(command);
+    if s("tool_name").as_deref() != Some("Bash") || class == Attestation::Skip {
+        return None;
+    }
+    let tool_use_id = s("tool_use_id")?;
+    let token = match backend.call(Request::AttestMint {
+        session,
+        agent_id: s("agent_id"),
+        agent_type: s("agent_type"),
+        tool_use_id,
+        command_digest: Some(command_digest(command)),
+    }) {
+        Ok(Response::Ticket { token }) => token,
+        Ok(other) => {
+            failures.push(format!("attest.mint: unexpected {other:?}"));
+            return None;
+        }
+        Err(e) => {
+            failures.push(format!("attest.mint: {}", e.message));
+            return None;
+        }
+    };
+    let mut input = p["tool_input"].clone();
+    input["command"] = json!(format!("export {}={token}; {command}", remote::ATTEST_VAR));
+    Some(pre_tool_use(class, env.forced_ask, &input))
+}
+
+/// `PermissionDenied` (Bash). A denied call's line sits in the model's transcript, ticket and all,
+/// and is what an operator's grant names: park the ticket, dead until the same agent retries the
+/// same command and mints it back. A line this hook skips holds no ticket to park.
+fn park_denied(backend: &dyn Backend, p: &Value, session: String, failures: &mut Vec<String>) {
+    let command = strip_own_prefix(p["tool_input"]["command"].as_str().unwrap_or_default());
+    if p["tool_name"].as_str() != Some("Bash") || attestation(command) == Attestation::Skip {
+        return;
+    }
+    let Some(tool_use_id) = p["tool_use_id"].as_str().map(str::to_owned) else {
+        return;
+    };
+    if let Err(e) = backend.call(Request::AttestPark {
+        session,
+        tool_use_id,
+    }) {
+        failures.push(format!("attest.park: {}", e.message));
+    }
+}
+
 /// One hook event: what to print, the failures to log, and what to acknowledge once printed.
 ///
 /// * `PreToolUse` (Bash): mint the call's ticket and put it on the command.
@@ -1334,6 +1429,9 @@ fn take(
 /// * `SessionStart`: register the process and its inbox (`session.started`, through the one builder
 ///   the notification hook uses too), then the take; after a compaction or a resume, also the requests
 ///   still open, so a session that lost its memory of them is told.
+/// * `PermissionDenied` (Bash, a line this hook tickets): park the denied call's ticket
+///   (`attest.park`), so the retry of the same command mints the same ticket back and its rewritten
+///   line is the very text the denial's grant names.
 /// * `SubagentStop`: release the subagent's tickets — which also makes its undelivered results the
 ///   session's to hear.
 /// * `SessionEnd`: release the session's tickets.
@@ -1346,41 +1444,14 @@ fn attest_event(backend: &dyn Backend, p: &Value, env: &HookEnv) -> Said {
     let event = s("hook_event_name").unwrap_or_default();
     let request = match event.as_str() {
         "PreToolUse" => {
-            let command = p["tool_input"]["command"].as_str().unwrap_or_default();
-            let class = attestation(command);
-            if s("tool_name").as_deref() != Some("Bash") || class == Attestation::Skip {
-                return said;
-            }
-            let Some(tool_use_id) = s("tool_use_id") else {
-                return said;
-            };
-            let token = match backend.call(Request::AttestMint {
-                session,
-                agent_id: s("agent_id"),
-                agent_type: s("agent_type"),
-                tool_use_id,
-            }) {
-                Ok(Response::Ticket { token }) => token,
-                Ok(other) => {
-                    said.failures
-                        .push(format!("attest.mint: unexpected {other:?}"));
-                    return said;
-                }
-                Err(e) => {
-                    said.failures.push(format!("attest.mint: {}", e.message));
-                    return said;
-                }
-            };
-            let mut input = p["tool_input"].clone();
-            input["command"] = json!(format!("export {}={token}; {command}", remote::ATTEST_VAR));
-            said.out = Some(pre_tool_use(class, env.forced_ask, &input));
+            said.out = ticket_the_call(backend, p, session, env, &mut said.failures);
             return said;
         }
         "PostToolUse" | "PostToolUseFailure" => {
             let context = take(backend, &session, s("agent_id"), false, &mut said);
             // Only a call this hook ticketed has anything to release: asking the daemon after every
             // `ls` put it on every Bash call's path.
-            let command = p["tool_input"]["command"].as_str().unwrap_or_default();
+            let command = strip_own_prefix(p["tool_input"]["command"].as_str().unwrap_or_default());
             if s("tool_name").as_deref() == Some("Bash")
                 && attestation(command) != Attestation::Skip
             {
@@ -1394,6 +1465,10 @@ fn attest_event(backend: &dyn Backend, p: &Value, env: &HookEnv) -> Said {
             }
             // `PostToolUseFailure` takes its context under its own event name.
             said.out = context.map(|c| context_output(&event, &c));
+            return said;
+        }
+        "PermissionDenied" => {
+            park_denied(backend, p, session, &mut said.failures);
             return said;
         }
         "UserPromptSubmit" => {
@@ -2479,6 +2554,195 @@ mod tests {
             (agent_id.as_deref(), tool_use_id.as_deref()),
             (Some("ag1"), None)
         );
+    }
+
+    #[test]
+    fn strip_own_prefix_strips_exactly_the_hooks_own_export() {
+        use super::strip_own_prefix as strip;
+        assert_eq!(
+            strip("export JKB_ATTEST=t_ab12; jkb task show x"),
+            "jkb task show x"
+        );
+        assert_eq!(strip("export JKB_ATTEST=t_A-b_9; a && b"), "a && b");
+        for near in [
+            "export JKB_ATTEST=t_ab12;jkb task show x",
+            "export JKB_ATTEST=t_ab12;rm -rf x",
+            "export JKB_ATTEST=t_ab12 ; jkb x",
+            "export JKB_ATTEST=$X; jkb x",
+            "export JKB_ATTEST=t_$X; jkb x",
+            "export JKB_ATTEST=t_; jkb x",
+            "export JKB_ATTEST=ab12; jkb x",
+            "export JKB_ATTESTX=t_ab12; jkb x",
+            "export OTHER=t_ab12; jkb x",
+            "export  JKB_ATTEST=t_ab12; jkb x",
+            " export JKB_ATTEST=t_ab12; jkb x",
+            "cd x; export JKB_ATTEST=t_ab12; jkb x",
+            "export JKB_ATTEST=t_ab12",
+            "jkb task show x",
+        ] {
+            assert_eq!(strip(near), near, "{near}");
+        }
+        // Two exports: only the first is the hook's; the second stays, and keeps the line deferred.
+        let two = "export JKB_ATTEST=t_a; export JKB_ATTEST=t_b; jkb task show x";
+        assert_eq!(strip(two), "export JKB_ATTEST=t_b; jkb task show x");
+        assert_eq!(attestation(strip(two)), Attestation::Defer);
+        // A pasted-back approved line is still approved.
+        assert_eq!(
+            attestation(strip("export JKB_ATTEST=t_a; jkb task show x")),
+            Attestation::Allow
+        );
+    }
+
+    /// A daemon that mints, parks and hands back tickets as `jkb serve` does, keyed by what the
+    /// hook reports, recording every request.
+    /// What a ticket was minted for: session, agent id, agent type, command digest.
+    type Key = Vec<Option<String>>;
+
+    #[derive(Default)]
+    struct Minter {
+        sent: RefCell<Vec<Request>>,
+        /// Live tickets: token, tool call, key.
+        live: RefCell<Vec<(String, String, Key)>>,
+        parked: RefCell<Vec<(String, Key)>>,
+    }
+
+    impl Backend for Minter {
+        fn call(&self, request: Request) -> Result<Response, ApiError> {
+            let answer = match &request {
+                Request::AttestMint {
+                    session,
+                    agent_id,
+                    agent_type,
+                    tool_use_id,
+                    command_digest,
+                } => {
+                    let key = vec![
+                        Some(session.clone()),
+                        agent_id.clone(),
+                        agent_type.clone(),
+                        command_digest.clone(),
+                    ];
+                    let mut parked = self.parked.borrow_mut();
+                    let token = match parked.iter().position(|(_, k)| *k == key) {
+                        Some(i) => parked.remove(i).0,
+                        None => format!("t_{}", self.sent.borrow().len()),
+                    };
+                    self.live
+                        .borrow_mut()
+                        .push((token.clone(), tool_use_id.clone(), key));
+                    Response::Ticket { token }
+                }
+                Request::AttestPark { tool_use_id, .. } => {
+                    let mut live = self.live.borrow_mut();
+                    let mut count = 0;
+                    while let Some(i) = live.iter().position(|(_, t, _)| t == tool_use_id) {
+                        let (token, _, key) = live.remove(i);
+                        self.parked.borrow_mut().push((token, key));
+                        count += 1;
+                    }
+                    Response::TicketsReleased { count }
+                }
+                other => panic!("unexpected request {other:?}"),
+            };
+            self.sent.borrow_mut().push(request);
+            Ok(answer)
+        }
+    }
+
+    impl Minter {
+        fn event(&self, payload: &Value) -> Option<Value> {
+            let said = super::attest_event(self, payload, &super::HookEnv::default());
+            assert!(said.failures.is_empty(), "{:?}", said.failures);
+            said.out
+        }
+
+        fn pre(&self, tool: &str, command: &str) -> String {
+            let out = self
+                .event(&json!({
+                    "hook_event_name": "PreToolUse", "session_id": "s1", "tool_name": "Bash",
+                    "agent_id": "ag1", "agent_type": "implementer", "tool_use_id": tool,
+                    "tool_input": { "command": command }
+                }))
+                .expect("a ticketed line is rewritten");
+            out["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+
+        fn denied(&self, tool: &str, rewritten: &str) {
+            assert_eq!(
+                self.event(&json!({
+                    "hook_event_name": "PermissionDenied", "session_id": "s1",
+                    "tool_name": "Bash", "agent_id": "ag1", "agent_type": "implementer",
+                    "tool_use_id": tool, "tool_input": { "command": rewritten },
+                    "reason": "denied by the auto-mode classifier"
+                })),
+                None
+            );
+        }
+    }
+
+    /// The property a `/permissions` grant depends on: the retry of a denied line is rewritten to the
+    /// very text the denial quoted, whichever way the model spells the retry.
+    #[test]
+    fn a_denied_lines_retry_is_rewritten_byte_identical_in_either_spelling() {
+        let b = Minter::default();
+        let original = "./scripts/merge-queue.sh && jkb task show x";
+        let first = b.pre("tu1", original);
+        assert!(first.starts_with("export JKB_ATTEST=t_"), "{first}");
+        assert!(first.ends_with(&format!("; {original}")), "{first}");
+
+        b.denied("tu1", &first);
+        assert_eq!(b.sent.borrow().last().unwrap().op(), "attest.park");
+        let Request::AttestPark {
+            session,
+            tool_use_id,
+        } = b.sent.borrow().last().unwrap().clone()
+        else {
+            panic!()
+        };
+        assert_eq!((session.as_str(), tool_use_id.as_str()), ("s1", "tu1"));
+
+        // (a) The model retries the command it wrote.
+        assert_eq!(b.pre("tu2", original), first);
+        b.denied("tu2", &first);
+        // (b) The model retries the text the grant quoted, ticket and all.
+        assert_eq!(b.pre("tu3", &first), first);
+
+        // Both spellings sent the same digest, of the model's own command.
+        let digests: Vec<_> = b
+            .sent
+            .borrow()
+            .iter()
+            .filter_map(|r| match r {
+                Request::AttestMint { command_digest, .. } => command_digest.clone(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(digests.len(), 3);
+        assert!(digests
+            .iter()
+            .all(|d| *d == super::command_digest(original)));
+
+        // Not denied: an identical call gets its own ticket, never the live one.
+        assert_ne!(b.pre("tu4", original), first);
+    }
+
+    #[test]
+    fn a_denied_line_the_hook_skips_parks_nothing() {
+        let b = Minter::default();
+        for (tool_name, command) in [("Bash", "echo jkb"), ("Bash", "ls"), ("Read", "jkb ls")] {
+            assert_eq!(
+                b.event(&json!({
+                    "hook_event_name": "PermissionDenied", "session_id": "s1",
+                    "tool_name": tool_name, "tool_use_id": "tu1",
+                    "tool_input": { "command": command }
+                })),
+                None
+            );
+        }
+        assert!(b.sent.borrow().is_empty());
     }
 
     #[test]

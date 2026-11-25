@@ -604,6 +604,11 @@ fn samples() -> Vec<Request> {
             agent_id: None,
             agent_type: None,
             tool_use_id: "t".into(),
+            command_digest: None,
+        },
+        Request::AttestPark {
+            session: "s".into(),
+            tool_use_id: "t".into(),
         },
         Request::AttestRelease {
             session: "s".into(),
@@ -4134,6 +4139,7 @@ const OP_WORDS: &[(&str, &str)] = &[
     ("role.grant", "hand out"),
     ("role.revoke", "revoke"),
     ("attest.mint", "vouch"),
+    ("attest.park", "vouch"),
     ("attest.release", "vouch"),
     ("exec.request", "ask the operator"),
     ("design.thread_start", "start and resolve design threads"),

@@ -5896,6 +5896,48 @@ fn the_attestation_hook_puts_a_ticket_on_a_jkb_command_and_takes_it_back() {
     }));
     assert!(!whoami(&sub).status.success(), "released at SubagentStop");
 
+    // A call the harness denied has its ticket parked — dead, though the denial quoted it — until the
+    // same agent retries the same command, which gets it back: the retried line is byte-identical to
+    // the one a /permissions grant names, whether the model retries its own text or the quoted one.
+    let line = |out: &str| -> String {
+        let v: serde_json::Value = serde_json::from_str(out).unwrap_or_else(|_| panic!("{out}"));
+        v["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let first = pre("t5", Some(("ag-8", "reviewer")), "jkb role whoami");
+    let (denied, denied_line) = (ticket_of(&first), line(&first));
+    hook(serde_json::json!({
+        "hook_event_name": "PermissionDenied", "session_id": "sess-1", "tool_name": "Bash",
+        "agent_id": "ag-8", "agent_type": "reviewer", "tool_use_id": "t5",
+        "tool_input": { "command": denied_line, "description": "d" }, "reason": "classifier",
+    }));
+    assert!(
+        !whoami(&denied).status.success(),
+        "a parked ticket authenticates nothing"
+    );
+    let retry = pre("t6", Some(("ag-8", "reviewer")), &denied_line);
+    assert_eq!(
+        line(&retry),
+        denied_line,
+        "the retry carries the granted text"
+    );
+    assert!(
+        whoami(&denied).status.success(),
+        "live again, for the retry"
+    );
+    hook(serde_json::json!({
+        "hook_event_name": "PermissionDenied", "session_id": "sess-1", "tool_name": "Bash",
+        "agent_id": "ag-8", "agent_type": "reviewer", "tool_use_id": "t6",
+        "tool_input": { "command": denied_line, "description": "d" }, "reason": "classifier",
+    }));
+    let retry = pre("t7", Some(("ag-8", "reviewer")), "jkb role whoami");
+    assert_eq!(line(&retry), denied_line, "the model's own spelling too");
+    hook(serde_json::json!({
+        "hook_event_name": "SubagentStop", "session_id": "sess-1", "agent_id": "ag-8",
+    }));
+
     // A run request the session filed and stopped waiting for: the operator's answer reaches the
     // session as context on its next tool call — any tool — once, and never on the one after.
     let filed = pre("t3", None, "jkb exec request --no-wait");

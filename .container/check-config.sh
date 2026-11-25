@@ -472,6 +472,16 @@ if [ -z "$rr_bad" ]; then
 else
     bad "a run request's result would go unheard — managed-settings.json:$rr_bad"
 fi
+# A CLASSIFIER-DENIED jkb LINE'S TICKET IS PARKED, so the operator's grant can match its retry: Claude
+# Code judges the hook's rewritten line, ticket and all, and the grant names that exact text. The
+# PermissionDenied hook parks the ticket (`attest.park`), and the retry's mint hands it back. Without
+# the registration every retry carries a fresh ticket and no grant ever matches.
+pd_m="$(jq -r --arg h "$rr_hook attest hook" '.hooks.PermissionDenied[]? | select([.hooks[]?.command] | index($h)) | .matcher // ""' "$here/managed-settings.json" 2>/dev/null)"
+if [ "$pd_m" = Bash ]; then
+    ok "the attest hook parks a denied Bash call's ticket, so a /permissions grant matches its retry"
+else
+    bad "a denied jkb line's grant can never match its retry — managed-settings.json has no PermissionDenied attest hook on Bash (matcher [$pd_m])"
+fi
 # THE TWO THINGS A DENY RULE OVER THE TRANSCRIPT TREE CAN BREAK, and they pull in OPPOSITE
 # directions. This is one check because treating either alone produces the other's failure.
 #

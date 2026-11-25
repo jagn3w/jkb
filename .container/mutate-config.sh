@@ -1411,6 +1411,23 @@ json.dump(d, open(p, "w"), indent=2)
 PYX
 run "a bare directory rule covers auto-memory's subtree" "covers ~/.claude/projects/<slug>/memory"
 
+# The PermissionDenied registration that parks a denied line's ticket: dropped, and narrowed off Bash.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+del d["hooks"]["PermissionDenied"]
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the PermissionDenied attest hook is dropped" "no PermissionDenied attest hook on Bash (matcher [])"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["hooks"]["PermissionDenied"][0]["matcher"] = "Read"
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the PermissionDenied attest hook is narrowed off Bash" "no PermissionDenied attest hook on Bash (matcher [Read])"
+
 # THE REVIEW ROUND'S ROWS (2026-10-01): each one a guard the first cut had and could not fire.
 # `Edit` is a substring of `NotebookEdit`, so a substring matcher check passed a matcher without Edit.
 seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
@@ -2631,7 +2648,7 @@ echo "==> coverage"
 settle
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=126
+PINNED_BAD_SITES=127
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
