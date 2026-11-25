@@ -28,10 +28,13 @@ CREATE TABLE exec_delivery (
 );
 CREATE INDEX exec_delivery_open ON exec_delivery (state) WHERE state <> 'delivered';
 
--- Every request made before this migration counts as delivered, so the upgrade does not flood
--- sessions with old results.
+-- Every request that ENDED before this migration counts as delivered, so the upgrade does not flood
+-- sessions with old results. One still pending or running is waiting: its session hears it end.
 INSERT INTO exec_delivery (request_id, state, via, delivered_at)
-SELECT id, 'delivered', 'backfill', coalesce(ended_at, created_at) FROM exec_requests;
+SELECT id, 'delivered', 'backfill', coalesce(ended_at, created_at) FROM exec_requests
+WHERE state NOT IN ('pending', 'running');
+INSERT INTO exec_delivery (request_id, state)
+SELECT id, 'waiting' FROM exec_requests WHERE state IN ('pending', 'running');
 
 -- The `warning:` lines of a run's output, collected by `exec::output` as each chunk arrives (the
 -- tail keeps only the last 256 KiB, and a land's early warning can fall out of it). `exec_output` is
@@ -47,6 +50,11 @@ ALTER TABLE exec_output ADD COLUMN warn_carry BLOB NOT NULL DEFAULT x''
 -- its log only.
 ALTER TABLE exec_output ADD COLUMN streamed_bytes INTEGER NOT NULL DEFAULT 0
     CHECK (streamed_bytes >= 0);
+-- An output that ended before this migration was not scanned, and nothing more will reach it: count
+-- it as streamed whole, so its result is not reported as reaching jkb only in part. A run still going
+-- keeps 0 — what it streamed before was not scanned, and saying so is the truth.
+UPDATE exec_output SET streamed_bytes = total_bytes
+WHERE request_id IN (SELECT id FROM exec_requests WHERE state NOT IN ('pending', 'running'));
 
 -- Each `claude` process's inbox socket and its token, from the hook's environment. Per (session, pid,
 -- instance) row, because each process has its own socket. The token never leaves the database

@@ -378,12 +378,13 @@ impl Request {
             | Self::DesignTarget { .. }
             | Self::DesignSources { .. } => OpPermission::Design,
             Self::DesignApprove { .. } => OpPermission::DesignApprove,
-            // Handing a session its results reads their messages and marks them delivered: the
+            // Handing a session its results reads their messages and holds them for delivery: the
             // harness's job, as attesting is, so a session cannot swallow another's — or its own
             // subagent's — before they are heard.
-            Self::AttestMint { .. } | Self::AttestRelease { .. } | Self::ExecInboxTake { .. } => {
-                OpPermission::Attest
-            }
+            Self::AttestMint { .. }
+            | Self::AttestRelease { .. }
+            | Self::ExecInboxTake { .. }
+            | Self::ExecInboxAck { .. } => OpPermission::Attest,
             // Threads are started and resolved by the operator, who alone approves a selection.
             Self::DesignThreadStart { .. }
             | Self::DesignThreadResolve { .. }
@@ -518,6 +519,7 @@ impl Request {
             | Self::AttestMint { .. }
             | Self::AttestRelease { .. }
             | Self::ExecInboxTake { .. }
+            | Self::ExecInboxAck { .. }
             // Reads, and the hooks' own records.
             | Self::KbAmbient { .. }
             | Self::KbQuery { .. }

@@ -572,3 +572,15 @@ fn a_malformed_inbox_is_refused_without_naming_its_value() {
     assert!(super::Inbox::new(&format!("/{}", "a".repeat(600)), "t").is_err());
     assert!(super::Inbox::new("/s", &"t".repeat(513)).is_err());
 }
+
+#[test]
+fn an_inbox_and_a_target_never_show_their_token() {
+    let db = Db::open_in_memory().unwrap();
+    let inbox = super::Inbox::new("/tmp/cc-socks/1.sock", "sekrit-token").unwrap();
+    assert!(!format!("{inbox:?}").contains("sekrit"));
+    assert!(format!("{inbox:?}").contains("/tmp/cc-socks/1.sock"));
+    start_with(&db, &p("s1", "10", "h#b"), Some(("/s", "sekrit-token")), T0);
+    let targets = db.read(|c| super::inbox_targets(c, "s1", "h#b")).unwrap();
+    assert_eq!(targets[0].inbox.token(), "sekrit-token");
+    assert!(!format!("{targets:?}").contains("sekrit"));
+}

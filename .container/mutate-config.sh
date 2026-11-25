@@ -1336,6 +1336,18 @@ open(p, 'w').write(s.replace('"hooks": {', '"hooks_moved": {', 1))
 PYX
 run "the managed hooks cannot be read" "no hook commands could be read"
 
+# A run request's result reaches its session through the attest hook on every tool call's
+# PostToolUse: narrowed back to Bash, a session that only reads and edits never hears it.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+for h in d["hooks"]["PostToolUse"]:
+    if "attest hook" in json.dumps(h):
+        h["matcher"] = "Bash"
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the attest hook's PostToolUse is narrowed back to Bash" "a run request's result would go unheard"
+
 # THE TRANSCRIPT DENY (2026-09-30), which is a HOOK because a glob cannot be both cheap and
 # correct here. A `Read(...*.jsonl)` glob is named per-matching-file in the bubblewrap argv (206
 # files = 52% of MAX_ARG_STRLEN, and past it every Bash call dies at spawn); the collapsing
@@ -2619,7 +2631,7 @@ echo "==> coverage"
 settle
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=125
+PINNED_BAD_SITES=126
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

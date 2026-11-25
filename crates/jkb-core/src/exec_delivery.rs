@@ -9,12 +9,16 @@
 //! | (new) → `waiting` | [`create`] |
 //! | `waiting`/`failed`, or `sending` with a lapsed lease → `sending` | [`claim_for_socket`] |
 //! | `sending` → `delivered` (via `socket`) or `failed` | [`report`] |
-//! | anything not `delivered` and not under a live lease → `delivered` (via `hook`) | [`take_for_hook`] |
+//! | anything not `delivered` and not under a live lease → `sending`, for [`HOOK_LEASE_MS`] | [`take_for_hook`] |
+//! | `sending` → `delivered` (via `hook`) | [`ack_hook`] |
 //!
-//! A row reaches `delivered` once, and nothing moves it out: that is the whole "never delivered
-//! twice" guarantee, a schema fact (`CHECK`s in `V035`) rather than a convention each deliverer keeps.
-//! A deliverer that claims and then dies loses nothing: the lease lapses, and the hook path or the next
-//! claim picks the row up, because a claim is not delivery until [`report`] says the post succeeded.
+//! A row reaches `delivered` once, and nothing moves it out. A deliverer that claims and then dies
+//! loses nothing: the lease lapses, and the hook path or the next claim picks the row up, because a
+//! claim is not delivery until [`report`] or [`ack_hook`] says the message went out. The hook's take is
+//! two-phase for that reason: the daemon can commit a take after the hook's client has given up, or
+//! the hook can die before it prints, and a take that marked the rows delivered at once lost them both
+//! times. The cost is the other direction: a hook that printed and then lost its ack hands the result
+//! over again once the lease lapses — said twice rather than never.
 //!
 //! **When a result is due.** Its request is terminal, ended within [`WINDOW_MS`], and is not an
 //! ending `settle` wrote by age alone while its runner may still report its own
@@ -43,6 +47,10 @@ pub const MAX_ATTEMPTS: i64 = 5;
 
 /// The longest error [`report`] records, in characters.
 pub const MAX_ERROR_CHARS: usize = 500;
+
+/// How long the hook's [`take_for_hook`] holds what it handed over for its [`ack_hook`]: past it, the
+/// rows are taken again — the hook is bounded by Claude Code's 10-second hook timeout.
+pub const HOOK_LEASE_MS: i64 = 30_000;
 
 /// The most ids one [`due`] returns.
 pub const MAX_DUE: usize = 256;
@@ -322,9 +330,12 @@ pub fn report(
 }
 
 /// The condition that a row belongs to the agent a hook take speaks for (`?6`): that subagent's rows
-/// alone, or — for the main agent (`?6` NULL) — the main agent's and those of subagents that are gone.
+/// alone, or — for the main agent (`?6` NULL) — the main agent's, those of subagents that are gone,
+/// and those of any subagent whose request ended [`SUBAGENT_GRACE_MS`] (`?7`) ago or more: the
+/// `SubagentStop` that marks a subagent gone is sent fail-open, and a lost one must not strand its
+/// results.
 const AGENT_OF_TAKE: &str = "CASE WHEN ?6 IS NULL \
-     THEN (d.agent_id IS NULL OR d.agent_gone_at IS NOT NULL) \
+     THEN (d.agent_id IS NULL OR d.agent_gone_at IS NOT NULL OR r.ended_at + ?7 <= ?1) \
      ELSE d.agent_id = ?6 END";
 
 /// Whether [`take_for_hook`] could take anything for `session`'s `agent_id` at `now` — a read, so a
@@ -346,7 +357,7 @@ pub fn any_for_hook(
              WHERE r.session = ?5 AND d.state <> 'delivered' AND {AGENT_OF_TAKE} AND ( \
                  ({DELIVERABLE}) \
                  OR (r.state = 'pending' AND r.expires_at <= ?1) \
-                 OR (r.state = 'running' AND r.started_at + r.timeout_ms + ?7 <= ?1))"
+                 OR (r.state = 'running' AND r.started_at + r.timeout_ms + ?8 <= ?1))"
         ))?
         .query_row(
             params![
@@ -356,6 +367,7 @@ pub fn any_for_hook(
                 LATEST_END_MS,
                 session,
                 agent_id,
+                SUBAGENT_GRACE_MS,
                 exec::RUN_GRACE_MS
             ],
             |r| r.get(0),
@@ -363,11 +375,13 @@ pub fn any_for_hook(
     Ok(n > 0)
 }
 
-/// Deliver, through the hook, every result of `session` due for `agent_id` (the main agent for
-/// `None`: its own and those of subagents that are gone): each moves to `delivered` via `hook` in this
-/// one transaction, and is returned, oldest first, with its row, its output and its delivery — what
-/// [`crate::exec::delivery_text`] composes the message from. Settles expiries first, so a result is
-/// never held back for want of an exec op. A row under a live socket lease is left to its deliverer.
+/// Hand the hook every result of `session` due for `agent_id` (the main agent for `None`: its own,
+/// those of subagents that are gone, and those past [`SUBAGENT_GRACE_MS`]): each moves to `sending`
+/// under a [`HOOK_LEASE_MS`] lease in this one transaction, and is returned, oldest first, with its
+/// row, its output and its delivery — what [`crate::exec::delivery_text`] composes the message from.
+/// Delivered only by the hook's [`ack_hook`] once it has printed them; unacknowledged, they are taken
+/// again when the lease lapses. Settles expiries first, so a result is never held back for want of an
+/// exec op. A row under a live lease is left to its holder.
 ///
 /// # Errors
 /// A database error.
@@ -381,8 +395,7 @@ pub fn take_for_hook(
     exec::settle(conn, meta, now)?;
     let mut ids: Vec<i64> = conn
         .prepare_cached(&format!(
-            "UPDATE exec_delivery SET state = 'delivered', via = 'hook', delivered_at = ?1, \
-                 lease_until = NULL \
+            "UPDATE exec_delivery SET state = 'sending', lease_until = ?8 \
              WHERE request_id IN ( \
                  SELECT r.id FROM exec_requests r JOIN exec_delivery d ON d.request_id = r.id \
                  WHERE r.session = ?5 AND {DELIVERABLE} AND {AGENT_OF_TAKE}) \
@@ -395,13 +408,36 @@ pub fn take_for_hook(
                 SETTLED_INTERRUPT,
                 LATEST_END_MS,
                 session,
-                agent_id
+                agent_id,
+                SUBAGENT_GRACE_MS,
+                now.saturating_add(HOOK_LEASE_MS)
             ],
             |r| r.get(0),
         )?
         .collect::<rusqlite::Result<_>>()?;
     ids.sort_unstable();
     ids.into_iter().map(|id| taken(conn, id)).collect()
+}
+
+/// The hook printed what [`take_for_hook`] handed it: each of `ids` (of `session`) still `sending`
+/// moves to `delivered` via `hook`. Returns how many moved — fewer when a lease lapsed and another
+/// deliverer took a row, which is then that deliverer's.
+///
+/// # Errors
+/// A database error.
+pub fn ack_hook(conn: &Connection, session: &str, ids: &[i64], now: i64) -> Result<usize> {
+    let mut n = 0;
+    for id in ids {
+        n += conn
+            .prepare_cached(
+                "UPDATE exec_delivery SET state = 'delivered', via = 'hook', delivered_at = ?3, \
+                     lease_until = NULL \
+                 WHERE request_id = ?1 AND state = 'sending' \
+                   AND request_id IN (SELECT id FROM exec_requests WHERE session = ?2)",
+            )?
+            .execute(params![id, session, now])?;
+    }
+    Ok(n)
 }
 
 /// A result handed over: what its message is composed from.

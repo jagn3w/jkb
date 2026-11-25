@@ -4,8 +4,8 @@
 use proptest::prelude::*;
 
 use super::{
-    agent_gone, any_for_hook, claim_for_socket, due, get, open, report, take_for_hook,
-    DeliveryState, Via, MAX_ATTEMPTS, SUBAGENT_GRACE_MS, WINDOW_MS,
+    ack_hook, agent_gone, any_for_hook, claim_for_socket, due, get, open, report, take_for_hook,
+    DeliveryState, Via, HOOK_LEASE_MS, MAX_ATTEMPTS, SUBAGENT_GRACE_MS, WINDOW_MS,
 };
 use crate::claude_session::{self, Inbox, Process};
 use crate::exec::{
@@ -89,7 +89,8 @@ fn reported(db: &Db, id: i64, ok: bool, now: i64) -> bool {
     .unwrap()
 }
 
-fn take(db: &Db, agent: Option<&str>, now: i64) -> Vec<i64> {
+/// The hook's first phase: what it is handed, under its lease.
+fn hand(db: &Db, agent: Option<&str>, now: i64) -> Vec<i64> {
     let agent = agent.map(str::to_owned);
     db.write_txn("t", move |c, m| {
         take_for_hook(c, m, "s1", agent.as_deref(), now)
@@ -98,6 +99,20 @@ fn take(db: &Db, agent: Option<&str>, now: i64) -> Vec<i64> {
     .into_iter()
     .map(|t| t.row.id)
     .collect()
+}
+
+/// The hook's second phase: it printed `ids`.
+fn ack(db: &Db, ids: &[i64], now: i64) -> usize {
+    let ids = ids.to_vec();
+    db.write_txn("t", move |c, _| ack_hook(c, "s1", &ids, now))
+        .unwrap()
+}
+
+/// A hook take that printed what it was handed: the ids delivered.
+fn take(db: &Db, agent: Option<&str>, now: i64) -> Vec<i64> {
+    let ids = hand(db, agent, now);
+    assert_eq!(ack(db, &ids, now), ids.len());
+    ids
 }
 
 fn start_inbox(db: &Db, pid: &str, now: i64) {
@@ -202,13 +217,58 @@ fn a_lapsed_lease_is_claimable_again_and_the_hook_takes_it() {
     assert!(due_at(&db, T0 + 20 + LEASE - 1).is_empty());
     assert_eq!(due_at(&db, T0 + 20 + LEASE), vec![id]);
     assert!(claim(&db, id, T0 + 20 + LEASE));
-    // The first claimer's report is now the second's to make: a row reports from `sending` only.
-    assert_eq!(take(&db, None, T0 + 20 + 2 * LEASE), vec![id]);
-    assert!(!reported(&db, id, true, T0 + 20 + 2 * LEASE));
+    // The socket's second lease lapses too, and the hook is handed the row; whichever then says the
+    // message went out first delivers it, and the other finds it delivered.
+    let at = T0 + 20 + 2 * LEASE;
+    assert_eq!(hand(&db, None, at), vec![id]);
+    assert!(
+        reported(&db, id, true, at + 1),
+        "the late post did reach the session"
+    );
+    assert_eq!(ack(&db, &[id], at + 2), 0);
     assert_eq!(
         db.read(move |c| get(c, id)).unwrap().unwrap().via,
-        Some(Via::Hook)
+        Some(Via::Socket)
     );
+}
+
+/// The hook's take is two-phase: a take whose answer never reached the session — the hook's client
+/// gave up, or the hook died before it printed — is handed over again once its lease lapses, and only
+/// an acknowledgement delivers it.
+#[test]
+fn a_take_never_acknowledged_is_handed_over_again() {
+    let db = Db::open_in_memory().unwrap();
+    let id = finished(&db, None, "a", T0 + 10);
+    let at = T0 + 20;
+    assert_eq!(
+        hand(&db, None, at),
+        vec![id],
+        "the reply to this take is lost"
+    );
+    assert_eq!(state(&db, id), DeliveryState::Sending);
+    assert!(
+        hand(&db, None, at + HOOK_LEASE_MS - 1).is_empty(),
+        "held for its ack"
+    );
+    assert!(due_at(&db, at + HOOK_LEASE_MS - 1).is_empty());
+    assert_eq!(
+        take(&db, None, at + HOOK_LEASE_MS),
+        vec![id],
+        "handed over again"
+    );
+    let d = db.read(move |c| get(c, id)).unwrap().unwrap();
+    assert_eq!(
+        (d.state, d.via),
+        (DeliveryState::Delivered, Some(Via::Hook))
+    );
+    assert_eq!(ack(&db, &[id], at + HOOK_LEASE_MS + 1), 0, "delivered once");
+    // An ack names its own session's requests only.
+    let other = finished(&db, None, "b", T0 + 10);
+    hand(&db, None, at + HOOK_LEASE_MS + 2);
+    let n = db
+        .write_txn("t", move |c, _| ack_hook(c, "s2", &[other], at))
+        .unwrap();
+    assert_eq!(n, 0);
 }
 
 #[test]
@@ -233,7 +293,7 @@ fn a_main_agent_take_never_takes_a_live_subagents_row() {
     let db = Db::open_in_memory().unwrap();
     let mine = finished(&db, None, "a", T0 + 10);
     let theirs = finished(&db, Some("ag1"), "b", T0 + 10);
-    let now = T0 + 10 + SUBAGENT_GRACE_MS * 3;
+    let now = T0 + 10 + SUBAGENT_GRACE_MS - 1;
     assert!(db.read(move |c| any_for_hook(c, "s1", None, now)).unwrap());
     assert_eq!(take(&db, None, now), vec![mine]);
     assert!(!db.read(move |c| any_for_hook(c, "s1", None, now)).unwrap());
@@ -244,6 +304,18 @@ fn a_main_agent_take_never_takes_a_live_subagents_row() {
     db.write_txn("t", move |c, _| agent_gone(c, "s1", "ag3", now))
         .unwrap();
     assert_eq!(take(&db, None, now), vec![later], "a stopped subagent's");
+}
+
+/// A subagent whose `SubagentStop` was lost — the hook is fail-open — does not strand its results:
+/// once its request ended the grace ago, the main agent is handed them.
+#[test]
+fn a_subagents_result_is_the_main_agents_after_the_grace() {
+    let db = Db::open_in_memory().unwrap();
+    let theirs = finished(&db, Some("ag1"), "b", T0 + 10);
+    assert!(take(&db, None, T0 + 10 + SUBAGENT_GRACE_MS - 1).is_empty());
+    let at = T0 + 10 + SUBAGENT_GRACE_MS;
+    assert!(db.read(move |c| any_for_hook(c, "s1", None, at)).unwrap());
+    assert_eq!(take(&db, None, at), vec![theirs]);
 }
 
 #[test]
@@ -326,6 +398,7 @@ enum Op {
     ReportOk,
     ReportErr,
     TakeMain,
+    AckMain,
     Advance(i64),
     Inbox,
 }
@@ -336,13 +409,14 @@ fn op() -> impl Strategy<Value = Op> {
         Just(Op::ReportOk),
         Just(Op::ReportErr),
         Just(Op::TakeMain),
+        Just(Op::AckMain),
         (1..2 * LEASE).prop_map(Op::Advance),
         Just(Op::Inbox),
     ]
 }
 
 proptest! {
-    /// However the socket's claims and reports interleave with the hook's takes, a result is
+    /// However the socket's claims and reports interleave with the hook's takes and acks, a result is
     /// delivered at most once, and once delivered nothing hands it over again.
     #[test]
     fn a_result_is_delivered_at_most_once(ops in proptest::collection::vec(op(), 1..40)) {
@@ -351,12 +425,14 @@ proptest! {
         let mut now = T0 + 20;
         let mut deliveries = 0;
         let mut pid = 0;
+        let mut handed: Vec<i64> = Vec::new();
         for o in ops {
             match o {
                 Op::Claim => { claim(&db, id, now); }
                 Op::ReportOk => if reported(&db, id, true, now) { deliveries += 1; },
                 Op::ReportErr => { reported(&db, id, false, now); }
-                Op::TakeMain => deliveries += take(&db, None, now).len(),
+                Op::TakeMain => handed = hand(&db, None, now),
+                Op::AckMain => deliveries += ack(&db, &handed, now),
                 Op::Advance(ms) => now += ms,
                 Op::Inbox => {
                     pid += 1;

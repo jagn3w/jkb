@@ -256,10 +256,20 @@ pub const MAX_INBOX_BYTES: usize = 512;
 
 /// A `claude` process's inbox: the socket its `CLAUDE_CODE_MESSAGING_SOCKET` names, and the token
 /// its `CLAUDE_CODE_MESSAGING_TOKEN` holds. Built only through [`Inbox::new`], which validates both.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Inbox {
     socket: String,
     token: String,
+}
+
+/// Never the token: a `Debug` of a target or an error lands in logs.
+impl std::fmt::Debug for Inbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inbox")
+            .field("socket", &self.socket)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Inbox {

@@ -716,6 +716,11 @@ fn samples() -> Vec<Request> {
         Request::ExecInboxTake {
             session: "s".into(),
             agent_id: None,
+            open: false,
+        },
+        Request::ExecInboxAck {
+            session: "s".into(),
+            ids: vec!["exec-1".into()],
         },
         Request::ExecBegin {
             id: "exec-1".into(),
@@ -4077,6 +4082,7 @@ const OP_WORDS: &[(&str, &str)] = &[
     ("exec.list", "run requests"),
     ("exec.follow", "run requests"),
     ("exec.inbox.take", "hand a session the results"),
+    ("exec.inbox.ack", "hand a session the results"),
     ("task.add", "add tasks"),
     ("task.set", "fields"),
     ("task.edit", "text"),

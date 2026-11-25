@@ -583,18 +583,32 @@ pub enum Request {
         /// At most this many (at most 256).
         max: usize,
     },
-    /// Hand over every run-request result due for one agent of a session, through the attest hook
-    /// ([`jkb_core::exec_delivery::take_for_hook`]): each is marked delivered, and its message
-    /// returned, so a session hears its result on its next tool call, prompt or start. Also lists the
-    /// session's still-open requests. The dev container's credential's, and the operator's, alone.
+    /// Hand the attest hook every run-request result due for one agent of a session
+    /// ([`jkb_core::exec_delivery::take_for_hook`]), so a session hears its result on its next tool
+    /// call, prompt or start: each is held for the hook under a lease, and its message returned. The
+    /// hook acknowledges what it printed with `exec.inbox.ack`; what it never acknowledges is handed
+    /// over again when the lease lapses. The dev container's credential's, and the operator's, alone.
     #[serde(rename = "exec.inbox.take")]
     ExecInboxTake {
         /// The Claude Code session.
         session: String,
         /// The subagent the hook event came from; absent for the main agent, which is handed its own
-        /// results and those of subagents that have stopped.
+        /// results and those of subagents that have stopped (or ended their request long enough ago).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<String>,
+        /// Also list the session's requests still pending or running — what a session reminded after
+        /// a compaction or a resume is told.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        open: bool,
+    },
+    /// The attest hook printed what `exec.inbox.take` handed it: those results are delivered
+    /// ([`jkb_core::exec_delivery::ack_hook`]).
+    #[serde(rename = "exec.inbox.ack")]
+    ExecInboxAck {
+        /// The Claude Code session.
+        session: String,
+        /// The requests whose messages were printed (`exec-<n>`), as `exec.inbox.take` named them.
+        ids: Vec<String>,
     },
     /// Start running a pending request — the operator's runner (`jkb_core::exec::begin`).
     ///
@@ -1905,6 +1919,7 @@ impl Request {
         "exec.list",
         "exec.follow",
         "exec.inbox.take",
+        "exec.inbox.ack",
         "exec.begin",
         "exec.decline",
         "exec.refuse",
@@ -2166,6 +2181,7 @@ impl Request {
             Self::ExecList { .. } => "exec.list",
             Self::ExecFollow { .. } => "exec.follow",
             Self::ExecInboxTake { .. } => "exec.inbox.take",
+            Self::ExecInboxAck { .. } => "exec.inbox.ack",
             Self::ExecBegin { .. } => "exec.begin",
             Self::ExecDecline { .. } => "exec.decline",
             Self::ExecRefuse { .. } => "exec.refuse",
@@ -2309,7 +2325,7 @@ impl Request {
             | Self::WorkflowDefine { .. }
             | Self::WorkflowAgentCopy { .. }
             | Self::WorkflowAgentSet { .. }
-            // In memory: no database at all, so the writer is as good as anywhere.
+            // In memory, and a subagent's release also marks its run-request results due: the writer.
             | Self::AttestMint { .. }
             | Self::AttestRelease { .. }
             | Self::TaskReclaim { .. }
@@ -2350,6 +2366,7 @@ impl Request {
             // A read first, and a write only when something is due — on the writer, since it may
             // write, and the hook that sends it must not wait behind a long read.
             | Self::ExecInboxTake { .. }
+            | Self::ExecInboxAck { .. }
             | Self::ExecBegin { .. }
             | Self::ExecDecline { .. }
             | Self::ExecRefuse { .. }
@@ -2665,8 +2682,17 @@ pub enum Response {
     ExecInboxTaken {
         /// One message per result handed over, oldest first ([`jkb_core::exec::delivery_text`]).
         lines: Vec<String>,
-        /// The session's requests still pending or running.
+        /// The requests those messages report (`exec-<n>`), in the same order: what the hook
+        /// acknowledges with `exec.inbox.ack` once it has printed them.
+        #[serde(default)]
+        ids: Vec<String>,
+        /// The session's requests still pending or running, when asked for.
         open: Vec<exec::OpenRequest>,
+    },
+    /// An `exec.inbox.ack`.
+    ExecInboxAcked {
+        /// How many were delivered by it — fewer than asked when a lease had lapsed.
+        count: usize,
     },
     /// An `exec.output`.
     ExecOutputSent {
@@ -3248,6 +3274,7 @@ impl Response {
             | Self::ExecBegun { .. }
             | Self::ExecRequests { .. }
             | Self::ExecInboxTaken { .. }
+            | Self::ExecInboxAcked { .. }
             | Self::ExecOutputSent { .. } => false,
         }
     }
@@ -3286,6 +3313,7 @@ impl Response {
             // A recorded prompt is announced on its design's topic (D53.6), when it wrote.
             Self::DesignPromptRecorded { wrote, .. } => *wrote,
             Self::Created { .. }
+            | Self::ExecInboxAcked { .. }
             | Self::GroupDeleted { .. }
             | Self::Messages { .. }
             | Self::Position { .. }
@@ -4443,9 +4471,14 @@ impl LocalBackend {
                 )?;
                 Response::ExecRequests { requests, next }
             }
-            Request::ExecInboxTake { session, agent_id } => {
-                exec::inbox_take(db, actor, &session, agent_id, now)?
-            }
+            Request::ExecInboxTake {
+                session,
+                agent_id,
+                open,
+            } => exec::inbox_take(db, actor, &session, agent_id, open, now)?,
+            Request::ExecInboxAck { session, ids } => Response::ExecInboxAcked {
+                count: exec::inbox_ack(db, actor, &session, &ids, now)?,
+            },
             Request::ExecFollow { id, after, max } => Response::Messages {
                 messages: exec::follow(db, principal, &id, after.unwrap_or(0), max, now)?
                     .into_iter()
@@ -5071,22 +5104,20 @@ impl LocalBackend {
                 agent_id,
                 tool_use_id,
             } => {
+                // The tickets first, so a database error below cannot leave a stopped subagent's
+                // tickets live.
+                let count = match &self.tickets {
+                    Some(t) => t.release(&session, agent_id.as_deref(), tool_use_id.as_deref())?,
+                    None => 0,
+                };
                 // A subagent's stop, in the same op: its undelivered run-request results become the
                 // session's to hear, at once.
-                if let (Some(agent), None) = (&agent_id, &tool_use_id) {
-                    let (s, a) = (session.clone(), agent.clone());
+                if let (Some(agent), None) = (agent_id, tool_use_id) {
                     db.write_txn(actor, move |c, _| {
-                        jkb_core::exec_delivery::agent_gone(c, &s, &a, now)
+                        jkb_core::exec_delivery::agent_gone(c, &session, &agent, now)
                     })?;
                 }
-                Response::TicketsReleased {
-                    count: match &self.tickets {
-                        Some(t) => {
-                            t.release(&session, agent_id.as_deref(), tool_use_id.as_deref())?
-                        }
-                        None => 0,
-                    },
-                }
+                Response::TicketsReleased { count }
             }
             Request::TaskClaims { after } => {
                 let (claims, next) = db.read_with(move |c| claims::claims(c, after))?;

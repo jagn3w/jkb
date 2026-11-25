@@ -460,10 +460,11 @@ pub fn follow(
     })
 }
 
-/// `exec.inbox.take`: hand `session`'s `agent_id` every result due for it, and list the session's open
-/// requests. A plain read first, so the common case — nothing due, on every tool call of every
-/// session — opens no write transaction; the take itself in one transaction. All of it on `db`, the
-/// writer's connection: the hook has a second, and must not wait behind a long read on the reader.
+/// `exec.inbox.take`: hand `session`'s `agent_id` every result due for it, under the hook's lease, and
+/// with `open` list the session's open requests. A plain read first, so the common case — nothing due,
+/// on every tool call of every session — opens no write transaction; the take itself in one
+/// transaction. All of it on `db`, the writer's connection: the hook has a second, and must not wait
+/// behind a long read on the reader.
 ///
 /// # Errors
 /// [`ErrorCode::Invalid`] for a malformed session; a database error.
@@ -472,34 +473,62 @@ pub fn inbox_take(
     actor: &str,
     session: &str,
     agent_id: Option<String>,
+    open: bool,
     now: i64,
 ) -> Result<crate::Response, ApiError> {
-    if !jkb_types::is_session_id(session) {
-        return Err(invalid(format!("{session:?} is not a session id")));
-    }
+    check_session(session)?;
     let (s, a) = (session.to_owned(), agent_id.clone());
     let any = db.read(move |c| delivery::any_for_hook(c, &s, a.as_deref(), now))?;
-    let lines = if any {
+    let (lines, ids) = if any {
         let (s, a) = (session.to_owned(), agent_id);
         db.write_txn(actor, move |c, m| {
             let taken = delivery::take_for_hook(c, m, &s, a.as_deref(), now)?;
-            Ok(taken.iter().map(delivery::Taken::text).collect())
+            Ok(taken.iter().map(|t| (t.text(), t.row.wire_id())).unzip())
         })?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let open = if open {
+        let s = session.to_owned();
+        db.read(move |c| delivery::open(c, &s))?
+            .into_iter()
+            .map(|r| OpenRequest {
+                id: r.wire_id(),
+                state: r.state.as_str().to_owned(),
+                agent_type: r.requester.agent_type,
+                reason: r.ask.reason,
+            })
+            .collect()
     } else {
         Vec::new()
     };
+    Ok(crate::Response::ExecInboxTaken { lines, ids, open })
+}
+
+/// `exec.inbox.ack`: the hook printed the messages of `ids`, which `exec.inbox.take` handed it for
+/// `session`; they are delivered. Returns how many were.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for a malformed session or id; a database error.
+pub fn inbox_ack(
+    db: &Db,
+    actor: &str,
+    session: &str,
+    ids: &[String],
+    now: i64,
+) -> Result<usize, ApiError> {
+    check_session(session)?;
+    let ids = ids.iter().map(|i| id(i)).collect::<Result<Vec<_>, _>>()?;
     let s = session.to_owned();
-    let open = db
-        .read(move |c| delivery::open(c, &s))?
-        .into_iter()
-        .map(|r| OpenRequest {
-            id: r.wire_id(),
-            state: r.state.as_str().to_owned(),
-            agent_type: r.requester.agent_type,
-            reason: r.ask.reason,
-        })
-        .collect();
-    Ok(crate::Response::ExecInboxTaken { lines, open })
+    Ok(db.write_txn(actor, move |c, _| delivery::ack_hook(c, &s, &ids, now))?)
+}
+
+fn check_session(session: &str) -> Result<(), ApiError> {
+    if jkb_types::is_session_id(session) {
+        Ok(())
+    } else {
+        Err(invalid(format!("{session:?} is not a session id")))
+    }
 }
 
 /// Whether an end reported for `session` by `principal` may expire that session's pending run

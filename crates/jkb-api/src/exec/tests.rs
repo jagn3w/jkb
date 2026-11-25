@@ -509,13 +509,35 @@ fn the_request_index_is_read_by_the_operator_alone() {
     }
 }
 
+/// One hook take: what it handed over (acknowledged, as the hook does once it printed them), and
+/// the open requests.
 fn take(b: &LocalBackend, session: &str, agent: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let (lines, ids, open) = take_unacked(b, session, agent, true);
+    if !ids.is_empty() {
+        match ok(
+            b,
+            &json!({ "op": "exec.inbox.ack", "session": session, "ids": ids }),
+        ) {
+            Response::ExecInboxAcked { count } => assert_eq!(count, ids.len()),
+            other => panic!("{other:?}"),
+        }
+    }
+    (lines, open)
+}
+
+fn take_unacked(
+    b: &LocalBackend,
+    session: &str,
+    agent: Option<&str>,
+    open: bool,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     match ok(
         b,
-        &json!({ "op": "exec.inbox.take", "session": session, "agent_id": agent }),
+        &json!({ "op": "exec.inbox.take", "session": session, "agent_id": agent, "open": open }),
     ) {
-        Response::ExecInboxTaken { lines, open } => (
+        Response::ExecInboxTaken { lines, ids, open } => (
             lines,
+            ids,
             open.iter().map(crate::exec::OpenRequest::line).collect(),
         ),
         other => panic!("{other:?}"),
@@ -582,7 +604,8 @@ fn the_inbox_take_is_the_harness_s_alone() {
     assert_eq!(
         crate::Request::ExecInboxTake {
             session: "s".into(),
-            agent_id: None
+            agent_id: None,
+            open: false
         }
         .permission(),
         OpPermission::Attest
@@ -710,4 +733,39 @@ fn an_inbox_is_set_only_by_the_harness_or_the_session_and_never_listed() {
     // A request's debug form never shows the token.
     let r: crate::Request = serde_json::from_value(start("s1", "1")).unwrap();
     assert!(!format!("{r:?}").contains("sekrit"));
+}
+
+/// A take whose reply never reached the session — the hook's client gave up after the daemon
+/// committed it, or the hook died before printing — is handed over again once the hook's lease
+/// lapses; without `open`, nothing but the take is computed.
+#[test]
+fn a_lost_take_is_handed_over_again_and_open_is_listed_only_when_asked() {
+    let kb = Kb::new();
+    let hook = kb.as_token(&kb.container);
+    let (r, _) = requested(ok(&kb.ticket("s1", None, "t1"), &ask(&["land"])));
+    let (_, _, open) = take_unacked(&hook, "s1", None, false);
+    assert!(open.is_empty(), "not asked for");
+    let (_, _, open) = take_unacked(&hook, "s1", None, true);
+    assert_eq!(open.len(), 1);
+    run_to_end(&kb, &r.id, b"ok\n");
+    let (lines, ids, _) = take_unacked(&hook, "s1", None, false);
+    assert_eq!((lines.len(), ids), (1, vec![r.id.clone()]));
+    // The reply is lost: nothing is acknowledged. Held for the lease, then handed over again.
+    assert!(take_unacked(&hook, "s1", None, false).0.is_empty());
+    let n = crate::exec::id(&r.id).unwrap();
+    kb.db
+        .write_txn("t", move |c, _| {
+            c.execute(
+                "UPDATE exec_delivery SET lease_until = 0 WHERE request_id = ?1",
+                [n],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (lines, _) = take(&hook, "s1", None);
+    assert_eq!(lines.len(), 1, "handed over again after the lease");
+    assert!(
+        take(&hook, "s1", None).0.is_empty(),
+        "acknowledged: delivered"
+    );
 }

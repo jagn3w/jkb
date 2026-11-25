@@ -455,7 +455,8 @@ fi
 # for an hour never runs Bash), on UserPromptSubmit (an idle session hears it on the next prompt), and
 # on SessionStart (which also registers the process's inbox, and after a compaction lists what is still
 # open). A matcher narrowed back to Bash, or an entry dropped, silently leaves results unheard.
-# `crossSessionInbound: accept` lets the forwarder's posts to a session's inbox start a turn.
+# `crossSessionInbound: accept` is NOT set yet: it lifts Claude Code's hold on cross-session messages,
+# and nothing posts to a session's inbox until the forwarder ships (which adds it, and its pin here).
 rr_hook=/usr/local/lib/jkb-hook/jkb
 rr_bad=""
 for rr_ev in PostToolUse PostToolUseFailure; do
@@ -466,10 +467,8 @@ for rr_ev in UserPromptSubmit SessionStart SubagentStop SessionEnd; do
     jq -e --arg e "$rr_ev" --arg h "$rr_hook attest hook" '[.hooks[$e][]?.hooks[]?.command] | index($h)' "$here/managed-settings.json" >/dev/null 2>&1 \
         || rr_bad="$rr_bad $rr_ev(no attest hook)"
 done
-[ "$(jq -r '.crossSessionInbound // ""' "$here/managed-settings.json" 2>/dev/null)" = accept ] \
-    || rr_bad="$rr_bad crossSessionInbound(not accept)"
 if [ -z "$rr_bad" ]; then
-    ok "the attest hook delivers run-request results on every tool call, prompt and start, and the inbox accepts them"
+    ok "the attest hook delivers run-request results on every tool call, prompt and start"
 else
     bad "a run request's result would go unheard — managed-settings.json:$rr_bad"
 fi

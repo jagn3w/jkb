@@ -1179,13 +1179,43 @@ pub fn attest(cmd: &AttestCmd) {
         },
         instance,
     };
-    let (out, failures) = attest_event(&backend, &p, &env);
-    for f in failures {
+    let said = attest_event(&backend, &p, &env);
+    for f in emit(&backend, said, &mut std::io::stdout().lock()) {
         log_failure(&f);
     }
-    if let Some(out) = out {
-        println!("{out}");
+}
+
+/// What one hook event says: the output to print, the failures so far, and — when the output carries
+/// run-request results — the `exec.inbox.ack` to send once it is printed.
+#[derive(Debug, Default)]
+struct Said {
+    out: Option<Value>,
+    failures: Vec<String>,
+    ack: Option<Request>,
+}
+
+/// Print what `said` says to `w`, then acknowledge the results it carried: only a message that reached
+/// the hook's stdout is delivered, and one never acknowledged is handed over again when its lease
+/// lapses. Returns every failure to log.
+fn emit(backend: &dyn Backend, said: Said, w: &mut dyn std::io::Write) -> Vec<String> {
+    let Said {
+        out,
+        mut failures,
+        ack,
+    } = said;
+    let Some(out) = out else {
+        return failures;
+    };
+    if let Err(e) = writeln!(w, "{out}").and_then(|()| w.flush()) {
+        failures.push(format!("printing the hook output: {e}"));
+        return failures;
     }
+    if let Some(ack) = ack {
+        if let Err(e) = backend.call(ack) {
+            failures.push(format!("exec.inbox.ack: {}", e.message));
+        }
+    }
+    failures
 }
 
 /// What the attest hook reads from outside its payload, resolved at the edge so [`attest_event`] is a
@@ -1255,13 +1285,23 @@ fn take(
     session: &str,
     agent_id: Option<String>,
     open: bool,
-    failures: &mut Vec<String>,
+    said: &mut Said,
 ) -> Option<String> {
+    let failures = &mut said.failures;
     let (lines, still_open) = match backend.call(Request::ExecInboxTake {
         session: session.to_owned(),
         agent_id,
+        open,
     }) {
-        Ok(Response::ExecInboxTaken { lines, open }) => (lines, open),
+        Ok(Response::ExecInboxTaken { lines, ids, open }) => {
+            if !ids.is_empty() {
+                said.ack = Some(Request::ExecInboxAck {
+                    session: session.to_owned(),
+                    ids,
+                });
+            }
+            (lines, open)
+        }
         Ok(other) => {
             failures.push(format!("exec.inbox.take: unexpected {other:?}"));
             return None;
@@ -1284,7 +1324,7 @@ fn take(
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
-/// One hook event: what to print, and the failures to log.
+/// One hook event: what to print, the failures to log, and what to acknowledge once printed.
 ///
 /// * `PreToolUse` (Bash): mint the call's ticket and put it on the command.
 /// * `PostToolUse`/`PostToolUseFailure`, for any tool: hand over the results due for the agent that
@@ -1297,11 +1337,11 @@ fn take(
 /// * `SubagentStop`: release the subagent's tickets — which also makes its undelivered results the
 ///   session's to hear.
 /// * `SessionEnd`: release the session's tickets.
-fn attest_event(backend: &dyn Backend, p: &Value, env: &HookEnv) -> (Option<Value>, Vec<String>) {
-    let mut failures = Vec::new();
+fn attest_event(backend: &dyn Backend, p: &Value, env: &HookEnv) -> Said {
+    let mut said = Said::default();
     let s = |k: &str| p[k].as_str().map(str::to_owned);
     let Some(session) = s("session_id") else {
-        return (None, failures);
+        return said;
     };
     let event = s("hook_event_name").unwrap_or_default();
     let request = match event.as_str() {
@@ -1309,10 +1349,10 @@ fn attest_event(backend: &dyn Backend, p: &Value, env: &HookEnv) -> (Option<Valu
             let command = p["tool_input"]["command"].as_str().unwrap_or_default();
             let class = attestation(command);
             if s("tool_name").as_deref() != Some("Bash") || class == Attestation::Skip {
-                return (None, failures);
+                return said;
             }
             let Some(tool_use_id) = s("tool_use_id") else {
-                return (None, failures);
+                return said;
             };
             let token = match backend.call(Request::AttestMint {
                 session,
@@ -1322,20 +1362,22 @@ fn attest_event(backend: &dyn Backend, p: &Value, env: &HookEnv) -> (Option<Valu
             }) {
                 Ok(Response::Ticket { token }) => token,
                 Ok(other) => {
-                    failures.push(format!("attest.mint: unexpected {other:?}"));
-                    return (None, failures);
+                    said.failures
+                        .push(format!("attest.mint: unexpected {other:?}"));
+                    return said;
                 }
                 Err(e) => {
-                    failures.push(format!("attest.mint: {}", e.message));
-                    return (None, failures);
+                    said.failures.push(format!("attest.mint: {}", e.message));
+                    return said;
                 }
             };
             let mut input = p["tool_input"].clone();
             input["command"] = json!(format!("export {}={token}; {command}", remote::ATTEST_VAR));
-            return (Some(pre_tool_use(class, env.forced_ask, &input)), failures);
+            said.out = Some(pre_tool_use(class, env.forced_ask, &input));
+            return said;
         }
         "PostToolUse" | "PostToolUseFailure" => {
-            let said = take(backend, &session, s("agent_id"), false, &mut failures);
+            let context = take(backend, &session, s("agent_id"), false, &mut said);
             // Only a call this hook ticketed has anything to release: asking the daemon after every
             // `ls` put it on every Bash call's path.
             let command = p["tool_input"]["command"].as_str().unwrap_or_default();
@@ -1347,15 +1389,17 @@ fn attest_event(backend: &dyn Backend, p: &Value, env: &HookEnv) -> (Option<Valu
                     agent_id: None,
                     tool_use_id: s("tool_use_id"),
                 }) {
-                    failures.push(format!("attest.release: {}", e.message));
+                    said.failures.push(format!("attest.release: {}", e.message));
                 }
             }
             // `PostToolUseFailure` takes its context under its own event name.
-            return (said.map(|c| context_output(&event, &c)), failures);
+            said.out = context.map(|c| context_output(&event, &c));
+            return said;
         }
         "UserPromptSubmit" => {
-            let said = take(backend, &session, None, false, &mut failures);
-            return (said.map(|c| context_output(&event, &c)), failures);
+            let context = take(backend, &session, None, false, &mut said);
+            said.out = context.map(|c| context_output(&event, &c));
+            return said;
         }
         "SessionStart" => {
             // Registered only with a process it can name: a pid-less row would keep the session from
@@ -1368,13 +1412,15 @@ fn attest_event(backend: &dyn Backend, p: &Value, env: &HookEnv) -> (Option<Valu
                     env.inbox.clone(),
                 ) {
                     if let Err(e) = backend.call(start) {
-                        failures.push(format!("session.started: {}", e.message));
+                        said.failures
+                            .push(format!("session.started: {}", e.message));
                     }
                 }
             }
             let open = matches!(s("source").as_deref(), Some("compact" | "resume"));
-            let said = take(backend, &session, None, open, &mut failures);
-            return (said.map(|c| context_output(&event, &c)), failures);
+            let context = take(backend, &session, None, open, &mut said);
+            said.out = context.map(|c| context_output(&event, &c));
+            return said;
         }
         "SubagentStop" => match s("agent_id") {
             Some(agent) => Request::AttestRelease {
@@ -1382,19 +1428,19 @@ fn attest_event(backend: &dyn Backend, p: &Value, env: &HookEnv) -> (Option<Valu
                 agent_id: Some(agent),
                 tool_use_id: None,
             },
-            None => return (None, failures),
+            None => return said,
         },
         "SessionEnd" => Request::AttestRelease {
             session,
             agent_id: None,
             tool_use_id: None,
         },
-        _ => return (None, failures),
+        _ => return said,
     };
     if let Err(e) = backend.call(request) {
-        failures.push(format!("attest.release: {}", e.message));
+        said.failures.push(format!("attest.release: {}", e.message));
     }
-    (None, failures)
+    said
 }
 
 #[cfg(test)]
@@ -2231,10 +2277,14 @@ mod tests {
     impl Backend for Recorder {
         fn call(&self, request: Request) -> Result<Response, ApiError> {
             let answer = match &request {
-                Request::ExecInboxTake { .. } => Response::ExecInboxTaken {
+                Request::ExecInboxTake { open, .. } => Response::ExecInboxTaken {
                     lines: self.lines.clone(),
-                    open: self.open.clone(),
+                    ids: (1..=self.lines.len())
+                        .map(|n| format!("exec-{n}"))
+                        .collect(),
+                    open: if *open { self.open.clone() } else { Vec::new() },
                 },
+                Request::ExecInboxAck { ids, .. } => Response::ExecInboxAcked { count: ids.len() },
                 Request::AttestRelease { .. } => Response::TicketsReleased { count: 1 },
                 Request::SessionStarted { .. } => Response::SessionStart {
                     was: "unknown".to_owned(),
@@ -2246,10 +2296,14 @@ mod tests {
         }
     }
 
+    /// One hook event, printed as the hook prints it, and acknowledged.
     fn event(b: &Recorder, payload: &Value, env: &super::HookEnv) -> Option<Value> {
-        let (out, failures) = super::attest_event(b, payload, env);
+        let said = super::attest_event(b, payload, env);
+        let mut printed = Vec::new();
+        let failures = super::emit(b, said, &mut printed);
         assert!(failures.is_empty(), "{failures:?}");
-        out
+        let printed = String::from_utf8(printed).unwrap();
+        (!printed.is_empty()).then(|| serde_json::from_str(&printed).unwrap())
     }
 
     fn context(out: &Value, event: &str) -> String {
@@ -2274,12 +2328,15 @@ mod tests {
         );
         assert_eq!(
             b.ops(),
-            vec!["exec.inbox.take"],
-            "a Read has no ticket to release"
+            vec!["exec.inbox.take", "exec.inbox.ack"],
+            "a Read has no ticket to release; what it printed is acknowledged"
         );
         {
             let sent = b.sent.borrow();
-            let Request::ExecInboxTake { session, agent_id } = &sent[0] else {
+            let Request::ExecInboxTake {
+                session, agent_id, ..
+            } = &sent[0]
+            else {
                 panic!()
             };
             assert_eq!((session.as_str(), agent_id.as_deref()), ("s1", Some("ag1")));
@@ -2290,6 +2347,27 @@ mod tests {
         });
         let out = event(&b, &failed, &super::HookEnv::default()).unwrap();
         context(&out, "PostToolUseFailure");
+    }
+
+    /// A hook that cannot print what it was handed acknowledges nothing, so the take is handed over
+    /// again once its lease lapses.
+    #[test]
+    fn what_could_not_be_printed_is_not_acknowledged() {
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let b = Recorder::new(&["result"]);
+        let p = json!({ "hook_event_name": "UserPromptSubmit", "session_id": "s1" });
+        let said = super::attest_event(&b, &p, &super::HookEnv::default());
+        let failures = super::emit(&b, said, &mut Broken);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(b.ops(), vec!["exec.inbox.take"]);
     }
 
     #[test]
@@ -2338,7 +2416,10 @@ mod tests {
             "hook_event_name": "SessionStart", "session_id": "s1", "source": "compact", "cwd": "/w"
         });
         let out = event(&b, &p, &env).unwrap();
-        assert_eq!(b.ops(), vec!["session.started", "exec.inbox.take"]);
+        assert_eq!(
+            b.ops(),
+            vec!["session.started", "exec.inbox.take", "exec.inbox.ack"]
+        );
         let Request::SessionStarted {
             pid, inbox, source, ..
         } = &b.sent.borrow()[0]

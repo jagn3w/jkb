@@ -888,6 +888,28 @@ tool call last installed there. `setup.sh` pins its build with `sudo -n /usr/loc
 refuses a managed hook naming anything else, and `verify.sh` that the pinned binary is missing or
 writable. The residual: it pins whatever `~/.cargo/bin/jkb` is when it runs.
 
+**The attestation hook also hands a session the results of the run requests it filed.** A session
+that ran `jkb exec request --no-wait` is told how the request ended as hook context
+(`additionalContext`), on its next event: `PostToolUse`/`PostToolUseFailure` for *every* tool (the
+managed matcher is `.*`, not `Bash` — a session that only reads and edits for an hour must still hear
+it), `UserPromptSubmit` (an idle session hears it on the operator's next prompt), and `SessionStart`
+(which also registers the process's inbox socket, and after a compaction or a resume lists the
+requests still open). The take is two-phase: the hook is handed the messages under a 30-second lease
+(`exec.inbox.take`), prints them, and only then acknowledges them (`exec.inbox.ack`), so a reply lost
+after the daemon committed it, or a hook killed before it printed, is handed over again rather than
+lost. `SessionStart` registers the process only when the hook's parent is not a shell, since a row
+with no pid would keep the session from ever reading as ended. `check-config.sh` and `verify.sh` pin
+the matchers and entries, and `mutate-config.sh` carries the narrowed-matcher mutation.
+
+**Not here yet: the forwarder, and `crossSessionInbound`.** The design pushes each result into the
+session's own Claude Code inbox socket from a forwarder (`jkb exec forward`) that the entrypoint
+starts and supervises, so an idle session takes a turn without waiting for a prompt. It is not
+built: its message format is unmeasured (experiment E1 in the design, which needs a session outside
+an agent's sandbox), and it is not written against a guessed format. `"crossSessionInbound": "accept"`
+is left out of the managed settings until then: it lifts Claude Code's hold on cross-session
+messages, and with no forwarder nothing legitimate posts to an inbox. The forwarder's change adds
+both, with their pins.
+
 **Not yet measured, because it needs this image running:** that managed hooks run beside the
 project's and user's (they are not exclusive unless `allowManagedHooksOnly`, which is not set
 because it would disable this repo's own hooks); that the managed deny rules merge with the
