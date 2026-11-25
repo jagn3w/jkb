@@ -46,6 +46,14 @@
 //! nobody has taught this module about is a named refusal rather than a transaction that fails
 //! identically for ever.
 //!
+//! One inspection question is about **other transactions**: [`later_writer`] refuses an entry while
+//! a strictly later, live, work transaction has logged an overlapping change to the identical
+//! `(entity_type, entity_id)` — reverting it would overwrite that work, or write into a row whose
+//! id `SQLite` has since reissued. Two column updates on disjoint columns do not overlap; anything
+//! else covers the whole row. Only a later transaction blocks, so the newest work transaction never
+//! is and [`undo_last`] is unaffected; an older one undoes once the history above it is peeled
+//! back, newest first, and the refusal names the transaction to take back next.
+//!
 //! ## …which requires every arm to report its result honestly
 //!
 //! The wrapper can only see failures that are *reported*. Several arms used to answer `Ok(0)` for
@@ -1046,11 +1054,21 @@ fn blocker(
     {
         return Some(format!("its changelog key `{entity_id}` is not a row id"));
     }
+    // A later transaction that wrote the same row: reverting this entry would overwrite its work, or
+    // write into a row whose id `SQLite` has since reissued. Asked after the payload checks, so an
+    // unreadable entry is named for what is wrong with it, and before the design check, which
+    // covers rows keyed by `design_id` that this key match cannot see.
+    match later_writer_refusal(conn, txn_id, op, table, entity_id, snapshot.as_ref()) {
+        Ok(None) => {}
+        Ok(Some(why)) => return Some(why),
+        Err(e) => return Some(e.to_string()),
+    }
     // Deleting a design cascades its document away, so a design's creation is undone only while
     // `design::undo_would_lose` finds no later work: no compaction, and no row in a design-owned
     // table (`design::DESIGN_OWNED`) whose `txn_id` is a later transaction not itself undone and not
     // an `undo`. Design-only on purpose — the rule and the generic guard tried and dropped are under
-    // docs/foundation.md. Every other item's insert undoes as it always has.
+    // docs/foundation.md. Every item's own row is covered by `later_writer` above; this adds the
+    // design's cascade children, which are keyed by `design_id` and so invisible to that key match.
     if op == Op::Insert.as_str() && table == Entity::Items.as_str() {
         if let Some(why) = entity_id.parse::<i64>().ok().and_then(|row| {
             crate::design::undo_would_lose(conn, ItemId::new(row), txn_id).transpose()
@@ -1068,6 +1086,162 @@ fn blocker(
         }
     }
     None
+}
+
+/// What of a row a changelog entry's inverse writes — the unit [`later_writer`] compares.
+#[derive(Debug, PartialEq, Eq)]
+enum Touched {
+    /// Only these columns: the entry is an [`Inverse::Columns`] update, and its before-state is
+    /// the column map that inverse writes back, so its keys are exactly what an undo would touch.
+    Columns(BTreeSet<String>),
+    /// The whole row: an insert, a delete, or a hand-written inverse whose payload is not
+    /// guaranteed to be a column map.
+    Row,
+}
+
+/// What of its row the entry `(op, table, before)` touches.
+///
+/// Precise only where the precision is guaranteed: [`check_restorable`] holds every
+/// [`Inverse::Columns`] before-state to "a non-empty object naming real columns" at its writer, so
+/// its keys can be trusted to be the columns it changed. Every other entry — and a `Columns` entry
+/// whose before-state is somehow not an object — covers the whole row, which can only make the
+/// guard refuse more, never let a lost update through.
+fn touched(op: &str, table: &str, before: Option<&Value>) -> Touched {
+    if inverse_for(op, table) != Some(Inverse::Columns) {
+        return Touched::Row;
+    }
+    match column_map(op, table, before).and_then(Value::as_object) {
+        Some(map) if !map.is_empty() => Touched::Columns(map.keys().cloned().collect()),
+        _ => Touched::Row,
+    }
+}
+
+/// What two entries on the same row both touch, or `None` when they are disjoint — which only two
+/// column updates can be.
+fn overlap(earlier: &Touched, later: &Touched) -> Option<String> {
+    match (earlier, later) {
+        (Touched::Columns(a), Touched::Columns(b)) => {
+            let shared: Vec<String> = a.intersection(b).map(|c| format!("`{c}`")).collect();
+            (!shared.is_empty()).then(|| shared.join(", "))
+        }
+        _ => Some("the whole row".to_owned()),
+    }
+}
+
+/// The newest **later, live, work** transaction that wrote the row entry `(op, table, entity_id)`
+/// of transaction `txn_id` would restore, and what of it the two share — or `None`.
+///
+/// Reverting an entry writes its before-state over whatever is there now; if a later transaction
+/// changed the same thing since, that later work is lost, and an undo cannot itself be undone. On a
+/// table without `AUTOINCREMENT` it is worse: the rowid may have been reissued to an unrelated row,
+/// which the inverse would then write into or delete. So the entry waits until the later work is
+/// undone — newest first, exactly as a bare `jkb undo` would take it — and the refusal names the
+/// newest such transaction, the one to undo next.
+///
+/// **Keyed, not attributed.** It reads only the changelog and matches the identical
+/// `(entity_type, entity_id)` — the key every writer logs under one convention — so an `items` key
+/// is never compared with a `placements` one, and no table row is ever attributed to a writer.
+/// That is what separates it from the generic cascade guard docs/foundation.md records as tried
+/// and dropped. And only a *strictly later* transaction blocks, so two transactions can never
+/// refuse each other: the newest work transaction is never blocked, and `undo_last` is unchanged.
+///
+/// "Live" excludes a transaction already undone ([`undone_sql`]) and one that is itself an undo
+/// (its forward design revert and marker are not work), the same two exclusions
+/// `design::undo_would_lose` makes; "work" is [`is_work`], so a later `sync_state` journal update
+/// never blocks.
+///
+/// # Errors
+/// A database error.
+fn later_writer(
+    conn: &Connection,
+    txn_id: i64,
+    op: &str,
+    table: &str,
+    entity_id: &str,
+    before: Option<&Value>,
+) -> Result<Option<(i64, String)>> {
+    let later = conn
+        .prepare_cached(&later_writer_sql())?
+        .query_map(params![table, entity_id, txn_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mine = touched(op, table, before);
+    for (later_txn, later_op, later_before) in later {
+        if !is_work(&later_op, table) {
+            continue;
+        }
+        // An unreadable later before-state is taken as the whole row: the guard errs towards
+        // refusing, never towards writing over work it could not read.
+        let later_before = later_before.and_then(|b| serde_json::from_str::<Value>(&b).ok());
+        if let Some(what) = overlap(&mine, &touched(&later_op, table, later_before.as_ref())) {
+            return Ok(Some((later_txn, what)));
+        }
+    }
+    Ok(None)
+}
+
+/// [`later_writer`]'s query: every later entry on one `(entity_type, entity_id)`, newest first,
+/// from transactions neither undone nor themselves an undo. Served by `idx_changelog_entity`
+/// (`V036`); every value is bound, and the only splice is [`undone_sql`]'s operand.
+fn later_writer_sql() -> String {
+    format!(
+        "SELECT l.txn_id, l.op, l.before FROM changelog l
+          WHERE l.entity_type = ?1 AND l.entity_id = ?2 AND l.txn_id > ?3
+            AND NOT {}
+            AND NOT EXISTS (SELECT 1 FROM changelog x
+                             WHERE x.txn_id = l.txn_id AND x.op = 'undo')
+          ORDER BY l.txn_id DESC, l.id DESC",
+        undone_sql("l.txn_id")
+    )
+}
+
+/// Why entry `(op, table, entity_id)` of `txn_id` waits for a later writer of its row, or `None`.
+///
+/// The refusal text for [`later_writer`]'s answer. An item's creation also gets the reversible way
+/// to remove it now: `jkb item rm` snapshots the item and its cascade, so it can be undone, where
+/// deleting it through this undo would take its later history with it for good.
+fn later_writer_refusal(
+    conn: &Connection,
+    txn_id: i64,
+    op: &str,
+    table: &str,
+    entity_id: &str,
+    before: Option<&Value>,
+) -> Result<Option<String>> {
+    let Some((later, what)) = later_writer(conn, txn_id, op, table, entity_id, before)? else {
+        return Ok(None);
+    };
+    let deletes = inverse_for(op, table) == Some(Inverse::DeleteRow);
+    let effect = if deletes {
+        "deleting it would take that work with it"
+    } else {
+        "reverting this would overwrite it"
+    };
+    let instead = if deletes && table == Entity::Items.as_str() {
+        let uid: Option<String> = match entity_id.parse::<i64>() {
+            Ok(row) => conn
+                .prepare_cached("SELECT uid FROM items WHERE id = ?1")?
+                .query_row([row], |r| r.get(0))
+                .optional()?,
+            Err(_) => None,
+        };
+        let target = uid.unwrap_or_else(|| "<uid>".to_owned());
+        format!(
+            ", or remove the item with `jkb item rm {target}`, which keeps its history and can \
+             itself be undone"
+        )
+    } else {
+        String::new()
+    };
+    Ok(Some(format!(
+        "transaction {later} has changed the same row since ({what}), and {effect}. Undo \
+         transaction {later} first{instead}"
+    )))
 }
 
 /// A refusal that a reader can act on: what is wrong, that nothing moved, and **which
@@ -4240,12 +4414,14 @@ mod tests {
             .unwrap();
         let bad = db
             .write_txn("t", |c, m| {
-                upsert(c, m, &note("newer"))?;
-                // The legacy shape, inserted past the writer's guard.
+                let newer = upsert(c, m, &note("newer"))?;
+                // The legacy shape, inserted past the writer's guard — against this transaction's own
+                // item. Against `keep-me` it would be a later write to that row, and undoing
+                // `keep-me`'s creation would then wait for it rather than be the way out.
                 c.execute(
                     "INSERT INTO changelog (txn_id, op, entity_type, entity_id, before, actor)
-                     VALUES (?1, 'update', 'items', '1', '{\"content_len\": 12}', 't')",
-                    [m.txn_id],
+                     VALUES (?1, 'update', 'items', ?2, '{\"content_len\": 12}', 't')",
+                    rusqlite::params![m.txn_id, newer.get().to_string()],
                 )?;
                 Ok(m.txn_id)
             })
@@ -4415,6 +4591,15 @@ mod tests {
                 Ok((m.txn_id, a))
             })
             .unwrap();
+        // The way out the refusal will name: the next older change, which the rename did not touch.
+        // (The tag's own creation is no way out — the rename is a later write to its row, so undoing
+        // it waits for the rename; asserted at the end.)
+        let unrelated = db
+            .write_txn("t", |c, m| {
+                upsert(c, m, &note("unrelated"))?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
         let renamed = db
             .write_txn("t", |c, m| {
                 tag::rename_facet(c, m, "size", "scale")?;
@@ -4446,7 +4631,7 @@ mod tests {
             "the refusal does not name the entry that failed, or why: {first}"
         );
         assert!(
-            first.contains(&format!("`jkb undo {oldest}`")),
+            first.contains(&format!("`jkb undo {unrelated}`")),
             "the refusal names no older transaction to revert instead: {first}"
         );
         assert_eq!(
@@ -4461,13 +4646,27 @@ mod tests {
             .to_string();
         assert_eq!(first, second, "the refusal is not stable across attempts");
         // The way out it advertises works.
-        db.write_txn("t", move |c, m| super::undo(c, m, oldest))
+        db.write_txn("t", move |c, m| super::undo(c, m, unrelated))
             .unwrap();
         assert!(
-            db.read(move |c| tag::applications(c, a))
+            db.read(|c| crate::item::id_for_uid(c, "unrelated"))
                 .unwrap()
-                .is_empty(),
+                .is_none(),
             "`jkb undo <older>`, the way out the refusal advertises, did nothing"
+        );
+        // Undoing the tag's creation would delete the row the rename — still live, however wedged —
+        // has written since; it waits for the rename, as it does for any later writer.
+        let blocked = db
+            .write_txn("t", move |c, m| super::undo(c, m, oldest))
+            .expect_err("the tag's creation was undone under a live later rename of it")
+            .to_string();
+        assert!(
+            blocked.contains(&format!("Undo transaction {renamed} first")),
+            "{blocked}"
+        );
+        assert_eq!(
+            db.read(move |c| tag::applications(c, a)).unwrap(),
+            vec![("scale".to_owned(), "small".to_owned())]
         );
     }
 
@@ -4576,14 +4775,16 @@ mod tests {
             })
             .unwrap();
 
+        // The delete is a later write to the same row, so the pre-flight names it before the
+        // restore is ever tried; the cascade variant below reaches the restore's own refusal.
         let err = db
             .write_txn("t", move |c, m| super::undo(c, m, edited))
             .expect_err("an update whose row is gone was reported as a successful undo")
             .to_string();
         assert!(
             err.contains(&format!("transaction {edited} cannot be undone"))
-                && err.contains("restored nothing"),
-            "the vanished row is not a named refusal: {err}"
+                && err.contains(&format!("Undo transaction {deleted} first")),
+            "the vanished row is not a named refusal naming the delete: {err}"
         );
 
         // Put the row back the ordinary way, then reach the edit behind it.
@@ -4595,6 +4796,66 @@ mod tests {
             db.read(move |c| item::get_content(c, a)).unwrap(),
             Some("the original body".to_owned()),
             "the edit was not reverted once its row was back"
+        );
+    }
+
+    /// The same, for a row taken by a **cascade**: the later delete is logged against the item, not
+    /// the placement, so the later-writer pre-flight (keyed on the identical row) does not see it,
+    /// and the restore's own row count is what refuses — still nothing marked, and the retry works
+    /// once the item and its placement are back.
+    #[test]
+    fn a_column_restore_whose_row_was_cascaded_away_refuses_and_the_retry_works() {
+        use crate::{item, ns, placement};
+        use jkb_types::PlacementRole;
+
+        let db = Db::open_in_memory().unwrap();
+        let (a, zone) = db
+            .write_txn("t", |c, m| {
+                let a = upsert(c, m, &note("a"))?;
+                let zone = ns::ensure(c, m, "x/y")?;
+                placement::place(c, m, a, zone, PlacementRole::Primary, 0)?;
+                Ok((a, zone))
+            })
+            .unwrap();
+        let moved = db
+            .write_txn("t", move |c, m| {
+                placement::place(c, m, a, zone, PlacementRole::Primary, 5)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        let deleted = db
+            .write_txn("t", move |c, m| {
+                item::remove(c, m, a, true)?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+
+        let err = db
+            .write_txn("t", move |c, m| super::undo(c, m, moved))
+            .expect_err("an update whose row was cascaded away was reported as undone")
+            .to_string();
+        assert!(
+            err.contains(&format!("transaction {moved} cannot be undone"))
+                && err.contains("restored nothing"),
+            "the cascaded-away row is not a named refusal: {err}"
+        );
+
+        db.write_txn("t", move |c, m| super::undo(c, m, deleted))
+            .unwrap();
+        db.write_txn("t", move |c, m| super::undo(c, m, moved))
+            .expect("the retry was refused, so the refused undo had marked the transaction anyway");
+        let position: i64 = db
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT position FROM placements WHERE item_id = ?1",
+                    [a.get()],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            position, 0,
+            "the re-placement was not reverted once its row was back"
         );
     }
 
@@ -5114,6 +5375,430 @@ mod selection_tests {
             ("claim", "items"),
         ] {
             assert!(is_work(op, table), "{op}/{table} stopped counting as work");
+        }
+    }
+}
+
+/// `jkb undo <txn>` of an early transaction waits for every later transaction that wrote the same
+/// row — see [`later_writer`].
+#[cfg(test)]
+mod later_writer_tests {
+    use super::undo_last;
+    use crate::item::{upsert, NewItem};
+    use crate::Db;
+
+    fn note(uid: &str) -> NewItem {
+        NewItem {
+            uid: uid.to_owned(),
+            kind: "note".to_owned(),
+            content: Some("body".to_owned()),
+            content_hash: None,
+            mime: None,
+        }
+    }
+
+    /// A task created in its own transaction, with nothing else in it.
+    fn later_writer_task(db: &Db, uid: &'static str) -> jkb_types::ItemId {
+        use crate::task;
+        db.write_txn("t", move |c, m| {
+            task::create(
+                c,
+                m,
+                &task::NewTask::from_quick_add(
+                    uid,
+                    task::parse_quick_add("a task")?,
+                    task::Under::inbox_of("t"),
+                ),
+            )
+        })
+        .unwrap()
+    }
+
+    /// Run `f` in its own transaction and hand back that transaction's id.
+    fn txn<F>(db: &Db, f: F) -> i64
+    where
+        F: FnOnce(&rusqlite::Connection, &crate::store::WriteMeta) -> crate::Result<()>
+            + Send
+            + 'static,
+    {
+        db.write_txn("t", move |c, m| {
+            f(c, m)?;
+            Ok(m.txn_id)
+        })
+        .unwrap()
+    }
+
+    fn try_undo(db: &Db, txn_id: i64) -> std::result::Result<usize, String> {
+        db.write_txn("t", move |c, m| super::undo(c, m, txn_id))
+            .map_err(|e| e.to_string())
+    }
+
+    fn status_of(db: &Db, id: jkb_types::ItemId) -> Option<String> {
+        db.read(move |c| crate::item::get(c, id))
+            .unwrap()
+            .and_then(|t| t.status)
+    }
+
+    /// The transaction a later-writer refusal says to undo first.
+    fn named_later(message: &str) -> Option<i64> {
+        let rest = &message[message.find("Undo transaction ")? + "Undo transaction ".len()..];
+        rest.split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    /// The lost update. Undoing `open -> in_progress` wrote `open` straight over the later `done`,
+    /// and an undo cannot itself be undone, so the close was gone for good. Now the earlier change
+    /// waits for the later one; undone newest first, both come back.
+    #[test]
+    fn undoing_an_earlier_status_change_waits_for_a_later_one() {
+        use jkb_types::TaskStatus;
+        let db = Db::open_in_memory().unwrap();
+        let id = later_writer_task(&db, "task:lost-update");
+        let t1 = txn(&db, move |c, m| {
+            crate::task::set_status(c, m, id, TaskStatus::InProgress)
+        });
+        let t2 = txn(&db, move |c, m| {
+            crate::task::set_status(c, m, id, TaskStatus::Done)
+        });
+
+        let refused = try_undo(&db, t1).expect_err("the earlier status change was reverted");
+        assert_eq!(
+            named_later(&refused),
+            Some(t2),
+            "the refusal must name the later change to undo first: {refused}"
+        );
+        assert!(refused.contains("`status`"), "{refused}");
+        assert_eq!(status_of(&db, id).as_deref(), Some("done"));
+        assert!(!db.read(move |c| super::already_undone(c, t1)).unwrap());
+
+        try_undo(&db, t2).unwrap();
+        try_undo(&db, t1).unwrap();
+        assert_eq!(status_of(&db, id).as_deref(), Some("open"));
+    }
+
+    /// A later change undone by a bare `jkb undo` no longer blocks the one before it.
+    #[test]
+    fn an_undone_later_change_no_longer_blocks() {
+        use jkb_types::TaskStatus;
+        let db = Db::open_in_memory().unwrap();
+        let id = later_writer_task(&db, "task:undone-later");
+        let t1 = txn(&db, move |c, m| {
+            crate::task::set_status(c, m, id, TaskStatus::InProgress)
+        });
+        txn(&db, move |c, m| {
+            crate::task::set_status(c, m, id, TaskStatus::Done)
+        });
+        db.write_txn("t", undo_last).unwrap();
+        try_undo(&db, t1).unwrap();
+        assert_eq!(status_of(&db, id).as_deref(), Some("open"));
+    }
+
+    /// Two column writes to one row on disjoint columns do not overlap: undoing a priority change
+    /// leaves a later status change alone, and is not refused for it.
+    #[test]
+    fn a_later_change_to_other_columns_does_not_block() {
+        use jkb_types::TaskStatus;
+        let db = Db::open_in_memory().unwrap();
+        let id = later_writer_task(&db, "task:disjoint");
+        let priority = move |db: &Db| {
+            db.read(move |c| crate::item::get(c, id))
+                .unwrap()
+                .and_then(|t| t.priority)
+        };
+        let original = priority(&db);
+        let t1 = txn(&db, move |c, m| {
+            crate::task::set_priority(c, m, id, Some(7))
+        });
+        txn(&db, move |c, m| {
+            crate::task::set_status(c, m, id, TaskStatus::InProgress)
+        });
+
+        try_undo(&db, t1).expect("a later write to other columns blocked the undo");
+        assert_eq!(priority(&db), original);
+        assert_eq!(status_of(&db, id).as_deref(), Some("in_progress"));
+    }
+
+    /// The lost history. Undoing an item's creation deleted it with every later edit, and unlike
+    /// `jkb item rm` nothing snapshotted it. Now it waits for the edit, and says how to remove the
+    /// item reversibly instead.
+    #[test]
+    fn undoing_an_items_creation_waits_for_later_edits_to_it() {
+        let db = Db::open_in_memory().unwrap();
+        let (id, t0) = db
+            .write_txn("t", |c, m| {
+                Ok((upsert(c, m, &note("note:history"))?, m.txn_id))
+            })
+            .unwrap();
+        let t1 = txn(&db, move |c, m| {
+            crate::item::set_content(c, m, id, "edited later", None)
+        });
+
+        let refused = try_undo(&db, t0).expect_err("the creation was undone over a later edit");
+        assert_eq!(named_later(&refused), Some(t1), "{refused}");
+        assert!(
+            refused.contains("`jkb item rm note:history`"),
+            "the refusal must offer the reversible removal: {refused}"
+        );
+        assert!(db.read(move |c| crate::item::get(c, id)).unwrap().is_some());
+
+        try_undo(&db, t1).unwrap();
+        try_undo(&db, t0).unwrap();
+        assert!(db.read(move |c| crate::item::get(c, id)).unwrap().is_none());
+    }
+
+    /// The wrong row. `ingestions` has no `AUTOINCREMENT`, so once a later transaction deletes a
+    /// row and another inserts one, `SQLite` hands the new row the old id — and undoing an update
+    /// of the old row wrote its before-state into the new, unrelated one.
+    #[test]
+    fn a_reissued_rowid_is_not_restored_into() {
+        use crate::ingestion::{self, Key};
+        let key = |hash: &'static str| Key {
+            source_hash: hash,
+            pipeline_version: 1,
+            strategy: "s",
+            embedder_model: "m",
+        };
+        let rowid = |db: &Db, hash: &'static str| -> i64 {
+            db.read(move |c| {
+                Ok(c.query_row(
+                    "SELECT rowid FROM ingestions WHERE source_hash = ?1",
+                    [hash],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+        };
+        let db = Db::open_in_memory().unwrap();
+        txn(&db, move |c, m| {
+            ingestion::record_capture(c, m, key("one"))?;
+            ingestion::mark_complete(c, key("one"))
+        });
+        // T: a re-capture, logged as an update whose before-state is `complete`.
+        let t = txn(&db, move |c, m| ingestion::record_capture(c, m, key("one")));
+        let r = rowid(&db, "one");
+        // L1 deletes the row (a stand-in for any deleter), L2 inserts another that takes its id.
+        db.write_txn("t", |c, _| {
+            c.execute("DELETE FROM ingestions WHERE source_hash = 'one'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        let l2 = txn(&db, move |c, m| ingestion::record_capture(c, m, key("two")));
+        assert_eq!(rowid(&db, "two"), r, "setup: the rowid was not reissued");
+
+        let refused = try_undo(&db, t).expect_err("an undo wrote into a reissued row");
+        assert_eq!(named_later(&refused), Some(l2), "{refused}");
+        assert_eq!(
+            db.read(move |c| ingestion::status(c, key("two")))
+                .unwrap()
+                .as_deref(),
+            Some("captured"),
+            "the unrelated row was changed"
+        );
+    }
+
+    /// Resurrection order. Undoing an insert whose row a later transaction removed matched nothing
+    /// and marked it undone; undoing the removal afterwards then restored a row whose creation was
+    /// recorded as undone. Now the insert waits for the removal.
+    #[test]
+    fn undoing_an_insert_waits_for_a_later_delete_of_it() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |c, m| upsert(c, m, &note("note:tagged")))
+            .unwrap();
+        let t = txn(&db, move |c, m| {
+            crate::tag::apply(c, m, id, "size", "small")
+        });
+        let l = txn(&db, move |c, m| {
+            crate::tag::remove(c, m, id, "size", "small")
+        });
+
+        let refused = try_undo(&db, t).expect_err("an insert was undone after its row's removal");
+        assert_eq!(named_later(&refused), Some(l), "{refused}");
+        assert!(refused.contains("the whole row"), "{refused}");
+
+        try_undo(&db, l).unwrap();
+        assert_eq!(
+            db.read(move |c| crate::tag::applications(c, id)).unwrap(),
+            vec![("size".to_owned(), "small".to_owned())]
+        );
+        try_undo(&db, t).unwrap();
+        assert!(db
+            .read(move |c| crate::tag::applications(c, id))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A later transaction that is itself an undo is not work, even where it carries an entry on
+    /// the same row: its forward writes are the reversal of something, not a change anyone made.
+    #[test]
+    fn a_later_undo_transaction_does_not_block() {
+        use crate::changelog::{self, Entity, Op};
+        use jkb_types::TaskStatus;
+        let db = Db::open_in_memory().unwrap();
+        let unrelated = db
+            .write_txn("t", |c, m| {
+                upsert(c, m, &note("note:unrelated"))?;
+                Ok(m.txn_id)
+            })
+            .unwrap();
+        let id = later_writer_task(&db, "task:undo-later");
+        let t1 = txn(&db, move |c, m| {
+            crate::task::set_status(c, m, id, TaskStatus::InProgress)
+        });
+        // A later transaction writing the same column, and carrying an `undo` marker.
+        txn(&db, move |c, m| {
+            crate::task::set_status(c, m, id, TaskStatus::Done)?;
+            changelog::append(
+                c,
+                m,
+                Op::Undo,
+                Entity::Changelog,
+                &unrelated.to_string(),
+                None,
+                None,
+            )
+        });
+        try_undo(&db, t1).expect("a transaction carrying an undo marker blocked an undo");
+    }
+
+    /// The query the guard runs for every entry is served by the index `V036` adds; without it an
+    /// old transaction's undo scans most of the log once per entry.
+    #[test]
+    fn the_later_writer_query_uses_the_entity_index() {
+        let db = Db::open_in_memory().unwrap();
+        let plan: Vec<String> = db
+            .read(|c| {
+                let mut stmt =
+                    c.prepare(&format!("EXPLAIN QUERY PLAN {}", super::later_writer_sql()))?;
+                let rows = stmt.query_map(rusqlite::params!["items", "1", 0_i64], |r| {
+                    r.get::<_, String>(3)
+                })?;
+                Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("idx_changelog_entity") && d.starts_with("SEARCH l ")),
+            "the later-writer query does not search by the entity index: {plan:?}"
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    enum Step {
+        Status(usize, u8),
+        Priority(usize, i64),
+        Tag(usize, bool),
+        Content(usize, u8),
+    }
+
+    fn arb_step() -> impl proptest::strategy::Strategy<Value = Step> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (0..3usize, 0..3u8).prop_map(|(i, s)| Step::Status(i, s)),
+            (0..3usize, 0..4i64).prop_map(|(i, p)| Step::Priority(i, p)),
+            (0..3usize, any::<bool>()).prop_map(|(i, on)| Step::Tag(i, on)),
+            (0..3usize, 0..3u8).prop_map(|(i, n)| Step::Content(i, n)),
+        ]
+    }
+
+    /// A history of one transaction per step over three tasks, and the ids of the transactions
+    /// that logged anything.
+    fn play(steps: &[Step]) -> (Db, Vec<i64>) {
+        use jkb_types::TaskStatus;
+        let db = Db::open_in_memory().unwrap();
+        let ids = [
+            later_writer_task(&db, "task:p0"),
+            later_writer_task(&db, "task:p1"),
+            later_writer_task(&db, "task:p2"),
+        ];
+        for step in steps.iter().cloned() {
+            db.write_txn("t", move |c, m| match step {
+                Step::Status(i, s) => crate::task::set_status(
+                    c,
+                    m,
+                    ids[i],
+                    [TaskStatus::Open, TaskStatus::InProgress, TaskStatus::Done][usize::from(s)],
+                ),
+                Step::Priority(i, p) => crate::task::set_priority(c, m, ids[i], Some(p)),
+                Step::Tag(i, true) => crate::tag::apply(c, m, ids[i], "size", "small"),
+                Step::Tag(i, false) => crate::tag::remove(c, m, ids[i], "size", "small"),
+                Step::Content(i, n) => {
+                    crate::item::set_content(c, m, ids[i], &format!("body {n}"), None)
+                }
+            })
+            .unwrap();
+        }
+        let txns = db
+            .read(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT DISTINCT txn_id FROM changelog WHERE op <> 'undo' ORDER BY txn_id",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+                Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+            })
+            .unwrap();
+        (db, txns)
+    }
+
+    /// Undo `t`, first peeling back whatever later transaction each refusal names. Every named
+    /// transaction must be later than the one it blocks — which is what makes the peeling end.
+    fn peel(db: &Db, t: i64, budget: &mut usize) -> std::result::Result<(), String> {
+        loop {
+            if db.read(move |c| super::already_undone(c, t)).unwrap() {
+                return Ok(());
+            }
+            match try_undo(db, t) {
+                Ok(_) => return Ok(()),
+                Err(refused) => {
+                    let later = named_later(&refused)
+                        .ok_or_else(|| format!("refused for another reason: {refused}"))?;
+                    if later <= t {
+                        return Err(format!("{t} was blocked by an earlier {later}: {refused}"));
+                    }
+                    if *budget == 0 {
+                        return Err(format!("peeling {t} did not terminate"));
+                    }
+                    *budget -= 1;
+                    peel(db, later, budget)?;
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+
+        /// The newest work transaction is never blocked, so a bare `jkb undo` drains any history.
+        #[test]
+        fn undo_last_is_never_blocked_by_later_writers(
+            steps in proptest::collection::vec(arb_step(), 1..12)
+        ) {
+            let (db, txns) = play(&steps);
+            for _ in 0..=txns.len() {
+                if db.read(|c| super::select_work_txn(c, i64::MAX)).unwrap().is_none() {
+                    break;
+                }
+                let undone = db.write_txn("t", undo_last);
+                proptest::prop_assert!(undone.is_ok(), "bare undo refused: {:?}", undone.err());
+            }
+            proptest::prop_assert!(db.read(|c| super::select_work_txn(c, i64::MAX)).unwrap().is_none());
+        }
+
+        /// Any transaction either undoes, or names a strictly later one, and undoing the named ones
+        /// in turn always ends with it undoable: no cycle, no permanent block.
+        #[test]
+        fn an_explicit_undo_is_reachable_by_peeling_later_writers(
+            steps in proptest::collection::vec(arb_step(), 1..12),
+            pick in proptest::prelude::any::<proptest::sample::Index>(),
+        ) {
+            let (db, txns) = play(&steps);
+            let t = txns[pick.index(txns.len())];
+            let mut budget = txns.len();
+            let peeled = peel(&db, t, &mut budget);
+            proptest::prop_assert!(peeled.is_ok(), "{}", peeled.unwrap_err());
+            proptest::prop_assert!(db.read(move |c| super::already_undone(c, t)).unwrap());
         }
     }
 }

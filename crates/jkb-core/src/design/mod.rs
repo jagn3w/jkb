@@ -2148,7 +2148,10 @@ const DESIGN_OWNED: &[(&str, &str)] = &[
 /// and not an `undo` (whose forward revert of an undone edit is no work of its own) — and while the
 /// design has a compaction (`design_snapshots` has no `txn_id`, folds later rows into itself, and
 /// is never undone). Asked by `undo`'s pre-flight for every `(insert, items)` entry. Design-only on
-/// purpose; why is recorded in docs/foundation.md.
+/// purpose; why is recorded in docs/foundation.md. It sits beside the row-level guard
+/// (`undo::later_writer`), which refuses any entry while a later transaction has written the same
+/// changelog key — the design's own `items` row included — but cannot see these cascade children,
+/// which are keyed by `design_id` rather than by the design's row.
 ///
 /// # Errors
 /// A database error.

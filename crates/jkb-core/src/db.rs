@@ -142,8 +142,8 @@ mod tests {
         // strategy definition's description (workflow_strategies.describe); V033 tags every review
         // finding `finding=review`; V034 links each recorded finding `found_in` its task; V035
         // a run request's delivery state (exec_delivery), its output's warning lines and each
-        // session process's inbox.
-        assert_eq!(user_version, 35);
+        // session process's inbox; V036 indexes the changelog by row for undo's later-writer check.
+        assert_eq!(user_version, 36);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -313,8 +313,8 @@ mod tests {
         // strategy definition's description (workflow_strategies.describe); V033 tags every review
         // finding `finding=review`; V034 links each recorded finding `found_in` its task; V035
         // a run request's delivery state (exec_delivery), its output's warning lines and each
-        // session process's inbox.
-        assert_eq!(user_version, 35);
+        // session process's inbox; V036 indexes the changelog by row for undo's later-writer check.
+        assert_eq!(user_version, 36);
         assert_eq!(
             crate::supported_schema_version(),
             user_version,
