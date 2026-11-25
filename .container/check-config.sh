@@ -2299,6 +2299,31 @@ if [ -f "$here/../ui/vscode/package.json" ]; then
     fi
 fi
 
+# GIT TRUSTS THE REPOS BIND, AND NOTHING WIDER. The image grants `safe.directory` for
+# /home/vscode/repos/* in the root-owned system config, so a `--target container` run request can run
+# git at all (README, "Git trusts the repos bind"). Two ways to get it wrong, both asked: the grant
+# gone (every container exec fails "dubious ownership" again) and the grant widened, to `*` or by a
+# second grant anywhere the container is assembled, which drops git's check on the native paths
+# where it still means something. Comment-stripped, so a commented-out RUN does not pass.
+sd_want="^RUN git config --system --add safe\\.directory '/home/vscode/repos/\\*' && chmod 0644 /etc/gitconfig\$"
+sd_other=""
+for sd_f in Dockerfile container.json run.sh entrypoint.sh; do
+    if [ ! -f "$here/$sd_f" ]; then
+        sd_other="$sd_other $sd_f is missing, so it could not be read;"
+        continue
+    fi
+    sd_text="$(dc_strip_comments "$here/$sd_f")"
+    sd_hits="$(grep -nE 'safe\.directory' <<<"$sd_text" | grep -vE "^[0-9]+:${sd_want#^}" || true)"
+    [ -z "$sd_hits" ] || sd_other="$sd_other $sd_f:$(cut -d: -f1 <<<"$sd_hits" | tr '\n' ',')"
+done
+if ! stripped_matches "$here/Dockerfile" "$sd_want"; then
+    bad "the Dockerfile no longer grants git's safe.directory for exactly /home/vscode/repos/* in the system config — every git command in a container run request fails 'dubious ownership'"
+elif [ -n "$sd_other" ]; then
+    bad "safe.directory is granted somewhere other than the Dockerfile's one system grant for /home/vscode/repos/* —$sd_other — a wider grant drops git's ownership check on paths where it still means something"
+else
+    ok "git trusts exactly /home/vscode/repos/*, from the root-owned system config, and nothing wider"
+fi
+
 # A PRODUCER THAT CAN REFUSE MUST NOT BE READ THROUGH `< <( )`. Bash discards a process
 # substitution's exit status, so a refusal inside one kills the subshell alone and the reading loop
 # keeps whatever was emitted before it. `dc_subst` refuses on an unset ${localEnv:…} precisely so a

@@ -233,6 +233,15 @@ RUN chmod 0755 /usr/local/bin/pin-jkb-hook.sh \
 RUN mkdir -p /home/vscode/.jkb/claude-memory /home/vscode/.jkb/logs /home/vscode/.jkb-container \
     && chown -R vscode:vscode /home/vscode/.jkb /home/vscode/.jkb-container
 
+# GIT TRUSTS THE REPOS BIND, and only it. A `--target container` run request (a `docker exec`, outside
+# the agent's sandbox, which supplies its own grants on git's command line) failed every git command
+# with "detected dubious ownership" (exec-98), though there is no second user under ~/repos: the owner
+# git sees on the bind is a property of the mount. In the SYSTEM config, root-owned, so every way into
+# the container gets it and nothing in a session can widen it. Not `*`: volumes, /tmp and ~/.cargo keep
+# git's check. .container/README.md ("Git trusts the repos bind") has the measurements and the
+# alternatives; check-config.sh pins the value, verify.sh the running container.
+RUN git config --system --add safe.directory '/home/vscode/repos/*' && chmod 0644 /etc/gitconfig
+
 # --- non-root from here on ------------------------------------------------------------------
 USER vscode
 ENV PATH=/home/vscode/.local/bin:/home/vscode/.cargo/bin:$PATH

@@ -2002,6 +2002,33 @@ case "$(hooks_dir_state "$hooks_read" "$hooks_raw" "$hooks_dir" "$hooks_mount" 0
     *)          bad "the hooks-directory check answered something it does not recognise" ;;
 esac
 
+# 3f. GIT TRUSTS THE REPOS BIND, from the image's root-owned system config, and nothing wider
+#     (README, "Git trusts the repos bind"). check-config.sh asks whether the Dockerfile grants it;
+#     this asks whether the running container has it, which a stale image or a hand edit can make
+#     untrue. Three facts, each its own way to lose or widen the grant: the value, who can write
+#     the file, and the one variable that makes git skip the system config altogether.
+#     The caller's repository selection is dropped, as for every git call in these scripts: the
+#     system config names no repository, but the scan in dev-scripts.test.sh asks it of every call
+#     rather than of the ones that look like they need it.
+sd_got="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+    -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    git config --system --get-all safe.directory 2>/dev/null)"
+if [ "$sd_got" = '/home/vscode/repos/*' ]; then
+    ok "git's system config trusts exactly /home/vscode/repos/*"
+else
+    bad "git's system safe.directory is [$(tr '\n' ' ' <<<"$sd_got")], not exactly /home/vscode/repos/* — a container run request fails 'dubious ownership', or git's check is dropped beyond the repos bind"
+fi
+if [ -f /etc/gitconfig ] && [ "$(stat -c '%U' /etc/gitconfig 2>/dev/null)" = root ] && [ ! -w /etc/gitconfig ]; then
+    ok "/etc/gitconfig is root-owned and read-only to $(id -un)"
+else
+    bad "/etc/gitconfig is not root-owned-and-read-only to $(id -un) — the grant of git's trust can be widened from here"
+fi
+if [ -z "${GIT_CONFIG_NOSYSTEM+set}" ]; then
+    ok "GIT_CONFIG_NOSYSTEM is unset, so git reads the system config"
+else
+    bad "GIT_CONFIG_NOSYSTEM is set in the container's environment — git skips /etc/gitconfig, and with it the repos bind's safe.directory grant"
+fi
+
 # 4. ...and these must be present, or the container is merely empty rather than confined.
 # THE MOUNT, asked of the kernel — and asked about THIS checkout rather than about a path.
 #

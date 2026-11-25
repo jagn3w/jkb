@@ -58,6 +58,8 @@ queue() {
     out="$( cd "$r" && PATH="$work/bin:$PATH" JKB=jkb JKB_CALLS="$r/.jkb-calls" env "$@" \
         bash scripts/merge-queue.sh feat trunk "$r" 2>&1 )"
     rc=$?
+    # The whole output, kept beside the repo for `queue_detail`; what this prints is unchanged.
+    printf '%s\n' "$out" >"$r.out"
     post="$(git -C "$r" rev-parse refs/heads/trunk)"
     # `grep -c` PRINTS ITS ZERO AND THEN EXITS 1, so `|| echo 0` appends a second zero and every
     # field after it shifts. `|| true` keeps the count grep already printed.
@@ -70,6 +72,10 @@ queue() {
     printf '%s|%s|%s|%s\n' "$rc" "$([ "$pre" = "$post" ] && echo still || echo moved)" \
         "${calls:-0}" "$detail"
 }
+
+# queue_detail <repo> — the line before the outcome line of the last `queue` over <repo>: the
+# detail a coordinator reports, which `queue`'s positional format does not carry.
+queue_detail() { tail -2 "$1.out" | sed -n 1p; }
 
 # check <label> <repo> <want-exit> <want-moved> <want-landed-calls> [VAR=VAL …]
 check() {
@@ -165,6 +171,176 @@ case_conflict() {
     git -C "$r" checkout -qb feat; echo THEIRS >"$r/f"; git -C "$r" commit -qam theirs
     git -C "$r" checkout -q trunk; echo OURS >"$r/f"; git -C "$r" commit -qam ours
     check "a rebase conflict is handed back and the base never moves" "$r" 1 still 0
+    # ...NAMING THE COMMIT AND THE PATH, and leaving nothing behind: the graft is built in the object
+    # database, so there is no half-done rebase to abort and no switch back that could fail.
+    local d bad=""; d="$(queue_detail "$r")"
+    [[ "$d" =~ ^eject:\ rebase\ conflict\ onto\ trunk\ —\ [0-9a-f]+\ theirs:\ f\ \(see\ /tmp/merge-queue\.log\)$ ]] \
+        || bad="$bad the detail does not name the commit and the path: $d;"
+    [ "$(git -C "$r" symbolic-ref -q --short HEAD)" = trunk ] || bad="$bad the worktree is not on trunk;"
+    [ -z "$(git -C "$r" status --porcelain --untracked-files=no)" ] || bad="$bad the worktree is not clean;"
+    [ ! -e "$(git -C "$r" rev-parse --absolute-git-dir)/rebase-merge" ] || bad="$bad a rebase-merge directory was left;"
+    [ -z "$bad" ] && ok "a conflict names the commit and the path, and leaves the worktree on trunk, clean" \
+        || fail "queue: conflict detail" "$bad"
+}
+
+# THE REGRESSION: a pick that refuses a CLEAN tree. On the container's virtiofs repo mount, rebase's
+# pick said "Your local changes ... would be overwritten" for exactly the files the commit changed
+# (exec-99, exec-101). The shim makes every porcelain replay refuse that way, so a branch lands only
+# if the queue never asks rebase, cherry-pick or am to touch the worktree.
+case_phantom() {
+    local r shim; r="$(mkrepo phantom)"; shim="$work/phantom-bin"
+    git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
+    git -C "$r" checkout -q trunk
+    mkdir -p "$shim"
+    cat >"$shim/git" <<SHIM
+#!/bin/sh
+case "\$1" in rebase | cherry-pick | am)
+    echo "error: Your local changes to the following files would be overwritten by merge:" >&2
+    printf '\tf\n' >&2
+    exit 1 ;;
+esac
+exec "$(command -v git)" "\$@"
+SHIM
+    chmod +x "$shim/git"
+    check "a clean branch lands when every porcelain replay refuses a clean tree" "$r" 0 moved 1 \
+        PATH="$shim:$work/bin:$PATH"
+}
+
+# PARITY WITH GIT'S OWN REBASE, on the inputs where a hand-written graft could differ: a normal edit,
+# a commit that STARTED empty (rebase keeps it), one that BECOMES empty against the base (dropped),
+# one whose patch the base already carries and that would conflict if replayed (skipped by
+# --cherry-pick), an evil merge of a side branch (flattened, its own change lost, as rebase loses
+# it), and a message whose bytes `git commit` would
+# have cleaned up. The base moves on meanwhile. What `git rebase` makes of the same commits, in a
+# scratch worktree, is the expectation, commit by commit.
+case_parity() {
+    local r rb pre want got i n bad=""; r="$(mkrepo parity)"
+    printf 'one\n' >"$r/g"; git -C "$r" add g; git -C "$r" commit -qm "g"
+    git -C "$r" checkout -qb feat
+    echo a >>"$r/f"; git -C "$r" commit -qam "edit one"
+    git -C "$r" commit -q --allow-empty -m "started empty"
+    echo same >"$r/dup"; git -C "$r" add dup; git -C "$r" commit -qm "dup, which the base gets too"
+    printf 'one\nX\n' >"$r/g"; git -C "$r" commit -qam "X, a patch the base carries"
+    git -C "$r" checkout -qb side
+    echo s >"$r/s"; git -C "$r" add s; git -C "$r" commit -qm "side work"
+    # An EVIL merge: it adds a line no parent has. Rebase without --rebase-merges drops the merge
+    # and that line with it, and so must the queue -- this is what makes --no-merges observable.
+    git -C "$r" checkout -q feat; git -C "$r" merge -q --no-ff --no-commit side >/dev/null 2>&1
+    echo evil >>"$r/s"; git -C "$r" add s; git -C "$r" commit -qm "merge side"
+    echo b >>"$r/f"; git -C "$r" add f
+    printf 'edit two  \n\n\nbody\t\n\n' | git -C "$r" commit -q --cleanup=verbatim -F -
+    git -C "$r" checkout -q trunk; git -C "$r" branch -qD side
+    echo u >"$r/u"; git -C "$r" add u; git -C "$r" commit -qm "unrelated"
+    echo same >"$r/dup"; echo o >"$r/other"; git -C "$r" add dup other; git -C "$r" commit -qm "dup and other"
+    printf 'one\nX\n' >"$r/g"; git -C "$r" commit -qam "X on the base"
+    printf 'one\nY\n' >"$r/g"; git -C "$r" commit -qam "X becomes Y"
+    pre="$(git -C "$r" rev-parse refs/heads/trunk)"
+    rb="$work/parity-rebase"
+    git -C "$r" worktree add -q --detach "$rb" refs/heads/feat
+    if ! git -C "$rb" rebase -q refs/heads/trunk >/dev/null 2>&1; then
+        fail "queue: parity" "git's own rebase of the parity branch failed, so there is nothing to compare against"
+        return
+    fi
+    want="$(git -C "$rb" rev-parse HEAD)"
+    git -C "$r" worktree remove --force "$rb"
+    check "a branch of edits, empty commits, a cherry-pick and a merge lands" "$r" 0 moved 1
+    # tree, author and raw message of each commit, oldest first
+    describe() {
+        local c
+        for c in $(git -C "$r" rev-list --reverse "$pre..$1"); do
+            printf '%s|%s|' "$(git -C "$r" rev-parse "$c^{tree}")" \
+                "$(git -C "$r" cat-file commit "$c" | sed -n '1,/^$/s/^author //p')"
+            git -C "$r" cat-file commit "$c" | sed '1,/^$/d' | od -An -c | tr -s ' \n' ' '
+            echo
+        done
+    }
+    want="$(describe "$want")"; got="$(describe refs/heads/trunk)"
+    n="$(grep -c . <<<"$want")"
+    [ "$n" -eq 4 ] || bad="$bad git's rebase made $n commits, where this case expects 4 (edit one, started empty, side work, edit two);"
+    [ "$want" = "$got" ] || bad="$bad the queue's commits differ from git's rebase:
+       rebase: $(tr '\n' '~' <<<"$want")
+       queue:  $(tr '\n' '~' <<<"$got");"
+    [ -z "$bad" ] && ok "the queue's graft is git's rebase, commit for commit: tree, author and message bytes" \
+        || fail "queue: parity" "$bad"
+}
+
+# ...AND A BRANCH ALREADY ON THE BASE TIP LANDS AS ITS OWN COMMITS. Rebase fast-forwards a pick
+# whose parent is the current tip, so the commits keep their ids, committer and signature, and the
+# branch is an ancestor of the base afterwards. A graft that rewrote them would land copies.
+case_parity_ff() {
+    local r tip; r="$(mkrepo parity-ff)"
+    git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam one
+    git -C "$r" commit -q --allow-empty -m "started empty"
+    echo y >>"$r/f"; git -C "$r" commit -qam two
+    git -C "$r" checkout -q trunk
+    git -C "$r" config user.name Queue; git -C "$r" config user.email queue@example.com
+    tip="$(git -C "$r" rev-parse refs/heads/feat)"
+    check "a branch cut from the base tip lands" "$r" 0 moved 1
+    [ "$(git -C "$r" rev-parse refs/heads/trunk)" = "$tip" ] \
+        && ok "a branch cut from the base tip lands as its own commits, as rebase leaves them" \
+        || fail "queue: parity ff" "the base is at $(git -C "$r" rev-parse refs/heads/trunk), not the branch's own $tip: its commits were rewritten"
+}
+
+# A DIRTY QUEUE WORKTREE IS A STALL THAT NAMES THE FILE. `reset --hard` would discard the change
+# silently; the rebase used to carry it into the gate, or eject it as the implementer's conflict.
+case_dirty_tracked() {
+    local r; r="$(mkrepo dirty)"
+    git -C "$r" checkout -qb feat; echo w >"$r/work"; git -C "$r" add work; git -C "$r" commit -qm work
+    git -C "$r" checkout -q trunk; echo dirty >>"$r/f"
+    check "a tracked change in the queue's worktree stalls, and the base never moves" "$r" 3 still 0
+    if [ "$(tail -1 "$r/f")" != dirty ]; then
+        fail "queue: dirty tracked" "the tracked change in the queue's worktree was discarded"
+    elif [[ "$(queue_detail "$r")" != "error: the queue's worktree has tracked changes (f);"* ]]; then
+        fail "queue: dirty tracked detail" "the detail does not name the file: $(queue_detail "$r")"
+    else
+        ok "the tracked change is still there, and the stall names it"
+    fi
+}
+
+# AN UNTRACKED FILE AT A PATH THE GRAFT ADDS. `reset --hard` would overwrite it, where checkout refused.
+case_untracked_collision() {
+    local r; r="$(mkrepo untracked)"
+    git -C "$r" checkout -qb feat; echo branch >"$r/new.txt"; git -C "$r" add new.txt; git -C "$r" commit -qm new
+    git -C "$r" checkout -q trunk; echo mine >"$r/new.txt"
+    check "an untracked file the graft would overwrite stalls, and the base never moves" "$r" 3 still 0
+    if [ "$(cat "$r/new.txt")" != mine ]; then
+        fail "queue: untracked collision" "the untracked new.txt was overwritten: $(cat "$r/new.txt")"
+    elif [[ "$(queue_detail "$r")" != "error: the queue's worktree has an untracked new.txt,"* ]]; then
+        fail "queue: untracked collision detail" "the detail does not name the file: $(queue_detail "$r")"
+    else
+        ok "the untracked file is untouched, and the stall names it"
+    fi
+}
+
+# THE AUTHOR IS KEPT, THE COMMITTER IS THE QUEUE: what rebase did, and what `git blame` relies on.
+case_multi_author() {
+    local r got; r="$(mkrepo author)"
+    git -C "$r" checkout -qb feat; echo x >>"$r/f"
+    GIT_AUTHOR_NAME="Other Person" GIT_AUTHOR_EMAIL=other@example.com \
+        GIT_AUTHOR_DATE="981173106 +0130" git -C "$r" commit -qam "someone else's work"
+    # The base moves on, so the commit is replayed rather than fast-forwarded (case_parity_ff).
+    git -C "$r" checkout -q trunk; echo u >"$r/u"; git -C "$r" add u; git -C "$r" commit -qm unrelated
+    git -C "$r" config user.name Queue; git -C "$r" config user.email queue@example.com
+    check "a branch authored by someone else lands" "$r" 0 moved 1
+    got="$(git -C "$r" log -1 --format='%an <%ae> %ad|%cn <%ce>' --date=raw refs/heads/trunk)"
+    [ "$got" = "Other Person <other@example.com> 981173106 +0130|Queue <queue@example.com>" ] \
+        && ok "the landed commit keeps its author and date, and the queue is its committer" \
+        || fail "queue: multi author" "the landed commit reads: $got"
+}
+
+# GIT'S REASON WHEN THE BASE CANNOT BE SWITCHED TO. This said only "cannot switch to base", and a
+# container run request stalled with "dubious ownership" swallowed (exec-97). A second worktree
+# holding the base is the refusal reachable without another uid.
+case_base_unswitchable() {
+    local r d; r="$(mkrepo unswitchable)"
+    git -C "$r" checkout -qb feat; echo x >>"$r/f"; git -C "$r" commit -qam work
+    git -C "$r" worktree add -q "$work/holder" trunk
+    check "a base held by another worktree stalls, and the base never moves" "$r" 3 still 0
+    d="$(queue_detail "$r")"
+    [[ "$d" =~ ^error:\ cannot\ switch\ to\ base\ trunk\ —\ git\ said:\ fatal:\  ]] && [[ "$d" == *"$work/holder"* ]] \
+        && ok "the stall carries git's own reason, naming the worktree that holds the base" \
+        || fail "queue: base unswitchable detail" "the detail does not carry git's reason: $d"
+    git -C "$r" worktree remove --force "$work/holder"
 }
 
 case_already_landed() {   # real content, already in the base under somebody else's commit
@@ -366,7 +542,9 @@ case_signalled() {   # killed mid-gate by any signal: never `landed`, and the ba
 }
 
 run_cases case_signalled case_land case_unapproved case_moved_after_approval case_red_gate case_red_suite case_nothing_ahead case_empty_work \
-          case_conflict case_already_landed case_wedged case_already_merged \
+          case_conflict case_phantom case_parity case_parity_ff case_dirty_tracked case_untracked_collision \
+          case_multi_author case_base_unswitchable \
+          case_already_landed case_wedged case_already_merged \
           case_tag_like_branch case_tag_like_ancestor_branch case_tag_like_base \
           case_tag_like_base_suite_floor case_tag_like_base_orphan
 

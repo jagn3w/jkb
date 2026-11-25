@@ -2564,6 +2564,39 @@ open(p, 'w').write(s[:i] + s[j:])
 PYX
 run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 
+# GIT'S TRUST IN THE REPOS BIND: gone, widened, commented out, granted a second time elsewhere, and
+# one of the files the second-grant scan reads missing (it must not pass having read nothing).
+sd_line="RUN git config --system --add safe.directory '/home/vscode/repos/*' && chmod 0644 /etc/gitconfig"
+seed; SD_LINE="$sd_line" python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import os, sys
+p = sys.argv[1]; s = open(p).read(); old = os.environ["SD_LINE"] + "\n"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "", 1))
+PYX
+run "the safe.directory grant is deleted" "no longer grants git's safe.directory"
+
+seed; SD_LINE="$sd_line" python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import os, sys
+p = sys.argv[1]; s = open(p).read(); old = os.environ["SD_LINE"]
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, old.replace("'/home/vscode/repos/*'", "'*'"), 1))
+PYX
+run "the safe.directory grant is widened to *" "no longer grants git's safe.directory"
+
+seed; SD_LINE="$sd_line" python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import os, sys
+p = sys.argv[1]; s = open(p).read(); old = os.environ["SD_LINE"]
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "# " + old, 1))
+PYX
+run "the safe.directory grant is commented out" "no longer grants git's safe.directory"
+
+seed; printf '%s\n' "git config --global --add safe.directory '*'" >>"$work/t/.container/entrypoint.sh"
+run "a second, wider safe.directory grant in entrypoint.sh" "safe.directory is granted somewhere other than"
+
+seed; rm -f "$work/t/.container/entrypoint.sh"
+run "a file the safe.directory scan reads is missing" "entrypoint.sh is missing, so it could not be read"
+
 # COVERAGE, PINNED rather than claimed. The old summary said "every check-config assertion fired"
 # while six of its failure paths had no mutation at all — so a 22nd assertion that cannot fail
 # (this repo's most repeated defect, found in check-config.sh three rounds running) would have left
@@ -2586,7 +2619,7 @@ echo "==> coverage"
 settle
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=123
+PINNED_BAD_SITES=125
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

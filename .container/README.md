@@ -1117,6 +1117,83 @@ the same checkout. What this change adds is that the path is now reachable from 
 container too. The mitigation is the one that already applies on the host: review what an agent
 changed before you pull over it.
 
+## Git trusts the repos bind
+
+**The defect.** A `--target container` run request, which is a `docker exec` outside the agent's
+sandbox, failed every git command with `detected dubious ownership` (exec-98, 2026-11-25). The merge
+queue could not run as a container exec at all, and exec-97 stalled at "cannot switch to base" with
+git's message swallowed by `merge-queue.sh` (which now prints it). Inside the sandbox git never
+complained, because the sandbox passes its own `safe.directory` grants on git's command line
+(`GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n`, scope `command line`), and a `docker exec` gets none of them.
+exec-99 succeeded once `safe.directory` was set to `/home/vscode/repos/jkb` and
+`/home/vscode/repos/jkb/*`, which also shows the `/*` form matches a linked worktree under the repo
+on git 2.51.1.
+
+**The fix is one line in the image.** The Dockerfile, in its root section, runs
+`git config --system --add safe.directory '/home/vscode/repos/*'` and makes `/etc/gitconfig` 0644,
+root-owned. Every way into the container gets it: run requests, `run.sh`'s own `docker exec`s, VS Code
+terminals and a hand-run `docker exec`. Nothing in a session can widen it. The agent-writable
+`~/.gitconfig` and `~/.config/git` are untouched, and git's `safe.directory` is multi-valued, so a
+grant VS Code adds there does not conflict. A container built before this line needs the env
+workaround exec-99 used until it is rebuilt.
+
+**What was measured, and what was not.**
+
+- Inside the agent's sandbox (git 2.51.1, uid 1000): `stat -c %u:%g` gives `1000:1000` for the repo,
+  its `.git`, `.swarm/integration-main` and `.git/worktrees/integration-main/*`; `/proc/self/uid_map`
+  is `1000 1000 1`; with the sandbox's grants removed (`env -u GIT_CONFIG_COUNT git status`) git
+  does not complain in the repo or in the integration worktree; `/etc/gitconfig` does not exist.
+- Outside the sandbox, as a container run request (exec-107, 2026-11-25): the same container
+  (hostname `5fb2a9349912`, so exec-98 did not reach a different one), `uid=1000(vscode)`,
+  `/proc/self/uid_map` `0 0 4294967295`, the repo, its `.git`, `.swarm/integration-main` and
+  `.git/worktrees/integration-main` all `1000:1000 755`, no `/etc/gitconfig`, and `git rev-parse`
+  worked in both the repo and the worktree **with no `safe.directory` at all**.
+- So the mismatch exec-98 hit is **intermittent**, not a constant uid mismatch between the two
+  contexts. Its cause is **not measured**. Docker Desktop's virtiofs presenting ownership
+  differently from moment to moment is the likely one. The grant does not depend on which it is,
+  because the mismatch belongs to the mount and not to a real second user.
+
+**Why granting it costs nothing git meant to protect.** The ownership check (CVE-2022-24765) exists
+because a repository's own config (`core.fsmonitor`, `core.hooksPath`, filters) runs code, and
+someone else's planted repository must not run as you. It never defended against the same uid. In
+this container there is no second user under `/home/vscode/repos`: the one bind is the operator's
+own `~/repos`, and its owner reads wrong only because of the mount. The part of a repository's
+config that matters is protected another way: each repository's `.git/config` and `.git/hooks` are
+read-only binds from the host (the section above), and `extensions.worktreeConfig` is not set in
+jkb's config, so `.git/worktrees/*/config.worktree` is not read. `git_audit` judges only a
+repository's own scopes, so a `system` key needs no change there.
+
+**The scope is the bind, not `*`.** Volumes, `/tmp` and `~/.cargo` keep git's check, because their
+ownership is native and the check means something there. A per-repo list was rejected: the mount is
+all of `~/repos`, so the list would be the wildcard spelled longer, it would have to be rewritten at
+every start by a new root path, and a repository cloned on the host would fail until a restart.
+
+**Rejected.**
+
+- *The exec wrapper in Code Factory* (`-e GIT_CONFIG_COUNT=…` in `terminals.ts`). Every other caller
+  would have to remember it, it gives the app container policy when apps are clients, and the env
+  channel replaces, rather than adds to, any `GIT_CONFIG_COUNT` the program sets.
+- *`safe.directory=*`*: it drops the check on native paths too, for no gain.
+- *Fixing ownership* (chown, `updateRemoteUserUID`): host files on a macOS virtiofs bind cannot be
+  meaningfully re-owned from inside, and remapping does not apply on macOS.
+- *A run-time write by `run.sh` or the entrypoint through sudo*: a new root-writable path to protect
+  a value that never changes.
+
+**The exposure, stated rather than hidden.** The refusal *incidentally* stopped unsandboxed git in a
+container run request from reading agent-writable git state: a linked worktree's `.git` gitfile, or
+a repository an agent creates under `~/repos`. A container run can read the container credential the
+sandbox denies. This is the exposure a Linux host with a native bind already has, and it belongs to
+the run-request design, which audits only host runs, not to ownership. Anything that sets
+`GIT_CONFIG_NOSYSTEM=1` loses the grant: `gitrepo.rs`'s reap scan does, and runs on the host, where
+ownership is native.
+
+**Pinned.** `check-config.sh` requires the Dockerfile's grant to be exactly
+`/home/vscode/repos/*` and refuses any other `safe.directory` in the Dockerfile, `container.json`,
+`run.sh` or `entrypoint.sh`; `mutate-config.sh` deletes, widens, comments out and duplicates it.
+`verify.sh` asserts, in the running container, that the system value is exactly that, that
+`/etc/gitconfig` is root-owned and not writable by `vscode`, and that `GIT_CONFIG_NOSYSTEM` is unset;
+`mutate-verify.sh` breaks each.
+
 ## Sibling-repo toolchains: Ruby and PostgreSQL
 
 One container serves every repo under `~/repos`, so when a sibling needs a toolchain, it goes in
