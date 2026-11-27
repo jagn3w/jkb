@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:foundation-18dcdeed0ab4d7709fd734, edit there (version 97.X4LfyqDozfwPAYLqkPH_p0UBhO2vnI20zgcBgvvZ1Mnb6Q0Bhu3u9vOuwQkBiefImrSgjgUBidepvMKL7AEBi-7vkr7UzwIBi4v13NKE4A0BjYWn0daWdwGQh6fnuO31DwGR4vys_rxrAZL-t5Wzl7ICAZSF453X3fYEAZXKovzQiI0NAZaB3JHjhKcNAZXZobTRvY8BAZi63c-qh70EAZmJ45HLrq0FAZXg2b340Z4KAZSTl_SJ7oQFAZ2Mx8bk4tkPAZ6VgO30xcYDAZ_PkrepqIABAZ-1w8KT-x0BosCV7pXhvg4BpfzbiJXP4AYBqY3Z4duPywYBqprvqf_k7gEBq7u0h9q0nwUBrcmgvui4_wgBreSM8OOM2gkBree0z5aL5Q4BsdCT8faJigQBtZjXif6wiwrfigS3l83i_4DFDwG46drXpriLDAG5hZyS-ojYDwG5wtCE2tavCgG72ZXjnJ-SCwG3kt3Iv43oAwG9x6qT5dr8CAG-9pjn9d3dBQG7npCdiY76CQHAwa2RrfHpBwHCkYvEusHvBAHEtOjXn4XQDgHGlI6whPnXCgHH3YKwwavqCAHIma7i1oOPBQHJ2JD6kb3dBQHKnpvM_br_DwHHlqzaquDIAQHMifX37fX2BgHNh9aKpqLsDQHJkYme__L_BAHPj-2Nzu2ZAwHP0onzzJWFCwHQ3-Lz5JSaCAHS5JfUxey_CgHQgOOmwqabCAHP8rD1vuNbAdWdgLio6tkIAdbDh5TWtcsPAdG3oL6mwcgIAdmW_t3a-ZELAdrm6Y-sraINAdvzrNjN48QKAdvs6rbhh7oPAduVj4GcpKMOAd6KqrX5jeMJAd62u72N-u4IAeDB0Pji9bcEAeHIyrDgov4LAeGGtb_I-v4OAeOTuJeas8gEAeT-nOrLy70IAeX8mPaHz6QEAebo062N5XoB5LHZ1qPBvQIB6OOByP2wgAMB6Jnf1O2t0QgB6KTkp5qUtgsB6O7o0pLooAUB4K_Th6zmqgcB6JOdntPMtwcB7pjK-piqhgcB8JSB9sq66g0B8ZCj_YuxuAQB8q_6gYm9lQQB8Prj56_kzgoB9vaf2vzcpA8B-dnGtKGi-A8B_PG7hYj2wgYB_6Px-ICjmg0B, blake3 77d1e908c4f5b6b1c2ad7a9eb751bab50b598dcd592efd96629e2abbc3e48e58) -->
+<!-- generated from jkb design design:foundation-18dcdeed0ab4d7709fd734, edit there (version 97.X4LfyqDozfwPAYLqkPH_p0UBhO2vnI20zgcBgvvZ1Mnb6Q0Bhu3u9vOuwQkBiefImrSgjgUBidepvMKL7AEBi-7vkr7UzwIBi4v13NKE4A0BjYWn0daWdwGQh6fnuO31DwGR4vys_rxrAZL-t5Wzl7ICAZSF453X3fYEAZXKovzQiI0NAZaB3JHjhKcNAZXZobTRvY8BAZi63c-qh70EAZmJ45HLrq0FAZXg2b340Z4KAZSTl_SJ7oQFAZ2Mx8bk4tkPAZ6VgO30xcYDAZ_PkrepqIABAZ-1w8KT-x0BosCV7pXhvg4BpfzbiJXP4AYBqY3Z4duPywYBqprvqf_k7gEBq7u0h9q0nwUBrcmgvui4_wgBreSM8OOM2gkBree0z5aL5Q4BsdCT8faJigQBtZjXif6wiwrfigS3l83i_4DFDwG46drXpriLDAG5hZyS-ojYDwG5wtCE2tavCgG72ZXjnJ-SCwG3kt3Iv43oAwG9x6qT5dr8CAG-9pjn9d3dBQG7npCdiY76CQHAwa2RrfHpBwHCkYvEusHvBAHEtOjXn4XQDgHGlI6whPnXCgHH3YKwwavqCAHIma7i1oOPBQHJ2JD6kb3dBQHKnpvM_br_DwHHlqzaquDIAQHMifX37fX2BgHNh9aKpqLsDQHJkYme__L_BAHPj-2Nzu2ZAwHP0onzzJWFCwHQ3-Lz5JSaCAHS5JfUxey_CgHQgOOmwqabCAHP8rD1vuNbAdWdgLio6tkIAdbDh5TWtcsPAdG3oL6mwcgIAdmW_t3a-ZELAdrm6Y-sraINAdvzrNjN48QKAdvs6rbhh7oPAduVj4GcpKMOAd6KqrX5jeMJAd62u72N-u4IAeDB0Pji9bcEAeHIyrDgov4LAeGGtb_I-v4OAeOTuJeas8gEAeT-nOrLy70IAeX8mPaHz6QEAebo062N5XoB5LHZ1qPBvQIB6OOByP2wgAMB6Jnf1O2t0QgB6KTkp5qUtgsB6O7o0pLooAUB4K_Th6zmqgcB6JOdntPMtwcB7pjK-piqhgcB8JSB9sq66g0B8ZCj_YuxuAQB8q_6gYm9lQQB8Prj56_kzgoB9vaf2vzcpA8B-dnGtKGi-A8B_PG7hYj2wgYB_6Px-ICjmg0B, blake3 c04f8e3f080f3a3aa5eb1120c21f76ae05cb1e077b509b7d0b05939e205b24ab) -->
 # Foundation
 
 jkb is a local-first, agent-native knowledge base. It replaced two rigid tools: the arch-helper
@@ -759,7 +759,31 @@ undo instead sent the user to undo their own edits for nothing.
 A table belongs on the list only if it records its writer in `txn_id`; there is no changelog
 fallback. The stated gap is `containment`: a plan put under a design by a later transaction is
 orphaned by undoing the design's creation (a span is not, since `design.span` writes a
-`design_updates` row too). Undo of anything other than a design is unchanged.
+`design_updates` row too). Every other undo is guarded per row, in the next section.
+
+### Undoing a change waits for later changes to the same row
+
+`undo`'s pre-flight (`undo::blocker`, through `later_writer`) asks of every work entry of the
+transaction being undone whether a later transaction has written the same row since: a
+changelog entry with the identical `(entity_type, entity_id)`, a strictly greater `txn_id`, a
+transaction neither undone nor itself an `undo`, and an op that is work rather than bookkeeping
+(a later `sync_state` journal update never blocks). If one has and the two overlap, the undo is
+refused and names the newest such transaction, which `jkb undo` takes back next; once it is
+undone, the earlier one undoes. Two column updates overlap only when they share a column, so a
+later `set_priority` never blocks undoing an earlier `set_status`; every other pair (an insert,
+a delete, a re-inserted row, an item snapshot, the hand-written inverses) overlaps on the whole
+row. A refused item creation also names `jkb item rm <uid>`, the reversible way to remove an
+item that has later history.
+
+Without it, undoing an early transaction overwrote later work: undoing a task's
+`open -> in_progress` wrote `open` over a later `done`, and an undo cannot itself be undone, so
+the lost update could not be repaired. The check reads only the changelog, never a table, and
+only a later transaction can block an earlier one, so two transactions can never refuse each
+other and bare `jkb undo` (the newest transaction) is never blocked. Later cascade children of
+an item's creation (tags, placements, edges added afterwards) are keyed by their own rowids and
+do not block; designs keep `DESIGN_OWNED` for theirs, checked after this one. `V036` adds the
+`(entity_type, entity_id, txn_id)` index the lookup runs on, one indexed query per entry. Pinned
+by the later-writer tests in `undo.rs`, two of them proptests.
 
 ### `V014` draws a date line for undo
 
@@ -1091,7 +1115,7 @@ belonged to the item. It confused rowids with item ids when attributing a row to
 unrelated transactions were blamed and rows that `undo` re-inserted had no writer, which made a
 creation permanently un-undoable; and it counted rows of unlogged audit tables
 (`task_transitions`), so a task's creation and the transaction the refusal named refused each
-other for ever. Replaced by `design::DESIGN_OWNED`, scoped to designs, in the Code Factory work.
+other for ever. Replaced by `design::DESIGN_OWNED`, scoped to designs, in the Code Factory work. Its goal came back later in a form that avoids all three failures: the per-row undo guard (the store-guarantees design) matches a later changelog entry to an earlier one only by an identical `(entity_type, entity_id)`, so it never attributes a table row to a writer and never sees re-inserted or unlogged rows, and only a strictly later transaction can block an earlier one.
 
 ### `V006` toggling foreign keys itself
 
