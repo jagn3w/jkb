@@ -77,7 +77,7 @@ fn state_words(row: &ExecRow) -> String {
             {
                 "expired: your session ended".to_owned()
             } else {
-                "expired: unanswered for two hours".to_owned()
+                "expired: unanswered for a day".to_owned()
             }
         }
     }

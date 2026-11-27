@@ -259,7 +259,7 @@ fn a_begin_after_the_expiry_expires_it() {
         panic!("an expired request ran: {got:?}")
     };
     assert_eq!(r.state, ExecState::Expired);
-    assert!(r.note.unwrap().contains("two hours"));
+    assert!(r.note.unwrap().contains("a day"));
     assert!(
         is_stale(&try_begin(&db, id, None, "app", T0 + EXPIRES_AFTER_MS + 1).unwrap_err()),
         "a later begin of an expired request is refused like any answered one"
@@ -981,7 +981,7 @@ fn compaction_reaps_a_request_topic_s_expired_messages_with_no_group() {
     assert_eq!(messages(&db, id).len(), 1);
     let report = db
         .write_txn("t", |c, m| {
-            mq::compact(c, m, T0 + 2 * 24 * 60 * 60 * 1000, true)
+            mq::compact(c, m, T0 + super::TOPIC_TTL_MS + 1, true)
         })
         .unwrap();
     assert!(report.messages_reaped >= 1);
@@ -1438,9 +1438,9 @@ fn the_message_says_what_became_of_the_request() {
     assert_eq!(
         words(&|x| {
             x.state = ExecState::Expired;
-            x.note = Some("expired: nobody answered it in two hours".into());
+            x.note = Some("expired: nobody answered it in a day".into());
         }),
-        format!("{head} expired: unanswered for two hours{why}")
+        format!("{head} expired: unanswered for a day{why}")
     );
     assert_eq!(
         words(&|x| {

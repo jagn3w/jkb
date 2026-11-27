@@ -74,9 +74,9 @@ pub const MAX_TAIL_BYTES: usize = 256 * 1024;
 /// ([`mq::MAX_PAYLOAD_BYTES`], 64 KiB) with the JSON around it: 47 KiB encodes to 64,172 bytes.
 pub const MAX_CHUNK_BYTES: usize = 47 * 1024;
 
-/// A pending request expires when it has gone unanswered this long: two hours (operator,
-/// 2026-10-16).
-pub const EXPIRES_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
+/// A pending request expires when it has gone unanswered this long: one day (operator,
+/// 2026-11-27, replacing two hours of 2026-10-16).
+pub const EXPIRES_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// A run's timeout when the request names none: 15 minutes (operator, 2026-10-16).
 pub const DEFAULT_TIMEOUT_MS: i64 = 15 * 60 * 1000;
@@ -116,8 +116,11 @@ pub const PAGE_BYTES: usize = 512 * 1024;
 /// A request topic's byte cap.
 const TOPIC_MAX_BYTES: i64 = 8 * 1024 * 1024;
 
-/// A request topic's message TTL: a day.
-const TOPIC_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// A request topic's message TTL: a day past [`LATEST_END_MS`], so a topic's messages outlive the
+/// request's whole possible life.
+const TOPIC_TTL_MS: i64 = LATEST_END_MS + 24 * 60 * 60 * 1000;
+// A provisional interrupt is held until `created_at + LATEST_END_MS`; its messages must outlast that.
+const _: () = assert!(TOPIC_TTL_MS > LATEST_END_MS);
 
 /// The index topic: one `exec.changed {id, state}` hint per request made and per move, so the
 /// operator's app re-reads the queue when something changed rather than polling it. Reserved like a
@@ -871,7 +874,7 @@ pub(crate) fn settle(conn: &Connection, meta: &WriteMeta, now: i64) -> Result<Ve
         .collect::<rusqlite::Result<_>>()?;
     let mut expired = Vec::with_capacity(due.len());
     for id in due {
-        let note = "expired: nobody answered it in two hours".to_owned();
+        let note = "expired: nobody answered it in a day".to_owned();
         if moved(
             conn,
             meta,

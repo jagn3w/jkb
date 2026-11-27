@@ -458,6 +458,44 @@ fn the_sweep_settles_an_expiry_and_finds_it_due() {
 }
 
 #[test]
+fn a_provisional_interrupt_is_delivered_once_its_hold_lifts() {
+    // The hook: nothing is handed over while the hold stands, and the row once it lifts.
+    let db = Db::open_in_memory().unwrap();
+    let id = request(&db, None, "a", T0).row.id;
+    db.write_txn("t", move |c, m| exec::begin(c, m, id, None, "app", T0))
+        .unwrap();
+    let late = T0 + exec::DEFAULT_TIMEOUT_MS + RUN_GRACE_MS;
+    db.write_txn("t", move |c, m| exec::status(c, m, id, late))
+        .unwrap();
+    let lifted = T0 + LATEST_END_MS;
+    assert!(
+        take(&db, None, lifted - 1).is_empty(),
+        "the hook waits out the hold"
+    );
+    assert_eq!(take(&db, None, lifted), vec![id]);
+    assert_eq!(state(&db, id), DeliveryState::Delivered);
+
+    // The socket: due only to a session with a live inbox, and then only once the hold lifts.
+    let db = Db::open_in_memory().unwrap();
+    start_inbox(&db, "1", T0);
+    let id = request(&db, None, "a", T0).row.id;
+    db.write_txn("t", move |c, m| exec::begin(c, m, id, None, "app", T0))
+        .unwrap();
+    db.write_txn("t", move |c, m| exec::status(c, m, id, late))
+        .unwrap();
+    assert!(
+        due_at(&db, lifted - 1).is_empty(),
+        "held until the runner can no longer report"
+    );
+    assert_eq!(due_at(&db, lifted), vec![id]);
+    assert!(claim(&db, id, lifted));
+    assert!(reported(&db, id, true, lifted + 1));
+    let d = db.read(move |c| get(c, id)).unwrap().unwrap();
+    assert_eq!(d.state, DeliveryState::Delivered);
+    assert!(due_at(&db, lifted + 2).is_empty());
+}
+
+#[test]
 fn the_hook_take_settles_an_expiry_and_delivers_it() {
     let db = Db::open_in_memory().unwrap();
     let id = request(&db, None, "a", T0).row.id;
@@ -470,7 +508,7 @@ fn the_hook_take_settles_an_expiry_and_delivers_it() {
     assert_eq!(taken[0].row.id, id);
     assert_eq!(taken[0].row.state, ExecState::Expired);
     assert!(taken[0].text().starts_with(&format!(
-        "[jkb run request] exec-{id} expired: unanswered for two hours"
+        "[jkb run request] exec-{id} expired: unanswered for a day"
     )));
 }
 

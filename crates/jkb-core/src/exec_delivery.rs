@@ -39,9 +39,11 @@ use crate::claude_session;
 use crate::exec::{self, ExecRow, LATEST_END_MS, SETTLED_INTERRUPT};
 use crate::{Result, WriteMeta};
 
-/// A result undelivered this long after its request ended is never pushed: a day, the request topic's
-/// TTL. `jkb exec status` still shows it.
-pub const WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+/// A result undelivered this long after its request ended is never pushed: a day past
+/// [`LATEST_END_MS`], the latest a result can become due. `jkb exec status` still shows it.
+pub const WINDOW_MS: i64 = LATEST_END_MS + 24 * 60 * 60 * 1000;
+// A provisional interrupt is held until `created_at + LATEST_END_MS`; the window must outlast that.
+const _: () = assert!(WINDOW_MS > LATEST_END_MS);
 
 /// How long after its request ended a subagent's result waits for that subagent's own next tool call
 /// before the session's socket may carry it: ten minutes.
