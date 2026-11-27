@@ -523,6 +523,130 @@ pub fn inbox_ack(
     Ok(db.write_txn(actor, move |c, _| delivery::ack_hook(c, &s, &ids, now))?)
 }
 
+/// Where `exec.inbox.claim` says to post a result: one live `claude` process's inbox socket and its
+/// token. The only answer that carries a token, so its `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxTarget {
+    /// The process's `CLAUDE_CODE_MESSAGING_SOCKET`.
+    pub socket: String,
+    /// Its `CLAUDE_CODE_MESSAGING_TOKEN`.
+    pub token: String,
+}
+
+impl std::fmt::Debug for InboxTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboxTarget")
+            .field("socket", &self.socket)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The longest container boot a forwarder names, in bytes: an instance is at most 150.
+const MAX_BOOT_BYTES: usize = 150;
+
+/// Refuse anything but a container boot, `host#boot`: a forwarder posts only to the sockets of its own
+/// container's processes, and a boot is what tells one container's from another's (and from the
+/// host's, whose instance names none).
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for an empty host or boot, a `/` (a pid namespace: the boot is the part
+/// before it), a control character, or more than 150 bytes.
+pub fn check_boot(instance: &str) -> Result<(), ApiError> {
+    let well_formed = instance.len() <= MAX_BOOT_BYTES
+        && !instance.contains('/')
+        && !instance.chars().any(char::is_control)
+        && instance.split_once('#').is_some_and(|(host, boot)| {
+            !host.is_empty() && !boot.is_empty() && !boot.contains('#')
+        });
+    if well_formed {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "{instance:?} is not a container boot (`host#boot`, at most {MAX_BOOT_BYTES} bytes)"
+        )))
+    }
+}
+
+/// `exec.inbox.due`: the requests whose results are due for the sockets of boot `instance`, after
+/// settling expiries — on the writer, as every exec op is.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for a malformed boot; a database error.
+pub fn inbox_due(
+    db: &Db,
+    actor: &str,
+    instance: &str,
+    max: usize,
+    now: i64,
+) -> Result<Vec<String>, ApiError> {
+    check_boot(instance)?;
+    let boot = instance.to_owned();
+    let ids = db.write_txn(actor, move |c, m| delivery::due(c, m, &boot, now, max))?;
+    Ok(ids.into_iter().map(exec::wire_id).collect())
+}
+
+/// `exec.inbox.claim`: claim request `wire` for a post to boot `instance`'s sockets, for `lease_ms`.
+///
+/// # Errors
+/// [`ErrorCode::NotFound`] when it is not due for this boot or another deliverer holds it;
+/// [`ErrorCode::Invalid`] for a malformed id or boot, or a lease out of bounds; a database error.
+pub fn inbox_claim(
+    db: &Db,
+    actor: &str,
+    wire: &str,
+    instance: &str,
+    lease_ms: i64,
+    now: i64,
+) -> Result<crate::Response, ApiError> {
+    check_boot(instance)?;
+    let n = id(wire)?;
+    let boot = instance.to_owned();
+    let claim = db.write_txn(actor, move |c, _| {
+        delivery::claim_for_socket(c, n, &boot, lease_ms, now)
+    })?;
+    let Some(claim) = claim else {
+        return Err(ApiError::with_code(
+            ErrorCode::NotFound,
+            format!(
+                "{wire} is not due for this container's sockets, or another deliverer holds it"
+            ),
+        ));
+    };
+    Ok(crate::Response::ExecInboxClaimed {
+        text: claim.taken.text(),
+        targets: claim
+            .targets
+            .into_iter()
+            .map(|t| InboxTarget {
+                socket: t.inbox.socket().to_owned(),
+                token: t.inbox.token().to_owned(),
+            })
+            .collect(),
+    })
+}
+
+/// `exec.inbox.report`: how the post of claimed request `wire` went. `false` when the claim had lapsed
+/// and another deliverer took the row.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for a malformed id; a database error.
+pub fn inbox_report(
+    db: &Db,
+    actor: &str,
+    wire: &str,
+    ok: bool,
+    error: Option<&str>,
+    now: i64,
+) -> Result<bool, ApiError> {
+    let n = id(wire)?;
+    let why = error.unwrap_or("the forwarder gave no reason").to_owned();
+    Ok(db.write_txn(actor, move |c, _| {
+        delivery::report(c, n, if ok { Ok(()) } else { Err(why.as_str()) }, now)
+    })?)
+}
+
 fn check_session(session: &str) -> Result<(), ApiError> {
     if jkb_types::is_session_id(session) {
         Ok(())

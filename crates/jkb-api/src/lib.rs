@@ -610,6 +610,41 @@ pub enum Request {
         /// The requests whose messages were printed (`exec-<n>`), as `exec.inbox.take` named them.
         ids: Vec<String>,
     },
+    /// The run requests whose results are due for the sockets of one dev container's forwarder
+    /// (`jkb exec forward`): ids only — no token, no text ([`jkb_core::exec_delivery::due`]). Settles
+    /// expiries first. The dev container's credential's, and the operator's, alone.
+    #[serde(rename = "exec.inbox.due")]
+    ExecInboxDue {
+        /// The forwarder's container boot, `host#boot` ([`exec::check_boot`]).
+        instance: String,
+        /// At most this many (at most [`jkb_core::exec_delivery::MAX_DUE`]).
+        max: usize,
+    },
+    /// Claim one due result for a socket post, under a lease: its message and the session's inbox
+    /// targets in the forwarder's boot ([`jkb_core::exec_delivery::claim_for_socket`]) — the one op
+    /// that returns an inbox token — or `not_found` when it is not due, or another deliverer holds it.
+    /// The dev container's credential's, and the operator's, alone.
+    #[serde(rename = "exec.inbox.claim")]
+    ExecInboxClaim {
+        /// `exec-<n>`.
+        id: String,
+        /// The forwarder's container boot, `host#boot`.
+        instance: String,
+        /// How long the claim holds (at most [`jkb_core::exec_delivery::MAX_SOCKET_LEASE_MS`]).
+        lease_ms: i64,
+    },
+    /// How a claimed result's socket post went ([`jkb_core::exec_delivery::report`]): delivered, or
+    /// failed with why. The dev container's credential's, and the operator's, alone.
+    #[serde(rename = "exec.inbox.report")]
+    ExecInboxReport {
+        /// `exec-<n>`.
+        id: String,
+        /// Whether a target took the post.
+        ok: bool,
+        /// Why every target failed, when none did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// Start running a pending request — the operator's runner (`jkb_core::exec::begin`).
     ///
     /// `recomputed_pin` is **not an echo of the request's pin**: the runner computes it itself, on
@@ -1935,6 +1970,9 @@ impl Request {
         "exec.follow",
         "exec.inbox.take",
         "exec.inbox.ack",
+        "exec.inbox.due",
+        "exec.inbox.claim",
+        "exec.inbox.report",
         "exec.begin",
         "exec.decline",
         "exec.refuse",
@@ -2199,6 +2237,9 @@ impl Request {
             Self::ExecFollow { .. } => "exec.follow",
             Self::ExecInboxTake { .. } => "exec.inbox.take",
             Self::ExecInboxAck { .. } => "exec.inbox.ack",
+            Self::ExecInboxDue { .. } => "exec.inbox.due",
+            Self::ExecInboxClaim { .. } => "exec.inbox.claim",
+            Self::ExecInboxReport { .. } => "exec.inbox.report",
             Self::ExecBegin { .. } => "exec.begin",
             Self::ExecDecline { .. } => "exec.decline",
             Self::ExecRefuse { .. } => "exec.refuse",
@@ -2385,6 +2426,10 @@ impl Request {
             // write, and the hook that sends it must not wait behind a long read.
             | Self::ExecInboxTake { .. }
             | Self::ExecInboxAck { .. }
+            // The forwarder's sweep settles expiries; its claim and report write.
+            | Self::ExecInboxDue { .. }
+            | Self::ExecInboxClaim { .. }
+            | Self::ExecInboxReport { .. }
             | Self::ExecBegin { .. }
             | Self::ExecDecline { .. }
             | Self::ExecRefuse { .. }
@@ -2422,6 +2467,7 @@ impl Request {
                     // Reads that expire what came due: twice is the same as once.
                     | Self::ExecStatus { .. }
                     | Self::ExecList { .. }
+                    | Self::ExecInboxDue { .. }
             )
     }
 }
@@ -2711,6 +2757,23 @@ pub enum Response {
     ExecInboxAcked {
         /// How many were delivered by it — fewer than asked when a lease had lapsed.
         count: usize,
+    },
+    /// An `exec.inbox.due`.
+    ExecInboxDue {
+        /// The requests due (`exec-<n>`), oldest first.
+        ids: Vec<String>,
+    },
+    /// An `exec.inbox.claim` this caller won.
+    ExecInboxClaimed {
+        /// The message to post ([`jkb_core::exec::delivery_text`]).
+        text: String,
+        /// Where to post it, newest process first.
+        targets: Vec<exec::InboxTarget>,
+    },
+    /// An `exec.inbox.report`.
+    ExecInboxReported {
+        /// `false` when the claim had lapsed and another deliverer took the row.
+        reported: bool,
     },
     /// An `exec.output`.
     ExecOutputSent {
@@ -3293,6 +3356,9 @@ impl Response {
             | Self::ExecRequests { .. }
             | Self::ExecInboxTaken { .. }
             | Self::ExecInboxAcked { .. }
+            | Self::ExecInboxDue { .. }
+            | Self::ExecInboxClaimed { .. }
+            | Self::ExecInboxReported { .. }
             | Self::ExecOutputSent { .. } => false,
         }
     }
@@ -3324,6 +3390,10 @@ impl Response {
             // A take that handed something over settled expiries first, which announces them; one that
             // found nothing — every tool call of every idle session — wrote nothing.
             Self::ExecInboxTaken { lines, .. } => !lines.is_empty(),
+            // A sweep settled expiries first, which announces each; one that found nothing due — every
+            // idle minute of every forwarder — is not announced, and an expiry it settled that is not
+            // due for its sockets reaches subscribers by the daemon's `data_version` floor.
+            Self::ExecInboxDue { ids } => !ids.is_empty(),
             Self::Notified { sent, .. } => *sent > 0,
             // Every stored design update is announced on `design/<uid>` (D53.4).
             Self::DesignWritten { written } => written.seq.is_some(),
@@ -3332,6 +3402,8 @@ impl Response {
             Self::DesignPromptRecorded { wrote, .. } => *wrote,
             Self::Created { .. }
             | Self::ExecInboxAcked { .. }
+            | Self::ExecInboxClaimed { .. }
+            | Self::ExecInboxReported { .. }
             | Self::GroupDeleted { .. }
             | Self::Messages { .. }
             | Self::Position { .. }
@@ -3905,9 +3977,10 @@ impl LocalBackend {
                 } else {
                     Start::FromNow
                 };
-                // The run-request index is reserved; its groups are the operator's alone
-                // (`exec::index_group_create`). Anyone else is refused by `mq`, as for any `exec/`.
-                if exec_index(principal, &topic) {
+                // The run-request index is reserved; its groups are the operator's and the
+                // container forwarders' (`exec_index`). Anyone else is refused by `mq`, as for any
+                // `exec/`.
+                if exec_index(principal, &topic, &group) {
                     return Ok(created(db.write_txn(actor, move |c, m| {
                         jkb_core::exec::index_group_create(c, m, &group, start, now)
                     })?));
@@ -3925,7 +3998,7 @@ impl LocalBackend {
                 // Asked with a read first: an idle subscriber polls several times a second, and a
                 // poll that hands nothing over and has no touch due must not take the write lock.
                 let (t, g) = (topic.clone(), group.clone());
-                let index = exec_index(principal, &topic);
+                let index = exec_index(principal, &topic, &group);
                 let needed = db.read(move |c| {
                     if index {
                         jkb_core::exec::index_poll_needed(c, &g, max, after, now)
@@ -3953,7 +4026,7 @@ impl LocalBackend {
                 }
             }
             Request::MqGroupDelete { topic, group } => {
-                let index = exec_index(principal, &topic);
+                let index = exec_index(principal, &topic, &group);
                 Response::GroupDeleted {
                     deleted: db.write_txn(actor, move |c, m| {
                         if index {
@@ -3965,7 +4038,7 @@ impl LocalBackend {
                 }
             }
             Request::MqAck { topic, group, seq } => {
-                let index = exec_index(principal, &topic);
+                let index = exec_index(principal, &topic, &group);
                 Response::Position {
                     position: db.write_txn(actor, move |c, m| {
                         if index {
@@ -4496,6 +4569,17 @@ impl LocalBackend {
             } => exec::inbox_take(db, actor, &session, agent_id, open, now)?,
             Request::ExecInboxAck { session, ids } => Response::ExecInboxAcked {
                 count: exec::inbox_ack(db, actor, &session, &ids, now)?,
+            },
+            Request::ExecInboxDue { instance, max } => Response::ExecInboxDue {
+                ids: exec::inbox_due(db, actor, &instance, max, now)?,
+            },
+            Request::ExecInboxClaim {
+                id,
+                instance,
+                lease_ms,
+            } => exec::inbox_claim(db, actor, &id, &instance, lease_ms, now)?,
+            Request::ExecInboxReport { id, ok, error } => Response::ExecInboxReported {
+                reported: exec::inbox_report(db, actor, &id, ok, error.as_deref(), now)?,
             },
             Request::ExecFollow { id, after, max } => Response::Messages {
                 messages: exec::follow(db, principal, &id, after.unwrap_or(0), max, now)?
@@ -5402,8 +5486,17 @@ impl LocalBackend {
 /// Whether an `mq` group, poll or ack on `topic` is the operator's on the run-request index
 /// ([`jkb_core::exec::INDEX_TOPIC`]): the one reserved topic a consumer group may be kept on, and
 /// only by the operator. Anyone else's falls through to `mq`, which refuses every `exec/` topic.
-fn exec_index(principal: &rbac::Principal, topic: &str) -> bool {
-    topic == jkb_core::exec::INDEX_TOPIC && principal.is_operator()
+/// Whether a queue op on `topic` for `group` by `principal` is one on the run-request index, served
+/// through `jkb_core::exec`'s index functions: the operator's groups (Code Factory's live queue), and
+/// a dev container forwarder's (`jkb exec forward`), which the container's own credential keeps
+/// under [`jkb_core::exec::INBOX_GROUP_PREFIX`] — the one widening of the rule that `exec/` topics are
+/// read by no queue op. Anyone else, any other group of the credential's, and every other `exec/`
+/// topic fall through to `mq`, which refuses them as reserved.
+fn exec_index(principal: &rbac::Principal, topic: &str, group: &str) -> bool {
+    topic == jkb_core::exec::INDEX_TOPIC
+        && (principal.is_operator()
+            || (matches!(&principal.kind, rbac::PrincipalKind::Grant(g) if g.container)
+                && group.starts_with(jkb_core::exec::INBOX_GROUP_PREFIX)))
 }
 
 #[cfg(test)]

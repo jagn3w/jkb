@@ -102,6 +102,16 @@ pub enum ExecCmd {
         #[arg(long)]
         state: Option<String>,
     },
+    /// Push each run request's result into the inbox socket of the session that filed it: the dev
+    /// container's forwarder, which its entrypoint starts and supervises as the pinned
+    /// `$JKB_HOOK_BIN exec forward`, outside the agent's sandbox and with the container credential.
+    /// Runs until a re-pin replaces its binary. Not for a tool call: the sandbox can read neither the
+    /// credential nor another session's socket.
+    Forward {
+        /// One sweep — post what is due now — and exit.
+        #[arg(long)]
+        once: bool,
+    },
     /// The tree pin of the repository containing a directory — what a request would record — and the
     /// `.gitignore` files it applied. Opens no database.
     Pin {
@@ -320,6 +330,11 @@ pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
                 print_view(&view, &mut std::io::stdout().lock())?;
             }
             Ok(())
+        }
+        // Dispatched before any database or daemon client is made (`forward::run_cli`): it builds
+        // its own, with the container credential.
+        ExecCmd::Forward { .. } => {
+            bail!("internal: jkb exec forward reached the ordinary dispatch")
         }
         ExecCmd::Decline { id, note } => {
             let view = expect_view(call(backend, Request::ExecDecline { id, note })?)?;
@@ -1070,6 +1085,8 @@ fn finish(view: &ExecView, s: &Follow, out: &mut dyn Write, err: &mut dyn Write)
     }
     Ok(code)
 }
+
+pub mod forward;
 
 #[cfg(test)]
 mod tests;

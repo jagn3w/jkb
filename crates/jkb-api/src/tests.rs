@@ -727,6 +727,20 @@ fn samples() -> Vec<Request> {
             session: "s".into(),
             ids: vec!["exec-1".into()],
         },
+        Request::ExecInboxDue {
+            instance: "h#b".into(),
+            max: 10,
+        },
+        Request::ExecInboxClaim {
+            id: "exec-1".into(),
+            instance: "h#b".into(),
+            lease_ms: 30_000,
+        },
+        Request::ExecInboxReport {
+            id: "exec-1".into(),
+            ok: true,
+            error: None,
+        },
         Request::ExecBegin {
             id: "exec-1".into(),
             recomputed_pin: None,
@@ -4088,6 +4102,9 @@ const OP_WORDS: &[(&str, &str)] = &[
     ("exec.follow", "run requests"),
     ("exec.inbox.take", "hand a session the results"),
     ("exec.inbox.ack", "hand a session the results"),
+    ("exec.inbox.due", "inbox socket"),
+    ("exec.inbox.claim", "inbox socket"),
+    ("exec.inbox.report", "inbox socket"),
     ("task.add", "add tasks"),
     ("task.set", "fields"),
     ("task.edit", "text"),

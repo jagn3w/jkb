@@ -455,8 +455,6 @@ fi
 # for an hour never runs Bash), on UserPromptSubmit (an idle session hears it on the next prompt), and
 # on SessionStart (which also registers the process's inbox, and after a compaction lists what is still
 # open). A matcher narrowed back to Bash, or an entry dropped, silently leaves results unheard.
-# `crossSessionInbound: accept` is NOT set yet: it lifts Claude Code's hold on cross-session messages,
-# and nothing posts to a session's inbox until the forwarder ships (which adds it, and its pin here).
 rr_hook=/usr/local/lib/jkb-hook/jkb
 rr_bad=""
 for rr_ev in PostToolUse PostToolUseFailure; do
@@ -471,6 +469,26 @@ if [ -z "$rr_bad" ]; then
     ok "the attest hook delivers run-request results on every tool call, prompt and start"
 else
     bad "a run request's result would go unheard — managed-settings.json:$rr_bad"
+fi
+# THE FORWARDER'S PUSH NEEDS `crossSessionInbound: accept`. `jkb exec forward` posts each result into
+# the filing session's inbox socket so an idle session takes a turn; Claude Code holds such a message
+# from a session that bypasses permission prompts unless this lets it in (the binary's strings, and
+# experiment E1 ran with it set). Dropped, the push is held and results wait for the hook path — the
+# session's next event — which is the failure the forwarder exists to remove, and nothing else says so.
+if [ "$(jq -r '.crossSessionInbound // ""' "$here/managed-settings.json" 2>/dev/null)" = accept ]; then
+    ok "the managed settings accept the forwarder's posts to a session's inbox (crossSessionInbound: accept)"
+else
+    bad "managed-settings.json does not set crossSessionInbound to accept — the forwarder's pushes would be held, and an idle session would not hear its result until its next prompt"
+fi
+# ...AND THE FORWARDER IS THE PINNED BINARY. The entrypoint's supervise loop runs `$JKB_HOOK_BIN exec
+# forward` outside the sandbox with the container credential readable, so JKB_HOOK_BIN must name the
+# same root-owned path the managed hooks run — an ENV naming anything the sandbox can write
+# (`~/.cargo/bin/jkb`) would run whatever a tool call last put there, as the credential's holder.
+fw_bin="$(sed -n 's/^ENV JKB_HOOK_BIN=//p' "$here/Dockerfile" 2>/dev/null | head -1)"
+if [ "$fw_bin" = "$rr_hook" ] && grep -qF '"$JKB_HOOK_BIN" exec forward' "$here/entrypoint.sh" 2>/dev/null; then
+    ok "the entrypoint supervises the forwarder as the pinned binary ($rr_hook)"
+else
+    bad "the forwarder is not the pinned binary — the Dockerfile's ENV JKB_HOOK_BIN is [$fw_bin], not $rr_hook, or entrypoint.sh does not run \"\$JKB_HOOK_BIN\" exec forward"
 fi
 # A CLASSIFIER-DENIED jkb LINE'S TICKET IS PARKED, so the operator's grant can match its retry: Claude
 # Code judges the hook's rewritten line, ticket and all, and the grant names that exact text. The

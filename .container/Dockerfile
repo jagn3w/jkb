@@ -221,6 +221,11 @@ RUN chmod 0755 /usr/local/bin/deny-transcripts.sh
 # The binary the managed hooks run, root-owned, where nothing in the sandbox can replace it (D52.9):
 # pin-jkb-hook.sh copies setup's build there, run through sudo — which a sandboxed tool call cannot.
 COPY --chown=root:root pin-jkb-hook.sh /usr/local/bin/pin-jkb-hook.sh
+# The same binary, as the run-request forwarder: entrypoint.sh's supervise loop runs
+# `$JKB_HOOK_BIN exec forward` outside the sandbox, with the credential readable, so it must be this
+# root-owned copy (check-config.sh holds the two to one path). An ENV, spelled once, for the reason
+# JKB_REAPER is: the entrypoint and verify.sh both need it, and ENV reaches both.
+ENV JKB_HOOK_BIN=/usr/local/lib/jkb-hook/jkb
 RUN chmod 0755 /usr/local/bin/pin-jkb-hook.sh \
     && install -d -o root -g root -m 0755 /usr/local/lib/jkb-hook \
     && printf 'vscode ALL=(root) NOPASSWD: /usr/local/bin/pin-jkb-hook.sh ""\n' > /etc/sudoers.d/pin-jkb-hook \

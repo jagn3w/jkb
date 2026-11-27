@@ -73,13 +73,18 @@ fn state(db: &Db, id: i64) -> DeliveryState {
     db.read(move |c| get(c, id)).unwrap().unwrap().state
 }
 
+/// The container boot every test's inbox is registered in ([`start_inbox`]).
+const BOOT: &str = "h#b";
+
 fn due_at(db: &Db, now: i64) -> Vec<i64> {
-    db.read(move |c| due(c, now, 100)).unwrap()
+    db.write_txn("t", move |c, m| due(c, m, BOOT, now, 100))
+        .unwrap()
 }
 
 fn claim(db: &Db, id: i64, now: i64) -> bool {
-    db.write_txn("t", move |c, _| claim_for_socket(c, id, LEASE, now))
+    db.write_txn("t", move |c, _| claim_for_socket(c, id, BOOT, LEASE, now))
         .unwrap()
+        .is_some()
 }
 
 fn reported(db: &Db, id: i64, ok: bool, now: i64) -> bool {
@@ -116,12 +121,17 @@ fn take(db: &Db, agent: Option<&str>, now: i64) -> Vec<i64> {
 }
 
 fn start_inbox(db: &Db, pid: &str, now: i64) {
-    let pid = pid.to_owned();
+    start_inbox_in(db, pid, "h#b/ns", now);
+}
+
+/// Session `s1`'s process `pid`, in `instance`, registers an inbox at `now`.
+fn start_inbox_in(db: &Db, pid: &str, instance: &str, now: i64) {
+    let (pid, instance) = (pid.to_owned(), instance.to_owned());
     db.write_txn("t", move |c, m| {
         let p = Process {
             session: "s1",
             pid: &pid,
-            instance: "h#b/ns",
+            instance: &instance,
         };
         let inbox = Inbox::new("/tmp/cc-socks/1.sock", "tok").unwrap();
         claude_session::started_with_inbox(c, m, &p, "/w", "resume", Some(&inbox), now)
@@ -166,10 +176,13 @@ fn a_fold_by_another_agent_sends_the_result_to_the_session() {
 #[test]
 fn only_a_terminal_request_ended_within_the_window_is_due() {
     let db = Db::open_in_memory().unwrap();
-    let pending = request(&db, None, "p", T0).row.id;
+    start_inbox(&db, "1", T0);
     let done = finished(&db, None, "f", T0 + 10);
     let old = finished(&db, None, "o", T0 + 5);
     let at = T0 + 5 + WINDOW_MS - 1;
+    // Filed late enough that the sweeps below, which settle expiries, find it still pending.
+    let filed = at - 1000;
+    let pending = request(&db, None, "p", filed).row.id;
     assert_eq!(due_at(&db, at), vec![done, old]);
     assert_eq!(
         due_at(&db, T0 + 5 + WINDOW_MS),
@@ -179,7 +192,7 @@ fn only_a_terminal_request_ended_within_the_window_is_due() {
     assert!(!due_at(&db, at).contains(&pending));
     assert!(!claim(&db, old, T0 + 5 + WINDOW_MS));
     assert_eq!(
-        take(&db, None, T0 + 10 + WINDOW_MS),
+        take(&db, None, filed + EXPIRES_AFTER_MS),
         vec![pending],
         "the two finished ones ended a day ago; the pending one expires in this take, and is new"
     );
@@ -188,6 +201,7 @@ fn only_a_terminal_request_ended_within_the_window_is_due() {
 #[test]
 fn a_claim_reported_ok_is_delivered_once() {
     let db = Db::open_in_memory().unwrap();
+    start_inbox(&db, "1", T0);
     let id = finished(&db, None, "a", T0 + 10);
     assert!(claim(&db, id, T0 + 20));
     assert!(!claim(&db, id, T0 + 21), "claimed already");
@@ -212,6 +226,7 @@ fn a_claim_reported_ok_is_delivered_once() {
 #[test]
 fn a_lapsed_lease_is_claimable_again_and_the_hook_takes_it() {
     let db = Db::open_in_memory().unwrap();
+    start_inbox(&db, "1", T0);
     let id = finished(&db, None, "a", T0 + 10);
     assert!(claim(&db, id, T0 + 20));
     assert!(due_at(&db, T0 + 20 + LEASE - 1).is_empty());
@@ -238,6 +253,7 @@ fn a_lapsed_lease_is_claimable_again_and_the_hook_takes_it() {
 #[test]
 fn a_take_never_acknowledged_is_handed_over_again() {
     let db = Db::open_in_memory().unwrap();
+    start_inbox(&db, "1", T0);
     let id = finished(&db, None, "a", T0 + 10);
     let at = T0 + 20;
     assert_eq!(
@@ -274,6 +290,7 @@ fn a_take_never_acknowledged_is_handed_over_again() {
 #[test]
 fn a_subagents_row_waits_for_its_end_or_the_grace() {
     let db = Db::open_in_memory().unwrap();
+    start_inbox(&db, "1", T0);
     let id = finished(&db, Some("ag1"), "a", T0 + 10);
     assert!(due_at(&db, T0 + 11).is_empty());
     assert!(!claim(&db, id, T0 + 11));
@@ -321,6 +338,7 @@ fn a_subagents_result_is_the_main_agents_after_the_grace() {
 #[test]
 fn a_failed_row_is_due_again_only_after_a_newer_inbox_and_at_most_five_times() {
     let db = Db::open_in_memory().unwrap();
+    start_inbox(&db, "1", T0);
     let id = finished(&db, None, "a", T0 + 10);
     let mut now = T0 + 20;
     for attempt in 0..MAX_ATTEMPTS {
@@ -343,6 +361,7 @@ fn a_failed_row_is_due_again_only_after_a_newer_inbox_and_at_most_five_times() {
 #[test]
 fn a_provisional_interrupt_is_not_due_until_the_runner_can_no_longer_report() {
     let db = Db::open_in_memory().unwrap();
+    start_inbox(&db, "1", T0);
     let id = request(&db, None, "a", T0).row.id;
     db.write_txn("t", move |c, m| exec::begin(c, m, id, None, "app", T0))
         .unwrap();
@@ -356,6 +375,86 @@ fn a_provisional_interrupt_is_not_due_until_the_runner_can_no_longer_report() {
     assert!(due_at(&db, late).is_empty());
     assert!(take(&db, None, late).is_empty());
     assert_eq!(due_at(&db, T0 + LATEST_END_MS), vec![id]);
+}
+
+/// A result is due for a forwarder's socket only while its session has a live inbox in that
+/// forwarder's container boot: with none, it waits for the hook path rather than being claimed and
+/// failed; with one only in another container, that container's forwarder is the one to post it.
+#[test]
+fn a_result_is_due_only_where_its_session_has_a_live_inbox() {
+    let db = Db::open_in_memory().unwrap();
+    let id = finished(&db, None, "a", T0 + 10);
+    assert!(due_at(&db, T0 + 20).is_empty(), "no inbox anywhere");
+    assert!(!claim(&db, id, T0 + 20));
+    assert_eq!(state(&db, id), DeliveryState::Waiting, "left for the hook");
+
+    start_inbox_in(&db, "7", "h#other/ns", T0 + 21);
+    assert!(due_at(&db, T0 + 22).is_empty(), "another boot's inbox");
+    assert!(!claim(&db, id, T0 + 22));
+    let theirs = db
+        .write_txn("t", move |c, m| due(c, m, "h#other", T0 + 22, 10))
+        .unwrap();
+    assert_eq!(theirs, vec![id]);
+    // A boot is matched whole: `h#b` is not a prefix match of `h#bb`.
+    start_inbox_in(&db, "8", "h#bb/ns", T0 + 23);
+    assert!(due_at(&db, T0 + 24).is_empty());
+
+    start_inbox(&db, "9", T0 + 25);
+    assert_eq!(due_at(&db, T0 + 26), vec![id]);
+    // An inbox whose process ended is no target.
+    db.write_txn("t", move |c, m| {
+        let p = Process {
+            session: "s1",
+            pid: "9",
+            instance: "h#b/ns",
+        };
+        claude_session::ended(c, m, &p, "exit", T0 + 27).map(|_| ())
+    })
+    .unwrap();
+    assert!(due_at(&db, T0 + 28).is_empty(), "its only inbox here ended");
+}
+
+/// A claim hands over the message and the session's targets in the claiming boot, newest start
+/// first; a lease outside its bounds is refused, and claims nothing.
+#[test]
+fn a_claim_carries_the_message_and_its_targets_newest_first() {
+    let db = Db::open_in_memory().unwrap();
+    start_inbox(&db, "1", T0);
+    start_inbox(&db, "2", T0 + 5);
+    start_inbox_in(&db, "3", "h#other/ns", T0 + 6);
+    let id = finished(&db, None, "a", T0 + 10);
+    for bad in [0, -1, super::MAX_SOCKET_LEASE_MS + 1] {
+        assert!(db
+            .write_txn("t", move |c, _| claim_for_socket(c, id, BOOT, bad, T0 + 20))
+            .is_err());
+    }
+    assert_eq!(state(&db, id), DeliveryState::Waiting);
+    let c = db
+        .write_txn("t", move |c, _| {
+            claim_for_socket(c, id, BOOT, LEASE, T0 + 20)
+        })
+        .unwrap()
+        .expect("claimed");
+    assert_eq!(c.taken.row.id, id);
+    assert!(c
+        .taken
+        .text()
+        .starts_with(&format!("[jkb run request] exec-{id} finished exit 0")));
+    let pids: Vec<&str> = c.targets.iter().map(|t| t.pid.as_str()).collect();
+    assert_eq!(pids, vec!["2", "1"], "this boot's only, newest first");
+    assert_eq!(c.targets[0].inbox.socket(), "/tmp/cc-socks/1.sock");
+    assert_eq!(state(&db, id), DeliveryState::Sending);
+}
+
+/// The forwarder's sweep settles an expiry itself: a request nobody answered is due at its expiry,
+/// without waiting for some other exec op to expire it.
+#[test]
+fn the_sweep_settles_an_expiry_and_finds_it_due() {
+    let db = Db::open_in_memory().unwrap();
+    start_inbox(&db, "1", T0);
+    let id = request(&db, None, "a", T0).row.id;
+    assert!(due_at(&db, T0 + EXPIRES_AFTER_MS - 1).is_empty());
+    assert_eq!(due_at(&db, T0 + EXPIRES_AFTER_MS), vec![id]);
 }
 
 #[test]
@@ -421,6 +520,7 @@ proptest! {
     #[test]
     fn a_result_is_delivered_at_most_once(ops in proptest::collection::vec(op(), 1..40)) {
         let db = Db::open_in_memory().unwrap();
+        start_inbox(&db, "1", T0);
         let id = finished(&db, None, "a", T0 + 10);
         let mut now = T0 + 20;
         let mut deliveries = 0;

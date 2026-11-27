@@ -351,6 +351,39 @@ reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <f
         *)                printf 'never-exited' ;;
     esac
 }
+# THE RUN-REQUEST FORWARDER, gathered: how many processes in $PROC are `<bin> exec forward`, and how
+# many of those descend from PID 1 -- the entrypoint's supervise loop is forked before the handover, so
+# its forwarder is a grandchild of the reaper; one started by hand from `docker exec` has a parent
+# outside the namespace (ppid 0) and does not. Builtins only (`read`), no forks, and it reads $PROC so
+# --self-test can hand it a fabricated tree. Sets FW_RUNNING and FW_ROOTED.
+forwarder_count() { # forwarder_count <bin>
+    local d argv w p n
+    FW_RUNNING=0; FW_ROOTED=0
+    for d in "$PROC"/[0-9]*; do
+        [ -r "$d/cmdline" ] || continue
+        argv=""
+        while IFS= read -r -d '' w; do argv="$argv$w "; done 2>/dev/null <"$d/cmdline"
+        [ "$argv" = "$1 exec forward " ] || continue
+        FW_RUNNING=$((FW_RUNNING+1))
+        p="${d##*/}"; n=0
+        while [ "$p" != 1 ] && [ "$n" -lt 64 ] && pstat "$p"; do p="$PS_PPID"; n=$((n+1)); done
+        [ "$p" = 1 ] && FW_ROOTED=$((FW_ROOTED+1))
+    done
+}
+# ...judged: <pinned yes|no> <running> <rooted> -> one word. Pure, so --self-test reaches every arm.
+#   unpinned  setup has not pinned the binary yet: the loop is waiting for it, and nothing is wrong
+#   ours      exactly one, under PID 1
+#   none      pinned, and no forwarder runs: results wait for each session's next event
+#   many      more than one: the lock should have stopped the second
+#   unrooted  one runs, but not under PID 1 -- started by hand, not supervised
+forwarder_verdict() { # forwarder_verdict <pinned> <running> <rooted>
+    [ "$1" = yes ] || { printf 'unpinned'; return; }
+    case "$2" in
+        0) printf 'none' ;;
+        1) if [ "$3" = 1 ]; then printf 'ours'; else printf 'unrooted'; fi ;;
+        *) printf 'many' ;;
+    esac
+}
 # One login file's state, for assertion 3c: <link> <file in the state volume> -> one word.
 #   linked     a link to the volume file (it may still dangle: nobody has logged in yet)
 #   pending    a regular file: a login or refresh replaced the link, and run.sh has not yet moved it
@@ -772,6 +805,35 @@ transcript sweep: 90000 deny bytes are projected and none of them can be archive
     st2 "an orphan still running was never there to be reaped" \
         "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 1 S)" "never-exited"
 
+
+    echo "==> verify.sh self-test: the run-request forwarder"
+    st2 "an unpinned binary is not a failure: the loop waits for it" "$(forwarder_verdict no 0 0)" "unpinned"
+    st2 "one supervised forwarder is the only ok arm"   "$(forwarder_verdict yes 1 1)" "ours"
+    st2 "pinned with none running"                     "$(forwarder_verdict yes 0 0)" "none"
+    st2 "two running"                                  "$(forwarder_verdict yes 2 2)" "many"
+    st2 "one started by hand, outside the loop"        "$(forwarder_verdict yes 1 0)" "unrooted"
+    # The gathering, over a fabricated /proc: PID 1 the reaper, the loop (2) under it, its forwarder (3)
+    # under that, a hand-started one (4) whose parent is outside the namespace, and a process (5)
+    # whose argv merely contains the words.
+    ft="$(mktemp -d)"
+    fproc() { # fproc <pid> <ppid> <argv...>
+        local pid="$1" ppid="$2"; shift 2; mkdir -p "$ft/$pid"
+        printf '%s (x) S %s 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 7 0 0\n' "$pid" "$ppid" > "$ft/$pid/stat"
+        printf '%s\0' "$@" > "$ft/$pid/cmdline"
+    }
+    fproc 1 0 /usr/bin/tini -- sleep infinity
+    fproc 2 1 bash /usr/local/bin/entrypoint.sh
+    fproc 3 2 /usr/local/lib/jkb-hook/jkb exec forward
+    fproc 5 1 grep /usr/local/lib/jkb-hook/jkb exec forward
+    saved_proc="$PROC"; PROC="$ft"
+    forwarder_count /usr/local/lib/jkb-hook/jkb
+    st2 "the supervised forwarder is counted, under PID 1" "$FW_RUNNING $FW_ROOTED" "1 1"
+    fproc 4 0 /usr/local/lib/jkb-hook/jkb exec forward
+    forwarder_count /usr/local/lib/jkb-hook/jkb
+    st2 "a hand-started one is counted, and not as supervised" "$FW_RUNNING $FW_ROOTED" "2 1"
+    forwarder_count /home/vscode/.cargo/bin/jkb
+    st2 "another binary's forwarder is not the pinned one" "$FW_RUNNING" "0"
+    PROC="$saved_proc"; rm -rf "$ft"
 
     echo "==> verify.sh self-test: login_link_state"
     lt="$(mktemp -d)"; want="$lt/volume/.credentials.json"; mkdir -p "$lt/volume"
@@ -1576,6 +1638,24 @@ else
     else
         bad "run-request results would go unheard — $rr_managed:$rr_bad (rebuild the image)"
     fi
+    [ "$(jq -r '.crossSessionInbound // ""' "$rr_managed" 2>/dev/null)" = accept ] \
+        || bad "$rr_managed does not set crossSessionInbound to accept — the forwarder's pushes would be held (rebuild the image)"
+fi
+# THE FORWARDER RUNS, supervised: one `$JKB_HOOK_BIN exec forward` under PID 1 once setup has pinned
+# the binary (the loop retries every 10s, so a verify run within seconds of the pin can be early).
+if [ -z "${JKB_HOOK_BIN:-}" ]; then
+    bad "JKB_HOOK_BIN is not set — the image predates the run-request forwarder, so idle sessions hear results only on their next prompt (rebuild the image)"
+else
+    forwarder_count "$JKB_HOOK_BIN"
+    fw_pinned=no; [ -x "$JKB_HOOK_BIN" ] && fw_pinned=yes
+    case "$(forwarder_verdict "$fw_pinned" "$FW_RUNNING" "$FW_ROOTED")" in
+        unpinned) ;;
+        ours)     ok "one run-request forwarder runs, supervised by the entrypoint's loop under PID 1" ;;
+        none)     bad "no run-request forwarder runs although $JKB_HOOK_BIN is pinned — see ~/.jkb/logs/exec-forward.log" ;;
+        many)     bad "$FW_RUNNING run-request forwarders run — its lock should admit one" ;;
+        unrooted) bad "the run-request forwarder that runs is not under PID 1 — it was started by hand, and nothing restarts it" ;;
+        *)        bad "could not judge the run-request forwarder: forwarder_verdict gave a word this case has no arm for" ;;
+    esac
 fi
 
 #     `sudo -n -l` failing and `sudo -n -l` listing nothing are different facts, and collapsing

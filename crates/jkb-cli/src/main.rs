@@ -1776,6 +1776,15 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    // The dev container's forwarder, likewise: it talks only to `jkb serve`, with the container's
+    // credential, and runs outside the sandbox from the entrypoint's supervise loop.
+    if let Command::Exec {
+        cmd: exec_cli::ExecCmd::Forward { once },
+    } = &cli.command
+    {
+        return exec_cli::forward::run_cli(*once);
+    }
+
     // The generated-docs drift check (D55.6, amended): it reads only the checkout's `docs/`, so it
     // runs ahead of remote mode and opens no database — `scripts/check.sh` and CI run it, and a gate
     // must not migrate, depend on or be refused by whatever store the machine holds. Not even

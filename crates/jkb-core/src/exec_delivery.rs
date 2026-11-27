@@ -7,7 +7,7 @@
 //! | from → to | function |
 //! |---|---|
 //! | (new) → `waiting` | [`create`] |
-//! | `waiting`/`failed`, or `sending` with a lapsed lease → `sending` | [`claim_for_socket`] |
+//! | `waiting`/`failed`, or `sending` with a lapsed lease → `sending`, for the forwarder | [`claim_for_socket`] |
 //! | `sending` → `delivered` (via `socket`) or `failed` | [`report`] |
 //! | anything not `delivered` and not under a live lease → `sending`, for [`HOOK_LEASE_MS`] | [`take_for_hook`] |
 //! | `sending` → `delivered` (via `hook`) | [`ack_hook`] |
@@ -25,12 +25,17 @@
 //! ([`crate::exec::SETTLED_INTERRUPT`]). A row a subagent filed is due for the session's socket only
 //! once that subagent is gone ([`agent_gone`]) or [`SUBAGENT_GRACE_MS`] after the request ended — the
 //! socket reaches the main agent, and the subagent hears it from its own next tool call until then.
+//! And it is due for **a** forwarder's socket only while its session has a live process with an inbox
+//! in that forwarder's container boot (`host#boot`): a result with no socket there to post to is left
+//! `waiting` for the hook path, not claimed and failed — and never claimed by another container's
+//! forwarder, which would fail it for want of a socket and cost the right one its push.
 //!
 //! Like `exec_output` and `claude_sessions`, this is observation: not changelogged, and `jkb undo`
 //! never reaches it.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::claude_session;
 use crate::exec::{self, ExecRow, LATEST_END_MS, SETTLED_INTERRUPT};
 use crate::{Result, WriteMeta};
 
@@ -54,6 +59,10 @@ pub const HOOK_LEASE_MS: i64 = 30_000;
 
 /// The most ids one [`due`] returns.
 pub const MAX_DUE: usize = 256;
+
+/// The longest lease [`claim_for_socket`] grants: five minutes. A post is one local socket write, and
+/// a forwarder that claims and dies must not keep the hook path off the row for longer than this.
+pub const MAX_SOCKET_LEASE_MS: i64 = 5 * 60 * 1000;
 
 macro_rules! words {
     ($(#[$doc:meta])* $name:ident { $( $(#[$vdoc:meta])* $variant:ident => $s:literal ),+ $(,)? }) => {
@@ -221,28 +230,41 @@ const DELIVERABLE: &str = "r.state IN ('finished', 'declined', 'refused', 'expir
               AND r.created_at + ?4 > ?1) \
      AND d.state <> 'delivered' AND NOT (d.state = 'sending' AND d.lease_until > ?1)";
 
-/// The condition, beyond [`DELIVERABLE`], that the result is due for the session's socket: a
-/// subagent's only once it is gone or past its grace (`?5`); a failed one only after the session
-/// registered an inbox newer than the last attempt (it was resumed), and fewer than `?6` attempts.
+/// The condition, beyond [`DELIVERABLE`], that the result is due for the socket of the forwarder of
+/// container boot `?7` (`host#boot`): a subagent's only once it is gone or past its grace (`?5`); a
+/// failed one only with fewer than `?6` attempts; and only while the session has a live process with
+/// an inbox in that boot — for a failed one, an inbox registered after the last attempt (it was
+/// resumed). The boot match is [`claude_session::inbox_targets`]'s, so what is due is exactly what
+/// has a target.
 const SOCKET_DUE: &str = "(d.agent_id IS NULL OR d.agent_gone_at IS NOT NULL \
           OR r.ended_at + ?5 <= ?1) \
-     AND (d.state <> 'failed' OR (d.attempts < ?6 AND EXISTS ( \
-          SELECT 1 FROM claude_sessions s WHERE s.session = r.session \
-             AND s.inbox_socket IS NOT NULL AND s.ended_at IS NULL \
-             AND s.started_at > d.last_attempt_at)))";
+     AND (d.state <> 'failed' OR d.attempts < ?6) \
+     AND EXISTS (SELECT 1 FROM claude_sessions s WHERE s.session = r.session \
+          AND s.ended_at IS NULL AND s.inbox_socket IS NOT NULL AND s.inbox_token IS NOT NULL \
+          AND (s.instance = ?7 OR substr(s.instance, 1, length(?7) + 1) = ?7 || '/') \
+          AND (d.state <> 'failed' OR s.started_at > d.last_attempt_at))";
 
-/// The ids due for the session's socket at `now`, oldest first, at most `max` (capped at
-/// [`MAX_DUE`]). What the forwarder sweeps. No token, no text.
+/// The ids due at `now` for the socket of the forwarder of container boot `host_boot`, oldest first,
+/// at most `max` (capped at [`MAX_DUE`]). What the forwarder sweeps: no token, no text. Settles
+/// expiries first, as every exec function taking `meta` does, so an expired request is due without
+/// waiting for another exec op.
 ///
 /// # Errors
 /// A database error.
-pub fn due(conn: &Connection, now: i64, max: usize) -> Result<Vec<i64>> {
+pub fn due(
+    conn: &Connection,
+    meta: &WriteMeta,
+    host_boot: &str,
+    now: i64,
+    max: usize,
+) -> Result<Vec<i64>> {
+    exec::settle(conn, meta, now)?;
     let max = i64::try_from(max.min(MAX_DUE)).unwrap_or(0);
     Ok(conn
         .prepare_cached(&format!(
             "SELECT r.id FROM exec_requests r JOIN exec_delivery d ON d.request_id = r.id \
              WHERE d.state <> 'delivered' AND {DELIVERABLE} AND {SOCKET_DUE} \
-             ORDER BY r.id LIMIT ?7"
+             ORDER BY r.id LIMIT ?8"
         ))?
         .query_map(
             params![
@@ -252,6 +274,7 @@ pub fn due(conn: &Connection, now: i64, max: usize) -> Result<Vec<i64>> {
                 LATEST_END_MS,
                 SUBAGENT_GRACE_MS,
                 MAX_ATTEMPTS,
+                host_boot,
                 max
             ],
             |r| r.get(0),
@@ -259,25 +282,43 @@ pub fn due(conn: &Connection, now: i64, max: usize) -> Result<Vec<i64>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// Claim `id` for a socket post, for `lease_ms`: `true` when this call won it — it was due
-/// ([`due`]'s rule) and nobody else holds it. A claim is not delivery: [`report`] says how the post went,
-/// and a claim never reported lapses, so the hook path or the next claim takes the row.
+/// A result claimed for a socket post: its message, and where to post it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    /// The result, as the hook would be handed it ([`Taken::text`] is the message).
+    pub taken: Taken,
+    /// The session's live processes with an inbox in the claiming boot, newest start first
+    /// ([`claude_session::inbox_targets`]).
+    pub targets: Vec<claude_session::Target>,
+}
+
+/// Claim `id` for a socket post by the forwarder of container boot `host_boot`, for `lease_ms`: the
+/// message and its targets when this call won it — it was due ([`due`]'s rule) and nobody else holds
+/// it — else `None`. A claim is not delivery: [`report`] says how the post went, and a claim never
+/// reported lapses, so the hook path or the next claim takes the row.
 ///
 /// # Errors
-/// A validation error for a lease that is not positive; a database error.
-pub fn claim_for_socket(conn: &Connection, id: i64, lease_ms: i64, now: i64) -> Result<bool> {
-    if lease_ms <= 0 {
+/// A validation error for a lease that is not positive or is longer than [`MAX_SOCKET_LEASE_MS`];
+/// a database error.
+pub fn claim_for_socket(
+    conn: &Connection,
+    id: i64,
+    host_boot: &str,
+    lease_ms: i64,
+    now: i64,
+) -> Result<Option<Claim>> {
+    if !(1..=MAX_SOCKET_LEASE_MS).contains(&lease_ms) {
         return Err(jkb_types::Error::Validation(format!(
-            "a lease of {lease_ms} ms is not positive"
+            "a lease of {lease_ms} ms is not 1 to {MAX_SOCKET_LEASE_MS} ms"
         ))
         .into());
     }
     let changed = conn
         .prepare_cached(&format!(
-            "UPDATE exec_delivery SET state = 'sending', lease_until = ?8 \
-             WHERE request_id = ?7 AND request_id IN ( \
+            "UPDATE exec_delivery SET state = 'sending', lease_until = ?9 \
+             WHERE request_id = ?8 AND request_id IN ( \
                  SELECT r.id FROM exec_requests r JOIN exec_delivery d ON d.request_id = r.id \
-                 WHERE r.id = ?7 AND {DELIVERABLE} AND {SOCKET_DUE})"
+                 WHERE r.id = ?8 AND {DELIVERABLE} AND {SOCKET_DUE})"
         ))?
         .execute(params![
             now,
@@ -286,10 +327,16 @@ pub fn claim_for_socket(conn: &Connection, id: i64, lease_ms: i64, now: i64) -> 
             LATEST_END_MS,
             SUBAGENT_GRACE_MS,
             MAX_ATTEMPTS,
+            host_boot,
             id,
             now.saturating_add(lease_ms)
         ])?;
-    Ok(changed > 0)
+    if changed == 0 {
+        return Ok(None);
+    }
+    let taken = taken(conn, id)?;
+    let targets = claude_session::inbox_targets(conn, &taken.row.requester.session, host_boot)?;
+    Ok(Some(Claim { taken, targets }))
 }
 
 /// Report how the socket post of claimed `id` went: `Ok` delivers it (via `socket`), `Err` records the

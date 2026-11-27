@@ -154,7 +154,8 @@ impl OpPermission {
             Self::Grant => "Hand out and revoke role grants, of the roles it may grant.",
             Self::Attest => {
                 "Vouch for which agent made a tool call, and hand a session the results of the run \
-                 requests it filed: the dev container's credential alone."
+                 requests it filed, as hook context or posted to its inbox socket: the dev \
+                 container's credential alone."
             }
             Self::ExecRequest => "Ask the operator to run one command.",
             Self::Admin => {
@@ -387,7 +388,12 @@ impl Request {
             | Self::AttestPark { .. }
             | Self::AttestRelease { .. }
             | Self::ExecInboxTake { .. }
-            | Self::ExecInboxAck { .. } => OpPermission::Attest,
+            | Self::ExecInboxAck { .. }
+            // The forwarder's ops, likewise: a claim returns an inbox token, which only the harness
+            // may read back.
+            | Self::ExecInboxDue { .. }
+            | Self::ExecInboxClaim { .. }
+            | Self::ExecInboxReport { .. } => OpPermission::Attest,
             // Threads are started and resolved by the operator, who alone approves a selection.
             Self::DesignThreadStart { .. }
             | Self::DesignThreadResolve { .. }
@@ -524,6 +530,9 @@ impl Request {
             | Self::AttestRelease { .. }
             | Self::ExecInboxTake { .. }
             | Self::ExecInboxAck { .. }
+            | Self::ExecInboxDue { .. }
+            | Self::ExecInboxClaim { .. }
+            | Self::ExecInboxReport { .. }
             // Reads, and the hooks' own records.
             | Self::KbAmbient { .. }
             | Self::KbQuery { .. }

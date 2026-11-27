@@ -901,14 +901,49 @@ lost. `SessionStart` registers the process only when the hook's parent is not a 
 with no pid would keep the session from ever reading as ended. `check-config.sh` and `verify.sh` pin
 the matchers and entries, and `mutate-config.sh` carries the narrowed-matcher mutation.
 
-**Not here yet: the forwarder, and `crossSessionInbound`.** The design pushes each result into the
-session's own Claude Code inbox socket from a forwarder (`jkb exec forward`) that the entrypoint
-starts and supervises, so an idle session takes a turn without waiting for a prompt. It is not
-built: its message format is unmeasured (experiment E1 in the design, which needs a session outside
-an agent's sandbox), and it is not written against a guessed format. `"crossSessionInbound": "accept"`
-is left out of the managed settings until then: it lifts Claude Code's hold on cross-session
-messages, and with no forwarder nothing legitimate posts to an inbox. The forwarder's change adds
-both, with their pins.
+**The run-request forwarder pushes each result into the session's inbox socket.** So an idle
+session takes a turn when its request ends, instead of hearing it on the operator's next prompt,
+`entrypoint.sh` starts a supervise loop just before handing over to the reaper (after the egress
+gate and the namespace marker, so a refusing boot starts nothing): `while :; do [ -x
+"$JKB_HOOK_BIN" ] && "$JKB_HOOK_BIN" exec forward; sleep 10; done`, all of its output in
+`~/.jkb/logs/exec-forward.log`. `JKB_HOOK_BIN` is the Dockerfile's `ENV`, spelled once and held by
+`check-config.sh` to the pinned `/usr/local/lib/jkb-hook/jkb` the managed hooks run, because the
+forwarder runs outside the sandbox with the container credential readable — the same trust, for the
+same reason. The `-x` test covers the first boot, before `setup.sh` pins the binary; a missing
+`JKB_HOOK_BIN` does not refuse the boot (the hook path above delivers everything the push would) but
+says so on stderr.
+
+The forwarder (`crates/jkb-cli/src/exec_cli/forward.rs`) keeps the consumer group `inbox/<hostname>`
+on the run-request index `exec/requests` — the only group there the container's credential may keep;
+every other `exec/` topic and group stays refused. On start, after each burst of hints naming a
+terminal state, and once a minute, it sweeps: `exec.inbox.due` for its container boot (`host#boot`;
+a result is due only while its session has a live process with an inbox in this boot, so another
+container's results, and a session with no inbox, are left `waiting` for the hook), then per id
+`exec.inbox.claim` (the message and the targets, newest process first, under a 30-second lease — the
+only op that returns an inbox token, and the container credential's and operator's alone), a post,
+and `exec.inbox.report`. A post is one connection: the auth line, then the body
+`{"type":"user","message":{"role":"user","content":<text>}}`, each newline-terminated, and close.
+That body is experiment E1's (Claude Code 2.1.317, 2026-11-25: routed to the session's queue and
+answered within ~2 s; `{"type":"message",…}` and `{"text":…}` are dropped; the socket writes nothing
+back), pinned byte for byte by a unit test under `jkb_core::exec::INBOX_BODY_VERSION`. It is
+single-instance by a `flock` beside the namespace marker (`/run/jkb/exec-forward.lock`: neither
+`$XDG_RUNTIME_DIR` nor `/run/user/<uid>` exists in this container, and `/run/jkb` is not writable
+from the sandbox), and once a minute it compares `/proc/self/exe` with `$JKB_HOOK_BIN`, exiting 0
+when `pin-jkb-hook.sh`'s `mv -f` replaced it, so a re-pin takes effect within about a minute.
+`"crossSessionInbound": "accept"` is in the managed settings for it: Claude Code holds a
+cross-session message for a session that bypasses permission prompts unless it is accepted.
+`check-config.sh` pins both (with their `mutate-config.sh` mutations), and `verify.sh` checks that
+exactly one forwarder runs under PID 1 once the binary is pinned.
+
+**What the forwarder cannot see, and what is not measured yet.** The socket replies with nothing, so
+a message Claude Code accepts and then holds (a repository's own `crossSessionInbound: "hold"`, or
+the hold case below) is reported delivered and is not handed to the hook again. Not yet measured
+live: the hold case (a permission-bypassing session with and without the managed `accept`); E2
+(socket and token across `/clear`, `/compact`, `--resume`, a container restart); E3 (whose socket a
+subagent's and a `CLAUDE_CODE_CHILD_SESSION` session's post reaches); E4 (both variables in a
+`SessionStart` hook's environment); E5 (whose context a subagent's hook output reaches); E6
+(`PostToolUse` with matcher `.*` for `Read`, `Edit` and `Agent`); and that the auth line followed by
+E1's body is accepted (E1's passing run sent the body alone).
 
 **Not yet measured, because it needs this image running:** that managed hooks run beside the
 project's and user's (they are not exclusive unless `allowManagedHooksOnly`, which is not set

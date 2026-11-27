@@ -122,10 +122,22 @@ const TOPIC_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// The index topic: one `exec.changed {id, state}` hint per request made and per move, so the
 /// operator's app re-reads the queue when something changed rather than polling it. Reserved like a
 /// request's own topic ([`mq::RESERVED_PREFIXES`]): only this module sends on it, and the only
-/// consumer groups on it are the operator's, through [`index_group_create`] and its siblings, which
-/// `jkb-api` serves to the operator alone. A hint carries an id and a state, never argv or a reason:
-/// the record is read for those.
+/// consumer groups on it are made through [`index_group_create`] and its siblings, which `jkb-api`
+/// serves to the operator and — for groups under [`INBOX_GROUP_PREFIX`] — to the dev container's
+/// credential, whose forwarder wakes on the hints. A hint carries an id and a state, never argv or a
+/// reason: the record is read for those.
 pub const INDEX_TOPIC: &str = "exec/requests";
+
+/// The prefix of a dev container forwarder's consumer group on [`INDEX_TOPIC`]
+/// (`inbox/<hostname>`): the only groups on it that anyone but the operator may keep.
+pub const INBOX_GROUP_PREFIX: &str = "inbox/";
+
+/// The version of the body the dev container's forwarder posts to a session's inbox socket
+/// (`jkb exec forward`). Version 1, measured on Claude Code 2.1.317 (experiment E1, 2026-11-25): one
+/// line, `{"type":"user","message":{"role":"user","content":<text>}}` and a newline, after the
+/// optional `{"type":"auth","token":…}` line. The forwarder's unit test pins the bytes of this
+/// version, so a change to the body is a change to this number.
+pub const INBOX_BODY_VERSION: u32 = 1;
 
 /// The kind of every message on [`INDEX_TOPIC`].
 pub const INDEX_KIND: &str = "exec.changed";
@@ -1566,8 +1578,8 @@ pub fn expire_session(
     Ok(n)
 }
 
-/// Put the operator's consumer group `group` on [`INDEX_TOPIC`], creating the topic if need be.
-/// Only `jkb-api` calls this, for the operator; idempotent as [`mq::group_create`] is.
+/// Put consumer group `group` on [`INDEX_TOPIC`], creating the topic if need be. Only `jkb-api` calls
+/// this, for the operator or a container forwarder's group; idempotent as [`mq::group_create`] is.
 ///
 /// # Errors
 /// A malformed group name, or a database error.
@@ -1582,7 +1594,7 @@ pub fn index_group_create(
     mq::group_create_reserved(conn, meta, INDEX_TOPIC, group, start, now)
 }
 
-/// Take the operator's group `group` off [`INDEX_TOPIC`]; `false` when it was not there.
+/// Take group `group` off [`INDEX_TOPIC`]; `false` when it was not there.
 ///
 /// # Errors
 /// As [`mq::group_delete`].
@@ -1590,7 +1602,7 @@ pub fn index_group_delete(conn: &Connection, meta: &WriteMeta, group: &str) -> R
     mq::group_delete_reserved(conn, meta, INDEX_TOPIC, group)
 }
 
-/// [`mq::poll`] on [`INDEX_TOPIC`], for the operator's group.
+/// [`mq::poll`] on [`INDEX_TOPIC`], for one of its groups.
 ///
 /// # Errors
 /// As [`mq::poll`].
@@ -1605,7 +1617,7 @@ pub fn index_poll(
     mq::poll_reserved(conn, meta, INDEX_TOPIC, group, max, after, now)
 }
 
-/// [`mq::poll_needed`] on [`INDEX_TOPIC`], for the operator's group.
+/// [`mq::poll_needed`] on [`INDEX_TOPIC`], for one of its groups.
 ///
 /// # Errors
 /// As [`mq::poll_needed`].
@@ -1619,7 +1631,7 @@ pub fn index_poll_needed(
     mq::poll_needed_reserved(conn, INDEX_TOPIC, group, max, after, now)
 }
 
-/// [`mq::ack`] on [`INDEX_TOPIC`], for the operator's group.
+/// [`mq::ack`] on [`INDEX_TOPIC`], for one of its groups.
 ///
 /// # Errors
 /// As [`mq::ack`].

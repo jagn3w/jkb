@@ -1,4 +1,5 @@
 {
+  "crossSessionInbound": "accept",
   "sandbox": { "enabled": true, "failIfUnavailable": true, "allowUnsandboxedCommands": false },
   "permissions": {
     "deny": [

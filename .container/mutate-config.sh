@@ -1348,6 +1348,24 @@ json.dump(d, open(p, "w"), indent=2)
 PYX
 run "the attest hook's PostToolUse is narrowed back to Bash" "a run request's result would go unheard"
 
+# The forwarder's push into a session's inbox is held without crossSessionInbound: accept.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.pop("crossSessionInbound", None)
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "crossSessionInbound is dropped from the managed settings" "does not set crossSessionInbound to accept"
+
+# The forwarder runs outside the sandbox with the credential readable: JKB_HOOK_BIN must be the
+# pinned, root-owned binary, not one a tool call can replace.
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('ENV JKB_HOOK_BIN=/usr/local/lib/jkb-hook/jkb', 'ENV JKB_HOOK_BIN=/home/vscode/.cargo/bin/jkb', 1))
+PYX
+run "the forwarder's JKB_HOOK_BIN names a binary the sandbox can replace" "the forwarder is not the pinned binary"
+
 # THE TRANSCRIPT DENY (2026-09-30), which is a HOOK because a glob cannot be both cheap and
 # correct here. A `Read(...*.jsonl)` glob is named per-matching-file in the bubblewrap argv (206
 # files = 52% of MAX_ARG_STRLEN, and past it every Bash call dies at spawn); the collapsing
@@ -2648,7 +2666,7 @@ echo "==> coverage"
 settle
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=127
+PINNED_BAD_SITES=129
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"
