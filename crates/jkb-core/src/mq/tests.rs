@@ -991,3 +991,82 @@ fn a_batch_is_bounded_whatever_it_asks_for() {
         MAX_BATCH
     );
 }
+
+/// A reserved topic's owner declaring a newer spec converges the stored one in place: the messages
+/// already held keep their own expiry, and every group keeps its position.
+#[test]
+fn a_reserved_topic_converges_to_its_owners_newer_spec_keeping_messages_and_groups() {
+    use super::{group_create_reserved, read_reserved, send_reserved, topic_create_reserved};
+    const NAME: &str = "exec/requests";
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+    let old = TopicSpec {
+        default_ttl_ms: Some(DAY),
+        ..TopicSpec::default()
+    };
+    let db = Db::open_in_memory().unwrap();
+    let old_ = old.clone();
+    let seq = db
+        .write_txn("t", move |c, m| {
+            assert_eq!(topic_create_reserved(c, m, NAME, &old_, T0)?, Created::New);
+            group_create_reserved(c, m, NAME, "g", Start::FromStart, T0)?;
+            send_reserved(c, m, NAME, &draft(NAME, 1), T0)
+        })
+        .unwrap();
+    let new = TopicSpec {
+        default_ttl_ms: Some(2 * DAY),
+        max_messages: 7,
+        group_idle_ms: 3 * DAY,
+        ..old
+    };
+    let new_ = new.clone();
+    let outcome = db
+        .write_txn("t", move |c, m| {
+            topic_create_reserved(c, m, NAME, &new_, T0 + 1)
+        })
+        .unwrap();
+    assert_eq!(outcome, Created::Respecced);
+    let (stored, groups, held) = db
+        .read(|c| {
+            let (_, stored) = super::topic_row_any(c, NAME)?;
+            let groups = super::group_count_reserved(c, NAME)?;
+            Ok((stored, groups, read_reserved(c, NAME, 0, 10, T0 + 2)?))
+        })
+        .unwrap();
+    assert_eq!(stored, new);
+    assert_eq!(groups, 1);
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].seq, seq);
+    // Sent under the old TTL, it keeps the old expiry.
+    assert_eq!(held[0].expires_at, Some(T0 + DAY));
+    // The group kept its position: it is still handed the message.
+    let polled = db
+        .write_txn("t", |c, m| {
+            super::poll_reserved(c, m, NAME, "g", 10, None, T0 + 2)
+        })
+        .unwrap();
+    assert_eq!(polled.iter().map(|d| d.seq).collect::<Vec<_>>(), vec![seq]);
+    // Declared again with the same spec, it is simply there.
+    let again = db
+        .write_txn("t", move |c, m| {
+            topic_create_reserved(c, m, NAME, &new, T0 + 3)
+        })
+        .unwrap();
+    assert_eq!(again, Created::Existing);
+}
+
+/// Converging is the owner's alone: the public create still refuses a different spec, and leaves
+/// the stored one as it was.
+#[test]
+fn the_public_create_still_refuses_a_different_spec_and_changes_nothing() {
+    let db = db_with_topic(TopicSpec::default());
+    let other = TopicSpec {
+        default_ttl_ms: Some(1000),
+        ..TopicSpec::default()
+    };
+    let err = db
+        .write_txn("t", move |c, m| topic_create(c, m, "t", &other, T0))
+        .unwrap_err();
+    assert_eq!(queue_err(err), QueueError::TopicConflict("t".to_owned()));
+    let stored = db.read(|c| Ok(super::topic_row_any(c, "t")?.1)).unwrap();
+    assert_eq!(stored, TopicSpec::default());
+}
