@@ -351,6 +351,39 @@ reaper_verdict() { # reaper_verdict <pid1-argv> <orphan-pid> <adopted-by-pid> <f
         *)                printf 'never-exited' ;;
     esac
 }
+# THE RUN-REQUEST FORWARDER, gathered: how many processes in $PROC are `<bin> exec forward`, and how
+# many of those descend from PID 1 -- the entrypoint's supervise loop is forked before the handover, so
+# its forwarder is a grandchild of the reaper; one started by hand from `docker exec` has a parent
+# outside the namespace (ppid 0) and does not. Builtins only (`read`), no forks, and it reads $PROC so
+# --self-test can hand it a fabricated tree. Sets FW_RUNNING and FW_ROOTED.
+forwarder_count() { # forwarder_count <bin>
+    local d argv w p n
+    FW_RUNNING=0; FW_ROOTED=0
+    for d in "$PROC"/[0-9]*; do
+        [ -r "$d/cmdline" ] || continue
+        argv=""
+        while IFS= read -r -d '' w; do argv="$argv$w "; done 2>/dev/null <"$d/cmdline"
+        [ "$argv" = "$1 exec forward " ] || continue
+        FW_RUNNING=$((FW_RUNNING+1))
+        p="${d##*/}"; n=0
+        while [ "$p" != 1 ] && [ "$n" -lt 64 ] && pstat "$p"; do p="$PS_PPID"; n=$((n+1)); done
+        [ "$p" = 1 ] && FW_ROOTED=$((FW_ROOTED+1))
+    done
+}
+# ...judged: <pinned yes|no> <running> <rooted> -> one word. Pure, so --self-test reaches every arm.
+#   unpinned  setup has not pinned the binary yet: the loop is waiting for it, and nothing is wrong
+#   ours      exactly one, under PID 1
+#   none      pinned, and no forwarder runs: results wait for each session's next event
+#   many      more than one: the lock should have stopped the second
+#   unrooted  one runs, but not under PID 1 -- started by hand, not supervised
+forwarder_verdict() { # forwarder_verdict <pinned> <running> <rooted>
+    [ "$1" = yes ] || { printf 'unpinned'; return; }
+    case "$2" in
+        0) printf 'none' ;;
+        1) if [ "$3" = 1 ]; then printf 'ours'; else printf 'unrooted'; fi ;;
+        *) printf 'many' ;;
+    esac
+}
 # One login file's state, for assertion 3c: <link> <file in the state volume> -> one word.
 #   linked     a link to the volume file (it may still dangle: nobody has logged in yet)
 #   pending    a regular file: a login or refresh replaced the link, and run.sh has not yet moved it
@@ -772,6 +805,35 @@ transcript sweep: 90000 deny bytes are projected and none of them can be archive
     st2 "an orphan still running was never there to be reaped" \
         "$(reaper_verdict '/usr/bin/tini -- sleep infinity' 42 1 S)" "never-exited"
 
+
+    echo "==> verify.sh self-test: the run-request forwarder"
+    st2 "an unpinned binary is not a failure: the loop waits for it" "$(forwarder_verdict no 0 0)" "unpinned"
+    st2 "one supervised forwarder is the only ok arm"   "$(forwarder_verdict yes 1 1)" "ours"
+    st2 "pinned with none running"                     "$(forwarder_verdict yes 0 0)" "none"
+    st2 "two running"                                  "$(forwarder_verdict yes 2 2)" "many"
+    st2 "one started by hand, outside the loop"        "$(forwarder_verdict yes 1 0)" "unrooted"
+    # The gathering, over a fabricated /proc: PID 1 the reaper, the loop (2) under it, its forwarder (3)
+    # under that, a hand-started one (4) whose parent is outside the namespace, and a process (5)
+    # whose argv merely contains the words.
+    ft="$(mktemp -d)"
+    fproc() { # fproc <pid> <ppid> <argv...>
+        local pid="$1" ppid="$2"; shift 2; mkdir -p "$ft/$pid"
+        printf '%s (x) S %s 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 7 0 0\n' "$pid" "$ppid" > "$ft/$pid/stat"
+        printf '%s\0' "$@" > "$ft/$pid/cmdline"
+    }
+    fproc 1 0 /usr/bin/tini -- sleep infinity
+    fproc 2 1 bash /usr/local/bin/entrypoint.sh
+    fproc 3 2 /usr/local/lib/jkb-hook/jkb exec forward
+    fproc 5 1 grep /usr/local/lib/jkb-hook/jkb exec forward
+    saved_proc="$PROC"; PROC="$ft"
+    forwarder_count /usr/local/lib/jkb-hook/jkb
+    st2 "the supervised forwarder is counted, under PID 1" "$FW_RUNNING $FW_ROOTED" "1 1"
+    fproc 4 0 /usr/local/lib/jkb-hook/jkb exec forward
+    forwarder_count /usr/local/lib/jkb-hook/jkb
+    st2 "a hand-started one is counted, and not as supervised" "$FW_RUNNING $FW_ROOTED" "2 1"
+    forwarder_count /home/vscode/.cargo/bin/jkb
+    st2 "another binary's forwarder is not the pinned one" "$FW_RUNNING" "0"
+    PROC="$saved_proc"; rm -rf "$ft"
 
     echo "==> verify.sh self-test: login_link_state"
     lt="$(mktemp -d)"; want="$lt/volume/.credentials.json"; mkdir -p "$lt/volume"
@@ -1554,6 +1616,47 @@ if [ -z "${JKB_SETUP_MARKER:-}" ]; then
 elif [ -f "$JKB_SETUP_MARKER" ] && [ ! -x /usr/local/lib/jkb-hook/jkb ]; then
     bad "setup finished but /usr/local/lib/jkb-hook/jkb is missing — the harness hooks have nothing to run (run: sudo -n /usr/local/bin/pin-jkb-hook.sh)"
 fi
+# THE POSTURE IN FORCE delivers a run request's result (check-config.sh pins the repo's copy; this
+# reads what Claude Code loaded): the attest hook on every tool call's PostToolUse/PostToolUseFailure,
+# and on UserPromptSubmit and SessionStart. An image built before them leaves results unheard until
+# the operator relays them.
+rr_managed=/etc/claude-code/managed-settings.json
+if [ ! -f "$rr_managed" ] || ! command -v jq >/dev/null 2>&1; then
+    bad "cannot read $rr_managed with jq, so whether run-request results reach their session is unchecked"
+else
+    rr_bad=""
+    for rr_ev in PostToolUse PostToolUseFailure; do
+        rr_m="$(jq -r --arg e "$rr_ev" '.hooks[$e][]? | select([.hooks[]?.command] | index("/usr/local/lib/jkb-hook/jkb attest hook")) | .matcher // ""' "$rr_managed" 2>/dev/null)"
+        [ "$rr_m" = ".*" ] || rr_bad="$rr_bad $rr_ev(matcher [$rr_m])"
+    done
+    for rr_ev in UserPromptSubmit SessionStart; do
+        jq -e --arg e "$rr_ev" '[.hooks[$e][]?.hooks[]?.command] | index("/usr/local/lib/jkb-hook/jkb attest hook")' "$rr_managed" >/dev/null 2>&1 \
+            || rr_bad="$rr_bad $rr_ev(no attest hook)"
+    done
+    if [ -z "$rr_bad" ]; then
+        ok "the managed attest hook hands sessions their run-request results on every tool call, prompt and start"
+    else
+        bad "run-request results would go unheard — $rr_managed:$rr_bad (rebuild the image)"
+    fi
+    [ "$(jq -r '.crossSessionInbound // ""' "$rr_managed" 2>/dev/null)" = accept ] \
+        || bad "$rr_managed does not set crossSessionInbound to accept — the forwarder's pushes would be held (rebuild the image)"
+fi
+# THE FORWARDER RUNS, supervised: one `$JKB_HOOK_BIN exec forward` under PID 1 once setup has pinned
+# the binary (the loop retries every 10s, so a verify run within seconds of the pin can be early).
+if [ -z "${JKB_HOOK_BIN:-}" ]; then
+    bad "JKB_HOOK_BIN is not set — the image predates the run-request forwarder, so idle sessions hear results only on their next prompt (rebuild the image)"
+else
+    forwarder_count "$JKB_HOOK_BIN"
+    fw_pinned=no; [ -x "$JKB_HOOK_BIN" ] && fw_pinned=yes
+    case "$(forwarder_verdict "$fw_pinned" "$FW_RUNNING" "$FW_ROOTED")" in
+        unpinned) ;;
+        ours)     ok "one run-request forwarder runs, supervised by the entrypoint's loop under PID 1" ;;
+        none)     bad "no run-request forwarder runs although $JKB_HOOK_BIN is pinned — see ~/.jkb/logs/exec-forward.log" ;;
+        many)     bad "$FW_RUNNING run-request forwarders run — its lock should admit one" ;;
+        unrooted) bad "the run-request forwarder that runs is not under PID 1 — it was started by hand, and nothing restarts it" ;;
+        *)        bad "could not judge the run-request forwarder: forwarder_verdict gave a word this case has no arm for" ;;
+    esac
+fi
 
 #     `sudo -n -l` failing and `sudo -n -l` listing nothing are different facts, and collapsing
 #     them reported the friendliest one: sudo missing, PAM broken or sudoers unparseable all
@@ -2001,6 +2104,33 @@ case "$(hooks_dir_state "$hooks_read" "$hooks_raw" "$hooks_dir" "$hooks_mount" 0
     writable)   bad "$hooks_dir is writable from here, so a sandboxed command could plant a hook that runs unsandboxed on your next commit — re-run run.sh, which makes it root-owned" ;;
     *)          bad "the hooks-directory check answered something it does not recognise" ;;
 esac
+
+# 3f. GIT TRUSTS THE REPOS BIND, from the image's root-owned system config, and nothing wider
+#     (README, "Git trusts the repos bind"). check-config.sh asks whether the Dockerfile grants it;
+#     this asks whether the running container has it, which a stale image or a hand edit can make
+#     untrue. Three facts, each its own way to lose or widen the grant: the value, who can write
+#     the file, and the one variable that makes git skip the system config altogether.
+#     The caller's repository selection is dropped, as for every git call in these scripts: the
+#     system config names no repository, but the scan in dev-scripts.test.sh asks it of every call
+#     rather than of the ones that look like they need it.
+sd_got="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR \
+    -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    git config --system --get-all safe.directory 2>/dev/null)"
+if [ "$sd_got" = '/home/vscode/repos/*' ]; then
+    ok "git's system config trusts exactly /home/vscode/repos/*"
+else
+    bad "git's system safe.directory is [$(tr '\n' ' ' <<<"$sd_got")], not exactly /home/vscode/repos/* — a container run request fails 'dubious ownership', or git's check is dropped beyond the repos bind"
+fi
+if [ -f /etc/gitconfig ] && [ "$(stat -c '%U' /etc/gitconfig 2>/dev/null)" = root ] && [ ! -w /etc/gitconfig ]; then
+    ok "/etc/gitconfig is root-owned and read-only to $(id -un)"
+else
+    bad "/etc/gitconfig is not root-owned-and-read-only to $(id -un) — the grant of git's trust can be widened from here"
+fi
+if [ -z "${GIT_CONFIG_NOSYSTEM+set}" ]; then
+    ok "GIT_CONFIG_NOSYSTEM is unset, so git reads the system config"
+else
+    bad "GIT_CONFIG_NOSYSTEM is set in the container's environment — git skips /etc/gitconfig, and with it the repos bind's safe.directory grant"
+fi
 
 # 4. ...and these must be present, or the container is merely empty rather than confined.
 # THE MOUNT, asked of the kernel — and asked about THIS checkout rather than about a path.

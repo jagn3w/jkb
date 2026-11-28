@@ -18,6 +18,7 @@
 
 use base64::Engine as _;
 use jkb_core::exec::{self, Ask, ExecRow, ExecState, ExecTarget, Outcome, RefuseReason, TreePin};
+use jkb_core::exec_delivery as delivery;
 use jkb_core::Db;
 use jkb_rbac::Role as _;
 use rusqlite::OptionalExtension as _;
@@ -155,6 +156,42 @@ pub struct ExecView {
     /// Its stored output — on `exec.status` only, once it ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputView>,
+    /// The message reporting its result, as the push and the hook deliver it
+    /// ([`jkb_core::exec::delivery_text`]) — on `exec.status` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_text: Option<String>,
+}
+
+/// A request still pending or running, as `exec.inbox.take` lists it for a session reminded of what
+/// it filed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenRequest {
+    /// `exec-<n>`.
+    pub id: String,
+    /// `pending` or `running`.
+    pub state: String,
+    /// The requesting subagent's type, if a subagent asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// The requester's sentence.
+    pub reason: String,
+}
+
+impl OpenRequest {
+    /// The reminder line: `exec-12 running, filed by implementer: "<reason>"`, escaped.
+    #[must_use]
+    pub fn line(&self) -> String {
+        format!(
+            "{} {}, filed by {}: \"{}\"",
+            self.id,
+            self.state,
+            exec::escape(
+                self.agent_type.as_deref().unwrap_or("the main agent"),
+                false
+            ),
+            exec::escape(&self.reason, false)
+        )
+    }
 }
 
 fn invalid(why: impl Into<String>) -> ApiError {
@@ -246,6 +283,7 @@ pub fn requester(principal: &Principal) -> Result<exec::Requester, ApiError> {
     Ok(exec::Requester {
         session: t.session.clone(),
         agent_type: t.agent_type.clone(),
+        agent_id: t.agent_id.clone(),
         role: role.name().to_owned(),
         task: principal.scope,
     })
@@ -322,6 +360,7 @@ pub fn view(conn: &rusqlite::Connection, row: ExecRow) -> Result<ExecView, ApiEr
         exit_status: row.exit_status,
         outcome: row.outcome.map(|o| o.as_str().to_owned()),
         output: None,
+        delivery_text: None,
     })
 }
 
@@ -347,7 +386,10 @@ pub fn status(
         if reader.as_ref().is_some_and(|s| *s != row.requester.session) {
             return Err(not_found(&wire));
         }
+        let delivery = delivery::get(c, n)?.unwrap_or_default();
+        let text = exec::delivery_text(&row, out.as_ref(), &delivery);
         let mut v = view(c, row)?;
+        v.delivery_text = Some(text);
         v.output = out.map(|o| OutputView {
             tail_b64: base64::engine::general_purpose::STANDARD.encode(&o.tail),
             total_bytes: o.total_bytes,
@@ -416,6 +458,201 @@ pub fn follow(
         }
         Ok(exec::follow(c, n, after, max, now)?)
     })
+}
+
+/// `exec.inbox.take`: hand `session`'s `agent_id` every result due for it, under the hook's lease, and
+/// with `open` list the session's open requests. A plain read first, so the common case — nothing due,
+/// on every tool call of every session — opens no write transaction; the take itself in one
+/// transaction. All of it on `db`, the writer's connection: the hook has a second, and must not wait
+/// behind a long read on the reader.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for a malformed session; a database error.
+pub fn inbox_take(
+    db: &Db,
+    actor: &str,
+    session: &str,
+    agent_id: Option<String>,
+    open: bool,
+    now: i64,
+) -> Result<crate::Response, ApiError> {
+    check_session(session)?;
+    let (s, a) = (session.to_owned(), agent_id.clone());
+    let any = db.read(move |c| delivery::any_for_hook(c, &s, a.as_deref(), now))?;
+    let (lines, ids) = if any {
+        let (s, a) = (session.to_owned(), agent_id);
+        db.write_txn(actor, move |c, m| {
+            let taken = delivery::take_for_hook(c, m, &s, a.as_deref(), now)?;
+            Ok(taken.iter().map(|t| (t.text(), t.row.wire_id())).unzip())
+        })?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let open = if open {
+        let s = session.to_owned();
+        db.read(move |c| delivery::open(c, &s))?
+            .into_iter()
+            .map(|r| OpenRequest {
+                id: r.wire_id(),
+                state: r.state.as_str().to_owned(),
+                agent_type: r.requester.agent_type,
+                reason: r.ask.reason,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(crate::Response::ExecInboxTaken { lines, ids, open })
+}
+
+/// `exec.inbox.ack`: the hook printed the messages of `ids`, which `exec.inbox.take` handed it for
+/// `session`; they are delivered. Returns how many were.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for a malformed session or id; a database error.
+pub fn inbox_ack(
+    db: &Db,
+    actor: &str,
+    session: &str,
+    ids: &[String],
+    now: i64,
+) -> Result<usize, ApiError> {
+    check_session(session)?;
+    let ids = ids.iter().map(|i| id(i)).collect::<Result<Vec<_>, _>>()?;
+    let s = session.to_owned();
+    Ok(db.write_txn(actor, move |c, _| delivery::ack_hook(c, &s, &ids, now))?)
+}
+
+/// Where `exec.inbox.claim` says to post a result: one live `claude` process's inbox socket and its
+/// token. The only answer that carries a token, so its `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InboxTarget {
+    /// The process's `CLAUDE_CODE_MESSAGING_SOCKET`.
+    pub socket: String,
+    /// Its `CLAUDE_CODE_MESSAGING_TOKEN`.
+    pub token: String,
+}
+
+impl std::fmt::Debug for InboxTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboxTarget")
+            .field("socket", &self.socket)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The longest container boot a forwarder names, in bytes: an instance is at most 150.
+const MAX_BOOT_BYTES: usize = 150;
+
+/// Refuse anything but a container boot, `host#boot`: a forwarder posts only to the sockets of its own
+/// container's processes, and a boot is what tells one container's from another's (and from the
+/// host's, whose instance names none).
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for an empty host or boot, a `/` (a pid namespace: the boot is the part
+/// before it), a control character, or more than 150 bytes.
+pub fn check_boot(instance: &str) -> Result<(), ApiError> {
+    let well_formed = instance.len() <= MAX_BOOT_BYTES
+        && !instance.contains('/')
+        && !instance.chars().any(char::is_control)
+        && instance.split_once('#').is_some_and(|(host, boot)| {
+            !host.is_empty() && !boot.is_empty() && !boot.contains('#')
+        });
+    if well_formed {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "{instance:?} is not a container boot (`host#boot`, at most {MAX_BOOT_BYTES} bytes)"
+        )))
+    }
+}
+
+/// `exec.inbox.due`: the requests whose results are due for the sockets of boot `instance`, after
+/// settling expiries — on the writer, as every exec op is.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for a malformed boot; a database error.
+pub fn inbox_due(
+    db: &Db,
+    actor: &str,
+    instance: &str,
+    max: usize,
+    now: i64,
+) -> Result<Vec<String>, ApiError> {
+    check_boot(instance)?;
+    let boot = instance.to_owned();
+    let ids = db.write_txn(actor, move |c, m| delivery::due(c, m, &boot, now, max))?;
+    Ok(ids.into_iter().map(exec::wire_id).collect())
+}
+
+/// `exec.inbox.claim`: claim request `wire` for a post to boot `instance`'s sockets, for `lease_ms`.
+///
+/// # Errors
+/// [`ErrorCode::NotFound`] when it is not due for this boot or another deliverer holds it;
+/// [`ErrorCode::Invalid`] for a malformed id or boot, or a lease out of bounds; a database error.
+pub fn inbox_claim(
+    db: &Db,
+    actor: &str,
+    wire: &str,
+    instance: &str,
+    lease_ms: i64,
+    now: i64,
+) -> Result<crate::Response, ApiError> {
+    check_boot(instance)?;
+    let n = id(wire)?;
+    let boot = instance.to_owned();
+    let claim = db.write_txn(actor, move |c, _| {
+        delivery::claim_for_socket(c, n, &boot, lease_ms, now)
+    })?;
+    let Some(claim) = claim else {
+        return Err(ApiError::with_code(
+            ErrorCode::NotFound,
+            format!(
+                "{wire} is not due for this container's sockets, or another deliverer holds it"
+            ),
+        ));
+    };
+    Ok(crate::Response::ExecInboxClaimed {
+        text: claim.taken.text(),
+        targets: claim
+            .targets
+            .into_iter()
+            .map(|t| InboxTarget {
+                socket: t.inbox.socket().to_owned(),
+                token: t.inbox.token().to_owned(),
+            })
+            .collect(),
+    })
+}
+
+/// `exec.inbox.report`: how the post of claimed request `wire` went. `false` when the claim had lapsed
+/// and another deliverer took the row.
+///
+/// # Errors
+/// [`ErrorCode::Invalid`] for a malformed id; a database error.
+pub fn inbox_report(
+    db: &Db,
+    actor: &str,
+    wire: &str,
+    ok: bool,
+    error: Option<&str>,
+    now: i64,
+) -> Result<bool, ApiError> {
+    let n = id(wire)?;
+    let why = error.unwrap_or("the forwarder gave no reason").to_owned();
+    Ok(db.write_txn(actor, move |c, _| {
+        delivery::report(c, n, if ok { Ok(()) } else { Err(why.as_str()) }, now)
+    })?)
+}
+
+fn check_session(session: &str) -> Result<(), ApiError> {
+    if jkb_types::is_session_id(session) {
+        Ok(())
+    } else {
+        Err(invalid(format!("{session:?} is not a session id")))
+    }
 }
 
 /// Whether an end reported for `session` by `principal` may expire that session's pending run

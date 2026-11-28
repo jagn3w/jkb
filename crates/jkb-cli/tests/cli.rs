@@ -53,6 +53,15 @@ fn jkb_bare() -> Command {
     cmd
 }
 
+/// This crate's directory, read at run time from the `CARGO_MANIFEST_DIR` that `cargo test` sets
+/// rather than baked in by `env!`: the build directory is shared across checkouts, so a baked
+/// path names whichever worktree compiled the binary, and that worktree may since be deleted.
+fn manifest_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo test sets CARGO_MANIFEST_DIR"),
+    )
+}
+
 fn db_path(dir: &TempDir) -> std::path::PathBuf {
     dir.path().join("jkb.db")
 }
@@ -1148,6 +1157,56 @@ fn doctor_fails_on_an_unplanned_task_after_its_whole_report() {
         .assert()
         .success()
         .stdout(predicate::str::contains("unplanned tasks: none"));
+}
+
+/// A sync file needing attention fails `jkb doctor` too, after the whole report, and it passes once
+/// the file is fixed: the exit status gates every finding the report prints as a fault, not only
+/// unplanned tasks.
+#[test]
+fn doctor_fails_on_a_flagged_sync_file_after_its_whole_report() {
+    let dir = TempDir::new().unwrap();
+    let db = db_path(&dir);
+    let proj = dir.path().canonicalize().unwrap().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let file = proj.join("tasks.md");
+    std::fs::write(&file, "## Backend\n- [ ] one ^one\n").unwrap();
+    jkb(&db)
+        .args(["mount", "create", "work", proj.to_str().unwrap()])
+        .args(["--serializer", "tasks"])
+        .assert()
+        .success();
+    map_mount(&db, "work");
+    sync_ok(&db, "work");
+    jkb(&db).args(["doctor"]).assert().success();
+
+    // Two tasks claiming one `^id` quarantines the file: flagged, its last good tasks kept.
+    std::fs::write(&file, "## Backend\n- [ ] one ^dup\n- [ ] two ^dup\n").unwrap();
+    let (ok, out) = sync_run(&db, "work");
+    assert!(!ok && out.contains("1 quarantined"), "{out}");
+
+    let out = jkb(&db).args(["doctor"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for section in [
+        "sync journal: 1 file(s) need attention",
+        "unplanned tasks: none",
+        "task claims:",
+        "vector index:",
+        "db location:",
+    ] {
+        assert!(stdout.contains(section), "{section:?} missing:\n{stdout}");
+    }
+    assert!(stderr.contains("1 sync file(s) need attention"), "{stderr}");
+    assert!(!stderr.contains("unplanned"), "{stderr}");
+
+    std::fs::write(&file, "## Backend\n- [ ] one ^one\n").unwrap();
+    sync_ok(&db, "work");
+    jkb(&db)
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sync journal: ok"));
 }
 
 /// Add a task via the CLI and return its minted uid (`--json` emits `{uid}`).
@@ -5836,6 +5895,108 @@ fn the_attestation_hook_puts_a_ticket_on_a_jkb_command_and_takes_it_back() {
         "hook_event_name": "SubagentStop", "session_id": "sess-1", "agent_id": "ag-7",
     }));
     assert!(!whoami(&sub).status.success(), "released at SubagentStop");
+
+    // A call the harness denied has its ticket parked — dead, though the denial quoted it — until the
+    // same agent retries the same command, which gets it back: the retried line is byte-identical to
+    // the one a /permissions grant names, whether the model retries its own text or the quoted one.
+    let line = |out: &str| -> String {
+        let v: serde_json::Value = serde_json::from_str(out).unwrap_or_else(|_| panic!("{out}"));
+        v["hookSpecificOutput"]["updatedInput"]["command"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let first = pre("t5", Some(("ag-8", "reviewer")), "jkb role whoami");
+    let (denied, denied_line) = (ticket_of(&first), line(&first));
+    hook(serde_json::json!({
+        "hook_event_name": "PermissionDenied", "session_id": "sess-1", "tool_name": "Bash",
+        "agent_id": "ag-8", "agent_type": "reviewer", "tool_use_id": "t5",
+        "tool_input": { "command": denied_line, "description": "d" }, "reason": "classifier",
+    }));
+    assert!(
+        !whoami(&denied).status.success(),
+        "a parked ticket authenticates nothing"
+    );
+    let retry = pre("t6", Some(("ag-8", "reviewer")), &denied_line);
+    assert_eq!(
+        line(&retry),
+        denied_line,
+        "the retry carries the granted text"
+    );
+    assert!(
+        whoami(&denied).status.success(),
+        "live again, for the retry"
+    );
+    hook(serde_json::json!({
+        "hook_event_name": "PermissionDenied", "session_id": "sess-1", "tool_name": "Bash",
+        "agent_id": "ag-8", "agent_type": "reviewer", "tool_use_id": "t6",
+        "tool_input": { "command": denied_line, "description": "d" }, "reason": "classifier",
+    }));
+    let retry = pre("t7", Some(("ag-8", "reviewer")), "jkb role whoami");
+    assert_eq!(line(&retry), denied_line, "the model's own spelling too");
+    hook(serde_json::json!({
+        "hook_event_name": "SubagentStop", "session_id": "sess-1", "agent_id": "ag-8",
+    }));
+
+    // A run request the session filed and stopped waiting for: the operator's answer reaches the
+    // session as context on its next tool call — any tool — once, and never on the one after.
+    let filed = pre("t3", None, "jkb exec request --no-wait");
+    let ticket = filed
+        .split_once("JKB_ATTEST=")
+        .unwrap()
+        .1
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let out = assert_cmd::Command::from_std(jkb_bare())
+        .env("HOME", dir.path())
+        .env("JKB_REMOTE", &url)
+        .env("JKB_ATTEST", &ticket)
+        .env_remove("JKB_DB")
+        .args([
+            "exec",
+            "request",
+            "--no-wait",
+            "--target",
+            "container",
+            "--dir",
+        ])
+        .arg(&work)
+        .args(["--reason", "land it", "--", "make", "land"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!("you will be told when {id} ends")),
+        "{out:?}"
+    );
+    let read = || {
+        hook(serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "sess-1", "tool_use_id": "t4",
+            "tool_name": "Read", "tool_input": { "file_path": "/x" },
+        }))
+    };
+    assert_eq!(read(), "", "nothing has happened to it yet");
+    jkb(&db)
+        .args(["exec", "decline", &id, "--note", "ask for make check"])
+        .assert()
+        .success();
+    let said: serde_json::Value = serde_json::from_str(&read()).unwrap();
+    let context = said["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        context.starts_with(&format!(
+            "[jkb run request] {id} declined: ask for make check: land it"
+        )),
+        "{context}"
+    );
+    assert_eq!(said["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    assert_eq!(read(), "", "delivered once");
 }
 
 /// A quote beginning with `-` (a Markdown list item) is a value, not a flag, in every quote option
@@ -6397,7 +6558,7 @@ fn workflow_agent_copy_set_show_and_export() {
     // Export into a copy of the packaged file: that entry moves to its next version.
     let file = dir.path().join("agents.json");
     std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../jkb-core/src/workflow/agents.json"),
+        manifest_dir().join("../jkb-core/src/workflow/agents.json"),
         &file,
     )
     .unwrap();

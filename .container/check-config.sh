@@ -450,6 +450,56 @@ elif grep -qvE '^(/usr/local/lib/jkb-hook/jkb |/usr/local/bin/deny-transcripts\.
 else
     ok "every managed hook runs one of the two pinned, root-owned programs (jkb, deny-transcripts.sh)"
 fi
+# A RUN REQUEST'S RESULT REACHES THE SESSION THAT FILED IT through the attest hook: its take runs on
+# every tool call's PostToolUse/PostToolUseFailure, whatever the tool (a session that reads and edits
+# for an hour never runs Bash), on UserPromptSubmit (an idle session hears it on the next prompt), and
+# on SessionStart (which also registers the process's inbox, and after a compaction lists what is still
+# open). A matcher narrowed back to Bash, or an entry dropped, silently leaves results unheard.
+rr_hook=/usr/local/lib/jkb-hook/jkb
+rr_bad=""
+for rr_ev in PostToolUse PostToolUseFailure; do
+    rr_m="$(jq -r --arg e "$rr_ev" --arg h "$rr_hook attest hook" '.hooks[$e][]? | select([.hooks[]?.command] | index($h)) | .matcher // ""' "$here/managed-settings.json" 2>/dev/null)"
+    [ "$rr_m" = ".*" ] || rr_bad="$rr_bad $rr_ev(matcher [$rr_m], not [.*])"
+done
+for rr_ev in UserPromptSubmit SessionStart SubagentStop SessionEnd; do
+    jq -e --arg e "$rr_ev" --arg h "$rr_hook attest hook" '[.hooks[$e][]?.hooks[]?.command] | index($h)' "$here/managed-settings.json" >/dev/null 2>&1 \
+        || rr_bad="$rr_bad $rr_ev(no attest hook)"
+done
+if [ -z "$rr_bad" ]; then
+    ok "the attest hook delivers run-request results on every tool call, prompt and start"
+else
+    bad "a run request's result would go unheard — managed-settings.json:$rr_bad"
+fi
+# THE FORWARDER'S PUSH NEEDS `crossSessionInbound: accept`. `jkb exec forward` posts each result into
+# the filing session's inbox socket so an idle session takes a turn; Claude Code holds such a message
+# from a session that bypasses permission prompts unless this lets it in (the binary's strings, and
+# experiment E1 ran with it set). Dropped, the push is held and results wait for the hook path — the
+# session's next event — which is the failure the forwarder exists to remove, and nothing else says so.
+if [ "$(jq -r '.crossSessionInbound // ""' "$here/managed-settings.json" 2>/dev/null)" = accept ]; then
+    ok "the managed settings accept the forwarder's posts to a session's inbox (crossSessionInbound: accept)"
+else
+    bad "managed-settings.json does not set crossSessionInbound to accept — the forwarder's pushes would be held, and an idle session would not hear its result until its next prompt"
+fi
+# ...AND THE FORWARDER IS THE PINNED BINARY. The entrypoint's supervise loop runs `$JKB_HOOK_BIN exec
+# forward` outside the sandbox with the container credential readable, so JKB_HOOK_BIN must name the
+# same root-owned path the managed hooks run — an ENV naming anything the sandbox can write
+# (`~/.cargo/bin/jkb`) would run whatever a tool call last put there, as the credential's holder.
+fw_bin="$(sed -n 's/^ENV JKB_HOOK_BIN=//p' "$here/Dockerfile" 2>/dev/null | head -1)"
+if [ "$fw_bin" = "$rr_hook" ] && grep -qF '"$JKB_HOOK_BIN" exec forward' "$here/entrypoint.sh" 2>/dev/null; then
+    ok "the entrypoint supervises the forwarder as the pinned binary ($rr_hook)"
+else
+    bad "the forwarder is not the pinned binary — the Dockerfile's ENV JKB_HOOK_BIN is [$fw_bin], not $rr_hook, or entrypoint.sh does not run \"\$JKB_HOOK_BIN\" exec forward"
+fi
+# A CLASSIFIER-DENIED jkb LINE'S TICKET IS PARKED, so the operator's grant can match its retry: Claude
+# Code judges the hook's rewritten line, ticket and all, and the grant names that exact text. The
+# PermissionDenied hook parks the ticket (`attest.park`), and the retry's mint hands it back. Without
+# the registration every retry carries a fresh ticket and no grant ever matches.
+pd_m="$(jq -r --arg h "$rr_hook attest hook" '.hooks.PermissionDenied[]? | select([.hooks[]?.command] | index($h)) | .matcher // ""' "$here/managed-settings.json" 2>/dev/null)"
+if [ "$pd_m" = Bash ]; then
+    ok "the attest hook parks a denied Bash call's ticket, so a /permissions grant matches its retry"
+else
+    bad "a denied jkb line's grant can never match its retry — managed-settings.json has no PermissionDenied attest hook on Bash (matcher [$pd_m])"
+fi
 # THE TWO THINGS A DENY RULE OVER THE TRANSCRIPT TREE CAN BREAK, and they pull in OPPOSITE
 # directions. This is one check because treating either alone produces the other's failure.
 #
@@ -2297,6 +2347,31 @@ if [ -f "$here/../ui/vscode/package.json" ]; then
     else
         bad "ui/vscode/package.json no longer yields a publisher.name — verify.sh would silently stop checking that the jkb explorer is installed"
     fi
+fi
+
+# GIT TRUSTS THE REPOS BIND, AND NOTHING WIDER. The image grants `safe.directory` for
+# /home/vscode/repos/* in the root-owned system config, so a `--target container` run request can run
+# git at all (README, "Git trusts the repos bind"). Two ways to get it wrong, both asked: the grant
+# gone (every container exec fails "dubious ownership" again) and the grant widened, to `*` or by a
+# second grant anywhere the container is assembled, which drops git's check on the native paths
+# where it still means something. Comment-stripped, so a commented-out RUN does not pass.
+sd_want="^RUN git config --system --add safe\\.directory '/home/vscode/repos/\\*' && chmod 0644 /etc/gitconfig\$"
+sd_other=""
+for sd_f in Dockerfile container.json run.sh entrypoint.sh; do
+    if [ ! -f "$here/$sd_f" ]; then
+        sd_other="$sd_other $sd_f is missing, so it could not be read;"
+        continue
+    fi
+    sd_text="$(dc_strip_comments "$here/$sd_f")"
+    sd_hits="$(grep -nE 'safe\.directory' <<<"$sd_text" | grep -vE "^[0-9]+:${sd_want#^}" || true)"
+    [ -z "$sd_hits" ] || sd_other="$sd_other $sd_f:$(cut -d: -f1 <<<"$sd_hits" | tr '\n' ',')"
+done
+if ! stripped_matches "$here/Dockerfile" "$sd_want"; then
+    bad "the Dockerfile no longer grants git's safe.directory for exactly /home/vscode/repos/* in the system config — every git command in a container run request fails 'dubious ownership'"
+elif [ -n "$sd_other" ]; then
+    bad "safe.directory is granted somewhere other than the Dockerfile's one system grant for /home/vscode/repos/* —$sd_other — a wider grant drops git's ownership check on paths where it still means something"
+else
+    ok "git trusts exactly /home/vscode/repos/*, from the root-owned system config, and nothing wider"
 fi
 
 # A PRODUCER THAT CAN REFUSE MUST NOT BE READ THROUGH `< <( )`. Bash discards a process

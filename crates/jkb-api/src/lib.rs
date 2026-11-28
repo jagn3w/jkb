@@ -49,6 +49,18 @@ pub mod tasks;
 pub mod timeline;
 pub mod workflows;
 
+/// This crate's directory, read at run time from the `CARGO_MANIFEST_DIR` that `cargo test` sets.
+///
+/// Not the compile-time `env!` form: the build directory is shared across checkouts, so a test
+/// binary compiled in one worktree is reused by another, and a baked path keeps naming the first
+/// one — after that worktree is deleted, every test reading a repo file through it fails `NotFound`.
+#[cfg(test)]
+pub(crate) fn manifest_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo test sets CARGO_MANIFEST_DIR"),
+    )
+}
+
 /// One operation. Serialized with an `"op"` tag, e.g. `{"op":"mq.send","topic":"t",…}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", deny_unknown_fields)]
@@ -203,6 +215,12 @@ pub enum Request {
         /// The session's working directory.
         #[serde(default)]
         cwd: String,
+        /// This process's inbox, from the hook's environment — honoured only from the harness (the
+        /// operator or the container's credential) or the session's own ticket, so no session can
+        /// point another's results at a socket it controls. A start without one keeps the inbox the
+        /// process already registered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inbox: Option<Inbox>,
     },
     /// A Claude Code session ended, as its own process reported: that process's hold ends. The session
     /// stays live while another process holds it.
@@ -564,6 +582,68 @@ pub enum Request {
         after: Option<i64>,
         /// At most this many (at most 256).
         max: usize,
+    },
+    /// Hand the attest hook every run-request result due for one agent of a session
+    /// ([`jkb_core::exec_delivery::take_for_hook`]), so a session hears its result on its next tool
+    /// call, prompt or start: each is held for the hook under a lease, and its message returned. The
+    /// hook acknowledges what it printed with `exec.inbox.ack`; what it never acknowledges is handed
+    /// over again when the lease lapses. The dev container's credential's, and the operator's, alone.
+    #[serde(rename = "exec.inbox.take")]
+    ExecInboxTake {
+        /// The Claude Code session.
+        session: String,
+        /// The subagent the hook event came from; absent for the main agent, which is handed its own
+        /// results and those of subagents that have stopped (or ended their request long enough ago).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// Also list the session's requests still pending or running — what a session reminded after
+        /// a compaction or a resume is told.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        open: bool,
+    },
+    /// The attest hook printed what `exec.inbox.take` handed it: those results are delivered
+    /// ([`jkb_core::exec_delivery::ack_hook`]).
+    #[serde(rename = "exec.inbox.ack")]
+    ExecInboxAck {
+        /// The Claude Code session.
+        session: String,
+        /// The requests whose messages were printed (`exec-<n>`), as `exec.inbox.take` named them.
+        ids: Vec<String>,
+    },
+    /// The run requests whose results are due for the sockets of one dev container's forwarder
+    /// (`jkb exec forward`): ids only — no token, no text ([`jkb_core::exec_delivery::due`]). Settles
+    /// expiries first. The dev container's credential's, and the operator's, alone.
+    #[serde(rename = "exec.inbox.due")]
+    ExecInboxDue {
+        /// The forwarder's container boot, `host#boot` ([`exec::check_boot`]).
+        instance: String,
+        /// At most this many (at most [`jkb_core::exec_delivery::MAX_DUE`]).
+        max: usize,
+    },
+    /// Claim one due result for a socket post, under a lease: its message and the session's inbox
+    /// targets in the forwarder's boot ([`jkb_core::exec_delivery::claim_for_socket`]) — the one op
+    /// that returns an inbox token — or `not_found` when it is not due, or another deliverer holds it.
+    /// The dev container's credential's, and the operator's, alone.
+    #[serde(rename = "exec.inbox.claim")]
+    ExecInboxClaim {
+        /// `exec-<n>`.
+        id: String,
+        /// The forwarder's container boot, `host#boot`.
+        instance: String,
+        /// How long the claim holds (at most [`jkb_core::exec_delivery::MAX_SOCKET_LEASE_MS`]).
+        lease_ms: i64,
+    },
+    /// How a claimed result's socket post went ([`jkb_core::exec_delivery::report`]): delivered, or
+    /// failed with why. The dev container's credential's, and the operator's, alone.
+    #[serde(rename = "exec.inbox.report")]
+    ExecInboxReport {
+        /// `exec-<n>`.
+        id: String,
+        /// Whether a target took the post.
+        ok: bool,
+        /// Why every target failed, when none did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// Start running a pending request — the operator's runner (`jkb_core::exec::begin`).
     ///
@@ -1272,6 +1352,21 @@ pub enum Request {
         agent_type: Option<String>,
         /// The tool call.
         tool_use_id: String,
+        /// The blake3 hex of the command the ticket is for, as the hook normalized it: a ticket
+        /// parked with the same agent and digest is handed back instead of a fresh one
+        /// ([`rbac::Tickets::park`]). An older hook sends none, and is never handed one back.
+        #[serde(default)]
+        command_digest: Option<String>,
+    },
+    /// Park the ticket of a tool call the harness denied: it authenticates nothing until the same
+    /// agent's retry of the same command mints it back ([`rbac::Tickets::park`]). Answered with
+    /// [`Response::TicketsReleased`], counting the tickets parked.
+    #[serde(rename = "attest.park")]
+    AttestPark {
+        /// The session.
+        session: String,
+        /// The denied tool call.
+        tool_use_id: String,
     },
     /// Release tickets: one tool call's, one subagent's, or a whole session's ([`rbac::Tickets::release`]).
     #[serde(rename = "attest.release")]
@@ -1533,6 +1628,27 @@ pub struct NotifySession {
     pub state: String,
 }
 
+/// A `claude` process's inbox, as `session.started` carries it: the socket and token from the hook's
+/// `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Inbox {
+    /// The socket's absolute path.
+    pub socket: String,
+    /// The token that authenticates a post to it.
+    pub token: String,
+}
+
+/// Never the token: a `Debug` of a request lands in logs.
+impl std::fmt::Debug for Inbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inbox")
+            .field("socket", &self.socket)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
 /// One process's hold on a Claude Code session, as `session.list` reports it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaudeSession {
@@ -1558,6 +1674,9 @@ pub struct ClaudeSession {
     /// Why it ended (`gone` when a sweep proved it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<String>,
+    /// Whether this process registered its inbox socket. Never the token, which no listing carries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inbox: bool,
 }
 
 impl From<jkb_core::claude_session::HolderRow> for ClaudeSession {
@@ -1572,6 +1691,7 @@ impl From<jkb_core::claude_session::HolderRow> for ClaudeSession {
             seen_at: r.seen_at,
             ended_at: r.ended_at,
             end_reason: r.end_reason,
+            inbox: r.has_inbox,
         }
     }
 }
@@ -1848,6 +1968,11 @@ impl Request {
         "exec.status",
         "exec.list",
         "exec.follow",
+        "exec.inbox.take",
+        "exec.inbox.ack",
+        "exec.inbox.due",
+        "exec.inbox.claim",
+        "exec.inbox.report",
         "exec.begin",
         "exec.decline",
         "exec.refuse",
@@ -1925,6 +2050,7 @@ impl Request {
         "timeline.plan",
         "design.compact",
         "attest.mint",
+        "attest.park",
         "attest.release",
         "task.claims",
         "task.reclaim",
@@ -2079,6 +2205,7 @@ impl Request {
             Self::DesignRetire { .. } => "design.retire",
             Self::DesignRestore { .. } => "design.restore",
             Self::AttestMint { .. } => "attest.mint",
+            Self::AttestPark { .. } => "attest.park",
             Self::AttestRelease { .. } => "attest.release",
             Self::TaskClaims { .. } => "task.claims",
             Self::TaskReclaim { .. } => "task.reclaim",
@@ -2108,6 +2235,11 @@ impl Request {
             Self::ExecStatus { .. } => "exec.status",
             Self::ExecList { .. } => "exec.list",
             Self::ExecFollow { .. } => "exec.follow",
+            Self::ExecInboxTake { .. } => "exec.inbox.take",
+            Self::ExecInboxAck { .. } => "exec.inbox.ack",
+            Self::ExecInboxDue { .. } => "exec.inbox.due",
+            Self::ExecInboxClaim { .. } => "exec.inbox.claim",
+            Self::ExecInboxReport { .. } => "exec.inbox.report",
             Self::ExecBegin { .. } => "exec.begin",
             Self::ExecDecline { .. } => "exec.decline",
             Self::ExecRefuse { .. } => "exec.refuse",
@@ -2251,8 +2383,9 @@ impl Request {
             | Self::WorkflowDefine { .. }
             | Self::WorkflowAgentCopy { .. }
             | Self::WorkflowAgentSet { .. }
-            // In memory: no database at all, so the writer is as good as anywhere.
+            // In memory, and a subagent's release also marks its run-request results due: the writer.
             | Self::AttestMint { .. }
+            | Self::AttestPark { .. }
             | Self::AttestRelease { .. }
             | Self::TaskReclaim { .. }
             // FTS5's integrity check is an `INSERT`, which the `query_only` reader refuses.
@@ -2289,6 +2422,14 @@ impl Request {
             | Self::ExecRequest(_)
             | Self::ExecStatus { .. }
             | Self::ExecList { .. }
+            // A read first, and a write only when something is due — on the writer, since it may
+            // write, and the hook that sends it must not wait behind a long read.
+            | Self::ExecInboxTake { .. }
+            | Self::ExecInboxAck { .. }
+            // The forwarder's sweep settles expiries; its claim and report write.
+            | Self::ExecInboxDue { .. }
+            | Self::ExecInboxClaim { .. }
+            | Self::ExecInboxReport { .. }
             | Self::ExecBegin { .. }
             | Self::ExecDecline { .. }
             | Self::ExecRefuse { .. }
@@ -2326,6 +2467,7 @@ impl Request {
                     // Reads that expire what came due: twice is the same as once.
                     | Self::ExecStatus { .. }
                     | Self::ExecList { .. }
+                    | Self::ExecInboxDue { .. }
             )
     }
 }
@@ -2599,6 +2741,39 @@ pub enum Response {
         /// Continue after this.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         next: Option<i64>,
+    },
+    /// An `exec.inbox.take`.
+    ExecInboxTaken {
+        /// One message per result handed over, oldest first ([`jkb_core::exec::delivery_text`]).
+        lines: Vec<String>,
+        /// The requests those messages report (`exec-<n>`), in the same order: what the hook
+        /// acknowledges with `exec.inbox.ack` once it has printed them.
+        #[serde(default)]
+        ids: Vec<String>,
+        /// The session's requests still pending or running, when asked for.
+        open: Vec<exec::OpenRequest>,
+    },
+    /// An `exec.inbox.ack`.
+    ExecInboxAcked {
+        /// How many were delivered by it — fewer than asked when a lease had lapsed.
+        count: usize,
+    },
+    /// An `exec.inbox.due`.
+    ExecInboxDue {
+        /// The requests due (`exec-<n>`), oldest first.
+        ids: Vec<String>,
+    },
+    /// An `exec.inbox.claim` this caller won.
+    ExecInboxClaimed {
+        /// The message to post ([`jkb_core::exec::delivery_text`]).
+        text: String,
+        /// Where to post it, newest process first.
+        targets: Vec<exec::InboxTarget>,
+    },
+    /// An `exec.inbox.report`.
+    ExecInboxReported {
+        /// `false` when the claim had lapsed and another deliverer took the row.
+        reported: bool,
     },
     /// An `exec.output`.
     ExecOutputSent {
@@ -2904,9 +3079,9 @@ pub enum Response {
         /// The ticket.
         token: String,
     },
-    /// An `attest.release`.
+    /// An `attest.release`, or an `attest.park`.
     TicketsReleased {
-        /// How many.
+        /// How many were released (or parked).
         count: usize,
     },
     /// A `design.list`.
@@ -3179,6 +3354,11 @@ impl Response {
             | Self::ExecRequest { .. }
             | Self::ExecBegun { .. }
             | Self::ExecRequests { .. }
+            | Self::ExecInboxTaken { .. }
+            | Self::ExecInboxAcked { .. }
+            | Self::ExecInboxDue { .. }
+            | Self::ExecInboxClaimed { .. }
+            | Self::ExecInboxReported { .. }
             | Self::ExecOutputSent { .. } => false,
         }
     }
@@ -3207,6 +3387,13 @@ impl Response {
             | Self::ExecBegun { .. }
             | Self::ExecRequests { .. }
             | Self::ExecOutputSent { .. } => true,
+            // A take that handed something over settled expiries first, which announces them; one that
+            // found nothing — every tool call of every idle session — wrote nothing.
+            Self::ExecInboxTaken { lines, .. } => !lines.is_empty(),
+            // A sweep settled expiries first, which announces each; one that found nothing due — every
+            // idle minute of every forwarder — is not announced, and an expiry it settled that is not
+            // due for its sockets reaches subscribers by the daemon's `data_version` floor.
+            Self::ExecInboxDue { ids } => !ids.is_empty(),
             Self::Notified { sent, .. } => *sent > 0,
             // Every stored design update is announced on `design/<uid>` (D53.4).
             Self::DesignWritten { written } => written.seq.is_some(),
@@ -3214,6 +3401,9 @@ impl Response {
             // A recorded prompt is announced on its design's topic (D53.6), when it wrote.
             Self::DesignPromptRecorded { wrote, .. } => *wrote,
             Self::Created { .. }
+            | Self::ExecInboxAcked { .. }
+            | Self::ExecInboxClaimed { .. }
+            | Self::ExecInboxReported { .. }
             | Self::GroupDeleted { .. }
             | Self::Messages { .. }
             | Self::Position { .. }
@@ -3787,9 +3977,10 @@ impl LocalBackend {
                 } else {
                     Start::FromNow
                 };
-                // The run-request index is reserved; its groups are the operator's alone
-                // (`exec::index_group_create`). Anyone else is refused by `mq`, as for any `exec/`.
-                if exec_index(principal, &topic) {
+                // The run-request index is reserved; its groups are the operator's and the
+                // container forwarders' (`exec_index`). Anyone else is refused by `mq`, as for any
+                // `exec/`.
+                if exec_index(principal, &topic, &group) {
                     return Ok(created(db.write_txn(actor, move |c, m| {
                         jkb_core::exec::index_group_create(c, m, &group, start, now)
                     })?));
@@ -3807,7 +3998,7 @@ impl LocalBackend {
                 // Asked with a read first: an idle subscriber polls several times a second, and a
                 // poll that hands nothing over and has no touch due must not take the write lock.
                 let (t, g) = (topic.clone(), group.clone());
-                let index = exec_index(principal, &topic);
+                let index = exec_index(principal, &topic, &group);
                 let needed = db.read(move |c| {
                     if index {
                         jkb_core::exec::index_poll_needed(c, &g, max, after, now)
@@ -3835,7 +4026,7 @@ impl LocalBackend {
                 }
             }
             Request::MqGroupDelete { topic, group } => {
-                let index = exec_index(principal, &topic);
+                let index = exec_index(principal, &topic, &group);
                 Response::GroupDeleted {
                     deleted: db.write_txn(actor, move |c, m| {
                         if index {
@@ -3847,7 +4038,7 @@ impl LocalBackend {
                 }
             }
             Request::MqAck { topic, group, seq } => {
-                let index = exec_index(principal, &topic);
+                let index = exec_index(principal, &topic, &group);
                 Response::Position {
                     position: db.write_txn(actor, move |c, m| {
                         if index {
@@ -3941,14 +4132,28 @@ impl LocalBackend {
                 pid,
                 instance,
                 cwd,
+                inbox,
             } => {
+                // Honoured only from whoever may vouch for the session; a malformed one is dropped, not
+                // a refused start — a lost start is what leaves a running session recorded as ended.
+                let inbox = inbox
+                    .filter(|_| exec::vouches_for_end(principal, &session))
+                    .and_then(|i| claude_session::Inbox::new(&i.socket, &i.token).ok());
                 let was = db.write_txn(actor, move |c, m| {
                     let process = claude_session::Process {
                         session: &session,
                         pid: &pid,
                         instance: &instance,
                     };
-                    claude_session::started(c, m, &process, &cwd, &source, now)
+                    claude_session::started_with_inbox(
+                        c,
+                        m,
+                        &process,
+                        &cwd,
+                        &source,
+                        inbox.as_ref(),
+                        now,
+                    )
                 })?;
                 Response::SessionStart {
                     was: was.as_str().to_owned(),
@@ -4357,6 +4562,25 @@ impl LocalBackend {
                 )?;
                 Response::ExecRequests { requests, next }
             }
+            Request::ExecInboxTake {
+                session,
+                agent_id,
+                open,
+            } => exec::inbox_take(db, actor, &session, agent_id, open, now)?,
+            Request::ExecInboxAck { session, ids } => Response::ExecInboxAcked {
+                count: exec::inbox_ack(db, actor, &session, &ids, now)?,
+            },
+            Request::ExecInboxDue { instance, max } => Response::ExecInboxDue {
+                ids: exec::inbox_due(db, actor, &instance, max, now)?,
+            },
+            Request::ExecInboxClaim {
+                id,
+                instance,
+                lease_ms,
+            } => exec::inbox_claim(db, actor, &id, &instance, lease_ms, now)?,
+            Request::ExecInboxReport { id, ok, error } => Response::ExecInboxReported {
+                reported: exec::inbox_report(db, actor, &id, ok, error.as_deref(), now)?,
+            },
             Request::ExecFollow { id, after, max } => Response::Messages {
                 messages: exec::follow(db, principal, &id, after.unwrap_or(0), max, now)?
                     .into_iter()
@@ -4959,6 +5183,7 @@ impl LocalBackend {
                 agent_id,
                 tool_use_id,
                 agent_type,
+                command_digest,
             } => {
                 let tickets = self.tickets.as_ref().ok_or_else(|| {
                     ApiError::with_code(
@@ -4974,19 +5199,44 @@ impl LocalBackend {
                         agent_id.as_deref(),
                         agent_type.as_deref(),
                         &tool_use_id,
+                        command_digest.as_deref(),
                     )?,
+                }
+            }
+            Request::AttestPark {
+                session,
+                tool_use_id,
+            } => {
+                let tickets = self.tickets.as_ref().ok_or_else(|| {
+                    ApiError::with_code(
+                        ErrorCode::Unsupported,
+                        "attestation tickets are parked by jkb serve, not an in-process backend",
+                    )
+                })?;
+                Response::TicketsReleased {
+                    count: rbac::park_ticket(tickets, principal, &session, &tool_use_id)?,
                 }
             }
             Request::AttestRelease {
                 session,
                 agent_id,
                 tool_use_id,
-            } => Response::TicketsReleased {
-                count: match &self.tickets {
+            } => {
+                // The tickets first, so a database error below cannot leave a stopped subagent's
+                // tickets live.
+                let count = match &self.tickets {
                     Some(t) => t.release(&session, agent_id.as_deref(), tool_use_id.as_deref())?,
                     None => 0,
-                },
-            },
+                };
+                // A subagent's stop, in the same op: its undelivered run-request results become the
+                // session's to hear, at once.
+                if let (Some(agent), None) = (agent_id, tool_use_id) {
+                    db.write_txn(actor, move |c, _| {
+                        jkb_core::exec_delivery::agent_gone(c, &session, &agent, now)
+                    })?;
+                }
+                Response::TicketsReleased { count }
+            }
             Request::TaskClaims { after } => {
                 let (claims, next) = db.read_with(move |c| claims::claims(c, after))?;
                 Response::Claims { claims, next }
@@ -5236,8 +5486,17 @@ impl LocalBackend {
 /// Whether an `mq` group, poll or ack on `topic` is the operator's on the run-request index
 /// ([`jkb_core::exec::INDEX_TOPIC`]): the one reserved topic a consumer group may be kept on, and
 /// only by the operator. Anyone else's falls through to `mq`, which refuses every `exec/` topic.
-fn exec_index(principal: &rbac::Principal, topic: &str) -> bool {
-    topic == jkb_core::exec::INDEX_TOPIC && principal.is_operator()
+/// Whether a queue op on `topic` for `group` by `principal` is one on the run-request index, served
+/// through `jkb_core::exec`'s index functions: the operator's groups (Code Factory's live queue), and
+/// a dev container forwarder's (`jkb exec forward`), which the container's own credential keeps
+/// under [`jkb_core::exec::INBOX_GROUP_PREFIX`] — the one widening of the rule that `exec/` topics are
+/// read by no queue op. Anyone else, any other group of the credential's, and every other `exec/`
+/// topic fall through to `mq`, which refuses them as reserved.
+fn exec_index(principal: &rbac::Principal, topic: &str, group: &str) -> bool {
+    topic == jkb_core::exec::INDEX_TOPIC
+        && (principal.is_operator()
+            || (matches!(&principal.kind, rbac::PrincipalKind::Grant(g) if g.container)
+                && group.starts_with(jkb_core::exec::INBOX_GROUP_PREFIX)))
 }
 
 #[cfg(test)]

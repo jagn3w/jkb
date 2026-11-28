@@ -90,7 +90,7 @@
             "name": "grant"
           },
           {
-            "describe": "Vouch for which agent made a tool call: the dev container's credential alone.",
+            "describe": "Vouch for which agent made a tool call, and hand a session the results of the run requests it filed, as hook context or posted to its inbox socket: the dev container's credential alone.",
             "name": "attest"
           },
           {
@@ -509,7 +509,7 @@
             "name": "grant"
           },
           {
-            "describe": "Vouch for which agent made a tool call: the dev container's credential alone.",
+            "describe": "Vouch for which agent made a tool call, and hand a session the results of the run requests it filed, as hook context or posted to its inbox socket: the dev container's credential alone.",
             "name": "attest"
           },
           {
@@ -927,7 +927,7 @@
             "name": "grant"
           },
           {
-            "describe": "Vouch for which agent made a tool call: the dev container's credential alone.",
+            "describe": "Vouch for which agent made a tool call, and hand a session the results of the run requests it filed, as hook context or posted to its inbox socket: the dev container's credential alone.",
             "name": "attest"
           },
           {

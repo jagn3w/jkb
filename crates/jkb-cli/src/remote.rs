@@ -44,7 +44,12 @@ pub const fn support(command: &Command) -> Support {
         | Command::Commands { .. }
         | Command::Attest { .. }
         | Command::Exec {
-            cmd: ExecCmd::Pin { .. } | ExecCmd::Base { .. } | ExecCmd::Diff { .. },
+            cmd:
+                ExecCmd::Pin { .. }
+                | ExecCmd::Base { .. }
+                | ExecCmd::Diff { .. }
+                // The container's forwarder builds its own client, with the container credential.
+                | ExecCmd::Forward { .. },
         } => Support::NoDatabase,
         Command::Serve { .. } => {
             Support::Refused("the daemon runs on the host, next to the database")
@@ -364,6 +369,10 @@ pub enum Purpose {
     /// A hook the Claude Code harness runs, outside the sandbox: the container credential if there is
     /// one, else the token file. Never an inherited ticket: a hook is the harness, not a tool call.
     Hook,
+    /// `jkb exec forward`, the dev container's forwarder: outside the sandbox, like a hook, so the
+    /// container credential if there is one, else the token file — never an inherited ticket. Long
+    /// lived, so the ordinary deadlines and no down marker: an outage is waited out, not skipped.
+    Forwarder,
     /// `jkb mcp`: one long-lived process serving every agent of a session, so it must not hold the
     /// container's ceiling on their behalf. Only a role token the operator configured, else the token
     /// file — which exists only on the host.
@@ -394,7 +403,7 @@ pub fn client(
     };
     let chosen = match purpose {
         Purpose::Command => scoped_token().or_else(container),
-        Purpose::Hook => container(),
+        Purpose::Hook | Purpose::Forwarder => container(),
         Purpose::Mcp => scoped_token(),
     };
     let backend = match chosen {
@@ -408,7 +417,7 @@ pub fn client(
         Purpose::Hook => backend
             .with_deadlines(crate::notify::CONNECT, crate::notify::TOTAL)?
             .with_down_marker(down_marker(url)),
-        Purpose::Command | Purpose::Mcp => backend,
+        Purpose::Command | Purpose::Mcp | Purpose::Forwarder => backend,
     })
 }
 
@@ -503,6 +512,9 @@ pub fn run(cli: Cli, remote: &str) -> Result<()> {
                 super::rbac_cli::attest(&cmd);
                 Ok(())
             }
+            Command::Exec {
+                cmd: ExecCmd::Forward { once },
+            } => super::exec_cli::forward::run_cli(once),
             Command::Exec { cmd } => match super::exec_cli::no_database(&cmd, cli.json) {
                 Some(done) => done,
                 None => bail!("internal: a NoDatabase exec command with no remote dispatch"),

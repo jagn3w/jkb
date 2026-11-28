@@ -1776,6 +1776,15 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    // The dev container's forwarder, likewise: it talks only to `jkb serve`, with the container's
+    // credential, and runs outside the sandbox from the entrypoint's supervise loop.
+    if let Command::Exec {
+        cmd: exec_cli::ExecCmd::Forward { once },
+    } = &cli.command
+    {
+        return exec_cli::forward::run_cli(*once);
+    }
+
     // The generated-docs drift check (D55.6, amended): it reads only the checkout's `docs/`, so it
     // runs ahead of remote mode and opens no database — `scripts/check.sh` and CI run it, and a gate
     // must not migrate, depend on or be refused by whatever store the machine holds. Not even
@@ -5176,6 +5185,18 @@ fn truncate(s: &str, n: usize) -> String {
     format!("{head}…")
 }
 
+/// This crate's directory, read at run time from the `CARGO_MANIFEST_DIR` that `cargo test` sets.
+///
+/// Not the compile-time `env!` form: the build directory is shared across checkouts, so a test
+/// binary compiled in one worktree is reused by another, and a baked path keeps naming the first
+/// one — after that worktree is deleted, every test reading a repo file through it fails `NotFound`.
+#[cfg(test)]
+pub(crate) fn manifest_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo test sets CARGO_MANIFEST_DIR"),
+    )
+}
+
 /// An in-memory database that knows repo `t` — its `repos/t` namespace exists, as a mount of it would
 /// make — for the tests that add tasks homed in `t`.
 #[cfg(test)]
@@ -5397,10 +5418,8 @@ mod tests {
             .collect();
         assert!(verbs.contains(&"why") && verbs.contains(&"pr"), "{verbs:?}");
 
-        let agents = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.md"),
-        )
-        .expect("AGENTS.md sits at the repo root");
+        let agents = std::fs::read_to_string(crate::manifest_dir().join("../../AGENTS.md"))
+            .expect("AGENTS.md sits at the repo root");
         // Matched **anywhere on the line**, not at its start. Anchoring it to the start read
         // every one of `GUIDE`'s bare command lines and none of AGENTS.md's, where the same
         // commands are markdown bullets (`- ` + a backtick) — so half this guard was inert, and
@@ -5451,10 +5470,8 @@ mod tests {
     /// adding a status fails here rather than shipping a verb an agent never learns about.
     #[test]
     fn both_status_enumerations_name_every_status_the_cli_accepts() {
-        let agents = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../AGENTS.md"),
-        )
-        .expect("AGENTS.md sits at the repo root");
+        let agents = std::fs::read_to_string(crate::manifest_dir().join("../../AGENTS.md"))
+            .expect("AGENTS.md sits at the repo root");
         for (surface, text) in [("jkb guide", GUIDE), ("AGENTS.md", agents.as_str())] {
             // Anchored on the verb, not on `--status`: `jkb find --status S` is a different line
             // in both files and matching it first would make this test pass against nothing.

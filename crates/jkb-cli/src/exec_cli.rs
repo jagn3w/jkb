@@ -68,7 +68,9 @@ pub enum ExecCmd {
         /// One sentence for the operator: why the session needs this.
         #[arg(long, default_value = "")]
         reason: String,
-        /// Print the request id and return at once; read the outcome with `jkb exec status`.
+        /// Print the request id and return at once. The session is told the result when it ends (a
+        /// message, or context on its next tool call); `jkb exec status --wait <id>` re-attaches in the
+        /// foreground.
         #[arg(long)]
         no_wait: bool,
         /// The program and its arguments, after `--`.
@@ -79,6 +81,12 @@ pub enum ExecCmd {
     Status {
         /// `exec-<n>`.
         id: String,
+        /// Re-attach: follow the request to its end, as `jkb exec request` does — its output to
+        /// stdout, and the result message last — and exit with its status. It does not mark the
+        /// result delivered. Held to the ordinary per-call ticket and its 10-minute backstop: for a
+        /// longer wait, the message the session is sent when the request ends is the mechanism.
+        #[arg(long)]
+        wait: bool,
     },
     /// Decline a pending request, with a note saying what to ask for instead (the operator's).
     Decline {
@@ -93,6 +101,16 @@ pub enum ExecCmd {
         /// Only requests in this state (`pending`, `running`, `finished`, …).
         #[arg(long)]
         state: Option<String>,
+    },
+    /// Push each run request's result into the inbox socket of the session that filed it: the dev
+    /// container's forwarder, which its entrypoint starts and supervises as the pinned
+    /// `$JKB_HOOK_BIN exec forward`, outside the agent's sandbox and with the container credential.
+    /// Runs until a re-pin replaces its binary. Not for a tool call: the sandbox can read neither the
+    /// credential nor another session's socket.
+    Forward {
+        /// One sweep — post what is due now — and exit.
+        #[arg(long)]
+        once: bool,
     },
     /// The tree pin of the repository containing a directory — what a request would record — and the
     /// `.gitignore` files it applied. Opens no database.
@@ -262,6 +280,7 @@ pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
                 } else {
                     println!("{}{}", view.id, if folded { " (folded)" } else { "" });
                 }
+                eprintln!("jkb exec: you will be told when {} ends", view.id);
                 return Ok(());
             }
             eprintln!(
@@ -294,7 +313,16 @@ pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
             }
             Ok(())
         }
-        ExecCmd::Status { id } => {
+        ExecCmd::Status { id, wait: true } => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let code = status_wait(backend, &id, json, &mut stdout.lock(), &mut stderr.lock())?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        ExecCmd::Status { id, wait: false } => {
             let view = expect_view(call(backend, Request::ExecStatus { id })?)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&view)?);
@@ -302,6 +330,11 @@ pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
                 print_view(&view, &mut std::io::stdout().lock())?;
             }
             Ok(())
+        }
+        // Dispatched before any database or daemon client is made (`forward::run_cli`): it builds
+        // its own, with the container credential.
+        ExecCmd::Forward { .. } => {
+            bail!("internal: jkb exec forward reached the ordinary dispatch")
         }
         ExecCmd::Decline { id, note } => {
             let view = expect_view(call(backend, Request::ExecDecline { id, note })?)?;
@@ -357,6 +390,46 @@ pub fn run(backend: &dyn Backend, cmd: ExecCmd, json: bool) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `jkb exec status <id> --wait`: re-attach to request `id` — pending, running or ended — and follow
+/// it to its end through [`wait`], which starts at the beginning of its topic and so prints whatever
+/// output was streamed, or the tail of a request already ended. Ends with the result message the push
+/// and the hook deliver ([`jkb_core::exec::delivery_text`], read back from `exec.status`), on `err`; with
+/// `json`, prints only the final view, on `out`. Returns the exit status [`exit_code`] gives.
+///
+/// # Errors
+/// A refused read, or the waiter's deadline.
+pub fn status_wait(
+    backend: &dyn Backend,
+    id: &str,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<i32> {
+    let view = expect_view(call(backend, Request::ExecStatus { id: id.to_owned() })?)?;
+    let mut sink = std::io::sink();
+    let followed: &mut dyn Write = if json { &mut sink } else { &mut *out };
+    let code =
+        wait(backend, &view, followed, err, Duration::from_millis(500)).with_context(|| {
+            format!(
+                "stopped waiting for {id}; it is still recorded — read its outcome with `jkb exec \
+             status {id}`",
+                id = view.id
+            )
+        })?;
+    let last = expect_view(call(
+        backend,
+        Request::ExecStatus {
+            id: view.id.clone(),
+        },
+    )?)?;
+    if json {
+        writeln!(out, "{}", serde_json::to_string_pretty(&last)?)?;
+    } else if let Some(text) = &last.delivery_text {
+        writeln!(err, "\n{text}")?;
+    }
+    Ok(code)
 }
 
 /// Why `jkb exec pin` could not pin a directory, when the cause is identified, for a runner that
@@ -665,27 +738,7 @@ pub fn diff(
 /// and a tab (C0, DEL, C1), and every bidi or invisible formatting character, as `\u{…}`, so file
 /// content cannot move the cursor, erase lines or reorder what the operator reads.
 fn escape_for_terminal(text: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        let invisible = matches!(
-            c,
-            '\u{00ad}'
-                | '\u{061c}'
-                | '\u{180e}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{feff}'
-        );
-        if (c.is_control() && c != '\n' && c != '\t') || invisible {
-            let _ = write!(out, "\\u{{{:04x}}}", u32::from(c));
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    jkb_core::exec::escape(text, true)
 }
 
 /// A request, for a person: every argument on its own line, escaped.
@@ -1032,6 +1085,8 @@ fn finish(view: &ExecView, s: &Follow, out: &mut dyn Write, err: &mut dyn Write)
     }
     Ok(code)
 }
+
+pub mod forward;
 
 #[cfg(test)]
 mod tests;

@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use jkb_api::{ApiError, Backend, HookEvent, Request, Response};
+use jkb_api::{ApiError, Backend, HookEvent, Inbox, Request, Response};
 use jkb_fsm::Fact;
 
 use crate::NotifyCmd;
@@ -163,8 +163,11 @@ fn session_line(s: &jkb_api::ClaudeSession) -> String {
     };
     let pid = if s.pid.is_empty() { "?" } else { &s.pid };
     format!(
-        "{}  {how}  pid {pid} on {}  {}",
-        s.session, s.instance, s.cwd
+        "{}  {how}  pid {pid} on {}  inbox {}  {}",
+        s.session,
+        s.instance,
+        if s.inbox { "yes" } else { "no" },
+        s.cwd
     )
 }
 
@@ -200,7 +203,7 @@ struct Ask {
 ///
 /// A payload that names no session sends nothing addressed to one, but `SessionStart` still sweeps:
 /// the sweep is about other sessions.
-fn ask(raw: &str, owner: &str, instance: &str) -> Result<Ask> {
+fn ask(raw: &str, owner: &str, instance: &str, inbox: Option<&Inbox>) -> Result<Ask> {
     let payload: serde_json::Value =
         serde_json::from_str(raw).context("the hook payload is not JSON")?;
     let field = |k: &str| {
@@ -235,13 +238,12 @@ fn ask(raw: &str, owner: &str, instance: &str) -> Result<Ask> {
         return Ok(out);
     }
     match event {
-        None => out.requests.push(Request::SessionStarted {
-            session: session.clone(),
-            source: word("source"),
-            pid: owner.to_owned(),
-            instance: instance.to_owned(),
-            cwd: field("cwd"),
-        }),
+        None => out.requests.extend(session_start_request(
+            &payload,
+            owner,
+            instance,
+            inbox.cloned(),
+        )),
         Some(event) => {
             out.requests.push(Request::NotifyEvent {
                 session: session.clone(),
@@ -265,6 +267,51 @@ fn ask(raw: &str, owner: &str, instance: &str) -> Result<Ask> {
     Ok(out)
 }
 
+/// The variables Claude Code exports to every hook, `SessionStart` included, naming this process's
+/// inbox socket and its token.
+pub const INBOX_SOCKET_VAR: &str = "CLAUDE_CODE_MESSAGING_SOCKET";
+/// See [`INBOX_SOCKET_VAR`].
+pub const INBOX_TOKEN_VAR: &str = "CLAUDE_CODE_MESSAGING_TOKEN";
+
+/// This process's inbox, from the hook's environment: both variables, or none.
+#[must_use]
+pub fn inbox_from_env() -> Option<Inbox> {
+    let socket = std::env::var(INBOX_SOCKET_VAR).ok()?;
+    let token = std::env::var(INBOX_TOKEN_VAR).ok()?;
+    (!socket.is_empty() && !token.is_empty()).then_some(Inbox { socket, token })
+}
+
+/// The `session.started` a `SessionStart` payload asks for — the ONE builder, which both
+/// `jkb notify hook` (the project's notification shim) and the managed `jkb attest hook` call, so a
+/// session in a repository whose settings run no notification hook still registers its process and
+/// its inbox. `None` when the payload names no session. The upsert is idempotent and keeps an inbox a
+/// start without one would otherwise leave out, so two callers are safe.
+#[must_use]
+pub fn session_start_request(
+    payload: &serde_json::Value,
+    owner: &str,
+    instance: &str,
+    inbox: Option<Inbox>,
+) -> Option<Request> {
+    let field = |k: &str| payload.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let session = jkb_core::notify::sanitize(field("session_id"));
+    if session.is_empty() {
+        return None;
+    }
+    let source = match field("source") {
+        "" => "unknown",
+        s => s,
+    };
+    Some(Request::SessionStarted {
+        session,
+        source: source.to_owned(),
+        pid: owner.to_owned(),
+        instance: instance.to_owned(),
+        cwd: field("cwd").to_owned(),
+        inbox,
+    })
+}
+
 /// The process whose existence answers "is this session still alive?".
 ///
 /// Refuses anything it cannot tell apart from this invocation's own short-lived ancestry, and
@@ -276,7 +323,7 @@ fn ask(raw: &str, owner: &str, instance: &str) -> Result<Ask> {
 /// `claude` process itself. **`jkb` cannot ask for it**: its own parent is the shim, a bash script
 /// that exits milliseconds later, so recording that made every record read as *provably dead* and
 /// the next session's sweep withdrew a live session's pending prompt.
-fn owner_id() -> String {
+pub(crate) fn owner_id() -> String {
     owner_from(
         std::env::var("JKB_HOOK_OWNER").unwrap_or_default().trim(),
         std::os::unix::process::parent_id(),
@@ -287,7 +334,7 @@ fn owner_id() -> String {
 /// The owner to send from `instance`: none when there is no instance. A pid means nothing without the
 /// instance it belongs to, and the daemon refuses the pair, so the hook names no process rather than
 /// losing the notification.
-fn owner_in(instance: &str, owner: impl FnOnce() -> String) -> String {
+pub(crate) fn owner_in(instance: &str, owner: impl FnOnce() -> String) -> String {
     if instance.is_empty() {
         String::new()
     } else {
@@ -296,7 +343,7 @@ fn owner_in(instance: &str, owner: impl FnOnce() -> String) -> String {
 }
 
 /// The decision itself, with the two pids it must reject handed in, so it can be tested.
-fn owner_from(raw: &str, parent: u32, me: u32) -> String {
+pub(crate) fn owner_from(raw: &str, parent: u32, me: u32) -> String {
     let Ok(pid) = raw.parse::<u32>() else {
         return String::new();
     };
@@ -328,7 +375,7 @@ fn owner_from(raw: &str, parent: u32, me: u32) -> String {
 /// instance, probed their pids in a namespace where they do not exist, and withdrawn every live
 /// prompt in the container. With it, two instances are equal only when a pid means the same process
 /// in both. (Found by the stage-5 review.)
-fn instance() -> String {
+pub(crate) fn instance() -> String {
     let boot = std::env::var_os("JKB_NS_MARKER").and_then(|p| std::fs::read_to_string(p).ok());
     let pidns = std::fs::read_link("/proc/self/ns/pid")
         .ok()
@@ -428,6 +475,8 @@ struct Edge<'a> {
     backend: &'a dyn Backend,
     owner: String,
     instance: String,
+    /// This process's inbox, from the environment.
+    inbox: Option<Inbox>,
     probe: &'a dyn Fn(u32) -> Fact,
 }
 
@@ -435,7 +484,7 @@ struct Edge<'a> {
 /// return reaches anyone but the session it would disturb.
 fn handle(raw: &str, edge: &Edge<'_>) -> Vec<String> {
     let started = edge.began;
-    let ask = match ask(raw, &edge.owner, &edge.instance) {
+    let ask = match ask(raw, &edge.owner, &edge.instance, edge.inbox.as_ref()) {
         Ok(ask) => ask,
         Err(e) => return vec![format!("{e:#}")],
     };
@@ -593,6 +642,7 @@ fn hook() {
             backend: &backend,
             owner,
             instance,
+            inbox: inbox_from_env(),
             probe: &crate::owner::pid_alive,
         },
     );

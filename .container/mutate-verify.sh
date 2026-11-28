@@ -708,6 +708,17 @@ mutant jkb-dev-blanket-sudo "printf 'vscode ALL=(root) NOPASSWD:ALL\\n' > /etc/s
 run "blanket passwordless root is restored" "may run more than the firewall" \
     "${HEALTHY[@]}"
 
+# GIT'S TRUST IN THE REPOS BIND: widened, made agent-writable, and switched off by the one variable
+# that makes git skip the system config.
+mutant jkb-dev-safe-directory-wide "git config --system --replace-all safe.directory '*'"
+run "git's system safe.directory is widened to *" "not exactly /home/vscode/repos/*" \
+    "${HEALTHY[@]}"
+mutant jkb-dev-gitconfig-writable "chmod 0666 /etc/gitconfig"
+run "/etc/gitconfig is writable by the agent" "/etc/gitconfig is not root-owned-and-read-only" \
+    "${HEALTHY[@]}"
+run "GIT_CONFIG_NOSYSTEM is set in the container" "GIT_CONFIG_NOSYSTEM is set" \
+    "${HEALTHY[@]}" -e GIT_CONFIG_NOSYSTEM=1
+
 # A PID 1 THAT NEVER wait()s. Replacing the image's reaper with an init that runs the command and
 # observes its exit through waitid(WNOWAIT) -- which leaves that child, and every orphan this
 # process adopts, a zombie -- removes exactly the property the handover exists to supply, and

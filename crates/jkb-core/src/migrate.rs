@@ -1236,4 +1236,71 @@ mod edges_namespaces_autoincrement_tests {
             .unwrap();
         assert_eq!(edges, [(3, 1), (3, 2), (4, 1), (4, 2)]);
     }
+
+    /// V035 counts every request that ended before it as delivered (`backfill`), so an upgrade does
+    /// not flood sessions with old results — but one still pending or running is `waiting`, so its
+    /// session hears it end. An ended output counts as streamed whole, so its message does not claim
+    /// the output reached jkb only in part; a running one's does, because its earlier chunks were never
+    /// scanned.
+    #[test]
+    fn v035_backfills_ended_requests_as_delivered_and_waits_for_the_rest() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        embedded::migrations::runner()
+            .set_target(Target::Version(34))
+            .run(&mut conn)
+            .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "INSERT INTO exec_requests (id, created_at, expires_at, session, role, target, dir,
+                 dir_side, argv, reason, timeout_ms, state, ended_at, note, runner, started_at,
+                 outcome, exit_status)
+             VALUES (1, 10, 20, 's', 'implementer', 'host', '/w', 'host', '[\"a\"]', '', 1000,
+                     'finished', 15, NULL, 'app', 12, 'exited', 0),
+                    (2, 11, 21, 's', 'implementer', 'host', '/w', 'host', '[\"b\"]', '', 1000,
+                     'pending', NULL, NULL, NULL, NULL, NULL, NULL),
+                    (3, 11, 21, 's', 'implementer', 'host', '/w', 'host', '[\"c\"]', '', 1000,
+                     'running', NULL, NULL, 'app', 12, NULL, NULL);
+             INSERT INTO exec_output (request_id, total_bytes, chunks) VALUES (1, 500, 3), (3, 0, 2);",
+        )
+        .unwrap();
+
+        super::run(&mut conn).expect("V035 applied");
+
+        let rows: Vec<(i64, String, Option<String>, Option<i64>)> = conn
+            .prepare(
+                "SELECT request_id, state, via, delivered_at FROM exec_delivery ORDER BY request_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (
+                    1,
+                    "delivered".to_owned(),
+                    Some("backfill".to_owned()),
+                    Some(15)
+                ),
+                (2, "waiting".to_owned(), None, None),
+                (3, "waiting".to_owned(), None, None),
+            ]
+        );
+        let outputs: Vec<(i64, String, i64)> = conn
+            .prepare(
+                "SELECT request_id, warnings, streamed_bytes FROM exec_output ORDER BY request_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            outputs,
+            [(1, "[]".to_owned(), 500), (3, "[]".to_owned(), 0)]
+        );
+    }
 }

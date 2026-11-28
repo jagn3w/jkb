@@ -203,7 +203,7 @@ fn the_packaged_templates_are_what_the_coordinators_fill() {
         assert_eq!(get(c).def.role, Role::Coordinator, "{c}");
     }
     // `/task-swarm` fills the swarm's coordinator, the designer budget included.
-    assert_eq!(get("swarm-coordinator").version, 7);
+    assert_eq!(get("swarm-coordinator").version, 8);
     assert_eq!(
         placeholders(&get("swarm-coordinator").def.template).unwrap(),
         [
@@ -883,11 +883,9 @@ fn the_scope_rule_carves_out_exactly_the_findings_the_coordinator_closes() {
 /// is a flag passed to the template, and nothing parks a task by tag any more.
 #[test]
 fn the_slash_command_reads_the_frontier_by_phase_with_a_designer_budget() {
-    let md = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.claude/commands/task-swarm.md"),
-    )
-    .unwrap();
+    let md =
+        std::fs::read_to_string(crate::manifest_dir().join("../../.claude/commands/task-swarm.md"))
+            .unwrap();
     assert!(
         !md.contains("<GATE>"),
         "a frontier query still gates on the tag"
@@ -973,7 +971,7 @@ fn logical_lines(text: &str) -> Vec<String> {
 /// `FOLLOW-UP` lines instead, and their coordinators file them.
 #[test]
 fn every_filing_instruction_names_a_step() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = crate::manifest_dir().join("../..");
     let read = |rel: &str| {
         std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
     };
@@ -1860,10 +1858,8 @@ fn a_subagent_template_cannot_be_copied() {
 /// would attest as the wrong one. Read from the script, so the two cannot drift.
 #[test]
 fn setup_maps_every_subagent_type_to_its_templates_role() {
-    let setup = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/setup.sh"),
-    )
-    .unwrap();
+    let setup =
+        std::fs::read_to_string(crate::manifest_dir().join("../../scripts/setup.sh")).unwrap();
     let defs = packaged().unwrap();
     let subagents: Vec<_> = defs
         .iter()
@@ -1910,4 +1906,19 @@ fn setup_maps_every_subagent_type_to_its_templates_role() {
             "scripts/setup.sh does not clear the bare `{bare}` (cleared: {cleared:?})"
         );
     }
+}
+
+/// The swarm's coordinator relays a run request's `warning:` lines in its report: the result reaches
+/// the session as a message, and only the report reaches the operator.
+#[test]
+fn the_swarm_coordinator_relays_run_request_warnings() {
+    let agents = packaged().unwrap();
+    let coord = &agents
+        .iter()
+        .find(|a| a.name == "swarm-coordinator")
+        .unwrap()
+        .def
+        .template;
+    assert!(coord.contains("[jkb run request] exec-N"), "{coord}");
+    assert!(coord.contains("`WARNINGS:` (or `WARNINGS: none`)"));
 }

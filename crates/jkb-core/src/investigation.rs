@@ -238,11 +238,11 @@ pub fn add(conn: &Connection, meta: &WriteMeta, unit: &NewUnit) -> Result<ItemId
     }
     for (edge_type, target_uid, weight) in &unit.edges {
         let target = resolve_uid(conn, target_uid)?;
-        edge::link_weighted(conn, meta, id, target, *edge_type, *weight, None)?;
+        link_resolved(conn, meta, id, *edge_type, target, *weight)?;
     }
     for (edge_type, source_uid, weight) in &unit.reverse_edges {
         let source = resolve_uid(conn, source_uid)?;
-        edge::link_weighted(conn, meta, source, id, *edge_type, *weight, None)?;
+        link_resolved(conn, meta, source, *edge_type, id, *weight)?;
     }
     Ok(id)
 }
@@ -863,9 +863,14 @@ pub fn write_digest(
 /// anti-progress edge (`equivalent_in_strength_to`) which is a *judgement about* two
 /// existing statements rather than a new unit.
 ///
+/// Every other edge type stays advisory (a strategy's `edge_types()` is not enforced), but two
+/// are refused here: `found_in` (see [`refuse_review_edge`]) and a task-to-task `depends_on` or
+/// `parent_of` (see [`refuse_task_edge`]).
+///
 /// # Errors
-/// Returns a validation error if either uid is unknown or the edge would create a
-/// `depends_on` cycle; otherwise a database error.
+/// Returns a validation error if either uid is unknown, the edge is `found_in`, the edge is a
+/// `depends_on` or `parent_of` between two tasks, or it would create a `depends_on` cycle;
+/// otherwise a database error.
 pub fn link(
     conn: &Connection,
     meta: &WriteMeta,
@@ -877,7 +882,51 @@ pub fn link(
     refuse_review_edge(edge_type)?;
     let src = resolve_uid(conn, src_uid)?;
     let dst = resolve_uid(conn, dst_uid)?;
+    link_resolved(conn, meta, src, edge_type, dst, weight)
+}
+
+/// The one place an investigation writes an edge, for [`link`] and [`add`]: refuse a task-to-task
+/// edge a task command owns, then link.
+fn link_resolved(
+    conn: &Connection,
+    meta: &WriteMeta,
+    src: ItemId,
+    edge_type: EdgeType,
+    dst: ItemId,
+    weight: Option<f64>,
+) -> Result<()> {
+    refuse_task_edge(conn, src, edge_type, dst)?;
     edge::link_weighted(conn, meta, src, dst, edge_type, weight, None)?;
+    Ok(())
+}
+
+/// Refuse a `depends_on` or `parent_of` edge when **both** ends are tasks: between tasks those
+/// edges are the dependency DAG and the subtask tree, and their own commands enforce what an
+/// investigation link would bypass (`jkb task depend` checks the dependency; `jkb task move
+/// --under` / `task add --under` go through `task::add_subtask`, which keeps a plan or span from
+/// being a parent and a synced parent's children in its file). An edge with a non-task end stays
+/// advisory, as every other type does.
+fn refuse_task_edge(
+    conn: &Connection,
+    src: ItemId,
+    edge_type: EdgeType,
+    dst: ItemId,
+) -> Result<()> {
+    let owner = match edge_type {
+        EdgeType::DependsOn => "`jkb task depend <task> <dependency>`",
+        EdgeType::ParentOf => {
+            "`jkb task move <child> --under <parent>` (or `jkb task add … --under <parent>` for a new subtask)"
+        }
+        _ => return Ok(()),
+    };
+    let is_task =
+        |id| -> Result<bool> { Ok(item::get(conn, id)?.is_some_and(|m| m.kind == KIND_TASK)) };
+    if is_task(src)? && is_task(dst)? {
+        return Err(Error::Types(TypeError::Validation(format!(
+            "a `{}` edge between two tasks is written with {owner}, which enforces the task rules an investigation link would bypass",
+            edge_type.as_str()
+        ))));
+    }
     Ok(())
 }
 

@@ -426,8 +426,7 @@ fn graph_fixture_matches_presets() {
         })
         .unwrap();
     let answered = Value::Object(answered);
-    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../ui/app/test/fixtures/workflow-graphs.json");
+    let file = crate::manifest_dir().join("../../ui/app/test/fixtures/workflow-graphs.json");
     if std::env::var_os(WRITE_FIXTURE).is_some() {
         let text = serde_json::to_string_pretty(&answered).unwrap() + "\n";
         std::fs::write(&file, text).unwrap();
@@ -739,10 +738,8 @@ fn route(task: &Seen, read: Read, gate: Gate) -> Path {
 /// Every `role map <type> <role>` line of `scripts/setup.sh`, as `(type, role)`: the agent types
 /// an installed jkb attests, and the roles they attest as.
 fn setup_role_maps() -> Vec<(String, String)> {
-    let setup = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/setup.sh"),
-    )
-    .unwrap();
+    let setup =
+        std::fs::read_to_string(crate::manifest_dir().join("../../scripts/setup.sh")).unwrap();
     let maps: Vec<(String, String)> = setup
         .lines()
         .filter(|l| !l.trim_start().starts_with('#'))
@@ -2204,8 +2201,7 @@ fn roles_fixture_matches_presets() {
         })
         .unwrap();
     let answered = Value::Object(answered);
-    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../ui/app/test/fixtures/workflow-roles.json");
+    let file = crate::manifest_dir().join("../../ui/app/test/fixtures/workflow-roles.json");
     if std::env::var_os(WRITE_FIXTURE).is_some() {
         let text = serde_json::to_string_pretty(&answered).unwrap() + "\n";
         std::fs::write(&file, text).unwrap();

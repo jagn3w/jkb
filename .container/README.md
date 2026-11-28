@@ -501,6 +501,16 @@ an esbuild platform error and nothing pointing at the container. One shared muta
 two writers with incompatible requirements; the copy removes the sharing rather than adding a rule
 both sides have to remember.
 
+Reading that directory is a different matter, and is allowed. `ui/pnpm-workspace.yaml` sets
+`supportedArchitectures` so a host install links Linux's esbuild beside the host's own, on the host's
+CPU (the container runs on it), and the container can then run the `ui/` tests that bundle with
+esbuild against the host's `node_modules` without writing to it. Before that, a macOS install left
+only `@esbuild/darwin-arm64` there and every such test failed in the container. It does not make the
+directory writable from both sides — node-pty compiles in place and Electron downloads one
+platform's binary — so builds still copy `ui/` out. Measured with pnpm 11.17 from the Linux side
+(`os: [current, darwin]` linked both `@esbuild/linux-arm64` and `@esbuild/darwin-arm64` under every
+esbuild version, and `app/test/plan.test.mjs` passed; with the Linux package unlinked it failed).
+
 It is **fatal** on failure, like the `jkb` install, and for the same reason: the binary and the
 panel are the two things that make this a jkb container rather than a generic one. `verify.sh`
 appends its id to the declared list and asserts it like any other; `check-config.sh` pins the
@@ -878,6 +888,63 @@ tool call last installed there. `setup.sh` pins its build with `sudo -n /usr/loc
 refuses a managed hook naming anything else, and `verify.sh` that the pinned binary is missing or
 writable. The residual: it pins whatever `~/.cargo/bin/jkb` is when it runs.
 
+**The attestation hook also hands a session the results of the run requests it filed.** A session
+that ran `jkb exec request --no-wait` is told how the request ended as hook context
+(`additionalContext`), on its next event: `PostToolUse`/`PostToolUseFailure` for *every* tool (the
+managed matcher is `.*`, not `Bash` — a session that only reads and edits for an hour must still hear
+it), `UserPromptSubmit` (an idle session hears it on the operator's next prompt), and `SessionStart`
+(which also registers the process's inbox socket, and after a compaction or a resume lists the
+requests still open). The take is two-phase: the hook is handed the messages under a 30-second lease
+(`exec.inbox.take`), prints them, and only then acknowledges them (`exec.inbox.ack`), so a reply lost
+after the daemon committed it, or a hook killed before it printed, is handed over again rather than
+lost. `SessionStart` registers the process only when the hook's parent is not a shell, since a row
+with no pid would keep the session from ever reading as ended. `check-config.sh` and `verify.sh` pin
+the matchers and entries, and `mutate-config.sh` carries the narrowed-matcher mutation.
+
+**The run-request forwarder pushes each result into the session's inbox socket.** So an idle
+session takes a turn when its request ends, instead of hearing it on the operator's next prompt,
+`entrypoint.sh` starts a supervise loop just before handing over to the reaper (after the egress
+gate and the namespace marker, so a refusing boot starts nothing): `while :; do [ -x
+"$JKB_HOOK_BIN" ] && "$JKB_HOOK_BIN" exec forward; sleep 10; done`, all of its output in
+`~/.jkb/logs/exec-forward.log`. `JKB_HOOK_BIN` is the Dockerfile's `ENV`, spelled once and held by
+`check-config.sh` to the pinned `/usr/local/lib/jkb-hook/jkb` the managed hooks run, because the
+forwarder runs outside the sandbox with the container credential readable — the same trust, for the
+same reason. The `-x` test covers the first boot, before `setup.sh` pins the binary; a missing
+`JKB_HOOK_BIN` does not refuse the boot (the hook path above delivers everything the push would) but
+says so on stderr.
+
+The forwarder (`crates/jkb-cli/src/exec_cli/forward.rs`) keeps the consumer group `inbox/<hostname>`
+on the run-request index `exec/requests` — the only group there the container's credential may keep;
+every other `exec/` topic and group stays refused. On start, after each burst of hints naming a
+terminal state, and once a minute, it sweeps: `exec.inbox.due` for its container boot (`host#boot`;
+a result is due only while its session has a live process with an inbox in this boot, so another
+container's results, and a session with no inbox, are left `waiting` for the hook), then per id
+`exec.inbox.claim` (the message and the targets, newest process first, under a 30-second lease — the
+only op that returns an inbox token, and the container credential's and operator's alone), a post,
+and `exec.inbox.report`. A post is one connection: the auth line, then the body
+`{"type":"user","message":{"role":"user","content":<text>}}`, each newline-terminated, and close.
+That body is experiment E1's (Claude Code 2.1.317, 2026-11-25: routed to the session's queue and
+answered within ~2 s; `{"type":"message",…}` and `{"text":…}` are dropped; the socket writes nothing
+back), pinned byte for byte by a unit test under `jkb_core::exec::INBOX_BODY_VERSION`. It is
+single-instance by a `flock` beside the namespace marker (`/run/jkb/exec-forward.lock`: neither
+`$XDG_RUNTIME_DIR` nor `/run/user/<uid>` exists in this container, and `/run/jkb` is not writable
+from the sandbox), and once a minute it compares `/proc/self/exe` with `$JKB_HOOK_BIN`, exiting 0
+when `pin-jkb-hook.sh`'s `mv -f` replaced it, so a re-pin takes effect within about a minute.
+`"crossSessionInbound": "accept"` is in the managed settings for it: Claude Code holds a
+cross-session message for a session that bypasses permission prompts unless it is accepted.
+`check-config.sh` pins both (with their `mutate-config.sh` mutations), and `verify.sh` checks that
+exactly one forwarder runs under PID 1 once the binary is pinned.
+
+**What the forwarder cannot see, and what is not measured yet.** The socket replies with nothing, so
+a message Claude Code accepts and then holds (a repository's own `crossSessionInbound: "hold"`, or
+the hold case below) is reported delivered and is not handed to the hook again. Not yet measured
+live: the hold case (a permission-bypassing session with and without the managed `accept`); E2
+(socket and token across `/clear`, `/compact`, `--resume`, a container restart); E3 (whose socket a
+subagent's and a `CLAUDE_CODE_CHILD_SESSION` session's post reaches); E4 (both variables in a
+`SessionStart` hook's environment); E5 (whose context a subagent's hook output reaches); E6
+(`PostToolUse` with matcher `.*` for `Read`, `Edit` and `Agent`); and that the auth line followed by
+E1's body is accepted (E1's passing run sent the body alone).
+
 **Not yet measured, because it needs this image running:** that managed hooks run beside the
 project's and user's (they are not exclusive unless `allowManagedHooksOnly`, which is not set
 because it would disable this repo's own hooks); that the managed deny rules merge with the
@@ -1106,6 +1173,83 @@ that touches those paths. The host has always had the same exposure: it runs the
 the same checkout. What this change adds is that the path is now reachable from inside the
 container too. The mitigation is the one that already applies on the host: review what an agent
 changed before you pull over it.
+
+## Git trusts the repos bind
+
+**The defect.** A `--target container` run request, which is a `docker exec` outside the agent's
+sandbox, failed every git command with `detected dubious ownership` (exec-98, 2026-11-25). The merge
+queue could not run as a container exec at all, and exec-97 stalled at "cannot switch to base" with
+git's message swallowed by `merge-queue.sh` (which now prints it). Inside the sandbox git never
+complained, because the sandbox passes its own `safe.directory` grants on git's command line
+(`GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n`, scope `command line`), and a `docker exec` gets none of them.
+exec-99 succeeded once `safe.directory` was set to `/home/vscode/repos/jkb` and
+`/home/vscode/repos/jkb/*`, which also shows the `/*` form matches a linked worktree under the repo
+on git 2.51.1.
+
+**The fix is one line in the image.** The Dockerfile, in its root section, runs
+`git config --system --add safe.directory '/home/vscode/repos/*'` and makes `/etc/gitconfig` 0644,
+root-owned. Every way into the container gets it: run requests, `run.sh`'s own `docker exec`s, VS Code
+terminals and a hand-run `docker exec`. Nothing in a session can widen it. The agent-writable
+`~/.gitconfig` and `~/.config/git` are untouched, and git's `safe.directory` is multi-valued, so a
+grant VS Code adds there does not conflict. A container built before this line needs the env
+workaround exec-99 used until it is rebuilt.
+
+**What was measured, and what was not.**
+
+- Inside the agent's sandbox (git 2.51.1, uid 1000): `stat -c %u:%g` gives `1000:1000` for the repo,
+  its `.git`, `.swarm/integration-main` and `.git/worktrees/integration-main/*`; `/proc/self/uid_map`
+  is `1000 1000 1`; with the sandbox's grants removed (`env -u GIT_CONFIG_COUNT git status`) git
+  does not complain in the repo or in the integration worktree; `/etc/gitconfig` does not exist.
+- Outside the sandbox, as a container run request (exec-107, 2026-11-25): the same container
+  (hostname `5fb2a9349912`, so exec-98 did not reach a different one), `uid=1000(vscode)`,
+  `/proc/self/uid_map` `0 0 4294967295`, the repo, its `.git`, `.swarm/integration-main` and
+  `.git/worktrees/integration-main` all `1000:1000 755`, no `/etc/gitconfig`, and `git rev-parse`
+  worked in both the repo and the worktree **with no `safe.directory` at all**.
+- So the mismatch exec-98 hit is **intermittent**, not a constant uid mismatch between the two
+  contexts. Its cause is **not measured**. Docker Desktop's virtiofs presenting ownership
+  differently from moment to moment is the likely one. The grant does not depend on which it is,
+  because the mismatch belongs to the mount and not to a real second user.
+
+**Why granting it costs nothing git meant to protect.** The ownership check (CVE-2022-24765) exists
+because a repository's own config (`core.fsmonitor`, `core.hooksPath`, filters) runs code, and
+someone else's planted repository must not run as you. It never defended against the same uid. In
+this container there is no second user under `/home/vscode/repos`: the one bind is the operator's
+own `~/repos`, and its owner reads wrong only because of the mount. The part of a repository's
+config that matters is protected another way: each repository's `.git/config` and `.git/hooks` are
+read-only binds from the host (the section above), and `extensions.worktreeConfig` is not set in
+jkb's config, so `.git/worktrees/*/config.worktree` is not read. `git_audit` judges only a
+repository's own scopes, so a `system` key needs no change there.
+
+**The scope is the bind, not `*`.** Volumes, `/tmp` and `~/.cargo` keep git's check, because their
+ownership is native and the check means something there. A per-repo list was rejected: the mount is
+all of `~/repos`, so the list would be the wildcard spelled longer, it would have to be rewritten at
+every start by a new root path, and a repository cloned on the host would fail until a restart.
+
+**Rejected.**
+
+- *The exec wrapper in Code Factory* (`-e GIT_CONFIG_COUNT=…` in `terminals.ts`). Every other caller
+  would have to remember it, it gives the app container policy when apps are clients, and the env
+  channel replaces, rather than adds to, any `GIT_CONFIG_COUNT` the program sets.
+- *`safe.directory=*`*: it drops the check on native paths too, for no gain.
+- *Fixing ownership* (chown, `updateRemoteUserUID`): host files on a macOS virtiofs bind cannot be
+  meaningfully re-owned from inside, and remapping does not apply on macOS.
+- *A run-time write by `run.sh` or the entrypoint through sudo*: a new root-writable path to protect
+  a value that never changes.
+
+**The exposure, stated rather than hidden.** The refusal *incidentally* stopped unsandboxed git in a
+container run request from reading agent-writable git state: a linked worktree's `.git` gitfile, or
+a repository an agent creates under `~/repos`. A container run can read the container credential the
+sandbox denies. This is the exposure a Linux host with a native bind already has, and it belongs to
+the run-request design, which audits only host runs, not to ownership. Anything that sets
+`GIT_CONFIG_NOSYSTEM=1` loses the grant: `gitrepo.rs`'s reap scan does, and runs on the host, where
+ownership is native.
+
+**Pinned.** `check-config.sh` requires the Dockerfile's grant to be exactly
+`/home/vscode/repos/*` and refuses any other `safe.directory` in the Dockerfile, `container.json`,
+`run.sh` or `entrypoint.sh`; `mutate-config.sh` deletes, widens, comments out and duplicates it.
+`verify.sh` asserts, in the running container, that the system value is exactly that, that
+`/etc/gitconfig` is root-owned and not writable by `vscode`, and that `GIT_CONFIG_NOSYSTEM` is unset;
+`mutate-verify.sh` breaks each.
 
 ## Sibling-repo toolchains: Ruby and PostgreSQL
 

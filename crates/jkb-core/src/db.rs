@@ -140,8 +140,10 @@ mod tests {
         // applications unreusable ids; V030 records each vector's provenance (content_rev,
         // chunked_rev, vector_sources); V031 run requests (exec_requests, exec_output); V032 a
         // strategy definition's description (workflow_strategies.describe); V033 tags every review
-        // finding `finding=review`; V034 links each recorded finding `found_in` its task.
-        assert_eq!(user_version, 34);
+        // finding `finding=review`; V034 links each recorded finding `found_in` its task; V035
+        // a run request's delivery state (exec_delivery), its output's warning lines and each
+        // session process's inbox; V036 indexes the changelog by row for undo's later-writer check.
+        assert_eq!(user_version, 36);
 
         // V008 typed the reserved system namespaces it found (design D33.4). `tasks` is
         // not seeded by a migration, so only the `_sys` markers are typed here.
@@ -224,7 +226,7 @@ mod tests {
                 }
             }
         }
-        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let crates = crate::manifest_dir().join("..");
         let mut files = Vec::new();
         walk(&crates, &mut files);
         assert!(
@@ -233,7 +235,7 @@ mod tests {
             files.len()
         );
 
-        let this = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db.rs");
+        let this = crate::manifest_dir().join("src/db.rs");
         let this = std::fs::canonicalize(this).unwrap();
 
         // db.rs is exempt from the scan below only because its one file open is guarded — so that
@@ -309,8 +311,10 @@ mod tests {
         // applications unreusable ids; V030 records each vector's provenance (content_rev,
         // chunked_rev, vector_sources); V031 run requests (exec_requests, exec_output); V032 a
         // strategy definition's description (workflow_strategies.describe); V033 tags every review
-        // finding `finding=review`; V034 links each recorded finding `found_in` its task.
-        assert_eq!(user_version, 34);
+        // finding `finding=review`; V034 links each recorded finding `found_in` its task; V035
+        // a run request's delivery state (exec_delivery), its output's warning lines and each
+        // session process's inbox; V036 indexes the changelog by row for undo's later-writer check.
+        assert_eq!(user_version, 36);
         assert_eq!(
             crate::supported_schema_version(),
             user_version,

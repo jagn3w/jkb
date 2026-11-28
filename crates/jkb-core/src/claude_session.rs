@@ -78,6 +78,9 @@ pub struct HolderRow {
     pub ended_at: Option<i64>,
     /// Why (`prompt_input_exit`, `clear`, `resume`, `other`, …, or [`GONE`]).
     pub end_reason: Option<String>,
+    /// Whether this process registered its inbox socket. Never the token: that leaves the database
+    /// only through [`inbox_targets`].
+    pub has_inbox: bool,
 }
 
 impl HolderRow {
@@ -181,8 +184,8 @@ fn cwd(c: &str) -> String {
         .collect()
 }
 
-const COLUMNS: &str =
-    "session, pid, instance, cwd, started_at, start_source, seen_at, ended_at, end_reason";
+const COLUMNS: &str = "session, pid, instance, cwd, started_at, start_source, seen_at, ended_at, \
+                       end_reason, inbox_socket IS NOT NULL";
 
 fn row_to_holder(r: &rusqlite::Row<'_>) -> rusqlite::Result<HolderRow> {
     Ok(HolderRow {
@@ -195,6 +198,7 @@ fn row_to_holder(r: &rusqlite::Row<'_>) -> rusqlite::Result<HolderRow> {
         seen_at: r.get(6)?,
         ended_at: r.get(7)?,
         end_reason: r.get(8)?,
+        has_inbox: r.get(9)?,
     })
 }
 
@@ -247,6 +251,69 @@ fn holder(conn: &Connection, p: &Process<'_>) -> Result<Option<HolderRow>> {
         .optional()?)
 }
 
+/// The longest inbox socket path or token kept, in bytes.
+pub const MAX_INBOX_BYTES: usize = 512;
+
+/// A `claude` process's inbox: the socket its `CLAUDE_CODE_MESSAGING_SOCKET` names, and the token
+/// its `CLAUDE_CODE_MESSAGING_TOKEN` holds. Built only through [`Inbox::new`], which validates both.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Inbox {
+    socket: String,
+    token: String,
+}
+
+/// Never the token: a `Debug` of a target or an error lands in logs.
+impl std::fmt::Debug for Inbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inbox")
+            .field("socket", &self.socket)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Inbox {
+    /// An inbox, if both halves are well-formed: the socket an absolute path of at most
+    /// [`MAX_INBOX_BYTES`] with no control character, the token 1 to [`MAX_INBOX_BYTES`] printable
+    /// ASCII characters.
+    ///
+    /// # Errors
+    /// A validation error naming the half that is malformed — never its value, which is a secret.
+    pub fn new(socket: &str, token: &str) -> Result<Self> {
+        let bad = |why: &str| -> crate::Error { jkb_types::Error::Validation(why.into()).into() };
+        if !socket.starts_with('/')
+            || socket.len() > MAX_INBOX_BYTES
+            || socket.chars().any(char::is_control)
+        {
+            return Err(bad(
+                "an inbox socket is an absolute path of at most 512 bytes, with no control character",
+            ));
+        }
+        if token.is_empty()
+            || token.len() > MAX_INBOX_BYTES
+            || !token.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(bad("an inbox token is 1 to 512 printable ASCII characters"));
+        }
+        Ok(Self {
+            socket: socket.to_owned(),
+            token: token.to_owned(),
+        })
+    }
+
+    /// The socket's path.
+    #[must_use]
+    pub fn socket(&self) -> &str {
+        &self.socket
+    }
+
+    /// The token.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
 /// `p` started its session (or resumed it, cleared into it, compacted): its row is live. Its rows for
 /// other sessions are left alone (the module doc says why). Also prunes sessions not seen for
 /// [`PRUNE_AFTER_MS`]. Returns the session's state **before** — a revival is
@@ -257,10 +324,29 @@ fn holder(conn: &Connection, p: &Process<'_>) -> Result<Option<HolderRow>> {
 /// A validation error for a malformed session, pid or instance; or a database error.
 pub fn started(
     conn: &Connection,
+    meta: &WriteMeta,
+    p: &Process<'_>,
+    dir: &str,
+    source: &str,
+    now: i64,
+) -> Result<SessionState> {
+    started_with_inbox(conn, meta, p, dir, source, None, now)
+}
+
+/// [`started`], recording `inbox` as this process's. A start that carries none keeps the inbox the row
+/// already has — a second `session.started` from the same process, sent by a hook whose `jkb`
+/// predates inboxes, never erases one. Who may set an inbox is the caller's to decide (`jkb-api` honours
+/// one only from the harness or the session itself).
+///
+/// # Errors
+/// As [`started`].
+pub fn started_with_inbox(
+    conn: &Connection,
     _meta: &WriteMeta,
     p: &Process<'_>,
     dir: &str,
     source: &str,
+    inbox: Option<&Inbox>,
     now: i64,
 ) -> Result<SessionState> {
     p.check()?;
@@ -273,11 +359,14 @@ pub fn started(
     let before = state(conn, p.session)?;
     conn.prepare_cached(
         "INSERT INTO claude_sessions \
-             (session, pid, instance, cwd, started_at, start_source, seen_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5) \
+             (session, pid, instance, cwd, started_at, start_source, seen_at, inbox_socket, \
+              inbox_token) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, ?7, ?8) \
          ON CONFLICT(session, pid, instance) DO UPDATE SET cwd = excluded.cwd, \
              started_at = excluded.started_at, start_source = excluded.start_source, \
-             seen_at = excluded.seen_at, ended_at = NULL, end_reason = NULL",
+             seen_at = excluded.seen_at, ended_at = NULL, end_reason = NULL, \
+             inbox_socket = coalesce(excluded.inbox_socket, claude_sessions.inbox_socket), \
+             inbox_token = coalesce(excluded.inbox_token, claude_sessions.inbox_token)",
     )?
     .execute(params![
         p.session,
@@ -285,7 +374,9 @@ pub fn started(
         p.instance,
         cwd(dir),
         now,
-        word(source)
+        word(source),
+        inbox.map(Inbox::socket),
+        inbox.map(Inbox::token),
     ])?;
     Ok(before)
 }
@@ -365,6 +456,47 @@ pub fn gone(conn: &Connection, _meta: &WriteMeta, p: &Process<'_>, now: i64) -> 
         )?
         .execute(params![now, GONE, p.session, p.pid, p.instance])?;
     Ok(changed > 0)
+}
+
+/// Where a session's results can be posted: one live process's inbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// The process's pid, as recorded.
+    pub pid: String,
+    /// Its instance.
+    pub instance: String,
+    /// Its inbox.
+    pub inbox: Inbox,
+}
+
+/// The live processes of `session` with an inbox whose instance is of `host_boot` (`host#boot`, an
+/// instance's part before its `/pidns`), newest start first. A rebuilt container's rows never match:
+/// its boot differs. The only reader of a token.
+///
+/// # Errors
+/// A database error, or a stored inbox that no longer validates.
+pub fn inbox_targets(conn: &Connection, session: &str, host_boot: &str) -> Result<Vec<Target>> {
+    let rows: Vec<(String, String, String, String)> = conn
+        .prepare_cached(
+            "SELECT pid, instance, inbox_socket, inbox_token FROM claude_sessions \
+             WHERE session = ?1 AND ended_at IS NULL \
+               AND inbox_socket IS NOT NULL AND inbox_token IS NOT NULL \
+               AND (instance = ?2 OR substr(instance, 1, length(?2) + 1) = ?2 || '/') \
+             ORDER BY started_at IS NULL, started_at DESC, pid, instance",
+        )?
+        .query_map(params![session, host_boot], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    rows.into_iter()
+        .map(|(pid, instance, socket, token)| {
+            Ok(Target {
+                pid,
+                instance,
+                inbox: Inbox::new(&socket, &token)?,
+            })
+        })
+        .collect()
 }
 
 /// Where a [`list`] page ended: the last row it returned, in the listing's order.

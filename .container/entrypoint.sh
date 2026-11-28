@@ -102,10 +102,28 @@ STUB
     ln -sfn 'pid:[4026531836]' "$t/ns/pid"
     ln -sfn 'mnt:[4026532999]' "$t/ns/mnt"
 
+    # THE FORWARDER STUB stands in for `$JKB_HOOK_BIN exec forward`: it records its arguments, prints
+    # a line (which must land in the forwarder's log, not on the entrypoint's stdout), and then ends
+    # the supervise loop that started it by killing its parent -- the loop is `while :`, and a test
+    # that left one behind per boot would leak a process per row.
+    mkdir -p "$t/home"
+    cat >"$t/bin/forward" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"$JKB_FWD_RECORD"
+echo FORWARDER-OUTPUT
+kill "$PPID"
+STUB
+    chmod +x "$t/bin/forward"
+    export JKB_FWD_RECORD="$t/forwarded"
+    # Waits up to 5s for the backgrounded loop to run the stub once.
+    forwarded() { i=0; while [ ! -s "$t/forwarded" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+                  cat "$t/forwarded" 2>/dev/null; }
+
     run_ep() { # run_ep [accept]
         rm -f "$t/verdict"
         JKB_EGRESS_VERDICT="$t/verdict" JKB_EGRESS_ACCEPT_UNFILTERED="${1:-0}" \
             JKB_REAPER="$t/bin/reaper" JKB_NS_MARKER="$t/nsmarker" JKB_NS_DIR="$t/ns" \
+            JKB_HOOK_BIN="$t/bin/forward" HOME="$t/home" \
             PATH="$t/bin:$PATH" bash "$0" echo BECAME-THE-COMMAND 2>"$t/err"
     }
     export JKB_EGRESS_VERDICT="$t/verdict"
@@ -124,6 +142,20 @@ STUB
     # boot that reached the handover.
     eq "...and records both namespace ids for verify.sh" \
        "$(tr '\n' ' ' <"$t/nsmarker" 2>/dev/null)" "pid=pid:[4026531836] mnt=mnt:[4026532999] "
+    # THE RUN-REQUEST FORWARDER is started by a boot that reaches its handover, as the pinned binary's
+    # `exec forward`, with its output in its own log rather than on the command's stdout.
+    eq "...and starts the forwarder's supervise loop: \$JKB_HOOK_BIN exec forward" \
+       "$(forwarded)" "exec forward"
+    eq "...whose output goes to ~/.jkb/logs/exec-forward.log" \
+       "$(grep -c FORWARDER-OUTPUT "$t/home/.jkb/logs/exec-forward.log" 2>/dev/null)" "1"
+    rm -f "$t/forwarded"
+    # Without JKB_HOOK_BIN the boot still hands over -- the forwarder is a convenience the hook path
+    # backs up, not a boundary -- and says why no forwarder runs.
+    eq "a boot without JKB_HOOK_BIN still execs the command" \
+       "$(rm -f "$t/verdict"; JKB_EGRESS_VERDICT="$t/verdict" JKB_REAPER="$t/bin/reaper" \
+            JKB_NS_MARKER="$t/nsmarker" JKB_NS_DIR="$t/ns" HOME="$t/home" PATH="$t/bin:$PATH" \
+            env -u JKB_HOOK_BIN bash "$0" echo BECAME-THE-COMMAND 2>"$t/err")" "BECAME-THE-COMMAND"
+    eq "...and says no forwarder runs"              "$(grep -c 'no run-request forwarder' "$t/err")" "1"
 
     # DELETE-FIRST, WHICH IS THE HALF THAT CANNOT BE INFERRED FROM A HAPPY PATH. A marker in the
     # container's writable layer outlives `docker stop`, and namespace ids are REUSED once a
@@ -132,9 +164,13 @@ STUB
     # ABSENCE. `unfiltered` is such a boot: it refuses long before the write.
     printf 'pid=pid:[1] mnt=mnt:[1]\n' > "$t/nsmarker"
     stub unfiltered "IPv6 is unfiltered"
+    rm -f "$t/forwarded"
     run_ep >/dev/null 2>&1
     eq "a boot that REFUSES leaves no stale marker behind" \
        "$([ -e "$t/nsmarker" ] && echo present || echo absent)" "absent"
+    # ...and starts no forwarder: it is started after the egress gate, beside the handover.
+    sleep 1
+    eq "...and starts no forwarder"                 "$(cat "$t/forwarded" 2>/dev/null)" ""
     stub allowlisted "allowlist raised"
 
     # A blanket deny is SAFE but not working: no allowlist, so nothing but DNS and loopback. Staying
@@ -315,6 +351,38 @@ esac
 ns_pair "${JKB_NS_DIR:-/proc/self/ns}"
 if [ -n "$NS_PID" ] && [ -n "$NS_MNT" ]; then
     printf 'pid=%s\nmnt=%s\n' "$NS_PID" "$NS_MNT" > "$JKB_NS_MARKER" || true
+fi
+
+# THE RUN-REQUEST FORWARDER, started here so it becomes the reaper's child and is reaped. It pushes each
+# run request's result into the Claude Code inbox socket of the session that filed it
+# (`jkb exec forward`, crates/jkb-cli/src/exec_cli/forward.rs; README.md, "The run-request forwarder").
+# It must run OUTSIDE the agent's sandbox, which cannot read the container credential it authenticates
+# with, and it must be the pinned root-owned binary the managed hooks run, which no tool call can
+# replace -- JKB_HOOK_BIN, the Dockerfile's ENV, held to that path by check-config.sh.
+#
+# A SUPERVISE LOOP, NOT A SERVICE: there is no init system here, and the forwarder exits on its own when
+# a re-pin replaces its binary (it compares /proc/self/exe with $JKB_HOOK_BIN once a minute), so the
+# loop is what makes a re-pin of the hook binary take effect without restarting anything. (The
+# pinning script is not named here: check-config.sh counts a script naming it as one of its callers.)
+# The `-x` test covers the first boot, before setup.sh has pinned the binary. A second loop -- a second
+# boot of the same container never runs one, but a hand-started forwarder might -- is refused by the
+# forwarder's own lock beside the namespace marker.
+#
+# AFTER THE EGRESS GATE AND THE MARKER, deliberately: a boot that refuses must start nothing, and the
+# forwarder reads the marker for its container boot. Its whole output -- the loop's included -- goes to
+# its log, never to this process's stdout, which is the command's.
+#
+# NOT A BOUNDARY, so its absence does not refuse the boot: every result it would push is also handed to
+# the session by the attest hook on its next event.
+if [ -n "${JKB_HOOK_BIN:-}" ]; then
+    mkdir -p "$HOME/.jkb/logs" 2>/dev/null || true
+    ( while :; do
+        [ -x "$JKB_HOOK_BIN" ] && "$JKB_HOOK_BIN" exec forward
+        sleep 10
+      done ) </dev/null >>"$HOME/.jkb/logs/exec-forward.log" 2>&1 &
+else
+    printf 'entrypoint: JKB_HOOK_BIN is not set, so no run-request forwarder runs; results reach\n' >&2
+    printf 'entrypoint: their sessions on the sessions'"'"' next events only (see the Dockerfile).\n' >&2
 fi
 
 exec "${JKB_REAPER:?the image must set JKB_REAPER (see the Dockerfile) — refusing to become PID 1 without a reaper}" -- "$@"

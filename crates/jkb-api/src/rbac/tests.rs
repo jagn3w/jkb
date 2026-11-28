@@ -1631,3 +1631,376 @@ fn an_unbound_subagent_binds_to_a_task_and_nothing_else() {
         );
     }
 }
+
+// -------------------------------------------------------------------------------------------
+// Parked tickets: a denied call's ticket waits for its retry
+// -------------------------------------------------------------------------------------------
+
+const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const DIGEST_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// A ticket as `mint_ticket` builds one, minted at `at`.
+fn ticket(
+    session: &str,
+    agent: Option<&str>,
+    agent_type: Option<&str>,
+    tool: &str,
+    digest: Option<&str>,
+    at: std::time::Instant,
+) -> super::Ticket {
+    super::Ticket {
+        session: session.to_owned(),
+        agent_id: agent.map(str::to_owned),
+        agent_type: agent_type.map(str::to_owned),
+        tool_use_id: tool.to_owned(),
+        minted_by: 1,
+        command_digest: digest.map(str::to_owned),
+        minted_at: at,
+    }
+}
+
+fn mins(n: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(60 * n)
+}
+
+/// The hook's view, over the op: a container credential, and mint/park through it.
+struct Hook {
+    kb: Kb,
+    hook: LocalBackend,
+}
+
+impl Hook {
+    fn new() -> Self {
+        let kb = Kb::new();
+        ok(
+            &kb.op,
+            json!({ "op": "role.map", "agent_type": "reviewer", "role": "reviewer" }),
+        );
+        let container = match ok(&kb.op, json!({ "op": "role.rotate_container" })) {
+            Response::Granted { token, .. } => token,
+            other => panic!("{other:?}"),
+        };
+        let hook = kb.as_token(&container);
+        Self { kb, hook }
+    }
+
+    fn mint(
+        &self,
+        agent: Option<&str>,
+        agent_type: Option<&str>,
+        tool: &str,
+        digest: &str,
+    ) -> String {
+        self.mint_in("s1", agent, agent_type, tool, digest)
+    }
+
+    fn mint_in(
+        &self,
+        session: &str,
+        agent: Option<&str>,
+        agent_type: Option<&str>,
+        tool: &str,
+        digest: &str,
+    ) -> String {
+        match ok(
+            &self.hook,
+            json!({ "op": "attest.mint", "session": session, "agent_id": agent,
+                    "agent_type": agent_type, "tool_use_id": tool, "command_digest": digest }),
+        ) {
+            Response::Ticket { token } => token,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn park(&self, tool: &str) -> usize {
+        match ok(
+            &self.hook,
+            json!({ "op": "attest.park", "session": "s1", "tool_use_id": tool }),
+        ) {
+            Response::TicketsReleased { count } => count,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn authenticates(&self, token: &str) -> bool {
+        call(&self.kb.as_token(token), json!({ "op": "kb.ls" })).is_ok()
+    }
+}
+
+#[test]
+fn a_parked_ticket_authenticates_nothing_and_unlocks_no_subagent() {
+    let h = Hook::new();
+    let t = h.mint(Some("ag1"), Some("reviewer"), "tool-1", DIGEST_A);
+    assert!(h.authenticates(&t));
+    assert_eq!(h.park("tool-1"), 1);
+    assert_eq!(h.kb.tickets.get(&t).unwrap(), None);
+    assert!(!h.kb.tickets.contains(&t));
+    assert!(h.kb.tickets.agent_lock(&t).unwrap().is_none());
+    let e = call(&h.kb.as_token(&t), json!({ "op": "kb.ls" })).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Unauthorized, "{e:?}");
+    // Parking a call with no live ticket parks nothing.
+    assert_eq!(h.park("tool-1"), 0);
+    assert_eq!(h.park("never-minted"), 0);
+}
+
+#[test]
+fn the_retry_of_a_denied_call_gets_its_parked_ticket_back() {
+    let h = Hook::new();
+    let t = h.mint(Some("ag1"), Some("reviewer"), "tool-1", DIGEST_A);
+    h.park("tool-1");
+    let again = h.mint(Some("ag1"), Some("reviewer"), "tool-2", DIGEST_A);
+    assert_eq!(
+        again, t,
+        "the same token, so the retried line is the granted text"
+    );
+    assert!(h.authenticates(&again));
+    assert_eq!(h.kb.tickets.get(&t).unwrap().unwrap().tool_use_id, "tool-2");
+    // Rebound to the new call: released by ITS id, not the denied one's.
+    match ok(
+        &h.hook,
+        json!({ "op": "attest.release", "session": "s1", "tool_use_id": "tool-1" }),
+    ) {
+        Response::TicketsReleased { count } => assert_eq!(count, 0),
+        other => panic!("{other:?}"),
+    }
+    assert!(h.authenticates(&t));
+    match ok(
+        &h.hook,
+        json!({ "op": "attest.release", "session": "s1", "tool_use_id": "tool-2" }),
+    ) {
+        Response::TicketsReleased { count } => assert_eq!(count, 1),
+        other => panic!("{other:?}"),
+    }
+    assert!(!h.authenticates(&t));
+}
+
+#[test]
+fn a_parked_ticket_goes_only_to_the_same_agent_and_command() {
+    let h = Hook::new();
+    let t = h.mint(Some("ag1"), Some("reviewer"), "tool-1", DIGEST_A);
+    h.park("tool-1");
+    for (i, (session, agent, agent_type, digest)) in [
+        ("s2", Some("ag1"), Some("reviewer"), DIGEST_A),
+        ("s1", Some("ag2"), Some("reviewer"), DIGEST_A),
+        ("s1", None, Some("reviewer"), DIGEST_A),
+        ("s1", Some("ag1"), Some("implementer"), DIGEST_A),
+        ("s1", Some("ag1"), None, DIGEST_A),
+        ("s1", Some("ag1"), Some("reviewer"), DIGEST_B),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let other = h.mint_in(session, agent, agent_type, &format!("other-{i}"), digest);
+        assert_ne!(other, t, "{session} {agent:?} {agent_type:?} {digest}");
+        assert!(!h.kb.tickets.contains(&t), "still parked");
+    }
+    // A mint with no digest — an older hook — is never handed one either.
+    let plain = match ok(
+        &h.hook,
+        json!({ "op": "attest.mint", "session": "s1", "agent_id": "ag1",
+                "agent_type": "reviewer", "tool_use_id": "plain" }),
+    ) {
+        Response::Ticket { token } => token,
+        other => panic!("{other:?}"),
+    };
+    assert_ne!(plain, t);
+    // And the parked one is still there for its real retry.
+    assert_eq!(h.mint(Some("ag1"), Some("reviewer"), "tool-9", DIGEST_A), t);
+}
+
+#[test]
+fn without_a_park_identical_calls_get_distinct_tickets() {
+    let h = Hook::new();
+    let a = h.mint(Some("ag1"), Some("reviewer"), "tool-1", DIGEST_A);
+    let b = h.mint(Some("ag1"), Some("reviewer"), "tool-2", DIGEST_A);
+    assert_ne!(a, b, "a live ticket is never handed out twice");
+    assert!(h.authenticates(&a) && h.authenticates(&b));
+}
+
+#[test]
+fn a_release_by_session_agent_or_call_removes_parked_tickets() {
+    let h = Hook::new();
+    let release = |r: serde_json::Value| match ok(&h.hook, r) {
+        Response::TicketsReleased { count } => count,
+        other => panic!("{other:?}"),
+    };
+    let by_agent = h.mint(Some("ag1"), Some("reviewer"), "tool-1", DIGEST_A);
+    h.park("tool-1");
+    assert_eq!(
+        release(json!({ "op": "attest.release", "session": "s1", "agent_id": "ag1" })),
+        1
+    );
+    assert_ne!(
+        h.mint(Some("ag1"), Some("reviewer"), "tool-2", DIGEST_A),
+        by_agent
+    );
+
+    let by_session = h.mint(None, None, "tool-3", DIGEST_B);
+    h.park("tool-3");
+    assert_eq!(
+        release(json!({ "op": "attest.release", "session": "s1" })),
+        2,
+        "the parked main-session ticket and the live one minted above"
+    );
+    assert_ne!(h.mint(None, None, "tool-4", DIGEST_B), by_session);
+
+    let by_call = h.mint(None, None, "tool-5", DIGEST_A);
+    h.park("tool-5");
+    assert_eq!(
+        release(json!({ "op": "attest.release", "session": "s1", "tool_use_id": "tool-5" })),
+        1
+    );
+    assert_ne!(h.mint(None, None, "tool-6", DIGEST_A), by_call);
+}
+
+#[test]
+fn a_parked_ticket_expires_after_the_parked_backstop() {
+    let tickets = Tickets::default();
+    let t0 = std::time::Instant::now();
+    let tok = tickets
+        .mint(ticket("s", None, None, "x1", Some(DIGEST_A), t0))
+        .unwrap();
+    assert_eq!(tickets.park_at("s", "x1", t0 + mins(1)).unwrap(), 1);
+    // Past the live backstop, still parked: a retry 30 minutes on gets it back.
+    let later = t0 + mins(31);
+    assert_eq!(
+        tickets
+            .mint(ticket("s", None, None, "x2", Some(DIGEST_A), later))
+            .unwrap(),
+        tok
+    );
+    assert_eq!(tickets.park_at("s", "x2", later).unwrap(), 1);
+    // Past PARKED_BACKSTOP from its last park, it is gone.
+    let gone = later + super::PARKED_BACKSTOP;
+    assert_ne!(
+        tickets
+            .mint(ticket("s", None, None, "x3", Some(DIGEST_A), gone))
+            .unwrap(),
+        tok
+    );
+}
+
+/// The trap the design names: a rebound ticket keeps the expiry-queue entry of the call it was first
+/// minted for, and that entry must not expire it at the OLD deadline.
+#[test]
+fn a_rebound_ticket_outlives_its_stale_expiry_entry() {
+    let tickets = Tickets::default();
+    let t0 = std::time::Instant::now();
+    let tok = tickets
+        .mint(ticket("s", None, None, "x1", Some(DIGEST_A), t0))
+        .unwrap();
+    tickets.park_at("s", "x1", t0 + mins(1)).unwrap();
+    let rebound = t0 + mins(5);
+    assert_eq!(
+        tickets
+            .mint(ticket("s", None, None, "x2", Some(DIGEST_A), rebound))
+            .unwrap(),
+        tok
+    );
+    // Past the first mint's deadline, inside the rebind's: still live.
+    let t = tickets
+        .get_at(&tok, t0 + super::TICKET_BACKSTOP + mins(1))
+        .unwrap();
+    assert_eq!(t.map(|t| t.tool_use_id), Some("x2".to_owned()));
+    // Past the rebind's own deadline: gone.
+    assert_eq!(
+        tickets
+            .get_at(&tok, rebound + super::TICKET_BACKSTOP)
+            .unwrap(),
+        None
+    );
+}
+
+/// The same trap for the parked queue: a ticket parked, retried and parked again waits the full
+/// backstop from its LAST park.
+#[test]
+fn a_reparked_ticket_outlives_its_stale_parked_entry() {
+    let tickets = Tickets::default();
+    let t0 = std::time::Instant::now();
+    let tok = tickets
+        .mint(ticket("s", None, None, "x1", Some(DIGEST_A), t0))
+        .unwrap();
+    tickets.park_at("s", "x1", t0).unwrap();
+    let retry = t0 + mins(10);
+    tickets
+        .mint(ticket("s", None, None, "x2", Some(DIGEST_A), retry))
+        .unwrap();
+    tickets.park_at("s", "x2", retry).unwrap();
+    let after_first = t0 + super::PARKED_BACKSTOP + mins(1);
+    assert_eq!(
+        tickets
+            .mint(ticket("s", None, None, "x3", Some(DIGEST_A), after_first))
+            .unwrap(),
+        tok
+    );
+}
+
+#[test]
+fn a_session_s_parked_tickets_are_capped_oldest_first() {
+    let tickets = Tickets::default();
+    let t0 = std::time::Instant::now();
+    let digest = |i: usize| format!("{i:064x}");
+    let mut tokens = Vec::new();
+    for i in 0..=super::MAX_SESSION_PARKED {
+        let at = t0 + std::time::Duration::from_secs(i as u64);
+        let tool = format!("x{i}");
+        tokens.push(
+            tickets
+                .mint(ticket("s", None, None, &tool, Some(&digest(i)), at))
+                .unwrap(),
+        );
+        tickets.park_at("s", &tool, at).unwrap();
+    }
+    let at = t0 + mins(2);
+    // The oldest was evicted: its retry gets a fresh ticket.
+    assert_ne!(
+        tickets
+            .mint(ticket("s", None, None, "r0", Some(&digest(0)), at))
+            .unwrap(),
+        tokens[0]
+    );
+    // The rest are still parked.
+    assert_eq!(
+        tickets
+            .mint(ticket("s", None, None, "r1", Some(&digest(1)), at))
+            .unwrap(),
+        tokens[1]
+    );
+    // Another session is not held to this one's cap.
+    tickets
+        .mint(ticket("other", None, None, "o", Some(DIGEST_A), at))
+        .unwrap();
+    assert_eq!(tickets.park_at("other", "o", at).unwrap(), 1);
+}
+
+#[test]
+fn only_the_container_credential_parks() {
+    let h = Hook::new();
+    let t = h.mint(None, None, "tool-1", DIGEST_A);
+    // Not a ticket — not even the main session's own.
+    refused(
+        &h.kb.as_token(&t),
+        json!({ "op": "attest.park", "session": "s1", "tool_use_id": "tool-1" }),
+    );
+    // Not another coordinator grant.
+    let (_, other) = grant(&h.kb.op, "coordinator", None, "someone");
+    refused(
+        &h.kb.as_token(&other),
+        json!({ "op": "attest.park", "session": "s1", "tool_use_id": "tool-1" }),
+    );
+    assert!(h.authenticates(&t), "nothing was parked");
+}
+
+#[test]
+fn a_malformed_command_digest_is_refused() {
+    let h = Hook::new();
+    for bad in ["", "abc", &"A".repeat(64), &"g".repeat(64), &"a".repeat(65)] {
+        let e = call(
+            &h.hook,
+            json!({ "op": "attest.mint", "session": "s1", "tool_use_id": "t",
+                    "command_digest": bad }),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Invalid, "{bad}: {e:?}");
+    }
+}

@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 93f4cf5b858a9777ac432db54b86b871778531601d39116fedb97f557cc186f5) -->
+<!-- generated from jkb design design:agents-and-roles-18dcdf01b7c25370eba53a, edit there (version 167.nwGKxuu-nM74CQGLms6H9aGbAQGK1JWxm8B6AYqSsu6Sl64FAYuk55aS2r8BAZW4zIydqdoJAZfQwr7ppVMBmIbsxZzY0wnZDZySrbWI_zkBncD_tari3wMBncCOvKLiwwMBn7bApaLmwQcBoMC2rNSR4QMBoei65vOuggoBoK7Ivr_MsgcBpP7q1u6X5wMBqoS8rYqHDAGtwOr_i5K3BLcKr7SpmpHD-gwBsOi5gK6qrQGgB7KMlP_U5L4E5wy1_K3Q35y6AQG2lsTjsvz7CgG2juGzlLciAbas4qSk4bYJAbeUt-y31fQIT7rkqLzao94FAcCwi6jIjYUMAcH2t9rLt4wIAcLm5oLy3qoCAcLGutuOk_QOAcPS7umU8ccKAcK-mpumi7sBAcSgpP_smMINAcXGifTyz68KAciIx_GhwdwKAcm8mpOJhHcBx566l__9hwkBy8TMva6yDMELzbTfltS80AEBzsyMtYy9gQUBz8TT3-H3vggBzrrSvNyEzQoBztyFn8e6tg8B1ITw8dfJ_QIB1Ka175-f9Qb3D9aKrJvR-dgIAdfQhonB7sIEAdiM59qgnFgB1szQ7oCjigEB2tbxoPesxAYB2_Kgr4_xvAMB3aqJmZSthwwB4ZyYlteu8gsB4-65j_PfiQIB45bFr7S_-QWIEeWu06XgprEKAeXwv5652rUIAefO2sjjldQHAefQ7ObC-PADAemMkN-ol5EKAer6zvn9vOwMAeXomMT6q6gMAezewL7qy_0HAeXoxJH48VIB7sSt1t3UmgEB6_7b7I_Kzw8B6sbg8sGMmA6eCOusvKq_m5MB8hHzwLCAluoyAfOmwO28ktYPAfneouPj58cHAfma6Nif3NcHAYDvxvmVvYEEAYH9x8nvjNcEAYHf9c_EuYgHAYOnqNvR3IAHAYPRwYiXmKoPAYLfx6SJ5JkKAYXB8fnN4IMMAYLb15TpktMLAYibjZCajeIFAYqjm66NyYMGAYyLhbzn7cYJAY3R3_KZ7MgC_BCPqbL2z_vrDgGP7feEsMDDDdAnkd_i7vX5jQcBk8vIw46wyA4BmKHC56Xn1A0BmrWTrZ2WpAy77AWb1_PjhevWBwGc_4GegvX1CwGbrY_ypczxDwGguZLk2vm7CAGi7bHsstKAAgGjw637m9vkCAGklZm0jpjpAQGj19bE7sDuAQGk2Y6Qo7jdCpgJp9fzpbWjmgEBopvTxJ2yqg7aFKnz_vP_6cYCAarHxMSKxu8KAa6_1M6X_6kFAa_V_fmh2-IOAbDtj4IDBbSDtdvp8s8LAbSRtNeGvJEO8Ai45_S_6OCRDAG524ThmfivBAG6uejL_db6CN8Su8-_78OdkA8BvdfP2-2svggBwL2rrZ2nbQHJ6dbOparDDQHKqZ3J1MnNCAHLz8yJ05acCQHL66Tyz7C8BQHPg5bIi8j0DQHPnY-GsoznBQHR6evZs_GTDAHP-_y95IuWCQHS0Y3O3KG4BwHU56qqh_GtCAHVpe-YwMn7DwHW09_qwM7vBAHXh-GE-KPIAwHW84Gk45eeCAHagfL84rbgDAHc3ZnG55fXBwHemZyGnt7WBAHf-Z6Dt5DoCwHf8d-3rPOYBAHhl-TsstrVCvcN4v_fgYGZmQwB47PXx9qX_QMB5JeqkemK5QQB5LuJ_YyKUAHmj5r1hIqZBQHjsZrDw7zWBQHnwYSkqdjUAwHphYG9vsj8BwHi5d-NkeKoAgHrxbTZl5wOAey9gMffwrAPAeDP3sW6384FqxHwj6fU5eXWAgHxs9S7g6L-AgHz8YeelONVAfWz3Lb_zwUB9ffM0rbq4QUB9-Ggv9XNmgUB9YWu1t-88gkB-YHA_JH84QsB-531iuK-4wIB_Nftr-6m7Q7VB_2f34ettvMOAf_B59fbpZYKsw8, blake3 52f19ffcead1edfd8708d2370345cf34bc36a2bd52cc477c90111364736b12cf) -->
 # Agents and roles
 
 jkb is driven by agents as much as by people: a task swarm that schedules, implements, reviews
@@ -1149,7 +1149,7 @@ answers:
   something else (`jkb ls && git status`), one the classifier cannot model (a redirect, `$`, a
   glob, a bare tilde), one that reaches `jkb` by a path, a prefix or a wrapper
   (`~/.cargo/bin/jkb`, `FOO=1 jkb`, `sh -c "jkb …"`). The line is ticketed, and the session's own
-  rules judge it against the command as the model wrote it. Approving it would approve the rest of
+  rules judge it as rewritten, with the hook's `export JKB_ATTEST=…;` in front of it (see the 2.1.317 reading above). Approving it would approve the rest of
   the line past whatever rule the person set for that.
 - **nothing at all**, and no ticket, for a line that only mentions `jkb` as a harmless command's
   argument (`echo jkb`). A reader's mention (`grep -rn jkb src`) is deferred and ticketed, since no
@@ -1213,6 +1213,44 @@ deferred call) produced an approval prompt rather than a refusal, and in an inte
 text the model wrote. A trap met while measuring: a probe that itself contains `$` (`echo
 ${JKB_ATTEST:+present}`) is not approved by design, which looks like the fix failing and is the
 guard working.
+
+**Superseded on Claude Code 2.1.317.** The first half still holds: a deferred line keeps its
+ticket. The second does not. Read from the installed 2.1.317 bundle, a hook's `updatedInput` with
+no `permissionDecision` becomes the tool's input before `canUseTool` runs, so permission rules,
+the auto-mode classifier and the denial-retry grant all judge the rewritten `export
+JKB_ATTEST=t_…; <the model's command>`, and the grant text quotes the ticket. Seen live: a
+classifier denial of a merge-queue run was granted in /permissions as the exact string, and its
+retry, carrying a fresh ticket, never matched. Either the behaviour changed between 2.1.283 and
+2.1.317, or the deny-rule probe measured something else; the bundle reading is the one that
+matches what was observed. The next section is what keeps a granted string matching.
+
+### A denied call's ticket is parked, and its retry gets it back
+
+Because rules judge the rewritten line, an exact-string grant names the denied call's ticket, and
+a retry that minted a new one would never match it. So a denial parks the ticket instead of
+leaving it live. A `PermissionDenied` registration (matcher `Bash`; it fires on auto-mode
+classifier denials) runs `jkb attest hook`, which sends `attest.park {session, tool_use_id}`. A
+parked ticket authenticates nothing. That also closes a leak: the denial message quotes the ticket
+into the model's transcript, where it used to stay live for up to ten minutes.
+
+Every mint carries `command_digest`, the blake3 of the model's command after `strip_own_prefix`
+removes one leading `export JKB_ATTEST=t_…; ` in exactly the hook's own format, so retrying the
+command the model wrote and pasting back the grant's quoted text digest the same. Anything not of
+exactly that shape is left as it is. A mint whose `(session, agent_id, agent_type,
+command_digest)` matches a parked ticket gets that ticket back, rebound to the new call; anything
+else is minted fresh. Only a parked ticket is ever reused, so two identical calls in flight each
+hold their own. The retry's line is then byte-identical to the granted string, and Claude Code's
+own grant matches it, with no new approval UI and no permission rule.
+
+A parked ticket goes at `SubagentStop`/`SessionEnd`, at a `PostToolUse` release, after 60 minutes
+(`PARKED_BACKSTOP`, long enough to reach /permissions), or when a session holds more than 32
+(`MAX_SESSION_PARKED`, oldest first). Losing one costs only a fresh mint, today's outcome. An older
+daemon refuses `attest.park` and an older hook sends no digest; either way nothing is rebound.
+Rejected: carrying the ticket outside the command (the Bash input has no env field,
+`CLAUDE_CODE_TOOL_USE_ID` is not exported to the call, and a file is readable by any Bash call);
+one stable ticket per agent (it breaks the per-call credential); and reusing any unpresented
+ticket with the same digest without the denial signal (it cannot tell a denied call from a slow
+one). Pinned by the `rbac` unit tests; the live retry check runs after the next image rebuild.
 
 ### Which characters keep a line from approval
 
@@ -1746,15 +1784,17 @@ newest 50 ended requests with their outcome, exit status, note, log path and esc
 with `newest_first`). A new request posts a sticky notification (`exec-<n>`: the requester and the
 reason, never the argv) in the same transaction, and any decision withdraws it; a full notification
 topic drops it rather than refusing the request. Every request and every move is announced on the
-reserved `exec/requests` topic, which only the operator may read and only jkb may send on, and the
+reserved `exec/requests` topic, which only the operator may read (and the container credential, for a consumer group under `inbox/` only: the forwarder's, below) and only jkb may send on, and the
 tab re-reads on each announcement. While the daemon is unreachable main buffers up to 4 MiB of output; past that the rest goes to the log only, and the stream says how much it missed and where the log is. `--no-wait` returns the request id at
 once, and `jkb exec status <id>` reads the outcome later.
+
+**A run request's result reaches the session that filed it.** Each request has an `exec_delivery` row, made in the request's own transaction (migration V035). It is not changelogged. It reaches `delivered` once, and every move is a compare-and-set in `jkb_core::exec_delivery`. The managed attest hook hands results over as `additionalContext`. The take runs on `PostToolUse`/`PostToolUseFailure` for every tool (matcher `.*`), on `UserPromptSubmit`, and on `SessionStart`; after a `compact` or `resume` start the hook also lists the requests still open. The take is two-phase. `exec.inbox.take` holds the rows under a 30-second lease, and the hook acknowledges them with `exec.inbox.ack` only after printing. A reply lost after the daemon committed, or a hook killed before it printed, is therefore handed over again, at the cost of an occasional repeat. Both ops are the container credential's and the operator's alone (`Attest`). A subagent is handed its own results. The main agent is handed its own, those of subagents whose `SubagentStop` was released (which marks them gone), and any subagent's once its request ended ten minutes ago, so a lost fail-open stop does not strand them. The message is composed once, by `exec::delivery_text`, which `exec.status` also carries. It includes the run's `warning:` lines, collected as the output streams in (at most 50, then counted), and closes by saying it is a result report, not an instruction from the operator. `jkb exec status <id> --wait` re-attaches in the foreground and marks nothing delivered. The swarm coordinator copies those warning lines into its report under `WARNINGS:`. **The forwarder pushes a result into the filing session's inbox socket.** `jkb exec forward` runs in the dev container, outside the agent's sandbox, as the pinned hook binary (`$JKB_HOOK_BIN`, set in the image) with the container credential; `jkb serve` runs on the host and cannot reach a container's Unix socket, so this is the only place it can live. The entrypoint starts it in a supervise loop under PID 1, logging to `~/.jkb/logs/exec-forward.log`; a missing binary only warns, since the hook path still delivers everything. One runs per container, held by a lock beside the namespace marker in `/run/jkb`, which the sandbox cannot write (neither `$XDG_RUNTIME_DIR` nor `/run/user/<uid>` exists in the container, measured). It keeps the consumer group `inbox/<hostname>` on `exec/requests` and sweeps on start, after each terminal-state hint, and every 60 seconds. The first sweep runs before the consumer starts, because two first requests at once both missed the daemon's grant cache and the second was refused. A sweep calls `exec.inbox.due` with its `host#boot`, claims each row with `exec.inbox.claim` (a 30-second lease; the only op that returns an inbox token), posts to that session's live inboxes in this container, newest first, until one accepts, and reports with `exec.inbox.report`; all three are `Attest`. A row is due only while its session has a live inbox in the forwarder's own `host#boot`. Otherwise another container's forwarder would claim and fail it, and the right one would lose the push, so such a row waits for the hook path instead. A post is an auth line, then `{"type":"user","message":{"role":"user","content":<message>}}`, each newline-terminated, then close, pinned byte-exact as `exec::INBOX_BODY_VERSION` 1. E1 (Claude Code 2.1.317) measured that body routed to an idle session, which took a turn within about two seconds. The socket writes nothing back, so a message the session holds rather than queues still counts as delivered, which is why the image sets `crossSessionInbound: accept` in managed settings. The forwarder exits 0 when its binary is re-pinned and 1 when its credential is refused, and the loop restarts it. Not yet measured, to be recorded here after the image rebuild: the auth line with the E1 body, the hold case, and E2–E6 (socket lifetime across `/clear`, `/compact`, `--resume` and a restart; subagent and child-session sockets; the hook environment; where hook context lands).
 
 ### A request's states
 
 `pending`, then `running` and `finished` (exit status), or `declined` (the operator's note goes to
 the session), `refused` (tree changed, audit refused, or directory gone), or `expired` (the
-requester's session ended, or it went unanswered for two hours). A run times out after 15 minutes unless the request asks
+requester's session ended, or it went unanswered for a day, raised from two hours by the operator on 2026-11-27). The latest a request can end is that expiry plus the two-hour timeout cap plus five minutes of grace (`exec::LATEST_END_MS`, about 26 hours), and a run whose runner never reported is held from delivery until then. So the delivery window (`exec_delivery::WINDOW_MS`) and the retention of the exec topics (`exec::TOPIC_TTL_MS`) are both that latest end plus a day, each guarded by a compile-time assert: at a flat day, raising the expiry put the end of that hold past the window, and such a result was never delivered (found by a test when the expiry was raised). A run times out after 15 minutes unless the request asks
 for longer, up to two hours. A session holding claims with no event for 30 minutes is stalled. A request runs at most once. An
 identical pending request from the same session (same argv, directory, target and pin) folds into
 the existing one instead of queueing twice. Editing a request before running it is not offered:

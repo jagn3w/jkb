@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:task-lifecycle-18dcdeffaafbcfd87c069f, edit there (version 115.cYGwr8r1378CAYKo9cTruwUBh8rc4biU9QIBjOSnvIrrzQ4BjLzKt5Cd2AUBjvz45fSu2A0Bj5TL-7iHgwYBkMil2eDEzAMBjdLbv9f-9wQBkrivg62IuQ4BlpLLyPLkmAEBlpT2grSY0gQBl_KTjajtuwkBm4berKa5_gYBnuDUwZGG8gMBofblneKFuA0BotCO-afV7wgBqOjc06jB-QIBrJKai5vD2gIBrcLivemFyQQBsqqj8brGiQwBs7zX_LLn6AUBtf7U0ZCpvAwBtuaOpse_oAkBtsqjha2ppQQBtpiMnZfPgQsBvvax4ZGW2wYBwfzcsMibxAwBw6ratsvXCAHE1I7tgKvsDgHD6NWzpfupCQHGpqG-2-zGCQHH5KKojMwiAdCIrOa8rq8JAdSskO2_1bwFAdXGhL2xm7cPAdWOyaW7hIIDAduG3dnJiLQEAeDm5sGD6rUHAeHavY3KjZsLAeLaoqqpz6IJAeCOzej_k80CAerMz_K_94UBAeqK9aq5hPkGAfDS-NWr5ckLAfOytMOG4t4EAfS0t6v-o_ANAfX-rtmt-vEEAfaiw-aFpYANAfbslevNyHoB_Yjoid2wkQYB_dakx6mh3w0B_9yx8p6JmwoBgKm_lbr31Q0BgZ27_JT9rAMBhIWS9IeapA0Bhae59vPx-AoBhqHwycuzxAoBh4fWg8q79Q0Bit-6l4Wprw0BjdHWvb2O-A4BjcfDyc_llg8Bj5fqg9GohQcBk7Hmg4uU2AkBk5PmlsyXlgkBk7-h2qSg3ggBlqmrgaP4qgKs5wWXpeGpjb_VBAGYn8LK3t-nCwGZqdfqnNn-CAGa8eSp-v2-BAGg1bamxrlnAaKftbHfki4Bo4PB_PfpsAwBpdmYyJPIvgsBqImgkqXz8Q0BqaOkiNPXpwoBqbGkpNyznAIBrvHo_pyBeAGup5_Mj4LBCAGyhauIiO-UDwG02eeoz_eAAgG0yZ7Jn8PFCAG32bXx-an3DAG7kcGOj47YDgG-pfjsvNPRAwG-9aO5xPbECwG_x6_K2-u2DgHC5au0qq-dCAHIyYSv9rvyDgHMw9-08LDJCAHNkfDcsY_gDQHOu5bAvpvPB5wL0Lu07_eSWAHan4mk1JWmBwHc27ajqYWtAwHfh9baiOzxCgHgnaay18bLAwHflfjBpdb3CwHlwZbF2s7CCwHljaWUkvyeCQHsu82uhsiICwHur6L-yN7zDgHw95Dh9o-xAwHx0avxlrPECAHyy4jLntqlCgHz18zIqq7BCgH3196ovJTtCwH4hcO45MLZDAH43cKC95LLAgH6t5nE3pzwCAH5j4aOoarHBwH-uevR3deGCQE, blake3 084e362a65a23a4a8df8766134f7b031178073e214f96c4bf8751b1a9472946a) -->
+<!-- generated from jkb design design:task-lifecycle-18dcdeffaafbcfd87c069f, edit there (version 115.cYGwr8r1378CAYKo9cTruwUBh8rc4biU9QIBjOSnvIrrzQ4BjLzKt5Cd2AUBjvz45fSu2A0Bj5TL-7iHgwYBkMil2eDEzAMBjdLbv9f-9wQBkrivg62IuQ4BlpLLyPLkmAEBlpT2grSY0gQBl_KTjajtuwkBm4berKa5_gYBnuDUwZGG8gMBofblneKFuA0BotCO-afV7wgBqOjc06jB-QIBrJKai5vD2gIBrcLivemFyQQBsqqj8brGiQwBs7zX_LLn6AUBtf7U0ZCpvAwBtuaOpse_oAkBtsqjha2ppQQBtpiMnZfPgQsBvvax4ZGW2wYBwfzcsMibxAwBw6ratsvXCAHE1I7tgKvsDgHD6NWzpfupCQHGpqG-2-zGCQHH5KKojMwiAdCIrOa8rq8JAdSskO2_1bwFAdXGhL2xm7cPAdWOyaW7hIIDAduG3dnJiLQEAeDm5sGD6rUHAeHavY3KjZsLAeLaoqqpz6IJAeCOzej_k80CAerMz_K_94UBAeqK9aq5hPkGAfDS-NWr5ckLAfOytMOG4t4EAfS0t6v-o_ANAfX-rtmt-vEEAfaiw-aFpYANAfbslevNyHoB_Yjoid2wkQYB_dakx6mh3w0B_9yx8p6JmwoBgKm_lbr31Q0BgZ27_JT9rAMBhIWS9IeapA0Bhae59vPx-AoBhqHwycuzxAoBh4fWg8q79Q0Bit-6l4Wprw0BjdHWvb2O-A4BjcfDyc_llg8Bj5fqg9GohQcBk7Hmg4uU2AkBk5PmlsyXlgkBk7-h2qSg3ggBlqmrgaP4qgKs5wWXpeGpjb_VBAGYn8LK3t-nCwGZqdfqnNn-CAGa8eSp-v2-BAGg1bamxrlnAaKftbHfki4Bo4PB_PfpsAwBpdmYyJPIvgsBqImgkqXz8Q0BqaOkiNPXpwoBqbGkpNyznAIBrvHo_pyBeAGup5_Mj4LBCAGyhauIiO-UDwG02eeoz_eAAgG0yZ7Jn8PFCAG32bXx-an3DAG7kcGOj47YDgG-pfjsvNPRAwG-9aO5xPbECwG_x6_K2-u2DgHC5au0qq-dCAHIyYSv9rvyDgHMw9-08LDJCAHNkfDcsY_gDQHOu5bAvpvPB5wL0Lu07_eSWAHan4mk1JWmBwHc27ajqYWtAwHfh9baiOzxCgHgnaay18bLAwHflfjBpdb3CwHlwZbF2s7CCwHljaWUkvyeCQHsu82uhsiICwHur6L-yN7zDgHw95Dh9o-xAwHx0avxlrPECAHyy4jLntqlCgHz18zIqq7BCgH3196ovJTtCwH4hcO45MLZDAH43cKC95LLAgH6t5nE3pzwCAH5j4aOoarHBwH-uevR3deGCQE, blake3 143af34d78b4ed2d089a953f06177a9a24623e9a8e451888bec55ff1de4ce604) -->
 # Task lifecycle
 
 How a task moves from the frontier to merged. A task is decomposed into subtasks, so the
@@ -808,7 +808,7 @@ jkb client, so its caller must export `JKB` and `JKB_DB`; `.claude/workflows/tas
 `QUEUE_ENV` does, and the script header states the contract. The CLI is the home of the human
 path because the UI calls it directly and it must work in any repo.
 
-### `jkb task land` and the merge queue deliberately differ in one place
+### `jkb task land` and the merge queue deliberately differ in two places
 
 They are no longer the same algorithm, and the divergence is deliberate rather than drift, so it
 is recorded here and not only in a Rust comment. The difference dates from the 2026-09-12 queue
@@ -818,9 +818,20 @@ rework.
   against its merge-base is empty is refused however many commits it carries), because it closes
   whole task groups unattended, and a phantom landing there unblocks dependents with nothing
   implemented. `gitrepo::graft` still asks the commit question (`ahead_count == 0`).
+- **How the branch is replayed.** The queue no longer rebases. It builds each replayed commit in
+  the object database (`git merge-tree --write-tree --merge-base c~1 <onto> c`, then `git
+  commit-tree` with the commit's own author, author date and message), and moves the worktree once
+  with `reset --hard`, after refusing tracked changes and any untracked file the result would
+  overwrite (including one reached by a rename, or one standing where the result puts a
+  directory). On the dev container's virtiofs repo mount, `git rebase` refused clean branches with
+  "Your local changes … would be overwritten" for files the commit itself changes (exec-99 and
+  exec-101, on clean worktrees; `update-index --refresh` did not help), and the queue ejected them
+  as rebase conflicts. The replay skips and drops the same commits rebase does, which the queue's
+  parity tests check against git's own rebase. `gitrepo::graft` still rebases and can hit the same
+  phantom; porting the replay to it is tracked as its own task.
 
-It is tracked as its own task. Until it closes, a reader comparing the two must expect them
-to differ **here** and nowhere else.
+Each is tracked as its own task. Until they close, a reader comparing the two must expect them
+to differ in **these two places** and nowhere else.
 
 ## Auto-close
 

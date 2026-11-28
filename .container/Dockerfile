@@ -221,6 +221,11 @@ RUN chmod 0755 /usr/local/bin/deny-transcripts.sh
 # The binary the managed hooks run, root-owned, where nothing in the sandbox can replace it (D52.9):
 # pin-jkb-hook.sh copies setup's build there, run through sudo — which a sandboxed tool call cannot.
 COPY --chown=root:root pin-jkb-hook.sh /usr/local/bin/pin-jkb-hook.sh
+# The same binary, as the run-request forwarder: entrypoint.sh's supervise loop runs
+# `$JKB_HOOK_BIN exec forward` outside the sandbox, with the credential readable, so it must be this
+# root-owned copy (check-config.sh holds the two to one path). An ENV, spelled once, for the reason
+# JKB_REAPER is: the entrypoint and verify.sh both need it, and ENV reaches both.
+ENV JKB_HOOK_BIN=/usr/local/lib/jkb-hook/jkb
 RUN chmod 0755 /usr/local/bin/pin-jkb-hook.sh \
     && install -d -o root -g root -m 0755 /usr/local/lib/jkb-hook \
     && printf 'vscode ALL=(root) NOPASSWD: /usr/local/bin/pin-jkb-hook.sh ""\n' > /etc/sudoers.d/pin-jkb-hook \
@@ -232,6 +237,15 @@ RUN chmod 0755 /usr/local/bin/pin-jkb-hook.sh \
 # operator's database and root token do not exist in here at all.
 RUN mkdir -p /home/vscode/.jkb/claude-memory /home/vscode/.jkb/logs /home/vscode/.jkb-container \
     && chown -R vscode:vscode /home/vscode/.jkb /home/vscode/.jkb-container
+
+# GIT TRUSTS THE REPOS BIND, and only it. A `--target container` run request (a `docker exec`, outside
+# the agent's sandbox, which supplies its own grants on git's command line) failed every git command
+# with "detected dubious ownership" (exec-98), though there is no second user under ~/repos: the owner
+# git sees on the bind is a property of the mount. In the SYSTEM config, root-owned, so every way into
+# the container gets it and nothing in a session can widen it. Not `*`: volumes, /tmp and ~/.cargo keep
+# git's check. .container/README.md ("Git trusts the repos bind") has the measurements and the
+# alternatives; check-config.sh pins the value, verify.sh the running container.
+RUN git config --system --add safe.directory '/home/vscode/repos/*' && chmod 0644 /etc/gitconfig
 
 # --- non-root from here on ------------------------------------------------------------------
 USER vscode

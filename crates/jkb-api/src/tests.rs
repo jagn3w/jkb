@@ -114,6 +114,7 @@ fn samples() -> Vec<Request> {
             pid: "1".into(),
             instance: "h".into(),
             cwd: String::new(),
+            inbox: None,
         },
         Request::SessionEnded {
             session: "s".into(),
@@ -603,6 +604,11 @@ fn samples() -> Vec<Request> {
             agent_id: None,
             agent_type: None,
             tool_use_id: "t".into(),
+            command_digest: None,
+        },
+        Request::AttestPark {
+            session: "s".into(),
+            tool_use_id: "t".into(),
         },
         Request::AttestRelease {
             session: "s".into(),
@@ -711,6 +717,29 @@ fn samples() -> Vec<Request> {
             id: "exec-1".into(),
             after: None,
             max: 10,
+        },
+        Request::ExecInboxTake {
+            session: "s".into(),
+            agent_id: None,
+            open: false,
+        },
+        Request::ExecInboxAck {
+            session: "s".into(),
+            ids: vec!["exec-1".into()],
+        },
+        Request::ExecInboxDue {
+            instance: "h#b".into(),
+            max: 10,
+        },
+        Request::ExecInboxClaim {
+            id: "exec-1".into(),
+            instance: "h#b".into(),
+            lease_ms: 30_000,
+        },
+        Request::ExecInboxReport {
+            id: "exec-1".into(),
+            ok: true,
+            error: None,
         },
         Request::ExecBegin {
             id: "exec-1".into(),
@@ -3589,6 +3618,7 @@ fn a_session_list_cursor_is_opaque() {
             pid: "1".into(),
             instance: "h".into(),
             cwd: String::new(),
+            inbox: None,
         })
         .unwrap();
     }
@@ -4070,6 +4100,11 @@ const OP_WORDS: &[(&str, &str)] = &[
     ("exec.status", "run requests"),
     ("exec.list", "run requests"),
     ("exec.follow", "run requests"),
+    ("exec.inbox.take", "hand a session the results"),
+    ("exec.inbox.ack", "hand a session the results"),
+    ("exec.inbox.due", "inbox socket"),
+    ("exec.inbox.claim", "inbox socket"),
+    ("exec.inbox.report", "inbox socket"),
     ("task.add", "add tasks"),
     ("task.set", "fields"),
     ("task.edit", "text"),
@@ -4121,6 +4156,7 @@ const OP_WORDS: &[(&str, &str)] = &[
     ("role.grant", "hand out"),
     ("role.revoke", "revoke"),
     ("attest.mint", "vouch"),
+    ("attest.park", "vouch"),
     ("attest.release", "vouch"),
     ("exec.request", "ask the operator"),
     ("design.thread_start", "start and resolve design threads"),

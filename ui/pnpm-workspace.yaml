@@ -28,6 +28,24 @@ allowBuilds:
   node-pty: true
   electron-winstaller: false
 
+# Which platforms' optional dependencies an install links: this machine's, and Linux on this CPU.
+# esbuild resolves its binary from a per-platform optional package (`@esbuild/darwin-arm64`,
+# `@esbuild/linux-arm64`, …) and pnpm links only the installing machine's by default. The dev
+# container bind-mounts the checkout, so it reads the host's `ui/node_modules`: a macOS install left
+# it only the darwin binary, and every test that bundles with esbuild (the app's and the VS Code
+# adapter's `test/*.test.mjs`) failed in the container with esbuild's "installed for another
+# platform" error. Linking Linux too lets the container RUN them against the host's install, without
+# ever writing to it. The CPU stays `current`: the container runs on the host's own architecture.
+# It does not make the directory shareable for writes — node-pty is compiled in place and Electron
+# downloads one platform's binary — so a container BUILD still copies `ui/` out
+# (scripts/install-extension.sh --build-in). Takes effect at the host's next `pnpm install`.
+supportedArchitectures:
+  os:
+    - current
+    - linux
+  cpu:
+    - current
+
 onlyBuiltDependencies:
   - esbuild
   - electron

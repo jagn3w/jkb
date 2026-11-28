@@ -1643,3 +1643,93 @@ fn investigations_are_repo_scoped_and_reachable_from_the_generic_surface() {
         .collect();
     assert_eq!(via_view, via_inv);
 }
+
+/// `inv link` and `inv add` refuse a `depends_on` or `parent_of` edge between two tasks, naming
+/// the task command that owns it; an edge with a non-task end, `stages`, and any other type stay
+/// advisory, and `found_in` is still refused.
+#[test]
+fn task_to_task_dependency_and_subtask_edges_belong_to_the_task_commands() {
+    let db = Db::open_in_memory().unwrap();
+    let path = "memory/edges";
+    db.write_txn("test", |conn, meta| {
+        inv::create(
+            conn,
+            meta,
+            path,
+            debugging::NAME,
+            debugging::KIND_SYMPTOM,
+            "a symptom",
+            &[],
+        )?;
+        for uid in ["task:a", "task:b"] {
+            jkb_core::task::create(
+                conn,
+                meta,
+                &jkb_core::task::NewTask {
+                    home: path.to_owned(),
+                    ..jkb_core::task::NewTask::new(
+                        uid,
+                        "work",
+                        jkb_core::task::Under::inbox_of("t"),
+                    )
+                },
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let symptom = db
+        .read(move |conn| Ok(inv::goals(conn, path)?[0].uid.clone()))
+        .unwrap();
+    let link = |src: &str, edge: EdgeType, dst: &str| {
+        let (src, dst) = (src.to_owned(), dst.to_owned());
+        db.write_txn("test", move |conn, meta| {
+            inv::link(conn, meta, &src, edge, &dst, None)
+        })
+        .map_err(|e| e.to_string())
+    };
+    let count = |src: &str, edge: EdgeType, dst: &str| -> i64 {
+        let (src, dst) = (id_of(&db, src), id_of(&db, dst));
+        db.read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM edges WHERE src_item_id = ?1 AND dst_item_id = ?2 AND type = ?3",
+                rusqlite::params![src.get(), dst.get(), edge.as_str()],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap()
+    };
+
+    // Refused between two tasks, naming the owning command, and nothing is written.
+    let e = link("task:a", EdgeType::DependsOn, "task:b").unwrap_err();
+    assert!(e.contains("jkb task depend"), "{e}");
+    assert_eq!(count("task:a", EdgeType::DependsOn, "task:b"), 0);
+    let e = link("task:a", EdgeType::ParentOf, "task:b").unwrap_err();
+    assert!(e.contains("jkb task move"), "{e}");
+    assert_eq!(count("task:a", EdgeType::ParentOf, "task:b"), 0);
+
+    // `inv add` links through the same seam. Its own unit is never a task (a task is refused as a
+    // unit), so each of its edges has a non-task end: a reverse `depends_on` from a task is allowed.
+    let mut unit = inv::NewUnit::new(debugging::KIND_SYMPTOM, "another symptom", path);
+    unit.reverse_edges = vec![(EdgeType::DependsOn, "task:a".to_owned(), None)];
+    let added = db
+        .write_txn("test", move |conn, meta| inv::add(conn, meta, &unit))
+        .unwrap();
+    let added_uid = db
+        .read(move |conn| Ok(item::get(conn, added)?.unwrap().uid))
+        .unwrap();
+    assert_eq!(count("task:a", EdgeType::DependsOn, &added_uid), 1);
+
+    // An edge with a non-task end is advisory, in either direction.
+    link("task:a", EdgeType::DependsOn, &symptom).unwrap();
+    link(&symptom, EdgeType::DependsOn, "task:b").unwrap();
+    link(&symptom, EdgeType::ParentOf, "task:b").unwrap();
+    assert_eq!(count(&symptom, EdgeType::ParentOf, "task:b"), 1);
+    // `stages` and any other type stay advisory, even between two tasks.
+    link("task:a", EdgeType::Stages, "task:b").unwrap();
+    link("task:a", EdgeType::Informs, "task:b").unwrap();
+    assert_eq!(count("task:a", EdgeType::Informs, "task:b"), 1);
+    // `found_in` is still refused.
+    let e = link(&symptom, EdgeType::FoundIn, "task:a").unwrap_err();
+    assert!(e.contains("only by a review"), "{e}");
+}

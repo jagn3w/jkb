@@ -2916,23 +2916,36 @@ fn a_nest_never_strands_a_staged_span_or_exports_a_design_twice() {
     assert!(err.to_string().contains("doc target of its own"), "{err}");
 }
 
-/// A span's design is the one containing it: undoing an approval made before a split restores the
-/// old `metadata.design`, and the span must still be approvable in the design it now lives in.
+/// An approval made before a split is not undone over it. Undoing it used to write the span's
+/// pre-split `metadata` (its old `metadata.design` included) over the split's, so the span named a
+/// design that no longer held it. The split is a later write to the same column, so the approval's
+/// undo waits for the split's — and a split is never undone, so the refusal stands and the span stays
+/// approved in the design it now lives in.
 #[test]
-fn undoing_an_approval_made_before_a_split_leaves_the_span_in_its_new_design() {
+fn undoing_an_approval_made_before_a_split_waits_for_the_split() {
     let db = db();
     let uid = create(&db, SPLIT_BODY);
     let alpha = span(&db, &uid, "## Alpha\n\nAlpha text.", Reviewer::Operator).unwrap();
     approve_as(&db, &alpha, Approver::Operator).unwrap();
     let approved_in = last_txn(&db);
     let s = split_at(&db, &uid, &token(&db, &uid), 2).unwrap();
-    db.write_txn("t", move |c, m| crate::undo::undo(c, m, approved_in))
-        .unwrap();
+    let split_in = last_txn(&db);
+    let err = db
+        .write_txn("t", move |c, m| crate::undo::undo(c, m, approved_in))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(&format!("Undo transaction {split_in} first")),
+        "{err}"
+    );
     let child = &s.children[0].uid;
     assert_eq!(design_of_span(&db, &alpha), *child);
-    assert_eq!(view_of(&db, child, &alpha).state, SpanState::Proposed);
-    approve_as(&db, &alpha, Approver::Operator).unwrap();
     assert_eq!(view_of(&db, child, &alpha).state, SpanState::Approved);
+    assert!(
+        db.write_txn("t", move |c, m| crate::undo::undo(c, m, split_in))
+            .is_err(),
+        "a split is not undone, so nothing clears the way for the approval's undo"
+    );
 }
 
 #[test]
@@ -3735,4 +3748,39 @@ fn archived_and_unplanned_agree_on_what_a_step_holds() {
 fn the_step_kind_literal_is_the_step_kind() {
     assert_eq!(STEP_KIND, step_kind!());
     assert_eq!(STEP_KIND, "plan_step");
+}
+
+/// `unplanned_first` reads a prefix of `unplanned`, in its order, and `unplanned_count` counts the
+/// whole set without reading it: `kb.health` lists the page and reports the count, so the two must
+/// agree with the full read for any cap, including one past the end and zero.
+#[test]
+fn unplanned_page_and_count_agree_with_the_full_read() {
+    let db = db();
+    for i in 0..5 {
+        loose_task(&db, &format!("task:loose-{i}"), "tasks/repos/x/inbox");
+    }
+    let all: Vec<String> = db
+        .read(plan::unplanned)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.uid)
+        .collect();
+    assert_eq!(all.len(), 5);
+    assert_eq!(db.read(plan::unplanned_count).unwrap(), 5);
+    for cap in [0, 2, 5, 9] {
+        let page: Vec<String> = db
+            .read(move |c| plan::unplanned_first(c, Some(cap)))
+            .unwrap()
+            .into_iter()
+            .map(|t| t.uid)
+            .collect();
+        assert_eq!(page, all[..cap.min(all.len())], "cap {cap}");
+    }
+    let uncapped: Vec<String> = db
+        .read(|c| plan::unplanned_first(c, None))
+        .unwrap()
+        .into_iter()
+        .map(|t| t.uid)
+        .collect();
+    assert_eq!(uncapped, all);
 }

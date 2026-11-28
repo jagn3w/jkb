@@ -1,4 +1,4 @@
-<!-- generated from jkb design design:namespaces-18dcd5bda1dce798858c69, edit there (version 74.QoCbtJ2e474NAYGhk6zryPEBAf-4_azcsMoFAYnEiZzUubsOgPECip3usezp-w8BiZSAmbL_7g0BjOmAk7GMwAMBjtWo9_nAuw8Bj4GL_ufeiwEBkLGb8_3CnAwBkvjUhJDTqQEBlJHuxo6sjwQBmPv2l67ksAMBqefihKOnuA8Brd-MganIvwkBrtevofrfywcBrr-WoazRlQUBsJKU_8qh2QUBscO73MKTxgwBsqi29p_U9gIBsrC52vi-jQsBu_rpp-CkwgcBvI7Li7GJtQ0BwO6rtf_TyAEBwrir0PbCswMBwuuKl7_iVwHE8cbi9u8bAcTKj82RoOwCAcbC74-ix_wOAcODlOKRp3YByJHZ_p7PnwcBysv7reaPngkBytbB0qD_hwsBzLfbwJPKyQMBy5OFiqqK0gUBzrzgqPeVnwIBzr2G5QgW0ZGdpavwug4B05X6s6Or8QIB1sLnqtDruQIB2fy-lumW0AQB2uuaj52S3QoB2rWdo-rbng4B3J-tvPXp8wsB2vqrs-fdyQQB4IjM7K75pA4B4JGG0NyujAsB45n9ourfgAEB45vW0ZOT2wcB5Nv7yK64jAcB6tXa-bvpjQsB7dupluG9JgHu8NvqndOwBQHu1K7B3rp8AfLLweHIxcAOAfKNwc6v6OgIAfbvwcWV4a8GAffut-zDw4MNAfjQ35S4ydQPAfni4Oum0MIGAfqnp6v_xI4PAffUusnOktsFAffUufPww7IFAfn1x_PYjfkFAfqsqL_o5tAHAf_ioaCM6_kJAQ, blake3 d0ee8fe7bd2fff282551a71c58c3f3ac760fee59358988ac5fabe12ac32d047f) -->
+<!-- generated from jkb design design:namespaces-18dcd5bda1dce798858c69, edit there (version 74.QoCbtJ2e474NAYGhk6zryPEBAf-4_azcsMoFAYnEiZzUubsOgPECip3usezp-w8BiZSAmbL_7g0BjOmAk7GMwAMBjtWo9_nAuw8Bj4GL_ufeiwEBkLGb8_3CnAwBkvjUhJDTqQEBlJHuxo6sjwQBmPv2l67ksAMBqefihKOnuA8Brd-MganIvwkBrtevofrfywcBrr-WoazRlQUBsJKU_8qh2QUBscO73MKTxgwBsqi29p_U9gIBsrC52vi-jQsBu_rpp-CkwgcBvI7Li7GJtQ0BwO6rtf_TyAEBwrir0PbCswMBwuuKl7_iVwHE8cbi9u8bAcTKj82RoOwCAcbC74-ix_wOAcODlOKRp3YByJHZ_p7PnwcBysv7reaPngkBytbB0qD_hwsBzLfbwJPKyQMBy5OFiqqK0gUBzrzgqPeVnwIBzr2G5QgW0ZGdpavwug4B05X6s6Or8QIB1sLnqtDruQIB2fy-lumW0AQB2uuaj52S3QoB2rWdo-rbng4B3J-tvPXp8wsB2vqrs-fdyQQB4IjM7K75pA4B4JGG0NyujAsB45n9ourfgAEB45vW0ZOT2wcB5Nv7yK64jAcB6tXa-bvpjQsB7dupluG9JgHu8NvqndOwBQHu1K7B3rp8AfLLweHIxcAOAfKNwc6v6OgIAfbvwcWV4a8GAffut-zDw4MNAfjQ35S4ydQPAfni4Oum0MIGAfqnp6v_xI4PAffUusnOktsFAffUufPww7IFAfn1x_PYjfkFAfqsqL_o5tAHAf_ioaCM6_kJAQ, blake3 1dd3e2ee0c12e1f240108828b4de729159a062ce740a10e68dcd51581a7d7003) -->
 # Namespaces
 
 jkb is one global database (`~/.jkb/jkb.db`) meant to span every repo and project, to serve
@@ -327,6 +327,12 @@ several namespaces carrying one contract while relocating nothing, and missing v
 - **Validate edges.** A type's `edge_types()` stays advisory, because an investigation must
   always be able to record an association it has no vocabulary for yet (the over-structuring
   pitfall, below).
+  Two exceptions are refused, each because another command owns the edge and enforces what an
+  investigation link would bypass: `found_in` (only a review filing or recording writes it), and
+  a `depends_on` or `parent_of` edge whose **both** ends are tasks, which `jkb inv link` and
+  `jkb inv add` send to `jkb task depend` and `jkb task move --under` / `task add --under`
+  (the dependency DAG and the subtask tree). The same edge with a non-task end, `stages`, and
+  every other type stay advisory.
 - **Dispatch commands per type beyond `jkb inv do`.** `jkb task` already is the task surface,
   keyed by item kind; routing it through a descriptor adds a layer with no new capability.
 - **Validate status lifecycles.** `TaskStatus::from_manual_str` at the string boundary and

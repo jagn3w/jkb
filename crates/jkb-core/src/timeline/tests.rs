@@ -521,6 +521,7 @@ fn a_registry_events_id_does_not_move_when_another_process_is_seen() {
         seen_at,
         ended_at: None,
         end_reason: None,
+        has_inbox: false,
     };
     // The registry lists the most recently seen first: the same two processes, seen in turn.
     let before = super::registry_events(&[row("7", 2), row("9", 1)]);

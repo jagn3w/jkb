@@ -471,9 +471,7 @@ mod tests {
     /// Read from the directory rather than listed here: a second hand-written list would drift
     /// from the first, which is the failure these tests exist to catch one level up.
     fn repo_stems(kind: &str, ext: &str) -> BTreeSet<String> {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.claude")
-            .join(kind);
+        let dir = crate::manifest_dir().join("../../.claude").join(kind);
         std::fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
             .map(|entry| entry.expect("directory entry").path())
@@ -862,10 +860,7 @@ mod tests {
             }
         }
         let mut out = Vec::new();
-        walk(
-            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut out,
-        );
+        walk(&crate::manifest_dir().join("src"), &mut out);
         out
     }
 

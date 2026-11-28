@@ -27,7 +27,7 @@ fn exactly_one_hook_event_drives_the_sweep() {
     assert_eq!(sweepers, ["SessionStart"]);
     for (name, _) in HOOK_EVENTS {
         let raw = json!({ "hook_event_name": name, "session_id": "s1" }).to_string();
-        let asked = ask(&raw, "", "").unwrap();
+        let asked = ask(&raw, "", "", None).unwrap();
         assert!(!asked.requests.is_empty(), "{name} is inert");
         assert_eq!(asked.sweep, *name == "SessionStart", "{name}");
     }
@@ -43,7 +43,7 @@ fn a_session_start_and_end_feed_the_registry() {
     })
     .to_string();
     assert_eq!(
-        ask(&raw, "4242", "host").unwrap(),
+        ask(&raw, "4242", "host", None).unwrap(),
         Ask {
             requests: vec![Request::SessionStarted {
                 session: "s1".into(),
@@ -51,6 +51,7 @@ fn a_session_start_and_end_feed_the_registry() {
                 pid: "4242".into(),
                 instance: "host".into(),
                 cwd: "/w".into(),
+                inbox: None,
             }],
             sweep: true,
             session: "s1".into(),
@@ -58,7 +59,7 @@ fn a_session_start_and_end_feed_the_registry() {
     );
     let raw = json!({ "hook_event_name": "SessionEnd", "session_id": "s1", "reason": "clear" })
         .to_string();
-    let asked = ask(&raw, "4242", "host").unwrap();
+    let asked = ask(&raw, "4242", "host", None).unwrap();
     assert!(!asked.sweep);
     let ops: Vec<&str> = asked.requests.iter().map(Request::op).collect();
     assert_eq!(ops, ["notify.event", "session.ended"]);
@@ -73,14 +74,14 @@ fn a_session_start_and_end_feed_the_registry() {
     );
     // A payload without its word still records the event.
     let raw = json!({ "hook_event_name": "SessionEnd", "session_id": "s1" }).to_string();
-    let Request::SessionEnded { reason, .. } = &ask(&raw, "", "").unwrap().requests[1] else {
+    let Request::SessionEnded { reason, .. } = &ask(&raw, "", "", None).unwrap().requests[1] else {
         panic!("expected an end")
     };
     assert_eq!(reason, "unknown");
     // With no session to address, a start still sweeps — the sweep is about other sessions.
     let raw = json!({ "hook_event_name": "SessionStart" }).to_string();
     assert_eq!(
-        ask(&raw, "", "").unwrap(),
+        ask(&raw, "", "", None).unwrap(),
         Ask {
             requests: Vec::new(),
             sweep: true,
@@ -101,7 +102,7 @@ fn a_payload_becomes_one_notify_event() {
     })
     .to_string();
     assert_eq!(
-        ask(&raw, "4242", "host#pid:[1]").unwrap(),
+        ask(&raw, "4242", "host#pid:[1]", None).unwrap(),
         Ask {
             requests: vec![Request::NotifyEvent {
                 session: "___s1".into(),
@@ -118,7 +119,8 @@ fn a_payload_becomes_one_notify_event() {
     );
     let raw = json!({ "hook_event_name": "PostToolUse", "session_id": "s1", "tool_name": "Bash" })
         .to_string();
-    let Some(Request::NotifyEvent { event, tool, .. }) = ask(&raw, "", "").unwrap().requests.pop()
+    let Some(Request::NotifyEvent { event, tool, .. }) =
+        ask(&raw, "", "", None).unwrap().requests.pop()
     else {
         panic!("expected an event")
     };
@@ -135,9 +137,9 @@ fn an_unusable_payload_asks_nothing() {
         r#"{"session_id":"s1"}"#,
         "{}",
     ] {
-        assert_eq!(ask(raw, "", "").unwrap(), Ask::default(), "{raw}");
+        assert_eq!(ask(raw, "", "", None).unwrap(), Ask::default(), "{raw}");
     }
-    assert!(ask("not json", "", "").is_err());
+    assert!(ask("not json", "", "", None).is_err());
 }
 
 /// The owner rule, which was the whole of the fifth notification review's must-fix.
@@ -350,6 +352,7 @@ fn the_sweep_withdraws_what_is_provably_gone_and_spares_the_rest() {
             owner: "30".into(),
             instance: me.into(),
             probe: &probe,
+            inbox: None,
         },
     );
     assert!(failures.is_empty(), "{failures:?}");
@@ -392,6 +395,7 @@ fn the_sweep_spares_a_session_resumed_after_it_looked() {
             owner: "30".into(),
             instance: "host".into(),
             probe: &|_| Fact::No,
+            inbox: None,
         },
     );
     assert!(failures.is_empty(), "{failures:?}");
@@ -415,6 +419,7 @@ fn an_unreachable_daemon_is_a_logged_failure() {
         owner: String::new(),
         instance: "host".into(),
         probe: &|_| Fact::Unknown,
+        inbox: None,
     };
     let stop = json!({ "hook_event_name": "Stop", "session_id": "s1" }).to_string();
     assert_eq!(
@@ -503,6 +508,7 @@ fn a_hook_event_reaches_a_real_daemon_within_the_hook_deadlines() {
             owner: "4242".into(),
             instance: "host".into(),
             probe: &|_| Fact::Unknown,
+            inbox: None,
         },
     );
     assert!(failures.is_empty(), "{failures:?}");
@@ -528,6 +534,7 @@ fn register(b: &dyn Backend, session: &str, pid: &str, instance: &str) {
         pid: pid.into(),
         instance: instance.into(),
         cwd: "/w".into(),
+        inbox: None,
     })
     .unwrap();
 }
@@ -568,6 +575,7 @@ fn the_sweep_ends_the_registry_sessions_that_are_provably_gone() {
             owner: "30".into(),
             instance: me.into(),
             probe: &probe,
+            inbox: None,
         },
     );
     assert!(failures.is_empty(), "{failures:?}");
@@ -625,6 +633,7 @@ fn the_sweep_spares_a_registry_session_resumed_after_it_looked() {
             owner: "30".into(),
             instance: "host".into(),
             probe: &|pid| if pid == 30 { Fact::Yes } else { Fact::No },
+            inbox: None,
         },
     );
     assert!(failures.is_empty(), "{failures:?}");
@@ -672,6 +681,7 @@ fn a_slow_first_request_leaves_the_rest_unsent() {
         owner: "1".into(),
         instance: "host".into(),
         probe: &|_| Fact::Unknown,
+        inbox: None,
     };
     assert_eq!(
         handle(&end, &edge(&b)),
@@ -712,6 +722,7 @@ fn the_sweep_never_judges_the_session_that_is_starting() {
             owner: "30".into(),
             instance: me.into(),
             probe: &|pid| if pid == 30 { Fact::Yes } else { Fact::No },
+            inbox: None,
         },
     );
     assert!(failures.is_empty(), "{failures:?}");
@@ -759,6 +770,7 @@ fn the_sweep_pages_past_rows_it_cannot_judge() {
             owner: "30".into(),
             instance: "host".into(),
             probe: &|_| Fact::No,
+            inbox: None,
         },
     );
     assert!(failures.is_empty(), "{failures:?}");
@@ -809,6 +821,7 @@ fn a_slow_sweep_step_stops_the_sweep_there() {
         owner: "30".into(),
         instance: "host".into(),
         probe: &|pid| if pid == 30 { Fact::Yes } else { Fact::No },
+        inbox: None,
     };
     let no_session = json!({ "hook_event_name": "SessionStart" }).to_string();
 
@@ -882,6 +895,7 @@ fn a_hook_with_no_instance_sends_no_pid() {
             owner: String::new(),
             instance: String::new(),
             probe: &|_| Fact::Unknown,
+            inbox: None,
         },
     );
     assert!(failures.is_empty(), "{failures:?}");
@@ -894,6 +908,7 @@ fn a_hook_with_no_instance_sends_no_pid() {
             owner: "4242".into(),
             instance: String::new(),
             probe: &|_| Fact::Unknown,
+            inbox: None,
         },
     );
     assert_eq!(
@@ -922,6 +937,7 @@ fn a_row_repeated_across_pages_is_listed_once() {
         seen_at,
         ended_at: None,
         end_reason: None,
+        inbox: false,
     };
     let rows = keep_latest(vec![
         row("a", "1", 1),

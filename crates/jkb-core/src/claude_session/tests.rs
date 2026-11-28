@@ -477,3 +477,110 @@ fn identity_is_refused_and_the_rest_normalised() {
     end(&db, &p("s", "1", "h"), "Other!", T0 + 1);
     assert_eq!(one(&db, "s").end_reason.as_deref(), Some(UNKNOWN));
 }
+
+fn start_with(db: &Db, proc_: &Process<'_>, inbox: Option<(&str, &str)>, now: i64) {
+    let (s, i, n) = own(proc_);
+    let inbox = inbox.map(|(sock, tok)| super::Inbox::new(sock, tok).unwrap());
+    db.write_txn("t", move |c, m| {
+        super::started_with_inbox(c, m, &p(&s, &i, &n), "/w", "startup", inbox.as_ref(), now)
+    })
+    .unwrap();
+}
+
+fn targets(db: &Db, session: &str, host_boot: &str) -> Vec<(String, String)> {
+    let (s, hb) = (session.to_owned(), host_boot.to_owned());
+    db.read(move |c| super::inbox_targets(c, &s, &hb))
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.pid, t.inbox.socket().to_owned()))
+        .collect()
+}
+
+#[test]
+fn a_start_records_its_inbox_and_a_later_start_without_one_keeps_it() {
+    let db = Db::open_in_memory().unwrap();
+    let a = p("s1", "10", "h#b/ns1");
+    start_with(&db, &a, Some(("/tmp/cc-socks/1.sock", "tok1")), T0);
+    assert!(one(&db, "s1").has_inbox);
+    start_with(&db, &a, None, T0 + 1);
+    assert!(
+        one(&db, "s1").has_inbox,
+        "a start with no inbox never erases one"
+    );
+    assert_eq!(
+        targets(&db, "s1", "h#b"),
+        vec![("10".to_owned(), "/tmp/cc-socks/1.sock".to_owned())]
+    );
+    start(&db, &p("s2", "11", "h#b/ns1"), "startup", T0);
+    assert!(!one(&db, "s2").has_inbox);
+    let listed = db.read(|c| list(c, true, None)).unwrap().rows;
+    assert_eq!(
+        listed.iter().map(|r| r.has_inbox).collect::<Vec<_>>(),
+        vec![true, false]
+    );
+}
+
+#[test]
+fn inbox_targets_are_this_boots_live_processes_newest_first() {
+    let db = Db::open_in_memory().unwrap();
+    start_with(&db, &p("s1", "10", "h#b/ns1"), Some(("/s/old", "t")), T0);
+    start_with(
+        &db,
+        &p("s1", "11", "h#b/ns2"),
+        Some(("/s/new", "t")),
+        T0 + 5,
+    );
+    start_with(&db, &p("s1", "12", "h#b"), Some(("/s/bare", "t")), T0 + 1);
+    start_with(
+        &db,
+        &p("s1", "13", "h#old/ns1"),
+        Some(("/s/rebuilt", "t")),
+        T0 + 9,
+    );
+    start_with(
+        &db,
+        &p("s1", "14", "h#bb/ns1"),
+        Some(("/s/prefix", "t")),
+        T0 + 9,
+    );
+    start_with(
+        &db,
+        &p("s1", "15", "h#b/ns3"),
+        Some(("/s/ended", "t")),
+        T0 + 9,
+    );
+    end(&db, &p("s1", "15", "h#b/ns3"), "exit", T0 + 10);
+    let got: Vec<String> = targets(&db, "s1", "h#b")
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect();
+    assert_eq!(got, vec!["/s/new", "/s/bare", "/s/old"]);
+}
+
+#[test]
+fn a_malformed_inbox_is_refused_without_naming_its_value() {
+    for (sock, tok) in [
+        ("relative.sock", "t"),
+        ("/s\n", "t"),
+        ("/s", ""),
+        ("/s", "tok en"),
+        ("/s", "secret\u{7f}"),
+    ] {
+        let e = super::Inbox::new(sock, tok).unwrap_err();
+        assert!(!e.to_string().contains("secret"), "{e}");
+    }
+    assert!(super::Inbox::new(&format!("/{}", "a".repeat(600)), "t").is_err());
+    assert!(super::Inbox::new("/s", &"t".repeat(513)).is_err());
+}
+
+#[test]
+fn an_inbox_and_a_target_never_show_their_token() {
+    let db = Db::open_in_memory().unwrap();
+    let inbox = super::Inbox::new("/tmp/cc-socks/1.sock", "sekrit-token").unwrap();
+    assert!(!format!("{inbox:?}").contains("sekrit"));
+    assert!(format!("{inbox:?}").contains("/tmp/cc-socks/1.sock"));
+    start_with(&db, &p("s1", "10", "h#b"), Some(("/s", "sekrit-token")), T0);
+    let targets = db.read(|c| super::inbox_targets(c, "s1", "h#b")).unwrap();
+    assert_eq!(targets[0].inbox.token(), "sekrit-token");
+    assert!(!format!("{targets:?}").contains("sekrit"));
+}

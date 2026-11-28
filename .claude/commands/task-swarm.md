@@ -219,5 +219,6 @@ given while the run is going is picked up by its next frontier. Then tell the us
 - **Clean up.** `git worktree remove .swarm/integration`, then delete the local `swarm-task/*`
   branches. Never push them.
 - **Leftover claims.** If a run crashed and left claims, `jkb doctor --fix` clears them. It exits 1
-  whenever any open task is unplanned, after the repair has run: read its `task claims:` lines for
-  whether the claims were cleared, and its `unplanned tasks:` lines for the separate failure.
+  whenever a finding it cannot repair remains (an unplanned task, a sync file needing attention, a
+  failed full-text integrity check), after the repair has run: read its `task claims:` lines for
+  whether the claims were cleared, and the error it ends with for the separate failure.

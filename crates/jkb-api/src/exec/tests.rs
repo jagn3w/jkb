@@ -430,8 +430,9 @@ fn a_session_s_end_expires_its_requests_only_from_the_harness_or_itself() {
 }
 
 /// The run-request index (`exec/requests`) is the operator's to keep a group on — the app's live
-/// queue — and nobody else's: a session or the container's credential is refused every queue
-/// operation on it, as on any `exec/` topic, and the hints carry no argv.
+/// queue — and, under `inbox/`, the container forwarder's: a session, or the container's credential
+/// for any other group, is refused every queue operation on it, as on any `exec/` topic, and the
+/// hints carry no argv.
 #[test]
 fn the_request_index_is_read_by_the_operator_alone() {
     let kb = Kb::new();
@@ -503,6 +504,520 @@ fn the_request_index_is_read_by_the_operator_alone() {
     match ok(
         &kb.op,
         &json!({ "op": "mq.group_delete", "topic": topic, "group": "code-factory" }),
+    ) {
+        Response::GroupDeleted { deleted } => assert!(deleted),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// One hook take: what it handed over (acknowledged, as the hook does once it printed them), and
+/// the open requests.
+fn take(b: &LocalBackend, session: &str, agent: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let (lines, ids, open) = take_unacked(b, session, agent, true);
+    if !ids.is_empty() {
+        match ok(
+            b,
+            &json!({ "op": "exec.inbox.ack", "session": session, "ids": ids }),
+        ) {
+            Response::ExecInboxAcked { count } => assert_eq!(count, ids.len()),
+            other => panic!("{other:?}"),
+        }
+    }
+    (lines, open)
+}
+
+fn take_unacked(
+    b: &LocalBackend,
+    session: &str,
+    agent: Option<&str>,
+    open: bool,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    match ok(
+        b,
+        &json!({ "op": "exec.inbox.take", "session": session, "agent_id": agent, "open": open }),
+    ) {
+        Response::ExecInboxTaken { lines, ids, open } => (
+            lines,
+            ids,
+            open.iter().map(crate::exec::OpenRequest::line).collect(),
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn run_to_end(kb: &Kb, id: &str, chunk: &[u8]) {
+    use base64::Engine as _;
+    ok(
+        &kb.op,
+        &json!({ "op": "exec.begin", "id": id, "runner": "app",
+                        "recomputed_pin": { "head": "ab".repeat(20), "changes": "cd".repeat(32) } }),
+    );
+    let b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
+    ok(
+        &kb.op,
+        &json!({ "op": "exec.output", "id": id, "runner": "app", "chunk_b64": b64 }),
+    );
+    ok(
+        &kb.op,
+        &json!({ "op": "exec.finish", "id": id, "runner": "app", "outcome": "exited",
+                        "exit_status": 0, "total_bytes": chunk.len() }),
+    );
+}
+
+/// The hook's take is the harness's: the container credential and the operator hand a session its
+/// results; a ticket — even the session's own — or another grant cannot, so no tool call can swallow a
+/// result before it is heard.
+#[test]
+fn the_inbox_take_is_the_harness_s_alone() {
+    let kb = Kb::new();
+    let take_op = json!({ "op": "exec.inbox.take", "session": "s1" });
+    assert_eq!(
+        code(&kb.ticket("s1", None, "t1"), &take_op),
+        ErrorCode::Forbidden
+    );
+    assert_eq!(
+        code(
+            &kb.ticket("s1", Some(("a1", "implementer")), "t2"),
+            &take_op
+        ),
+        ErrorCode::Forbidden
+    );
+    let other_grant = match ok(
+        &kb.op,
+        &json!({ "op": "role.grant", "role": "coordinator", "agent": "someone" }),
+    ) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        code(&kb.as_token(&other_grant), &take_op),
+        ErrorCode::Forbidden
+    );
+    take(&kb.as_token(&kb.container), "s1", None);
+    take(&kb.op, "s1", None);
+    assert_eq!(
+        code(
+            &kb.op,
+            &json!({ "op": "exec.inbox.take", "session": "not a session" })
+        ),
+        ErrorCode::Invalid
+    );
+    assert_eq!(
+        crate::Request::ExecInboxTake {
+            session: "s".into(),
+            agent_id: None,
+            open: false
+        }
+        .permission(),
+        OpPermission::Attest
+    );
+}
+
+/// A session hears its result once: the first take hands over the message, with the warning the run
+/// printed; the next finds nothing. A subagent's result waits for that subagent, until it stops.
+#[test]
+fn a_result_reaches_the_agent_that_filed_it_once() {
+    let kb = Kb::new();
+    let hook = kb.as_token(&kb.container);
+    let (main_req, _) = requested(ok(&kb.ticket("s1", None, "t1"), &ask(&["land"])));
+    let (sub_req, _) = requested(ok(
+        &kb.ticket("s1", Some(("a1", "implementer")), "t2"),
+        &ask(&["check"]),
+    ));
+    let (lines, open) = take(&hook, "s1", None);
+    assert!(lines.is_empty());
+    assert_eq!(open.len(), 2, "{open:?}");
+    assert!(open[1].contains("running") || open[1].contains("pending"));
+
+    run_to_end(&kb, &main_req.id, b"warning: 1 task is unplanned\nok\n");
+    run_to_end(&kb, &sub_req.id, b"done\n");
+
+    let (lines, open) = take(&hook, "s1", None);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with(&format!(
+        "[jkb run request] {} finished exit 0",
+        main_req.id
+    )));
+    assert!(
+        lines[0].contains("\nwarning: 1 task is unplanned\n"),
+        "{}",
+        lines[0]
+    );
+    assert!(open.is_empty());
+    assert!(take(&hook, "s1", None).0.is_empty(), "delivered once");
+    assert!(take(&hook, "s2", None).0.is_empty(), "another session's");
+
+    let (lines, _) = take(&hook, "s1", Some("a1"));
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("filed by implementer (a1)"),
+        "{}",
+        lines[0]
+    );
+
+    // A subagent that stops before its next tool call: its result becomes the main agent's.
+    let (later, _) = requested(ok(
+        &kb.ticket("s1", Some(("a2", "implementer")), "t3"),
+        &ask(&["again"]),
+    ));
+    run_to_end(&kb, &later.id, b"x\n");
+    assert!(take(&hook, "s1", None).0.is_empty());
+    ok(
+        &hook,
+        &json!({ "op": "attest.release", "session": "s1", "agent_id": "a2" }),
+    );
+    assert_eq!(take(&hook, "s1", None).0.len(), 1);
+
+    // `exec.status` carries the same message, and reading it delivers nothing.
+    let v = view(ok(
+        &kb.op,
+        &json!({ "op": "exec.status", "id": main_req.id }),
+    ));
+    assert!(v
+        .delivery_text
+        .unwrap()
+        .contains("warning: 1 task is unplanned"));
+}
+
+/// An inbox is honoured only from whoever may vouch for the session — never from another session's
+/// ticket — and no listing carries its token.
+#[test]
+fn an_inbox_is_set_only_by_the_harness_or_the_session_and_never_listed() {
+    let kb = Kb::new();
+    let start = |session: &str, pid: &str| {
+        json!({ "op": "session.started", "session": session, "source": "startup",
+                "pid": pid, "instance": "h#b/ns",
+                "inbox": { "socket": "/tmp/cc-socks/9.sock", "token": "sekrit-token" } })
+    };
+    ok(&kb.ticket("s2", None, "t1"), &start("s1", "10"));
+    ok(&kb.ticket("s1", None, "t2"), &start("s1", "11"));
+    ok(&kb.as_token(&kb.container), &start("s3", "12"));
+    let rows = match ok(&kb.op, &json!({ "op": "session.list", "all": true })) {
+        Response::ClaudeSessions { sessions, .. } => sessions,
+        other => panic!("{other:?}"),
+    };
+    let has = |s: &str, pid: &str| {
+        rows.iter()
+            .find(|r| r.session == s && r.pid == pid)
+            .unwrap()
+            .inbox
+    };
+    assert!(
+        !has("s1", "10"),
+        "another session's ticket cannot point s1's results anywhere"
+    );
+    assert!(has("s1", "11"));
+    assert!(has("s3", "12"));
+    let listed = serde_json::to_string(&rows).unwrap();
+    assert!(!listed.contains("sekrit"), "{listed}");
+    let targets = kb
+        .db
+        .read(|c| jkb_core::claude_session::inbox_targets(c, "s1", "h#b"))
+        .unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].inbox.token(), "sekrit-token");
+    // A malformed inbox is dropped, and the start still recorded.
+    ok(
+        &kb.op,
+        &json!({ "op": "session.started", "session": "s4", "source": "startup", "pid": "13",
+                 "instance": "h", "inbox": { "socket": "relative", "token": "t" } }),
+    );
+    assert_eq!(
+        kb.db
+            .read(|c| jkb_core::claude_session::holders(c, "s4"))
+            .unwrap()
+            .iter()
+            .map(|h| h.has_inbox)
+            .collect::<Vec<_>>(),
+        vec![false]
+    );
+    // A request's debug form never shows the token.
+    let r: crate::Request = serde_json::from_value(start("s1", "1")).unwrap();
+    assert!(!format!("{r:?}").contains("sekrit"));
+}
+
+/// A take whose reply never reached the session — the hook's client gave up after the daemon
+/// committed it, or the hook died before printing — is handed over again once the hook's lease
+/// lapses; without `open`, nothing but the take is computed.
+#[test]
+fn a_lost_take_is_handed_over_again_and_open_is_listed_only_when_asked() {
+    let kb = Kb::new();
+    let hook = kb.as_token(&kb.container);
+    let (r, _) = requested(ok(&kb.ticket("s1", None, "t1"), &ask(&["land"])));
+    let (_, _, open) = take_unacked(&hook, "s1", None, false);
+    assert!(open.is_empty(), "not asked for");
+    let (_, _, open) = take_unacked(&hook, "s1", None, true);
+    assert_eq!(open.len(), 1);
+    run_to_end(&kb, &r.id, b"ok\n");
+    let (lines, ids, _) = take_unacked(&hook, "s1", None, false);
+    assert_eq!((lines.len(), ids), (1, vec![r.id.clone()]));
+    // The reply is lost: nothing is acknowledged. Held for the lease, then handed over again.
+    assert!(take_unacked(&hook, "s1", None, false).0.is_empty());
+    let n = crate::exec::id(&r.id).unwrap();
+    kb.db
+        .write_txn("t", move |c, _| {
+            c.execute(
+                "UPDATE exec_delivery SET lease_until = 0 WHERE request_id = ?1",
+                [n],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (lines, _) = take(&hook, "s1", None);
+    assert_eq!(lines.len(), 1, "handed over again after the lease");
+    assert!(
+        take(&hook, "s1", None).0.is_empty(),
+        "acknowledged: delivered"
+    );
+}
+
+/// Session `s1`'s process `pid` registers its inbox in container boot `h#b`, as the managed
+/// `SessionStart` hook does with the container's credential.
+fn start_inbox(kb: &Kb, pid: &str, token: &str) {
+    ok(
+        &kb.as_token(&kb.container),
+        &json!({ "op": "session.started", "session": "s1", "source": "startup", "pid": pid,
+                 "instance": "h#b/pid:[1]",
+                 "inbox": { "socket": format!("/tmp/cc-socks/{pid}.sock"), "token": token } }),
+    );
+}
+
+fn due_ids(b: &LocalBackend, instance: &str) -> Vec<String> {
+    match ok(
+        b,
+        &json!({ "op": "exec.inbox.due", "instance": instance, "max": 10 }),
+    ) {
+        Response::ExecInboxDue { ids } => ids,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The forwarder's ops are the harness's, as the hook's take is: a claim hands out an inbox token, so
+/// no ticket — not even the session's own — and no other grant may sweep, claim or report.
+#[test]
+fn the_forwarder_s_ops_are_the_harness_s_alone() {
+    let kb = Kb::new();
+    let other_grant = match ok(
+        &kb.op,
+        &json!({ "op": "role.grant", "role": "coordinator", "agent": "someone" }),
+    ) {
+        Response::Granted { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    let ops = [
+        json!({ "op": "exec.inbox.due", "instance": "h#b", "max": 10 }),
+        json!({ "op": "exec.inbox.claim", "id": "exec-1", "instance": "h#b", "lease_ms": 30000 }),
+        json!({ "op": "exec.inbox.report", "id": "exec-1", "ok": true }),
+    ];
+    for op in &ops {
+        for who in [
+            kb.ticket("s1", None, "t1"),
+            kb.ticket("s1", Some(("a1", "implementer")), "t2"),
+            kb.as_token(&other_grant),
+        ] {
+            assert_eq!(code(&who, op), ErrorCode::Forbidden, "{op}");
+        }
+        let r: crate::Request = serde_json::from_value(op.clone()).unwrap();
+        assert_eq!(r.permission(), OpPermission::Attest, "{op}");
+    }
+    assert!(due_ids(&kb.as_token(&kb.container), "h#b").is_empty());
+    assert!(due_ids(&kb.op, "h#b").is_empty());
+    for bad in ["h", "h/ns", "#b", "h#", "h#b/pid:[1]", "h#b#c", "h#b\n"] {
+        assert_eq!(
+            code(
+                &kb.op,
+                &json!({ "op": "exec.inbox.due", "instance": bad, "max": 1 })
+            ),
+            ErrorCode::Invalid,
+            "{bad:?}"
+        );
+    }
+    // A sweep is a read (it only settles expiries); a claim and a report are keyed for resend.
+    let due: crate::Request = serde_json::from_value(ops[0].clone()).unwrap();
+    assert!(!due.mutates());
+    for op in &ops[1..] {
+        let r: crate::Request = serde_json::from_value(op.clone()).unwrap();
+        assert!(r.mutates(), "{op}");
+    }
+}
+
+/// The forwarder's round: a due result is claimed with its message and the session's inbox targets in
+/// the forwarder's boot, newest first; while the claim holds, nobody else is handed it; reported
+/// posted, it is delivered, and neither the hook nor another sweep hands it over again.
+#[test]
+fn a_forwarder_claims_a_due_result_and_reports_it_posted() {
+    let kb = Kb::new();
+    let fwd = kb.as_token(&kb.container);
+    let (r, _) = requested(ok(&kb.ticket("s1", None, "t1"), &ask(&["land"])));
+    start_inbox(&kb, "10", "older-token");
+    start_inbox(&kb, "11", "newer-token");
+    assert!(due_ids(&fwd, "h#b").is_empty(), "still pending");
+    run_to_end(&kb, &r.id, b"warning: 1 task is unplanned\nok\n");
+    assert_eq!(due_ids(&fwd, "h#b"), vec![r.id.clone()]);
+    assert!(
+        due_ids(&fwd, "h#other").is_empty(),
+        "another container's boot"
+    );
+
+    let claim =
+        json!({ "op": "exec.inbox.claim", "id": r.id, "instance": "h#b", "lease_ms": 30000 });
+    assert_eq!(
+        code(
+            &fwd,
+            &json!({ "op": "exec.inbox.claim", "id": r.id, "instance": "h#other", "lease_ms": 30000 })
+        ),
+        ErrorCode::NotFound
+    );
+    let (text, targets) = match ok(&fwd, &claim) {
+        Response::ExecInboxClaimed { text, targets } => (text, targets),
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        text.starts_with(&format!("[jkb run request] {} finished exit 0", r.id)),
+        "{text}"
+    );
+    assert!(text.contains("\nwarning: 1 task is unplanned\n"), "{text}");
+    let tokens: Vec<&str> = targets.iter().map(|t| t.token.as_str()).collect();
+    assert_eq!(tokens, vec!["newer-token", "older-token"]);
+    assert_eq!(targets[0].socket, "/tmp/cc-socks/11.sock");
+    let debug = format!(
+        "{:?}",
+        Response::ExecInboxClaimed {
+            text: String::new(),
+            targets: targets.clone()
+        }
+    );
+    assert!(!debug.contains("newer-token"), "{debug}");
+
+    assert_eq!(code(&fwd, &claim), ErrorCode::NotFound, "claimed already");
+    assert!(
+        take(&kb.as_token(&kb.container), "s1", None).0.is_empty(),
+        "the hook leaves a live claim to its holder"
+    );
+    match ok(
+        &fwd,
+        &json!({ "op": "exec.inbox.report", "id": r.id, "ok": true }),
+    ) {
+        Response::ExecInboxReported { reported } => assert!(reported),
+        other => panic!("{other:?}"),
+    }
+    match ok(
+        &fwd,
+        &json!({ "op": "exec.inbox.report", "id": r.id, "ok": true }),
+    ) {
+        Response::ExecInboxReported { reported } => assert!(!reported, "delivered once"),
+        other => panic!("{other:?}"),
+    }
+    assert!(due_ids(&fwd, "h#b").is_empty());
+    let n = crate::exec::id(&r.id).unwrap();
+    let d = kb
+        .db
+        .read(move |c| jkb_core::exec_delivery::get(c, n))
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.via, Some(jkb_core::exec_delivery::Via::Socket));
+}
+
+/// A post every target refused is reported failed, with why: the row waits for the hook, or for the
+/// session to come back with a newer inbox.
+#[test]
+fn a_failed_post_is_recorded_and_left_to_the_hook() {
+    let kb = Kb::new();
+    let fwd = kb.as_token(&kb.container);
+    let (r, _) = requested(ok(&kb.ticket("s1", None, "t1"), &ask(&["land"])));
+    start_inbox(&kb, "10", "tok");
+    run_to_end(&kb, &r.id, b"ok\n");
+    ok(
+        &fwd,
+        &json!({ "op": "exec.inbox.claim", "id": r.id, "instance": "h#b", "lease_ms": 30000 }),
+    );
+    match ok(
+        &fwd,
+        &json!({ "op": "exec.inbox.report", "id": r.id, "ok": false,
+                 "error": "/tmp/cc-socks/10.sock: connection refused" }),
+    ) {
+        Response::ExecInboxReported { reported } => assert!(reported),
+        other => panic!("{other:?}"),
+    }
+    let n = crate::exec::id(&r.id).unwrap();
+    let d = kb
+        .db
+        .read(move |c| jkb_core::exec_delivery::get(c, n))
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.state, jkb_core::exec_delivery::DeliveryState::Failed);
+    assert_eq!(
+        d.last_error.as_deref(),
+        Some("/tmp/cc-socks/10.sock: connection refused")
+    );
+    assert!(due_ids(&fwd, "h#b").is_empty(), "no newer inbox");
+    assert_eq!(take(&fwd, "s1", None).0.len(), 1, "the hook delivers it");
+}
+
+/// The container's credential keeps its forwarder's `inbox/` group on the run-request index — and no
+/// other group there, and no group on any other `exec/` topic; a ticket keeps none.
+#[test]
+fn the_container_keeps_only_its_inbox_groups_on_the_request_index() {
+    let kb = Kb::new();
+    let container = kb.as_token(&kb.container);
+    let topic = jkb_core::exec::INDEX_TOPIC;
+    ok(
+        &container,
+        &json!({ "op": "mq.group_create", "topic": topic, "group": "inbox/h" }),
+    );
+    let (r, _) = requested(ok(
+        &kb.ticket("s1", None, "t1"),
+        &ask(&["make", "secret-arg"]),
+    ));
+    let poll = json!({ "op": "mq.poll", "topic": topic, "group": "inbox/h", "max": 10 });
+    let messages = match ok(&container, &poll) {
+        Response::Messages { messages } => messages,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].payload["id"], json!(r.id));
+    assert!(!messages[0].payload.to_string().contains("secret-arg"));
+    ok(
+        &container,
+        &json!({ "op": "mq.ack", "topic": topic, "group": "inbox/h", "seq": messages[0].seq }),
+    );
+    let s1 = kb.ticket("s1", None, "t2");
+    for (who, op) in [
+        (
+            &s1,
+            json!({ "op": "mq.group_create", "topic": topic, "group": "inbox/h" }),
+        ),
+        (
+            &s1,
+            json!({ "op": "mq.poll", "topic": topic, "group": "inbox/h", "max": 10 }),
+        ),
+        (
+            &container,
+            json!({ "op": "mq.group_create", "topic": topic, "group": "inboxes" }),
+        ),
+        (
+            &container,
+            json!({ "op": "mq.group_create", "topic": "exec/1", "group": "inbox/h" }),
+        ),
+        (
+            &container,
+            json!({ "op": "mq.poll", "topic": "exec/1", "group": "inbox/h", "max": 10 }),
+        ),
+        (
+            &container,
+            json!({ "op": "mq.send", "topic": topic, "key": "k", "kind": "exec.changed",
+                    "payload": {}, "producer": "p" }),
+        ),
+    ] {
+        let c = code(who, &op);
+        assert!(
+            matches!(c, ErrorCode::Invalid | ErrorCode::Forbidden),
+            "{op}: {c:?}"
+        );
+    }
+    match ok(
+        &container,
+        &json!({ "op": "mq.group_delete", "topic": topic, "group": "inbox/h" }),
     ) {
         Response::GroupDeleted { deleted } => assert!(deleted),
         other => panic!("{other:?}"),

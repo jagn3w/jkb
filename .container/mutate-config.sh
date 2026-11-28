@@ -1336,6 +1336,36 @@ open(p, 'w').write(s.replace('"hooks": {', '"hooks_moved": {', 1))
 PYX
 run "the managed hooks cannot be read" "no hook commands could be read"
 
+# A run request's result reaches its session through the attest hook on every tool call's
+# PostToolUse: narrowed back to Bash, a session that only reads and edits never hears it.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+for h in d["hooks"]["PostToolUse"]:
+    if "attest hook" in json.dumps(h):
+        h["matcher"] = "Bash"
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the attest hook's PostToolUse is narrowed back to Bash" "a run request's result would go unheard"
+
+# The forwarder's push into a session's inbox is held without crossSessionInbound: accept.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.pop("crossSessionInbound", None)
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "crossSessionInbound is dropped from the managed settings" "does not set crossSessionInbound to accept"
+
+# The forwarder runs outside the sandbox with the credential readable: JKB_HOOK_BIN must be the
+# pinned, root-owned binary, not one a tool call can replace.
+seed; python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import sys
+p = sys.argv[1]; s = open(p).read()
+open(p, 'w').write(s.replace('ENV JKB_HOOK_BIN=/usr/local/lib/jkb-hook/jkb', 'ENV JKB_HOOK_BIN=/home/vscode/.cargo/bin/jkb', 1))
+PYX
+run "the forwarder's JKB_HOOK_BIN names a binary the sandbox can replace" "the forwarder is not the pinned binary"
+
 # THE TRANSCRIPT DENY (2026-09-30), which is a HOOK because a glob cannot be both cheap and
 # correct here. A `Read(...*.jsonl)` glob is named per-matching-file in the bubblewrap argv (206
 # files = 52% of MAX_ARG_STRLEN, and past it every Bash call dies at spawn); the collapsing
@@ -1398,6 +1428,23 @@ d["permissions"]["deny"].append("Read(~/.claude/projects)")
 json.dump(d, open(p, "w"), indent=2)
 PYX
 run "a bare directory rule covers auto-memory's subtree" "covers ~/.claude/projects/<slug>/memory"
+
+# The PermissionDenied registration that parks a denied line's ticket: dropped, and narrowed off Bash.
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+del d["hooks"]["PermissionDenied"]
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the PermissionDenied attest hook is dropped" "no PermissionDenied attest hook on Bash (matcher [])"
+
+seed; python3 - "$work/t/.container/managed-settings.json" <<'PYX'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d["hooks"]["PermissionDenied"][0]["matcher"] = "Read"
+json.dump(d, open(p, "w"), indent=2)
+PYX
+run "the PermissionDenied attest hook is narrowed off Bash" "no PermissionDenied attest hook on Bash (matcher [Read])"
 
 # THE REVIEW ROUND'S ROWS (2026-10-01): each one a guard the first cut had and could not fire.
 # `Edit` is a substring of `NotebookEdit`, so a substring matcher check passed a matcher without Edit.
@@ -2564,6 +2611,39 @@ open(p, 'w').write(s[:i] + s[j:])
 PYX
 run "run.sh stops emitting any instance flag" "emits no instance flag at all"
 
+# GIT'S TRUST IN THE REPOS BIND: gone, widened, commented out, granted a second time elsewhere, and
+# one of the files the second-grant scan reads missing (it must not pass having read nothing).
+sd_line="RUN git config --system --add safe.directory '/home/vscode/repos/*' && chmod 0644 /etc/gitconfig"
+seed; SD_LINE="$sd_line" python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import os, sys
+p = sys.argv[1]; s = open(p).read(); old = os.environ["SD_LINE"] + "\n"
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "", 1))
+PYX
+run "the safe.directory grant is deleted" "no longer grants git's safe.directory"
+
+seed; SD_LINE="$sd_line" python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import os, sys
+p = sys.argv[1]; s = open(p).read(); old = os.environ["SD_LINE"]
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, old.replace("'/home/vscode/repos/*'", "'*'"), 1))
+PYX
+run "the safe.directory grant is widened to *" "no longer grants git's safe.directory"
+
+seed; SD_LINE="$sd_line" python3 - "$work/t/.container/Dockerfile" <<'PYX'
+import os, sys
+p = sys.argv[1]; s = open(p).read(); old = os.environ["SD_LINE"]
+assert old in s, "mutation target absent"
+open(p, 'w').write(s.replace(old, "# " + old, 1))
+PYX
+run "the safe.directory grant is commented out" "no longer grants git's safe.directory"
+
+seed; printf '%s\n' "git config --global --add safe.directory '*'" >>"$work/t/.container/entrypoint.sh"
+run "a second, wider safe.directory grant in entrypoint.sh" "safe.directory is granted somewhere other than"
+
+seed; rm -f "$work/t/.container/entrypoint.sh"
+run "a file the safe.directory scan reads is missing" "entrypoint.sh is missing, so it could not be read"
+
 # COVERAGE, PINNED rather than claimed. The old summary said "every check-config assertion fired"
 # while six of its failure paths had no mutation at all — so a 22nd assertion that cannot fail
 # (this repo's most repeated defect, found in check-config.sh three rounds running) would have left
@@ -2586,7 +2666,7 @@ echo "==> coverage"
 settle
 bad_sites="$(sed 's/[[:space:]]#.*$//; s/^#.*$//' "$repo/.container/check-config.sh" \
     | grep -o 'bad "' | grep -c .)"
-PINNED_BAD_SITES=123
+PINNED_BAD_SITES=129
 if [ "$bad_sites" -ne "$PINNED_BAD_SITES" ]; then
     fails=$((fails+1))
     printf '  check-config.sh has %s failure paths, pinned at %s.\n' "$bad_sites" "$PINNED_BAD_SITES"

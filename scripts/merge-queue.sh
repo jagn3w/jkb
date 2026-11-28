@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Deterministic merge-queue step (design D27.6): integrate ONE reviewer-approved branch
-# into the base feature branch by rebase + fast-forward (linear history, no merge commit,
-# no branch-name artifact), then run the gate. NO agent, NO reasoning — a merge train.
+# into the base feature branch by replaying its commits onto the base (a rebase built in the
+# object database, see step 1) + fast-forward (linear history, no merge commit, no branch-name
+# artifact), then run the gate. NO agent, NO reasoning — a merge train.
 #
 #   ./scripts/merge-queue.sh <branch> <base> <worktree>
 #
@@ -10,12 +11,14 @@
 #               every byte the branch adds (its commits dropped as empty, or empty to begin
 #               with) and is reported as such. BOTH arms call `jkb task landed`, because in
 #               both the content the tasks asked for is in <base>.
-#   1  eject   — the implementer's to fix: a rebase conflict, or a branch that DIVERGED from
-#               <base> and still changes nothing against it, however many commits it carries.
-#               Both are handed back.
+#   1  eject   — the implementer's to fix: a conflict replaying the branch onto <base>, or a
+#               branch that DIVERGED from <base> and still changes nothing against it, however
+#               many commits it carries. Both are handed back.
 #   2  eject   — gate failed on the integrated result; <base> never moved.
-#   3  error   — setup problem: a worktree or branch the queue cannot use, or a branch with no
-#               common ancestor with <base> at all. Nothing changed.
+#   3  error   — setup problem: a worktree or branch the queue cannot use (including a worktree
+#               with tracked changes, or an untracked file the graft would overwrite), a graft git
+#               could not build, or a branch with no common ancestor with <base> at all. Nothing
+#               changed.
 #   5  stall   — <branch> is already an ancestor of <base>, and the graph cannot say whether an
 #               earlier entry landed its work or it was never committed to. A person decides.
 #   6  stall   — no reviewer approved <branch>'s head: `jkb task landed --check` found no clean
@@ -71,10 +74,10 @@ set -uo pipefail
 # repository's content, silently. That is somebody's home directory under the
 # `export GIT_WORK_TREE=$HOME` dotfiles recipe this whole cluster (D46) exists for.
 #
-# ONCE, AT THE TOP, rather than `-C` on each of the fourteen call sites below (counted, not
-# estimated — it read "nine" for a round): a rule every call site has to remember is the defect
-# this repository keeps rediscovering, and a fifteenth git call added below would not have to
-# remember this one. The six names are `gitrepo::REPO_SELECTION_VARS` — which
+# ONCE, AT THE TOP, rather than `-C` on each of the call sites below (fourteen when this was
+# written, counted, not estimated — it read "nine" for a round; the graft's plumbing added a dozen
+# more since): a rule every call site has to remember is the defect this repository keeps
+# rediscovering, and the next git call added below does not have to remember this one. The six names are `gitrepo::REPO_SELECTION_VARS` — which
 # repository, and which parts of one — kept in step with it by
 # `dev-scripts.test.sh`'s case6, which reads the six names out of `REPO_SELECTION_VARS` itself.
 # (Not `git-hooks.test.sh`'s bare-git scan, which this line used to name: that one reads only
@@ -102,6 +105,86 @@ unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR \
 _suite_floor() {
     git ls-tree -r --name-only "$1" -- scripts/tests 2>/dev/null \
         | grep -cE '^scripts/tests/[^/]+\.test\.sh$' || true
+}
+
+# _graft <onto> <head> — replay <head>'s commits onto <onto> in the object database, and print the
+# new tip. Nothing here reads or writes the worktree or the index: every step is `merge-tree`,
+# which reads objects, and `commit-tree`, which writes them. Step 1 below says why.
+#
+#   exit 0  stdout is the new tip (== <onto> when every commit dropped as empty)
+#   exit 1  a real conflict; stdout is `<short sha> <subject>: <first conflicted path>`, and
+#           merge-tree's own report of it is in /tmp/merge-queue.log
+#   exit 3  git could not do it; stdout is git's first line
+#
+# THE COMMIT LIST IS THE ONE `git rebase` REPLAYS: the commits on <head>'s side only, merges
+# flattened (`--no-merges`), and a commit whose patch <onto> already carries skipped
+# (`--cherry-pick`) -- rebase's default without `--reapply-cherry-picks` or `--rebase-merges`.
+#
+# A COMMIT ALREADY ON THE TIP IS REUSED, as rebase's fast-forward reuses it (below).
+#
+# THE EMPTY-COMMIT RULE IS REBASE'S, EXACTLY: a commit that STARTED empty is kept, and one that
+# BECOMES empty against <onto> is dropped. The entry checks and the tree check after the gate both
+# rest on that asymmetry ("rebase drops what BECOMES empty, not what starts empty"), and
+# merge-queue.test.sh's case_parity holds this function to git's own rebase on the same inputs.
+#
+# THE COMMITS ARE UNREACHABLE until step 3 fast-forwards onto them, so a run killed in here leaves
+# nothing behind. A kill mid-`git rebase` left `.git/rebase-merge` in the worktree and wedged the
+# next run.
+#
+# Author name, email and date are the original's, and the message bytes are carried verbatim
+# (commit-tree does no stripspace); the committer of every rewritten commit is whoever runs the
+# queue, as with rebase. The author is the raw one, never mailmapped. A commit's `encoding` header
+# is not carried: this repository's commits are UTF-8, and case_parity compares the message bytes.
+_graft() {
+    local onto="$1" head="$2" list c tip tree rc out raw author
+    list="$(git rev-list --reverse --topo-order --no-merges --right-only --cherry-pick \
+                "$onto...$head" 2>&1)" || { sed -n 1p <<<"$list"; return 3; }
+    tip="$(git rev-parse --verify --quiet "$onto^{commit}")" || { echo "cannot resolve $onto"; return 3; }
+    for c in $list; do
+        # ALREADY ON THE TIP: reused, not rewritten. Rebase fast-forwards a pick whose parent is
+        # the current tip (without `--force-rebase`), so a branch cut from the base tip lands as
+        # its own commits -- same ids, committer and signature -- and stays an ancestor of <base>.
+        # Rewriting it would land a copy. Measured on git 2.51.1 against the rebase this replaced:
+        # a branch cut from the base tip landed with its original committer, and without this arm
+        # the graft landed it with the queue's. merge-queue.test.sh's case_parity_ff holds it.
+        if [ "$(git rev-parse "$c~1" 2>&1)" = "$tip" ]; then
+            tip="$c"; continue
+        fi
+        if [ "$(git rev-parse "$c^{tree}" 2>&1)" = "$(git rev-parse "$c~1^{tree}" 2>&1)" ]; then
+            # Started empty: kept, on <tip>'s tree, as rebase keeps it.
+            tree="$(git rev-parse "$tip^{tree}" 2>&1)" || { sed -n 1p <<<"$tree"; return 3; }
+        else
+            out="$(git merge-tree --write-tree --name-only --merge-base "$c~1" "$tip" "$c" 2>&1)"
+            rc=$?
+            case "$rc" in
+                0) tree="$(sed -n 1p <<<"$out")" ;;
+                1)
+                    { printf 'conflict replaying %s\n' "$(git log -1 --format='%h %s' "$c")"
+                      printf '%s\n' "$out"; } >/tmp/merge-queue.log
+                    printf '%s: %s\n' "$(git log -1 --format='%h %s' "$c")" "$(sed -n 2p <<<"$out")"
+                    return 1 ;;
+                *) sed -n 1p <<<"$out"; return 3 ;;
+            esac
+            # Became empty: dropped, as rebase drops it.
+            [ "$tree" = "$(git rev-parse "$tip^{tree}")" ] && continue
+        fi
+        # The author is read off the commit object's own `author` line -- `NAME <EMAIL> SECONDS TZ`,
+        # where git forbids `<` and `>` in the name -- rather than through `git log`'s formatting,
+        # which config (mailmap, `log.showSignature`) can reach.
+        # The date goes in as `@SECONDS TZ`: bare, commit-tree refuses an epoch before 1973 as an
+        # unparseable date (measured, review round 1).
+        raw="$(git cat-file commit "$c" 2>&1)" || { sed -n 1p <<<"$raw"; return 3; }
+        author="$(sed -n '1,/^$/s/^author //p' <<<"$raw")"
+        # The MESSAGE is piped straight from the object, never through a variable: `$( )` strips
+        # trailing newlines, and the bytes are meant to arrive verbatim.
+        out="$(git cat-file commit "$c" | sed '1,/^$/d' \
+            | GIT_AUTHOR_NAME="${author%% <*}" \
+              GIT_AUTHOR_EMAIL="$(sed 's/^[^<]*<\([^>]*\)>.*$/\1/' <<<"$author")" \
+              GIT_AUTHOR_DATE="@${author##*> }" \
+              git commit-tree "$tree" -p "$tip" -F - 2>&1)" || { sed -n 1p <<<"$out"; return 3; }
+        tip="$out"
+    done
+    printf '%s\n' "$tip"
 }
 
 # _shell_suites_pass <floor> — run every shell suite, and refuse if fewer than <floor> were found.
@@ -202,7 +285,16 @@ fi' EXIT
 : "${JKB:=jkb}"
 
 cd "$WT" 2>/dev/null || { echo "error: cannot cd to worktree $WT"; finish 3; }
-git switch "$BASE" >/dev/null 2>&1 || { echo "error: cannot switch to base $BASE"; finish 3; }
+# GIT'S REASON, NOT OURS, here as at every later switch. This line discarded git's output and said
+# only "cannot switch to base", so exec-97 (a container run request, 2026-11-25) stalled with its
+# cause swallowed: git had refused the repository as "dubious ownership", and the operator was left
+# to guess between that, a base held by another worktree and a tracked change the switch would
+# overwrite. Git's first line names each of them. ITS OWN LOG FILE, truncated by `>`, so line 1 is
+# this switch's and not a leftover of an earlier run's.
+if ! git switch "$BASE" >/tmp/merge-queue-switch.log 2>&1; then
+  echo "error: cannot switch to base $BASE — git said: $(sed -n 1p /tmp/merge-queue-switch.log)"
+  finish 3
+fi
 HEAD_SHA="$(git rev-parse --verify --quiet "$BRANCH_REF^{commit}" 2>/dev/null)" || HEAD_SHA=""
 [ -n "$HEAD_SHA" ] || { echo "error: no such branch $BRANCH"; finish 3; }
 # THE BRANCH IS READ ONCE. Every step below — the approval question, the entry checks, the graft and
@@ -290,26 +382,98 @@ PRE=$(git rev-parse HEAD)   # the base tip before this graft: what the gated res
                             # a clean rollback" as this line read for one commit — the reorder
                             # below deleted both rollbacks, which is its whole point.
 
-# 1. Rebase the branch's commits onto the CURRENT base tip WITHOUT moving the branch ref.
-# `git rebase <base> <branch>` checks out <branch> first, which git REFUSES when <branch>
-# is checked out in the implementer's worktree ("fatal: '<branch>' is already used by
-# worktree at …") — a setup error the old code caught and misreported as a *content*
-# conflict, ejecting every group forever. Detaching HEAD at the branch commit does not
-# claim the branch ref, so it is allowed even when the branch is live elsewhere; we rebase
-# that detached HEAD, then fast-forward the base to the grafted result (linear, no merge
-# commit). Empty commits drop exactly as a normal rebase would.
-if ! git checkout --detach "$HEAD_SHA" >/tmp/merge-queue.log 2>&1; then
-  git switch "$BASE" >/dev/null 2>&1
-  echo "eject: cannot detach at $BRANCH (see /tmp/merge-queue.log)"
-  finish 1
+# 1. Replay the branch's commits onto the CURRENT base tip WITHOUT moving the branch ref, then put
+#    the worktree on the result.
+#
+# THE GRAFT IS BUILT IN THE OBJECT DATABASE, and the worktree moves once, by `reset --hard`. This
+# was `git checkout --detach "$HEAD_SHA"` + `git rebase "$BASE_REF"`, and on the dev container's
+# virtiofs repo mount that ejected CLEAN branches as conflicts: rebase's pick refused with "Your
+# local changes to the following files would be overwritten" for exactly the files the commit
+# changes, in a clean worktree, while `git merge-tree --write-tree` of the same commits showed no
+# conflict (exec-99 and exec-101, 2026-11-25; reproduced in the sandbox in both task worktrees;
+# `git update-index --refresh` beforehand did not help, and the hand workaround needed a refresh
+# between every pick). The cause is not measured: bumping tracked files' mtimes before a rebase on
+# ext4 (git 2.51.1) did not reproduce it, because rebase refreshes the index first, so it is
+# probably not plain stat drift. Nothing here depends on which it is -- `merge-tree` reads only
+# objects, and `reset --hard` performs no "would be overwritten" check, which is the check that
+# misfires. A real conflict is still an eject: merge-tree reports it, and the worktree has not
+# been touched, so there is no `rebase --abort` and no switch back to fail.
+#
+# The scar this step's comment used to carry stays true: `git rebase <base> <branch>` checks the
+# branch out, which git refuses while it is checked out in the implementer's worktree, and the
+# old code misreported that as a content conflict. Nothing here checks the branch out at all.
+#
+# Rejected: a retry loop around rebase (it hides a real conflict behind N attempts, and the
+# phantom persisted across attempts in both runs); a throwaway worktree off the mount (a cold
+# target/ per land, and /tmp dies with docker); keeping rebase and falling back to this on failure
+# (two graft algorithms, where the fallback is the one that always works).
+#
+# 1a. Build it. No worktree writes.
+GRAFT="$(_graft "$BASE_REF" "$HEAD_SHA")"
+case $? in
+  0) ;;
+  1) echo "eject: rebase conflict onto $BASE — $GRAFT (see /tmp/merge-queue.log)"
+     finish 1 ;;
+  *) echo "error: could not build the graft of $BRANCH onto $BASE — git said: $GRAFT"
+     finish 3 ;;
+esac
+# 1b. Put the worktree on it. HEAD is on $BASE at $PRE here.
+#
+# A CLEAN WORKTREE FIRST, because `reset --hard` discards a tracked change silently where the
+# rebase used to refuse it -- and misreport it as the implementer's conflict. The queue's worktree
+# is the queue's: a stall that names the file beats both. Refreshed first, so the comparison is of
+# content and not of stat data.
+git update-index -q --refresh >/dev/null 2>&1
+if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+  echo "error: the queue's worktree has tracked changes ($(git diff-index --name-only HEAD -- 2>/dev/null | sed -n 1p)); it must be clean before $BRANCH can be grafted"
+  finish 3
 fi
-if ! git rebase "$BASE_REF" >/tmp/merge-queue.log 2>&1; then
-  git rebase --abort >/dev/null 2>&1 || true
-  git switch "$BASE" >/dev/null 2>&1
-  echo "eject: rebase conflict onto $BASE"
-  finish 1
+# ...AND NO UNTRACKED FILE IN THE WAY. `reset --hard` overwrites an untracked file where checkout
+# refused, in two places. At a path the graft ADDS: absent from $PRE's tree, so anything on disk
+# there is untracked, a directory included. And at a LEADING
+# COMPONENT of one: a branch adding `d/x` turns an untracked FILE `d` into a directory, deleting
+# it. A component that exists, is not a directory or is a symlink, and is not tracked in $PRE (a
+# tracked `d` is reset's to replace) is that file.
+#
+# PLUMBING, RENAMES OFF. This was porcelain `git diff --diff-filter=A`, which detects renames, so a
+# path the branch added by `git mv` was status R and never listed: measured, an untracked `new`
+# under a branch renaming `old` to `new` was overwritten and the queue landed (review round 1).
+# `diff-tree` never detects renames unless asked, and `--no-renames` says so anyway.
+#
+# The list is read into a variable first, not through a process substitution, which would discard
+# git's refusal and leave an empty list that passes; `-z` so a name is never C-quoted.
+if ! _added="$(git diff-tree -r -z --no-renames --name-only --diff-filter=A "$PRE" "$GRAFT" | tr '\0' '\n')"; then
+  echo "error: could not list the paths the graft of $BRANCH adds"
+  finish 3
 fi
-GRAFT=$(git rev-parse HEAD)   # the rebased commits (detached HEAD)
+while IFS= read -r _path; do
+  [ -n "$_path" ] || continue
+  if [ -e "$_path" ] || [ -L "$_path" ]; then
+    echo "error: the queue's worktree has an untracked $_path, which grafting $BRANCH would overwrite; move it out of the way"
+    finish 3
+  fi
+  _prefix=""
+  _rest="$_path"
+  while [ "${_rest#*/}" != "$_rest" ]; do
+    _prefix="${_prefix:+$_prefix/}${_rest%%/*}"
+    _rest="${_rest#*/}"
+    if { [ -L "$_prefix" ] || { [ -e "$_prefix" ] && [ ! -d "$_prefix" ]; }; } \
+       && ! git cat-file -e "$PRE:$_prefix" 2>/dev/null; then
+      echo "error: the queue's worktree has an untracked $_prefix where grafting $BRANCH puts a directory ($_path), which would delete it; move it out of the way"
+      finish 3
+    fi
+  done
+done <<<"$_added"
+# Detached at the current commit first (writes no files), so the reset moves HEAD and not $BASE.
+# HOOKS OFF on the reset: it runs none today, and the flag matches the fast-forward's below.
+if ! git switch --detach -q >/tmp/merge-queue-switch.log 2>&1; then
+  echo "error: could not detach the queue's worktree to graft $BRANCH — git said: $(sed -n 1p /tmp/merge-queue-switch.log)"
+  finish 3
+fi
+if ! git -c core.hooksPath=/dev/null reset --hard -q "$GRAFT" >/tmp/merge-queue-reset.log 2>&1; then
+  echo "error: could not move the queue's worktree onto the graft of $BRANCH ($BASE has not moved) — git said: $(sed -n 1p /tmp/merge-queue-reset.log)"
+  finish 3
+fi
 
 # 2. GATE THE GRAFT WHILE IT IS STILL DETACHED, before $BASE is allowed to move.
 #
@@ -362,7 +526,7 @@ fi
 
 # 3. Green — put $BASE on the gated commit.
 #
-# CHECKED. Step 1 detached HEAD, releasing $BASE for the whole rebase and the whole gate, so the
+# CHECKED. Step 1 detached HEAD, releasing $BASE for the whole gate, so the
 # conclusion reached before that — "this worktree holds $BASE" — is long stale. If another
 # worktree claimed the branch meanwhile this switch fails, HEAD stays detached AT $GRAFT and the
 # fast-forward below trivially succeeds because it is already there: the script would print
@@ -382,7 +546,7 @@ if ! git switch "$BASE" >/tmp/merge-queue-switch.log 2>&1; then
   finish 4
 fi
 # NOTHING TO ADD IS ASKED OF THE CONTENT, NOT OF THE COMMIT COUNT — and it is asked HERE, after
-# the rebase, because at entry the two cases that reach an identical tree cannot be told apart.
+# the graft, because at entry the two cases that reach an identical tree cannot be told apart.
 #
 # The entry check counts commits, and MEASURED on git 2.51.1 that is not the same question:
 # `git rebase` drops a commit that BECOMES empty but keeps one that STARTED empty. So a branch
