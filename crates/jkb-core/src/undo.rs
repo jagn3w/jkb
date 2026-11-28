@@ -1017,6 +1017,7 @@ fn revert_sync_state(conn: &Connection, entity_id: &str, before: Option<Value>) 
 /// no amount of payload inspection sees that coming. What makes refusal *total* is [`undo`]'s
 /// wrapper around [`invert_entry`], not this scan; this one only makes the common cases read
 /// better. Adding a predicted constraint check here would be the fifth round of predicting.
+/// When that wrapper meets a UNIQUE index, [`unique_refusal`] names the key's holder after the fact.
 fn blocker(
     conn: &Connection,
     txn_id: i64,
@@ -1242,6 +1243,327 @@ fn later_writer_refusal(
         "transaction {later} has changed the same row since ({what}), and {effect}. Undo \
          transaction {later} first{instead}"
     )))
+}
+
+/// Whether `e` is `SQLite` refusing a write on a UNIQUE index (`SQLITE_CONSTRAINT_UNIQUE`).
+///
+/// The extended code, not the primary one: `SQLITE_CONSTRAINT` alone also covers CHECK, NOT NULL,
+/// foreign key and primary key failures, and only a UNIQUE index has a *holder* to name.
+fn is_unique_violation(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Sqlite(rusqlite::Error::SqliteFailure(f, _))
+            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+    )
+}
+
+/// An identifier as a double-quoted `SQL` identifier, any `"` inside it doubled — the quoting
+/// rule `SQLite` documents for identifiers. Used only on names read back from `pragma_table_info`
+/// / `pragma_index_info` for a table named by [`Entity`], never on a string from the log.
+fn quoted(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// A value as one shell word: bare when it is plainly safe, else single-quoted with any `'`
+/// spliced out as `'\''`, so a refusal's command can be pasted as printed.
+fn shell_word(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,^".contains(c))
+    {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// The columns of each **full** UNIQUE index on `table`, read from the schema.
+///
+/// `pragma_index_list`/`pragma_index_info` are called as table-valued functions with the table
+/// and index names **bound**, so no name is spliced to ask. A partial index (its key only
+/// collides where its `WHERE` holds) and an index on an expression (a key column with no name) are
+/// left out: an equality lookup on their columns could find a row that is not the one in the way,
+/// and naming the wrong row is worse than the plain error this falls back to.
+fn unique_keys(conn: &Connection, table: &str) -> Result<Vec<Vec<String>>> {
+    let indexes: Vec<(String, bool)> = conn
+        .prepare_cached("SELECT name, partial FROM pragma_index_list(?1) WHERE \"unique\" = 1")?
+        .query_map([table], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut keys = Vec::new();
+    for (index, partial) in indexes {
+        if partial {
+            continue;
+        }
+        let columns: Vec<Option<String>> = conn
+            .prepare_cached("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?
+            .query_map([&index], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        if let Some(columns) = columns.into_iter().collect::<Option<Vec<_>>>() {
+            if !columns.is_empty() {
+                keys.push(columns);
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// The row the inverse of `(op, table, entity_id, before)` was trying to write, as column values:
+/// the logged row itself for a re-insert, or the live row with the logged columns laid over it
+/// for a column restore. `None` for every other inverse, which writes no UNIQUE-keyed row here.
+fn attempted_row(
+    conn: &Connection,
+    op: &str,
+    table: &str,
+    entity_id: &str,
+    before: Option<&Value>,
+) -> Result<Option<AttemptedRow>> {
+    let Some(entity) = Entity::parse(table) else {
+        return Ok(None);
+    };
+    let columns = table_columns(conn, entity.as_str())?;
+    let logged = column_map(op, table, before)
+        .and_then(Value::as_object)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter(|(c, _)| columns.contains(c.as_str()))
+                .map(|(c, v)| (c.clone(), as_sql(v)))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    match inverse_for(op, table) {
+        Some(Inverse::ReinsertRow) => Ok(Some((logged, None))),
+        Some(Inverse::Columns) => {
+            let Ok(row) = entity_id.parse::<i64>() else {
+                return Ok(None);
+            };
+            let names: Vec<&String> = columns.iter().collect();
+            let sql = format!(
+                "SELECT {} FROM {} WHERE rowid = ?1",
+                names
+                    .iter()
+                    .map(|c| quoted(c))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                quoted(entity.as_str())
+            );
+            let live = conn
+                .prepare_cached(&sql)?
+                .query_row([row], |r| {
+                    (0..names.len())
+                        .map(|i| r.get::<_, SqlValue>(i))
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                })
+                .optional()?;
+            let Some(live) = live else {
+                return Ok(None);
+            };
+            let mut merged: std::collections::BTreeMap<String, SqlValue> =
+                names.into_iter().cloned().zip(live).collect();
+            merged.extend(logged);
+            Ok(Some((merged, Some(row))))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Why the inverse of `(op, table, entity_id, before)` failed with `e`, for [`undo`]'s funnel.
+///
+/// A UNIQUE refusal has a holder, and the holder decides the next step: the later transaction that
+/// wrote it, or the command that removes it ([`unique_refusal`]). A UNIQUE failure aborts only its
+/// statement, so the connection can still be read here; if the lookup fails anyway, the plain error
+/// is still a refusal. The database's own words stay either way: they name the constraint, and the
+/// holder is read from the schema, so the two can be checked against each other.
+fn apply_failure(
+    conn: &Connection,
+    txn_id: i64,
+    op: &str,
+    table: &str,
+    entity_id: &str,
+    before: Option<&str>,
+    e: &Error,
+) -> String {
+    let held = if is_unique_violation(e) {
+        unique_refusal(conn, txn_id, op, table, entity_id, before)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    match held {
+        Some(held) => format!("reversing `{op}` on `{table}` failed: {e}; {held}"),
+        None => format!("reversing `{op}` on `{table}` failed: {e}"),
+    }
+}
+
+/// The row an inverse tried to write, as column values, and that row's own rowid when it already
+/// exists (a column restore) — the one row a holder lookup must not find.
+type AttemptedRow = (std::collections::BTreeMap<String, SqlValue>, Option<i64>);
+
+/// Why the inverse of `(op, table, entity_id, before)` in transaction `txn_id` hit a UNIQUE index,
+/// as a refusal naming the next step — or `None` when the holder cannot be found.
+///
+/// `blocker`'s pre-flight reads only the changelog, so it cannot see this coming (its own comment
+/// says why it must not try); this is the apply-time half, run only after the database has
+/// refused. The holder is the live row that already has the key the inverse writes: found by the
+/// table's UNIQUE indexes ([`unique_keys`]) over the attempted row ([`attempted_row`]).
+///
+/// What to do about it depends on who wrote the holder. Its newest live work writer, by the very
+/// query [`later_writer`] runs on the identical `(entity_type, holder id)` key, is named as the
+/// transaction to undo first **only if it is later than `txn_id`**: only a later transaction may
+/// block an earlier one, which is what keeps peeling finite. A holder with no such writer — put
+/// back by an undo of an older removal, say — is named with the reversible command that removes it.
+fn unique_refusal(
+    conn: &Connection,
+    txn_id: i64,
+    op: &str,
+    table: &str,
+    entity_id: &str,
+    before: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(entity) = Entity::parse(table) else {
+        return Ok(None);
+    };
+    let before = before.and_then(|b| serde_json::from_str::<Value>(b).ok());
+    let Some((row, own)) = attempted_row(conn, op, table, entity_id, before.as_ref())? else {
+        return Ok(None);
+    };
+    for key in unique_keys(conn, entity.as_str())? {
+        let Some(values) = key
+            .iter()
+            .map(|c| row.get(c).filter(|v| **v != SqlValue::Null).cloned())
+            .collect::<Option<Vec<_>>>()
+        else {
+            // A NULL never collides on a UNIQUE index, and an absent column is not this key.
+            continue;
+        };
+        let sql = format!(
+            "SELECT rowid FROM {} WHERE {} AND rowid IS NOT ? LIMIT 1",
+            quoted(entity.as_str()),
+            key.iter()
+                .map(|c| format!("{} = ?", quoted(c)))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        );
+        let mut args = values;
+        args.push(own.map_or(SqlValue::Null, SqlValue::Integer));
+        let Some(holder) = conn
+            .prepare_cached(&sql)?
+            .query_row(params_from_iter(args), |r| r.get::<_, i64>(0))
+            .optional()?
+        else {
+            continue;
+        };
+        let cols = key
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let held = format!("row {holder} of `{table}` already holds the same {cols}");
+        if let Some(later) = newest_later_work_writer(conn, txn_id, table, holder)? {
+            return Ok(Some(format!(
+                "{held}, written by transaction {later} since. Undo transaction {later} first"
+            )));
+        }
+        let remove = removal_command(conn, entity, holder)?.map_or_else(
+            || format!("remove row {holder} of `{table}` first"),
+            |command| format!("remove it first with `{command}`, which can itself be undone"),
+        );
+        return Ok(Some(format!(
+            "{held}, and no later transaction wrote it to undo instead; {remove}"
+        )));
+    }
+    Ok(None)
+}
+
+/// The newest live work transaction after `txn_id` with an entry on row `row` of `table` — the
+/// [`later_writer_sql`] lookup on the identical key, without the column overlap: the holder is
+/// in the way whole, whatever its writer changed.
+fn newest_later_work_writer(
+    conn: &Connection,
+    txn_id: i64,
+    table: &str,
+    row: i64,
+) -> Result<Option<i64>> {
+    let later = conn
+        .prepare_cached(&later_writer_sql())?
+        .query_map(params![table, row.to_string(), txn_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(later
+        .into_iter()
+        .find(|(_, op)| is_work(op, table))
+        .map(|(txn, _)| txn))
+}
+
+/// The `jkb` command that removes row `row` of `entity` reversibly (logged, so `jkb undo` can put
+/// it back), where one exists.
+fn removal_command(conn: &Connection, entity: Entity, row: i64) -> Result<Option<String>> {
+    Ok(match entity {
+        Entity::TagApplications => conn
+            .prepare_cached(
+                "SELECT i.uid, t.facet, t.value FROM tag_applications t
+                   JOIN items i ON i.id = t.item_id WHERE t.id = ?1",
+            )?
+            .query_row([row], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?
+            .map(|(uid, facet, value)| {
+                format!(
+                    "jkb task tag rm {} {}",
+                    shell_word(&uid),
+                    shell_word(&format!("{facet}={value}"))
+                )
+            }),
+        Entity::Placements => conn
+            .prepare_cached(
+                "SELECT i.uid, n.path, p.role FROM placements p
+                   JOIN items i ON i.id = p.item_id
+                   JOIN namespaces n ON n.id = p.namespace_id WHERE p.id = ?1",
+            )?
+            .query_row([row], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?
+            // Only a mirror has a removal; a primary placement is moved, never removed.
+            .filter(|(_, _, role)| role == jkb_types::PlacementRole::Reference.as_str())
+            .map(|(uid, path, _)| {
+                format!(
+                    "jkb task unplace {} {}",
+                    shell_word(&uid),
+                    shell_word(&path)
+                )
+            }),
+        Entity::Edges => conn
+            .prepare_cached(
+                "SELECT s.uid, d.uid FROM edges e
+                   JOIN items s ON s.id = e.src_item_id
+                   JOIN items d ON d.id = e.dst_item_id
+                  WHERE e.id = ?1 AND e.type = ?2",
+            )?
+            .query_row(params![row, jkb_types::EdgeType::DependsOn.as_str()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .optional()?
+            .map(|(src, dst)| {
+                format!(
+                    "jkb task undepend {} {}",
+                    shell_word(&src),
+                    shell_word(&dst)
+                )
+            }),
+        _ => None,
+    })
 }
 
 /// A refusal that a reader can act on: what is wrong, that nothing moved, and **which
@@ -1494,7 +1816,8 @@ pub fn undo(conn: &Connection, meta: &WriteMeta, txn_id: i64) -> Result<usize> {
         match invert_entry(conn, meta, &op, &table, &entity_id, before.as_deref()) {
             Ok(rows) => reverted += rows,
             Err(e) => {
-                let why = format!("reversing `{op}` on `{table}` failed: {e}");
+                let why =
+                    apply_failure(conn, txn_id, &op, &table, &entity_id, before.as_deref(), &e);
                 // …and the funnel does not depend on the connection still being usable. If the
                 // failure aborted the transaction, `refusal`'s own lookup for the escape hatch
                 // fails too; say what happened plainly rather than replacing the original error
@@ -5628,6 +5951,153 @@ mod later_writer_tests {
             .read(move |c| crate::tag::applications(c, id))
             .unwrap()
             .is_empty());
+    }
+
+    /// Apply, remove, re-apply. The re-application is a new row (`tag_applications` is
+    /// `AUTOINCREMENT`) with the removed row's UNIQUE key, so the changelog key match sees no later
+    /// writer of the removed row, and undoing the removal used to die on a bare UNIQUE error naming
+    /// no transaction. It must name the re-application, and peeling that first must work.
+    #[test]
+    fn undoing_a_tag_removal_names_the_later_reapplication() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |c, m| upsert(c, m, &note("note:reapplied")))
+            .unwrap();
+        let _t1 = txn(&db, move |c, m| {
+            crate::tag::apply(c, m, id, "size", "small")
+        });
+        let t2 = txn(&db, move |c, m| {
+            crate::tag::remove(c, m, id, "size", "small")
+        });
+        let t3 = txn(&db, move |c, m| {
+            crate::tag::apply(c, m, id, "size", "small")
+        });
+
+        let refused = try_undo(&db, t2).expect_err("the removal was undone over a re-applied tag");
+        assert_eq!(named_later(&refused), Some(t3), "{refused}");
+        assert!(refused.contains("`item_id`, `facet`, `value`"), "{refused}");
+
+        try_undo(&db, t3).unwrap();
+        try_undo(&db, t2).unwrap();
+        assert_eq!(
+            db.read(move |c| crate::tag::applications(c, id)).unwrap(),
+            vec![("size".to_owned(), "small".to_owned())]
+        );
+    }
+
+    /// The same shape on `placements`: a mirror removed and placed again.
+    #[test]
+    fn undoing_an_unplace_names_the_later_replacement() {
+        use jkb_types::PlacementRole;
+        let db = Db::open_in_memory().unwrap();
+        let (id, ns) = db
+            .write_txn("t", |c, m| {
+                Ok((
+                    upsert(c, m, &note("note:replaced"))?,
+                    crate::ns::ensure(c, m, "refs/mirror")?,
+                ))
+            })
+            .unwrap();
+        let _t1 = txn(&db, move |c, m| {
+            crate::placement::place(c, m, id, ns, PlacementRole::Reference, 0)
+        });
+        let t2 = txn(&db, move |c, m| {
+            crate::placement::unplace(c, m, id, ns).map(drop)
+        });
+        let t3 = txn(&db, move |c, m| {
+            crate::placement::place(c, m, id, ns, PlacementRole::Reference, 0)
+        });
+
+        let refused = try_undo(&db, t2).expect_err("the unplace was undone over a re-placement");
+        assert_eq!(named_later(&refused), Some(t3), "{refused}");
+
+        try_undo(&db, t3).unwrap();
+        try_undo(&db, t2).unwrap();
+        let mirrors: i64 = db
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM placements WHERE item_id = ?1 AND namespace_id = ?2 \
+                     AND role = 'reference'",
+                    rusqlite::params![id.get(), ns.get()],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(mirrors, 1);
+    }
+
+    /// The holder's own writer is EARLIER than the transaction being undone, so naming it would
+    /// break "only a later transaction blocks an earlier one" (and peeling would loop). T1 apply,
+    /// T2 remove, T3 apply, T4 remove, then undo T2 puts T1's row back; undoing T4 now collides
+    /// with that row, whose newest live writer is T1. The refusal names the reversible removal.
+    #[test]
+    fn a_holder_with_no_later_writer_is_named_with_its_removal() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |c, m| upsert(c, m, &note("note:held")))
+            .unwrap();
+        let apply = move |c: &rusqlite::Connection, m: &crate::store::WriteMeta| {
+            crate::tag::apply(c, m, id, "size", "small")
+        };
+        let remove = move |c: &rusqlite::Connection, m: &crate::store::WriteMeta| {
+            crate::tag::remove(c, m, id, "size", "small")
+        };
+        let t1 = txn(&db, apply);
+        let t2 = txn(&db, remove);
+        txn(&db, apply);
+        let t4 = txn(&db, remove);
+        try_undo(&db, t2).unwrap();
+
+        let refused = try_undo(&db, t4).expect_err("the removal was undone over a held key");
+        assert_eq!(named_later(&refused), None, "{refused}");
+        assert!(
+            !refused.contains(&format!("transaction {t1} since")),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("remove it first with `jkb task tag rm note:held size=small`"),
+            "{refused}"
+        );
+
+        // Doing what it says (the core of `jkb task tag rm`) clears the way.
+        txn(&db, remove);
+        try_undo(&db, t4).unwrap();
+        assert_eq!(
+            db.read(move |c| crate::tag::applications(c, id)).unwrap(),
+            vec![("size".to_owned(), "small".to_owned())]
+        );
+    }
+
+    /// A collision through a COLUMN restore, which a re-insert-only check would miss. A rename
+    /// between the removal and its undo moves the re-applied row off the key, so undoing the
+    /// removal succeeds; undoing the rename then writes `facet = 'size'` back onto that row, which
+    /// collides with the row the first undo restored.
+    #[test]
+    fn undoing_a_facet_rename_names_the_holder_of_the_restored_key() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .write_txn("t", |c, m| upsert(c, m, &note("note:renamed")))
+            .unwrap();
+        txn(&db, move |c, m| {
+            crate::tag::apply(c, m, id, "size", "small")
+        });
+        let t2 = txn(&db, move |c, m| {
+            crate::tag::remove(c, m, id, "size", "small")
+        });
+        txn(&db, move |c, m| {
+            crate::tag::apply(c, m, id, "size", "small")
+        });
+        let t4 = txn(&db, move |c, m| {
+            crate::tag::rename_facet(c, m, "size", "sz").map(drop)
+        });
+        try_undo(&db, t2).unwrap();
+
+        let refused = try_undo(&db, t4).expect_err("the rename was undone over a held key");
+        assert_eq!(named_later(&refused), None, "{refused}");
+        assert!(
+            refused.contains("remove it first with `jkb task tag rm note:renamed size=small`"),
+            "{refused}"
+        );
     }
 
     /// A later transaction that is itself an undo is not work, even where it carries an entry on
