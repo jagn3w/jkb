@@ -174,7 +174,8 @@ impl QueueType {
     }
 }
 
-/// A topic's type and limits, decided once at creation.
+/// A topic's type and limits, decided at creation. Only a reserved topic's owning module may change
+/// them later, by declaring a new spec ([`topic_create_reserved`] converges it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicSpec {
     /// How it is consumed.
@@ -211,6 +212,10 @@ pub enum Created {
     New,
     /// Already existed, unchanged.
     Existing,
+    /// Already existed with an older spec, which was replaced by the given one. Only a reserved
+    /// topic's owner gets this ([`topic_create_reserved`]); the public [`topic_create`] refuses a
+    /// different spec with [`QueueError::TopicConflict`] instead.
+    Respecced,
 }
 
 /// A message to send.
@@ -483,13 +488,13 @@ pub(crate) fn group_count_reserved(conn: &Connection, topic: &str) -> Result<i64
 /// [`QueueError::TopicConflict`] for an existing topic with a different spec, or a database error.
 pub fn topic_create(
     conn: &Connection,
-    meta: &WriteMeta,
+    _meta: &WriteMeta,
     name: &str,
     spec: &TopicSpec,
     now: i64,
 ) -> Result<Created> {
     check_unreserved(name)?;
-    topic_create_reserved(conn, meta, name, spec, now)
+    create_topic(conn, name, spec, now, OnDiffer::Refuse)
 }
 
 /// The topic prefixes whose topics one module of this crate owns: only it creates them, sends to
@@ -519,12 +524,55 @@ fn check_unreserved(topic: &str) -> std::result::Result<(), QueueError> {
 }
 
 /// [`topic_create`] without the reserved-prefix refusal — for the module that owns the prefix.
+///
+/// Unlike [`topic_create`], an existing topic with a different spec **converges** to the given one
+/// ([`Created::Respecced`]) rather than being refused. Only the owning module calls this, so the
+/// spec it passes is its own current declaration, and a different stored one is that module's older
+/// declaration — not another producer's. Refusing it left a long-lived reserved topic unusable after
+/// any release that changed its spec: `exec/requests`, made with a one-day TTL, refused every group
+/// creation once `exec`'s TTL became `LATEST_END_MS` plus a day, and the forwarder died at start.
+///
+/// # Errors
+/// [`QueueError::Invalid`] for a bad name or spec, [`QueueError::TopicConflict`] for an existing
+/// topic of a different [`QueueType`] (see [`OnDiffer::Converge`]), or a database error.
 pub(crate) fn topic_create_reserved(
     conn: &Connection,
     _meta: &WriteMeta,
     name: &str,
     spec: &TopicSpec,
     now: i64,
+) -> Result<Created> {
+    create_topic(conn, name, spec, now, OnDiffer::Converge)
+}
+
+/// What [`create_topic`] does with an existing topic whose stored spec differs from the given one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnDiffer {
+    /// Refuse with [`QueueError::TopicConflict`]: a user topic, whose creators may disagree.
+    Refuse,
+    /// Replace the stored spec with the given one, field by field as safe in place:
+    ///
+    /// - `default_ttl_ms` is read only by a send, which stamps each message's own `expires_at`, so
+    ///   messages already held keep the expiry they were sent with; only later sends get the new TTL.
+    /// - `group_idle_ms` and `compact_every_ms` are read only when [`compact`] runs.
+    /// - `max_bytes` and `max_messages` are read only by a send ([`make_room`], [`validate_draft`]).
+    ///   Shrinking either below what the topic holds deletes nothing: the topic is simply over its
+    ///   cap, and the next send reaps what every group has consumed, oldest first, or is refused
+    ///   with [`QueueError::QueueFull`] — the same state, under the same rule, as any full topic. No
+    ///   unread message is lost.
+    /// - `queue_type` decides how the messages and groups already stored are consumed, so changing it
+    ///   would reinterpret them; that is still refused with [`QueueError::TopicConflict`]. (With
+    ///   `log` the only type, nothing can reach this yet; it is the decision a second type inherits.)
+    Converge,
+}
+
+/// The one body of [`topic_create`] and [`topic_create_reserved`].
+fn create_topic(
+    conn: &Connection,
+    name: &str,
+    spec: &TopicSpec,
+    now: i64,
+    on_differ: OnDiffer,
 ) -> Result<Created> {
     check_name("topic name", name)?;
     check_positive("max_bytes", spec.max_bytes)?;
@@ -536,6 +584,24 @@ pub(crate) fn topic_create_reserved(
     }
     match topic_row_any(conn, name) {
         Ok((_, existing)) if existing == *spec => return Ok(Created::Existing),
+        Ok((id, existing))
+            if on_differ == OnDiffer::Converge && existing.queue_type == spec.queue_type =>
+        {
+            conn.prepare_cached(
+                "UPDATE mq_topics SET max_bytes = ?2, max_messages = ?3, default_ttl_ms = ?4, \
+                                      group_idle_ms = ?5, compact_every_ms = ?6 \
+                 WHERE id = ?1",
+            )?
+            .execute(params![
+                id,
+                spec.max_bytes,
+                spec.max_messages,
+                spec.default_ttl_ms,
+                spec.group_idle_ms,
+                spec.compact_every_ms
+            ])?;
+            return Ok(Created::Respecced);
+        }
         Ok(_) => return Err(QueueError::TopicConflict(name.to_owned()).into()),
         Err(crate::Error::Queue(QueueError::NoSuchTopic(_))) => {}
         Err(e) => return Err(e),

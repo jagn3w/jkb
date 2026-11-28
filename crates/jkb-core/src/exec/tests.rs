@@ -1475,3 +1475,57 @@ fn the_message_escapes_what_a_program_printed_and_stays_under_its_cap() {
     let more: usize = closing[2..closing.find(' ').unwrap()].parse().unwrap();
     assert_eq!(shown + more, 50, "every warning is shown or counted");
 }
+
+/// The live case: `exec/requests` made by a release whose TTL was one day must not refuse the
+/// groups of a release whose TTL is longer. Every group creation on it — the forwarder's and the
+/// operator's — once failed with `topic_conflict`, and the forwarder died at start.
+#[test]
+fn the_index_takes_a_group_over_a_topic_made_with_the_old_one_day_ttl() {
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+    let db = Db::open_in_memory().unwrap();
+    let old = TopicSpec {
+        default_ttl_ms: Some(DAY),
+        ..super::index_spec()
+    };
+    assert_ne!(
+        old,
+        super::index_spec(),
+        "the old spec must differ from today's"
+    );
+    db.write_txn("t", move |c, m| {
+        mq::topic_create_reserved(c, m, super::INDEX_TOPIC, &old, T0)?;
+        mq::group_create_reserved(
+            c,
+            m,
+            super::INDEX_TOPIC,
+            "forwarder",
+            mq::Start::FromNow,
+            T0,
+        )
+    })
+    .unwrap();
+    let created = db
+        .write_txn("t", |c, m| {
+            super::index_group_create(c, m, "code-factory", mq::Start::FromNow, T0 + 1)
+        })
+        .unwrap();
+    assert_eq!(created, mq::Created::New);
+    let again = db
+        .write_txn("t", |c, m| {
+            super::index_group_create(c, m, "forwarder", mq::Start::FromNow, T0 + 2)
+        })
+        .unwrap();
+    assert_eq!(again, mq::Created::Existing);
+    let (ttl, groups) = db
+        .read(|c| {
+            let ttl: Option<i64> = c.query_row(
+                "SELECT default_ttl_ms FROM mq_topics WHERE name = ?1",
+                [super::INDEX_TOPIC],
+                |r| r.get(0),
+            )?;
+            Ok((ttl, mq::group_count_reserved(c, super::INDEX_TOPIC)?))
+        })
+        .unwrap();
+    assert_eq!(ttl, Some(super::TOPIC_TTL_MS));
+    assert_eq!(groups, 2);
+}
